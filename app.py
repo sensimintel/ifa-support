@@ -624,7 +624,8 @@ function applyLocked(){  // 强制把相机拉回锁定视角（压制 auto-fram
 function applyAdaptive(){  // 自适应：保留角度 θ/φ 与 FOV；每帧按 getDimensions 算距离、对准 getBoundingBoxCenter
   // 关键用绝对米（getDimensions/getBoundingBoxCenter 可靠）；不用 %/auto——它们对点云会算负距离/全黑。
   const d=mv.getDimensions(), c=mv.getBoundingBoxCenter();
-  const maxDim=Math.max(d.x, d.y, d.z) || 2;
+  const maxDim=Math.max(d.x, d.y, d.z);
+  if(!(maxDim>0.05))return;  // 包围盒未就绪(读到 0)：跳过本次，保持上一帧视角，避免设错致黑
   const ADAPT_FILL=0.8;  // 取景充满度：1.0=恰好框住 maxDim；<1 拉近放大(点云填满/略出血)
   const dist=(maxDim / 2) / Math.tan(camState.fov * Math.PI / 360) * ADAPT_FILL;
   mv.cameraTarget=c.x+'m '+c.y+'m '+c.z+'m';
@@ -664,7 +665,8 @@ mv.addEventListener('camera-change',(e)=>{
 // 每帧点云载入后：用户正在调则不打断；自适应模式每帧自动框住点云；固定模式强制拉回锁定视角
 mv.addEventListener('load',()=>{
   if(interacting)return;
-  if(adaptive){ applyAdaptive(); return; }
+  // 自适应需读包围盒(getDimensions/Center)，load 瞬间可能未就绪(读到 0)→延迟一拍再算
+  if(adaptive){ setTimeout(()=>{ if(!interacting&&adaptive)applyAdaptive(); }, 150); return; }
   locked ? applyLocked() : lockFromNow();
 });
 $('camcopy').addEventListener('click',()=>{
