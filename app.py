@@ -235,11 +235,11 @@ def _prune_glb():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 顶层分栏首页：左 iframe=官方 Gradio(/gradio)，右 iframe=扩展面板(/panel)
+# 顶层分栏首页：左 iframe=扩展面板(/panel，设备帧+DA3)，右 iframe=电子秤(/weight)
 # ══════════════════════════════════════════════════════════════════════
 SPLIT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DA3 · 官方 Gradio ＋ 扩展面板</title>
+<title>DA3 · 设备实时帧 ＋ 电子秤</title>
 <style>
  *{box-sizing:border-box}
  html,body{margin:0;height:100%;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#0d0d0f}
@@ -256,17 +256,17 @@ SPLIT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  @media(max-width:900px){.wrap{flex-direction:column;height:auto}.pane{height:90vh;border-right:0;border-bottom:1px solid #2c2c2e}}
 </style></head><body>
  <div class="top"><b>Depth Anything 3</b>
-  <span class="tag">左：官方 Gradio（点云 / 网格 / 3D 量距）　·　右：扩展面板（深度图 · 点云 · 网格 · 电子秤，可调参转视角）　·　同一 8060 端口</span></div>
+  <span class="tag">左：设备实时帧 + DA3 产物（深度图 · 点云 · 网格，可调参转视角）　·　右：电子秤实时重量　·　同一 8060 端口</span></div>
  <div class="wrap">
   <div class="pane">
-   <div class="bar"><span class="dot" style="background:#34c759"></span>官方 Gradio UI
-    <a href="/gradio" target="_blank">单独打开 ↗</a></div>
-   <iframe src="/gradio" title="官方 Gradio"></iframe>
+   <div class="bar"><span class="dot" style="background:#0a84ff"></span>设备实时帧 · DA3 产物
+    <a href="/panel" target="_blank">单独打开 ↗</a></div>
+   <iframe src="/panel" title="设备实时帧 + DA3 产物"></iframe>
   </div>
   <div class="pane">
-   <div class="bar"><span class="dot" style="background:#0a84ff"></span>扩展面板（自研）
-    <a href="/panel" target="_blank">单独打开 ↗</a></div>
-   <iframe src="/panel" title="扩展面板"></iframe>
+   <div class="bar"><span class="dot" style="background:#34c759"></span>电子秤实时重量
+    <a href="/weight" target="_blank">单独打开 ↗</a></div>
+   <iframe src="/weight" title="电子秤实时重量"></iframe>
   </div>
  </div>
 </body></html>"""
