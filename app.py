@@ -16,12 +16,14 @@ import base64
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import struct
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -223,6 +225,192 @@ def build_mesh_glb(pred, out_path, conf_thresh_percentile=40.0, edge_ratio=0.06)
     return len(verts), len(faces)
 
 
+# ══════════════════════════════════════════════════════════════════════
+# LocateAnything 检测：调 5090 本地 LocateAnything 网关（localhost:8000，OpenAI 兼容），
+# 在帧上定位 food / drink，并把检测框内点云的 3D 包围盒画成彩色粗线框叠到点云 GLB 上。
+#   · 输入务必用 DA3 处理后的 processed_images（与深度同一张图），检测框归一化坐标零错位。
+#   · 坐标契约：响应 content 里 `<ref>label</ref><box><x1><y1><x2><y2></box>`，0-999 归一化，
+#     未命中 `<box>None</box>`；多类以 `</c>` 分隔（逗号分隔在真实第一视角帧上会崩，勿用）。
+# ══════════════════════════════════════════════════════════════════════
+LOCATE_ENDPOINT = "http://127.0.0.1:8000/v1/chat/completions"
+LOCATE_MODEL = "nvidia/LocateAnything-3B"
+LOCATE_TARGETS = "food</c>drink"          # 两类语义：食物 / 饮品
+LOCATE_TIMEOUT = 20.0                     # 单次检测超时（秒）；已挪到 GPU 锁外，不阻塞产线
+LOCATE_COLORS = {"food": (222, 52, 52),   # food = 红
+                 "drink": (46, 120, 235)}  # drink = 蓝
+_LOCATE_RE = re.compile(r"<ref>(.*?)</ref>\s*<box>(.*?)</box>", re.S)
+_LOCATE_INT_RE = re.compile(r"<(-?\d+)>")
+
+
+def _locate_food_drink(rgb: np.ndarray):
+    """调本地 LocateAnything 检测 food/drink。
+
+    入参 rgb 为 uint8 RGB（应传 DA3 的 processed_images，与深度图同尺寸同视图，检测框零错位）。
+    返回 [(label, nx1, ny1, nx2, ny2), ...]，坐标为相对图像宽高的归一化 0-1（左上、右下）。
+    任何失败（网络/解析）都吞掉并返回 []，保证点云仍能出（只是没框）。"""
+    try:
+        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+        if not ok:
+            return []
+        b64 = base64.b64encode(buf.tobytes()).decode()
+        payload = {
+            "model": LOCATE_MODEL,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text",
+                 "text": f"Locate all the instances that matches the following description: {LOCATE_TARGETS}."},
+            ]}],
+            "max_tokens": 512, "temperature": 0.0,
+        }
+        req = urllib.request.Request(
+            LOCATE_ENDPOINT, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=LOCATE_TIMEOUT) as r:
+            data = json.loads(r.read().decode())
+        content = data["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"[da3-web] LocateAnything 调用失败：{type(e).__name__}: {e}", flush=True)
+        return []
+    dets = []
+    for label, box in _LOCATE_RE.findall(content):
+        label = label.strip().lower()
+        if "none" in box.lower():
+            continue
+        ints = [int(x) for x in _LOCATE_INT_RE.findall(box)]
+        # 每 4 个整数一个框，兼容单/多实例
+        for k in range(0, len(ints) - 3, 4):
+            x1, y1, x2, y2 = ints[k:k + 4]
+            nx1, ny1 = min(x1, x2) / 1000.0, min(y1, y2) / 1000.0
+            nx2, ny2 = max(x1, x2) / 1000.0, max(y1, y2) / 1000.0
+            if nx2 - nx1 < 0.01 or ny2 - ny1 < 0.01:  # 退化框丢弃
+                continue
+            dets.append((label, nx1, ny1, nx2, ny2))
+    return dets
+
+
+def _box_wireframe_meshes(lo, hi, color_rgb, radius):
+    """用细圆柱拼一个 3D 轴对齐包围盒（AABB）的 12 条棱，返回 mesh 列表。
+
+    比 1px 线段醒目（model-viewer 里线宽固定很细），演示时框更清晰。"""
+    x0, y0, z0 = float(lo[0]), float(lo[1]), float(lo[2])
+    x1, y1, z1 = float(hi[0]), float(hi[1]), float(hi[2])
+    c = np.array([[x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+                  [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]], dtype=np.float64)
+    edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+             (0, 4), (1, 5), (2, 6), (3, 7)]
+    col = np.array([color_rgb[0], color_rgb[1], color_rgb[2], 255], dtype=np.uint8)
+    meshes = []
+    for a, b in edges:
+        p0, p1 = c[a], c[b]
+        if np.linalg.norm(p1 - p0) < 1e-9:
+            continue
+        try:
+            cyl = trimesh.creation.cylinder(radius=radius, segment=[p0, p1], sections=6)
+        except Exception:
+            continue
+        cyl.visual.vertex_colors = np.tile(col, (len(cyl.vertices), 1))
+        meshes.append(cyl)
+    return meshes
+
+
+def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentile=40.0,
+                               num_max_points=800000, show_cameras=True):
+    """自建单视图点云（复用 DA3 官方反投影 + 同一 glTF 对齐变换 A），并把 food/drink
+    检测框内点云的 3D 轴对齐包围盒画成彩色粗线框，一并导出 GLB。
+
+    点云与框来自同一套反投影 + 同一个 A 变换，故框必与点云严格对齐（不赌坐标系）。
+    detections 为 _locate_food_drink 的归一化框（相对 processed 图宽高）。
+    返回命中的 label 列表（用于状态展示）。"""
+    from depth_anything_3.utils.export import glb as _glb  # 复用官方对齐/相机/降采样
+
+    depth = np.asarray(pred.depth).astype(np.float32)       # (N,H,W)
+    K = np.asarray(pred.intrinsics).astype(np.float64)      # (N,3,3)
+    N, H, W = depth.shape
+    ext = pred.extrinsics
+    if ext is None:  # 单视图缺外参：相机置于原点（identity）
+        ext = np.tile(np.eye(4, dtype=np.float64), (N, 1, 1))
+    else:
+        ext = np.asarray(ext).astype(np.float64)
+    rgb = _rgb_uint8(pred, None)
+    if rgb is None or rgb.shape[:2] != (H, W):
+        rgb = np.full((H, W, 3), 180, np.uint8)
+
+    i = 0  # DA3 单图推理，只处理第 0 帧
+    d = depth[i]
+    valid = np.isfinite(d) & (d > 0)
+    if getattr(pred, "sky", None) is not None:
+        valid &= ~np.asarray(pred.sky)[i].astype(bool)
+    conf = pred.conf
+    if conf is not None:
+        conf = np.asarray(conf).astype(np.float32)
+        conf_thr = _glb.get_conf_thresh(pred, None, 1.05,
+                                        conf_thresh_percentile, 90.0)
+        valid &= conf[i] >= conf_thr
+
+    # 反投影全部像素到 world（保留像素网格，便于按检测框索引），与官方 glb 同款公式
+    us, vs = np.meshgrid(np.arange(W), np.arange(H))
+    pix = np.stack([us, vs, np.ones_like(us)], -1).reshape(-1, 3).astype(np.float64)
+    K_inv = np.linalg.inv(K[i])
+    c2w = np.linalg.inv(_glb._as_homogeneous44(ext[i]))
+    rays = K_inv @ pix.T                                # (3, H*W)
+    Xc = rays * d.reshape(-1)[None, :]                  # (3, H*W)
+    Xw = (c2w @ np.vstack([Xc, np.ones((1, Xc.shape[1]))]))[:3].T  # (H*W, 3) world
+
+    vmask = valid.reshape(-1)
+    # A：与官方一致——按第一相机对齐 glTF 轴系 + 以全部有效点中位数居中
+    A = _glb._compute_alignment_transform_first_cam_glTF_center_by_points(ext[i], Xw[vmask])
+    Xa = trimesh.transform_points(Xw, A)               # (H*W, 3) 对齐后
+    Xa_grid = Xa.reshape(H, W, 3)
+
+    scene = trimesh.Scene()
+    if scene.metadata is None:
+        scene.metadata = {}
+    scene.metadata["hf_alignment"] = A                 # 供相机线框复用
+
+    # 点云（降采样后加入场景）
+    pc_pts = Xa[vmask].astype(np.float32)
+    pc_cols = rgb.reshape(-1, 3)[vmask].astype(np.uint8)
+    pc_pts, pc_cols = _glb._filter_and_downsample(pc_pts, pc_cols, int(num_max_points))
+    if pc_pts.shape[0] > 0:
+        scene.add_geometry(trimesh.points.PointCloud(vertices=pc_pts, colors=pc_cols))
+
+    scene_scale = _glb._estimate_scene_scale(pc_pts, fallback=1.0)
+    radius = max(scene_scale * 0.004, 1e-4)            # 框线粗细随场景尺度
+
+    # 逐检测框：取框内有效像素的对齐点，算 3D AABB（2%/98% 分位抗离群），画粗线框
+    hit_labels = []
+    for (label, nx1, ny1, nx2, ny2) in detections:
+        u1, u2 = int(nx1 * W), int(np.ceil(nx2 * W))
+        v1, v2 = int(ny1 * H), int(np.ceil(ny2 * H))
+        u1, u2 = max(0, u1), min(W, u2)
+        v1, v2 = max(0, v1), min(H, v2)
+        if u2 <= u1 or v2 <= v1:
+            continue
+        sub_valid = valid[v1:v2, u1:u2].reshape(-1)
+        sub_pts = Xa_grid[v1:v2, u1:u2].reshape(-1, 3)[sub_valid]
+        if sub_pts.shape[0] < 20:        # 框内有效深度太少，无法定位 3D 盒
+            continue
+        lo = np.percentile(sub_pts, 2, axis=0)
+        hi = np.percentile(sub_pts, 98, axis=0)
+        hi = np.where(hi - lo < 1e-3, lo + 1e-3, hi)   # 防退化成面/线
+        color = LOCATE_COLORS.get(label, (255, 200, 0))
+        for m in _box_wireframe_meshes(lo, hi, color, radius):
+            scene.add_geometry(m)
+        hit_labels.append(label)
+
+    # 相机线框（复用官方逻辑，从 metadata 读同一个 A）
+    if show_cameras:
+        try:
+            _glb._add_cameras_to_scene(
+                scene=scene, K=K, ext_w2c=ext,
+                image_sizes=[(H, W)] * N, scale=scene_scale * 0.03)
+        except Exception:
+            pass
+
+    scene.export(out_path)
+    return hit_labels
+
+
 def _prune_glb():
     """只保留最近 GLB_KEEP 个产物子目录，清理旧的。"""
     try:
@@ -318,7 +506,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="fld"><label>产物类型 export_format</label>
    <select id="fmt">
     <option value="depth">深度图（彩色）</option>
-    <option value="glb">点云 + 相机（GLB · 可转视角）</option>
+    <option value="glb">点云 + food/drink 框（GLB · 可转视角）</option>
     <option value="mesh">网格 mesh（GLB · 可转视角）</option>
    </select></div>
   <div class="fld"><label>处理分辨率 process_res <span class="rngval" id="prv">504</span></label>
@@ -333,7 +521,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    <div class="fld" id="camwrap"><label>相机线框 show_cameras</label>
     <select id="cam"><option value="1">显示</option><option value="0">隐藏</option></select></div>
   </div>
-  <div class="hint">点云用 DA3 官方 scene.glb 导出；网格由深度反投影自建三角面（conf 分位越高越干净，num_max_points 仅点云生效）。分辨率越高越细、越吃显存，OOM 时会提示调低。</div>
+  <div class="hint">点云由深度反投影自建，并叠加 LocateAnything 检测的 food（红框）/drink（蓝框）3D 包围盒；网格由深度反投影自建三角面（conf 分位越高越干净，num_max_points 仅点云生效）。分辨率越高越细、越吃显存，OOM 时会提示调低。</div>
  </div>
  <div class="status" id="status">等待设备帧… 请让手机 App（或模拟脚本）向 /api/frame 发帧。</div>
 </div>
@@ -463,54 +651,56 @@ async def api_infer(
 
     model = get_model()
     try:
+        t0 = time.time()
+        # GPU 推理放锁内串行化；点云构建 / LocateAnything 检测（CPU+网络）挪到锁外，短占锁。
         with _gpu_lock:  # 与官方 Gradio 共用同一模型，串行化 GPU 推理
-            t0 = time.time()
-            if export_format in ("glb", "mesh"):
-                token = uuid.uuid4().hex
-                outdir = GLB_DIR / token
-                outdir.mkdir(parents=True, exist_ok=True)
-                if export_format == "glb":
-                    with torch.no_grad():
-                        pred = model.inference(
-                            [arr], process_res=res, export_dir=str(outdir),
-                            export_format="glb",
-                            conf_thresh_percentile=float(conf_thresh_percentile),
-                            num_max_points=int(num_max_points), show_cameras=show_cam)
-                    dt = time.time() - t0
-                    glb = outdir / "scene.glb"
-                    sz = glb.stat().st_size / 1024 if glb.exists() else 0
-                    depth = np.asarray(pred.depth)[0]
-                    _prune_glb()
-                    return JSONResponse({
-                        "mode": "glb", "glb_url": f"/glb/{token}/scene.glb", "dt": dt,
-                        "label": "点云 + 相机线框", "stat": f"GLB {sz:.0f}KB",
-                        "shape": [int(depth.shape[1]), int(depth.shape[0])]})
-                else:  # mesh：先出 prediction（含 intrinsics），再自建网格
-                    with torch.no_grad():
-                        pred = model.inference([arr], process_res=res, export_format="mini_npz")
-                    glb = outdir / "scene.glb"
-                    nv, nf = build_mesh_glb(
-                        pred, str(glb), conf_thresh_percentile=float(conf_thresh_percentile))
-                    dt = time.time() - t0
-                    sz = glb.stat().st_size / 1024 if glb.exists() else 0
-                    _prune_glb()
-                    return JSONResponse({
-                        "mode": "mesh", "glb_url": f"/glb/{token}/scene.glb", "dt": dt,
-                        "label": "三角网格 mesh",
-                        "stat": f"顶点 {nv:,} · 面 {nf:,} · GLB {sz:.0f}KB"})
-            else:  # depth
-                with torch.no_grad():
-                    pred = model.inference([arr], process_res=res, export_format="mini_npz")
+            with torch.no_grad():
+                pred = model.inference([arr], process_res=res, export_format="mini_npz")
+
+        if export_format in ("glb", "mesh"):
+            token = uuid.uuid4().hex
+            outdir = GLB_DIR / token
+            outdir.mkdir(parents=True, exist_ok=True)
+            glb = outdir / "scene.glb"
+            if export_format == "glb":
+                # 点云叠 food/drink 检测框：LocateAnything 走处理后同图，与深度零错位
+                proc = _rgb_uint8(pred, arr)
+                detections = _locate_food_drink(proc)
+                labels = build_pointcloud_boxes_glb(
+                    pred, detections, str(glb),
+                    conf_thresh_percentile=float(conf_thresh_percentile),
+                    num_max_points=int(num_max_points), show_cameras=show_cam)
                 dt = time.time() - t0
+                sz = glb.stat().st_size / 1024 if glb.exists() else 0
                 depth = np.asarray(pred.depth)[0]
-                base_rgb = _rgb_uint8(pred, arr)
+                n_food, n_drink = labels.count("food"), labels.count("drink")
+                _prune_glb()
                 return JSONResponse({
-                    "mode": "depth",
-                    "input_uri": to_data_uri_rgb(base_rgb),
-                    "depth_uri": to_data_uri_bgr(colorize_depth(depth)),
-                    "dt": dt,
-                    "dmin": float(np.nanmin(depth)), "dmax": float(np.nanmax(depth)),
+                    "mode": "glb", "glb_url": f"/glb/{token}/scene.glb", "dt": dt,
+                    "label": f"点云 + food/drink 框（food×{n_food} · drink×{n_drink}）",
+                    "stat": f"GLB {sz:.0f}KB",
                     "shape": [int(depth.shape[1]), int(depth.shape[0])]})
+            else:  # mesh：由 prediction（含 intrinsics）自建网格
+                nv, nf = build_mesh_glb(
+                    pred, str(glb), conf_thresh_percentile=float(conf_thresh_percentile))
+                dt = time.time() - t0
+                sz = glb.stat().st_size / 1024 if glb.exists() else 0
+                _prune_glb()
+                return JSONResponse({
+                    "mode": "mesh", "glb_url": f"/glb/{token}/scene.glb", "dt": dt,
+                    "label": "三角网格 mesh",
+                    "stat": f"顶点 {nv:,} · 面 {nf:,} · GLB {sz:.0f}KB"})
+        else:  # depth
+            dt = time.time() - t0
+            depth = np.asarray(pred.depth)[0]
+            base_rgb = _rgb_uint8(pred, arr)
+            return JSONResponse({
+                "mode": "depth",
+                "input_uri": to_data_uri_rgb(base_rgb),
+                "depth_uri": to_data_uri_bgr(colorize_depth(depth)),
+                "dt": dt,
+                "dmin": float(np.nanmin(depth)), "dmax": float(np.nanmax(depth)),
+                "shape": [int(depth.shape[1]), int(depth.shape[0])]})
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         return JSONResponse(
@@ -524,9 +714,10 @@ async def api_infer(
 def _da3_frame_processor(raw: bytes, config: dict) -> dict:
     """把收到的一帧按「面板控件配置」跑 DA3，产出：
       - export_format=depth → 彩色深度图（图片类产物，返回 JPEG 字节）
-      - export_format=glb   → DA3 官方点云+相机 scene.glb（模型类产物，返回 url）
+      - export_format=glb   → 点云 + food/drink 3D 检测框 + 相机线框 scene.glb（返回 url）
       - export_format=mesh  → 深度反投影自建网格 GLB（模型类产物，返回 url）
-    与官方 Gradio 共用同一模型、同一把 GPU 锁串行化，避免撞显存。首帧到达才懒加载模型。"""
+    与官方 Gradio 共用同一模型、同一把 GPU 锁串行化，避免撞显存。首帧到达才懒加载模型。
+    glb 分支额外调 5090 本地 LocateAnything 检测 food/drink，框与点云同坐标系严格对齐。"""
     try:
         img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
     except Exception as e:
@@ -541,45 +732,50 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
 
     model = get_model()
     try:
+        t0 = time.time()
+        # GPU 推理放锁内串行化；点云构建 / LocateAnything 检测（CPU+网络）挪到锁外，
+        # 避免检测网络往返长时间占着 GPU 锁、阻塞产线与其他产物。
         with _gpu_lock:  # 与官方 Gradio 共用同一模型，串行化 GPU 推理
-            t0 = time.time()
-            if fmt in ("glb", "mesh"):
-                token = uuid.uuid4().hex
-                outdir = GLB_DIR / token
-                outdir.mkdir(parents=True, exist_ok=True)
-                if fmt == "glb":
-                    with torch.no_grad():
-                        pred = model.inference(
-                            [arr], process_res=res, export_dir=str(outdir),
-                            export_format="glb", conf_thresh_percentile=conf,
-                            num_max_points=nmp, show_cameras=show_cam)
-                    glb = outdir / "scene.glb"
-                    sz = glb.stat().st_size / 1024 if glb.exists() else 0
-                    _prune_glb()
-                    return {"kind": "model", "url": f"/glb/{token}/scene.glb",
-                            "meta": {"label": "点云 + 相机线框", "dt": time.time() - t0,
-                                     "stat": f"GLB {sz:.0f}KB · res {res}"}}
-                else:  # mesh：先出 prediction（含 intrinsics），再自建网格
-                    with torch.no_grad():
-                        pred = model.inference([arr], process_res=res, export_format="mini_npz")
-                    glb = outdir / "scene.glb"
-                    nv, nf = build_mesh_glb(pred, str(glb), conf_thresh_percentile=conf)
-                    sz = glb.stat().st_size / 1024 if glb.exists() else 0
-                    _prune_glb()
-                    return {"kind": "model", "url": f"/glb/{token}/scene.glb",
-                            "meta": {"label": "三角网格 mesh", "dt": time.time() - t0,
-                                     "stat": f"顶点 {nv:,} · 面 {nf:,} · GLB {sz:.0f}KB · res {res}"}}
-            else:  # depth
-                with torch.no_grad():
-                    pred = model.inference([arr], process_res=res, export_format="mini_npz")
-                depth = np.asarray(pred.depth)[0]
-                ok, buf = cv2.imencode(".jpg", colorize_depth(depth))
-                if not ok:
-                    raise RuntimeError("深度图编码失败")
-                return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
-                        "meta": {"label": "彩色深度图（越亮=越近）", "dt": time.time() - t0,
-                                 "dmin": float(np.nanmin(depth)), "dmax": float(np.nanmax(depth)),
-                                 "shape": [int(depth.shape[1]), int(depth.shape[0])], "res": res}}
+            with torch.no_grad():
+                pred = model.inference([arr], process_res=res, export_format="mini_npz")
+
+        if fmt == "glb":
+            token = uuid.uuid4().hex
+            outdir = GLB_DIR / token
+            outdir.mkdir(parents=True, exist_ok=True)
+            glb = outdir / "scene.glb"
+            # 用 DA3 处理后的同一张图跑 LocateAnything，检测框与深度零错位
+            proc = _rgb_uint8(pred, arr)
+            detections = _locate_food_drink(proc)
+            labels = build_pointcloud_boxes_glb(
+                pred, detections, str(glb), conf_thresh_percentile=conf,
+                num_max_points=nmp, show_cameras=show_cam)
+            sz = glb.stat().st_size / 1024 if glb.exists() else 0
+            _prune_glb()
+            n_food, n_drink = labels.count("food"), labels.count("drink")
+            return {"kind": "model", "url": f"/glb/{token}/scene.glb",
+                    "meta": {"label": f"点云 + food/drink 框（food×{n_food} · drink×{n_drink}）",
+                             "dt": time.time() - t0, "stat": f"GLB {sz:.0f}KB · res {res}"}}
+        elif fmt == "mesh":
+            token = uuid.uuid4().hex
+            outdir = GLB_DIR / token
+            outdir.mkdir(parents=True, exist_ok=True)
+            glb = outdir / "scene.glb"
+            nv, nf = build_mesh_glb(pred, str(glb), conf_thresh_percentile=conf)
+            sz = glb.stat().st_size / 1024 if glb.exists() else 0
+            _prune_glb()
+            return {"kind": "model", "url": f"/glb/{token}/scene.glb",
+                    "meta": {"label": "三角网格 mesh", "dt": time.time() - t0,
+                             "stat": f"顶点 {nv:,} · 面 {nf:,} · GLB {sz:.0f}KB · res {res}"}}
+        else:  # depth
+            depth = np.asarray(pred.depth)[0]
+            ok, buf = cv2.imencode(".jpg", colorize_depth(depth))
+            if not ok:
+                raise RuntimeError("深度图编码失败")
+            return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
+                    "meta": {"label": "彩色深度图（越亮=越近）", "dt": time.time() - t0,
+                             "dmin": float(np.nanmin(depth)), "dmax": float(np.nanmax(depth)),
+                             "shape": [int(depth.shape[1]), int(depth.shape[0])], "res": res}}
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         raise RuntimeError("GPU 显存不足（5090 与产线共享），请调低处理分辨率后重试")
