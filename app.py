@@ -614,22 +614,24 @@ function applyLocked(){  // 强制把相机拉回锁定视角（压制 auto-fram
   mv.cameraTarget=locked.target; mv.cameraOrbit=locked.orbit; mv.fieldOfView=locked.fov;
   if(mv.jumpCameraToGoal)mv.jumpCameraToGoal();
 }
-function applyAdaptive(){  // 自适应：保留角度 θ/φ 与 FOV；中心(target)与距离(radius)用 auto 每帧自动框住点云
-  mv.cameraTarget='auto';
-  mv.cameraOrbit=camState.theta+'deg '+camState.phi+'deg auto';
+const ADAPT_RADIUS=130;   // 自适应距离(%)：相对每帧包围盒，>100% 留边距框住主体
+function applyAdaptive(){  // 自适应：保留角度 θ/φ 与 FOV；中心锁原点(点云 A 居中处)、距离用相对%框住
+  // 不用 camera-target/radius="auto"：auto 对含离群点的点云会算出负距离/全黑；
+  // 点云经 A 变换按中位数居中在原点，锁 target=0 即对准主体中心，radius 用相对% 稳定框住。
+  mv.cameraTarget='0m 0m 0m';
+  mv.cameraOrbit=camState.theta+'deg '+camState.phi+'deg '+ADAPT_RADIUS+'%';
   mv.fieldOfView=camState.fov+'deg';
   if(mv.jumpCameraToGoal)mv.jumpCameraToGoal();
-  lastCam='camera-orbit="'+camState.theta+'deg '+camState.phi+'deg auto" '
-         +'field-of-view="'+camState.fov+'deg" camera-target="auto"  （自适应：中心/距离跟随点云）';
+  lastCam='camera-orbit="'+camState.theta+'deg '+camState.phi+'deg '+ADAPT_RADIUS+'%" '
+         +'field-of-view="'+camState.fov+'deg" camera-target="0m 0m 0m"  （自适应：锁点云中心，距离相对框住）';
   $('camnow').textContent=lastCam;
 }
-function applyFromSliders(){  // 滑块档位 → 设相机；固定模式 radius 用 %，自适应模式用 auto
-  mv.cameraOrbit=camState.theta+'deg '+camState.phi+'deg '+(adaptive?'auto':(camState.radius+'%'));
+function applyFromSliders(){  // 滑块档位 → 设相机
+  if(adaptive){ applyAdaptive(); return; }   // 自适应：中心/距离固定策略，θ/φ/FOV 生效
+  mv.cameraOrbit=camState.theta+'deg '+camState.phi+'deg '+camState.radius+'%';
   mv.fieldOfView=camState.fov+'deg';
-  if(adaptive)mv.cameraTarget='auto';
   if(mv.jumpCameraToGoal)mv.jumpCameraToGoal();
-  if(adaptive)applyAdaptive();     // 刷新自适应状态与只读框
-  else setTimeout(lockFromNow, 50); // 固定模式：读回米值锁定
+  setTimeout(lockFromNow, 50); // 固定模式：读回米值锁定
 }
 [['cth','theta'],['cph','phi'],['crd','radius'],['cfv','fov']].forEach(([id,key])=>{
   $(id).addEventListener('input',()=>{markInteract();camState[key]=+$(id).value;$(id+'v').textContent=$(id).value;applyFromSliders();});
