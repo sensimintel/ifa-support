@@ -29,10 +29,15 @@ else
   sleep 2
 fi
 
-echo "==> 健康检查 http://127.0.0.1:8060/"
-if curl -fsS -o /dev/null -w '    HTTP %{http_code}\n' --max-time 8 http://127.0.0.1:8060/; then
-  echo "==> 部署完成"
-else
-  echo "!! 健康检查失败，请查看 serve.log 或 systemd 日志" >&2
-  exit 1
-fi
+echo "==> 健康检查 http://127.0.0.1:8060/（导入 torch/gradio + 构建 Gradio app 需若干秒，轮询至多 60s）"
+for i in $(seq 1 20); do
+  code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8060/ 2>/dev/null || true)
+  if [ "$code" = "200" ]; then
+    echo "    HTTP 200（约 $((i * 3))s 就绪）"
+    echo "==> 部署完成"
+    exit 0
+  fi
+  sleep 3
+done
+echo "!! 60s 内健康检查未通过，请查看 serve.log 或 systemd 日志" >&2
+exit 1
