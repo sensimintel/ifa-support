@@ -812,9 +812,10 @@ async def api_infer(
             outdir.mkdir(parents=True, exist_ok=True)
             glb = outdir / "scene.glb"
             if export_format == "glb":
-                # 点云叠 food/drink 检测框：LocateAnything 走处理后同图，与深度零错位
-                proc = _rgb_uint8(pred, arr)
-                detections = _locate_food_drink(proc)
+                # 点云叠 food/drink 检测框：LocateAnything 用原图检测（高分辨率、召回更好）。
+                # DA3 预处理是等比缩放(upper_bound_resize)无裁剪，原图归一化坐标≈深度图，
+                # 直接乘深度宽高映射，偏差 <2%(patch 对齐)可忽略。
+                detections = _locate_food_drink(arr)
                 labels = build_pointcloud_boxes_glb(
                     pred, detections, str(glb),
                     conf_thresh_percentile=float(conf_thresh_percentile),
@@ -893,9 +894,9 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
             outdir = GLB_DIR / token
             outdir.mkdir(parents=True, exist_ok=True)
             glb = outdir / "scene.glb"
-            # 用 DA3 处理后的同一张图跑 LocateAnything，检测框与深度零错位
-            proc = _rgb_uint8(pred, arr)
-            detections = _locate_food_drink(proc)
+            # LocateAnything 用原图检测（高分辨率、召回更好）。DA3 预处理等比缩放无裁剪，
+            # 原图归一化坐标≈深度图，直接乘深度宽高映射，偏差 <2%(patch 对齐)可忽略。
+            detections = _locate_food_drink(arr)
             labels = build_pointcloud_boxes_glb(
                 pred, detections, str(glb), conf_thresh_percentile=conf,
                 num_max_points=nmp, show_cameras=show_cam)
