@@ -548,10 +548,10 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="fld" style="flex:0 0 auto"><label style="display:inline;margin:0"><input type="checkbox" id="cadapt"> 跨场景自适应取景（保留角度/FOV，中心·距离自动跟随点云）</label></div>
  </div>
  <div class="row">
-  <div class="fld"><label>方位角 θ <span class="rngval" id="cthv">-17</span>°</label>
-   <input type="range" id="cth" min="-180" max="180" step="1" value="-17"></div>
-  <div class="fld"><label>俯仰角 φ <span class="rngval" id="cphv">49</span>°</label>
-   <input type="range" id="cph" min="0" max="180" step="1" value="49"></div>
+  <div class="fld"><label>方位角 θ <span class="rngval" id="cthv">0</span>°</label>
+   <input type="range" id="cth" min="-180" max="180" step="1" value="0"></div>
+  <div class="fld"><label>俯仰角 φ <span class="rngval" id="cphv">90</span>°</label>
+   <input type="range" id="cph" min="0" max="180" step="1" value="90"></div>
   <div class="fld"><label>距离 radius <span class="rngval" id="crdv">1.5</span>m</label>
    <input type="range" id="crd" min="0.3" max="10" step="0.1" value="1.5"></div>
   <div class="fld"><label>视场 FOV <span class="rngval" id="cfvv">45.5</span>°</label>
@@ -571,7 +571,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="box">
    <img id="prodimg" style="display:none">
    <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y"
-     camera-orbit="-17deg 49deg 1.5m" field-of-view="45.5deg" camera-target="-0.389m -0.923m 1.582m"
+     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
      min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
      min-field-of-view="10deg" max-field-of-view="60deg"
      interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
@@ -599,8 +599,9 @@ function syncOpts(){const f=$('fmt').value;
 // 治法：① 锁定绝对 camera-target + camera-orbit(米) + fov；② 只在「用户手动交互」时更新锁定值
 //（忽略 auto-frame 触发的 camera-change，避免把漂移固化）；③ 每帧 load 后强制 apply 锁定视角。
 const mv=$('mv');
-const camState={theta:-17,phi:49,radius:1.5,fov:45.5};  // 默认视角（角度/FOV=用户调定；radius 改绝对米，% 在 model-viewer 对点云换算不稳）
-let locked=null, lastCam='';   // locked: {orbit,target,fov} 绝对值字符串；null=尚未锁定（用初始默认）
+const camState={theta:0,phi:90,radius:1.5,fov:55};  // 默认=拍摄视角（正视 -Z：θ=0/φ=90，FOV 由后端真实相机内参覆盖）
+let photoFov=55;   // 后端传来的真实相机垂直 FOV（fov_deg），拿到前用占位
+let locked=null, lastCam='';   // locked: {orbit,target,fov} 绝对值字符串；null=尚未锁定（用初始默认=拍摄视角）
 let interacting=false, interactTimer;   // 「用户正在调」标志：交互期间新帧 load 不拉回，避免打断
 function markInteract(){interacting=true;clearTimeout(interactTimer);interactTimer=setTimeout(()=>{interacting=false;},600);}
 let adaptive=false;   // 取景模式：false=固定视角（锁定绝对值），true=自适应（角度固定，中心/距离每帧自动）
@@ -648,6 +649,19 @@ function applyAdaptive(){  // 自适应：保留角度 θ/φ 与 FOV；每帧按
          +'camera-target="'+lastAdaptive.target+'"  （自适应：每帧跟随点云中心/尺度）';
   $('camnow').textContent=lastCam;
 }
+function applyPhotoView(){  // 拍摄视角（默认）：相机放回点云光心、沿光轴正视 -Z，FOV=真实相机内参
+  // → 点云成像与深度图/原图同一视角。相机恒在原点（与距离 R 无关），点云深度怎么变都不飘。
+  const c=mv.getBoundingBoxCenter();      // 点云中心，z<0（点云在 -Z 前方）
+  const cz=(c.z<-0.001)?c.z:-1.5;         // 光轴上取点云中心深度；异常时回落
+  const R=Math.abs(cz);
+  // target 强制落在光轴 (0,0,cz)：θ=0/φ=90 时相机位置 = target+R·(0,0,1) = 原点，正视 -Z
+  mv.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
+  mv.cameraOrbit='0deg 90deg '+R.toFixed(4)+'m';
+  mv.fieldOfView=photoFov+'deg';
+  if(mv.jumpCameraToGoal)mv.jumpCameraToGoal();
+  lastCam='拍摄视角(正视 -Z)：orbit 0° 90° '+R.toFixed(2)+'m · fov '+photoFov+'° · target 0 0 '+cz.toFixed(2)+'m';
+  $('camnow').textContent=lastCam;
+}
 function preApplyView(){  // 换新点云「之前」先把镜头摆到当前锁定/自适应视角（设成属性），
   // 使新模型加载的第一帧就在正确视角，消除「先闪默认视角再跳回」的抖动。
   const v = adaptive ? lastAdaptive : locked;
@@ -689,7 +703,7 @@ mv.addEventListener('load',()=>{
     setTimeout(()=>{ if(!interacting&&adaptive)applyAdaptive(); }, 80);  // 待 dims 就绪后精调到新帧
     return;
   }
-  locked ? applyLocked() : lockFromNow();
+  locked ? applyLocked() : applyPhotoView();  // 未手动调过 → 默认拍摄视角（正视，与深度图一致）
 });
 $('camcopy').addEventListener('click',()=>{
   if(!lastCam)return;
@@ -753,7 +767,11 @@ async function tick(){
   if(s.product_error){pm='<span class="err">'+s.product_error+'</span>';}
   else if(s.product_meta){const m=s.product_meta;
     pm=(m.label||'')+(m.dt?(' · '+m.dt.toFixed(2)+'s'):'')+(m.stat?(' · '+m.stat):'')
-      +(m.shape?(' · '+m.shape[0]+'×'+m.shape[1]):'');}
+      +(m.shape?(' · '+m.shape[0]+'×'+m.shape[1]):'');
+    // 真实相机 FOV 到手 → 更新缓存；若正处于拍摄视角（未手动调），立即按真实 FOV 重摆一次
+    if(m.fov_deg && m.fov_deg!==photoFov){photoFov=m.fov_deg; camState.fov=m.fov_deg;
+      $('cfv').value=m.fov_deg; $('cfvv').textContent=m.fov_deg;
+      if(!locked && !adaptive && mv.loaded && !interacting) applyPhotoView();}}
   if(s.has_frame && s.product_seq<s.seq && !s.product_error) pm+=' <span class="dim">（处理中…）</span>';
   $('prodmeta').innerHTML=pm;
 
@@ -905,9 +923,15 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
             sz = glb.stat().st_size / 1024 if glb.exists() else 0
             _prune_glb()
             n_food, n_drink = labels.count("food"), labels.count("drink")
+            # 真实相机垂直 FOV（复现拍摄视角用）：fov_y = 2·atan(H/(2·fy))，fy=K[1,1]。
+            # 前端据此把点云相机摆回光心正视 -Z，使点云成像与深度图/原图同视角。
+            _K = np.asarray(pred.intrinsics)[0]
+            _H = int(np.asarray(pred.depth)[0].shape[0])
+            _fov_deg = round(float(np.degrees(2 * np.arctan(_H / (2 * _K[1, 1])))), 2)
             return {"kind": "model", "url": f"/glb/{token}/scene.glb",
                     "meta": {"label": f"点云 + food/drink 框（food×{n_food} · drink×{n_drink}）",
-                             "dt": time.time() - t0, "stat": f"GLB {sz:.0f}KB · res {res}"}}
+                             "dt": time.time() - t0, "stat": f"GLB {sz:.0f}KB · res {res}",
+                             "fov_deg": _fov_deg}}
         elif fmt == "mesh":
             token = uuid.uuid4().hex
             outdir = GLB_DIR / token
