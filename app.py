@@ -571,7 +571,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="box">
    <img id="prodimg" style="display:none">
    <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y"
-     camera-orbit="-17deg 40deg 1.5m" field-of-view="45.5deg" camera-target="-0.389m -0.923m 1.582m"
+     camera-orbit="-17deg 40deg 1.5m" field-of-view="45.5deg" camera-target="-0.389m -1.223m 1.582m"
      min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
      min-field-of-view="10deg" max-field-of-view="60deg"
      interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
