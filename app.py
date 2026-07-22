@@ -307,7 +307,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .err{color:#c1121f}
  @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style></head><body>
-<div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
+<div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/weight">电子秤实时重量</a><a href="/live" target="_top">设备实时帧</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <h1>Depth Anything 3 · 扩展面板</h1>
 <div class="sub">上传一张图，选产物类型 + 调参，右侧点云 / 网格可用鼠标 3D 转视角。模型：DA3NESTED-GIANT-LARGE-1.1</div>
 
@@ -543,7 +543,7 @@ WEIGHT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .off .weight{color:#c7c7cc}
  @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style></head><body>
-<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
+<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/weight">电子秤实时重量</a><a href="/live" target="_top">设备实时帧</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <h1>电子秤 · 实时重量</h1>
 <div class="sub">数据每 0.4s 由服务端轮询 · 页面每 0.5s 刷新</div>
 <div class="grid" id="grid"></div>

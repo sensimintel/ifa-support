@@ -184,6 +184,9 @@ _LIVE_PAGE = """<!doctype html>
  header h1{font-size:16px;margin:0;font-weight:600}
  .meta{color:#9aa0a6;font-size:13px}
  .meta b{color:#e6e6e6;font-weight:600}
+ .nav{margin-left:auto;display:flex;gap:12px}
+ .nav a{color:#8ab4f8;text-decoration:none;font-size:13px}
+ .nav a:hover{text-decoration:underline}
  .wrap{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:16px}
  @media(max-width:820px){.wrap{grid-template-columns:1fr}}
  figure{margin:0;background:#000;border-radius:10px;overflow:hidden;border:1px solid #26292d}
@@ -197,6 +200,7 @@ _LIVE_PAGE = """<!doctype html>
  <span class="meta">到达间隔 <b id="fps">—</b></span>
  <span class="meta">距上帧 <b id="age">—</b></span>
  <span class="meta" id="dstat">深度：—</span>
+ <span class="nav"><a href="/panel">深度/点云/网格</a><a href="/weight">电子秤</a><a href="/">↗ 对比首页</a></span>
 </header>
 <div class="wrap">
  <figure><figcaption>接收到的原始帧</figcaption><img id="raw" alt="等待帧…"></figure>
