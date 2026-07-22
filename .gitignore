@@ -6,6 +6,9 @@ __pycache__/
 # 备份文件
 *.bak
 
+# Gradio 运行时目录（app.py 启动时自动创建）
+workspace/
+
 # 虚拟环境
 .venv/
 venv/

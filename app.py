@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-Depth Anything 3 极简 Web 服务：浏览器上传一张图 → 返回彩色深度图。
-- 启动时把 GIANT-LARGE 模型常驻加载到 GPU，之后每次请求只做推理。
-- 纯服务端渲染，零前端依赖：GET / 出上传页，POST /infer 出结果页（内嵌 base64）。
+Depth Anything 3 Web 服务：一个页面、一个 8060 端口，左右两栏对比。
+- 左栏：官方 Gradio UI（点云/网格/3D 量距等），通过 gr.mount_gradio_app 挂在同一 FastAPI 的 /gradio。
+- 右栏：自研扩展面板（单图彩色深度图 + 电子秤实时重量），路径 /panel。
+- 顶层 / 是左右分栏首页，用两个同源 iframe 分别嵌入 /gradio 与 /panel。
+- 启动时不加载模型；两个功能都在首次推理时各自懒加载权重到 GPU。
 - 绑定 0.0.0.0，局域网内可直接用 http://<5090局域网IP>:8060 访问。
 """
 import base64
 import io
 import json
+import os
 import socket
 import struct
 import sys
@@ -16,6 +19,7 @@ import time
 from pathlib import Path
 
 import cv2
+import gradio as gr
 import numpy as np
 import torch
 from fastapi import FastAPI, File, UploadFile
@@ -26,6 +30,7 @@ from PIL import Image, ImageOps
 DA3_ROOT = Path("/home/odyss/Depth-Anything-3")
 sys.path.append(str(DA3_ROOT / "src"))
 from depth_anything_3.api import DepthAnything3  # noqa: E402
+from depth_anything_3.app.gradio_app import DepthAnything3App  # noqa: E402
 
 MODEL_DIR = str(DA3_ROOT / "models" / "DA3NESTED-GIANT-LARGE-1.1")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -136,6 +141,44 @@ def to_data_uri_rgb(rgb: np.ndarray) -> str:
     return to_data_uri_bgr(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 顶层分栏首页：左 iframe=官方 Gradio(/gradio)，右 iframe=扩展面板(/panel)
+# ══════════════════════════════════════════════════════════════════════
+SPLIT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DA3 · 官方 Gradio ＋ 扩展面板</title>
+<style>
+ *{box-sizing:border-box}
+ html,body{margin:0;height:100%;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#0d0d0f}
+ .top{height:48px;display:flex;align-items:center;gap:14px;padding:0 18px;color:#fff;background:#1c1c1e;font-size:14px;flex-wrap:wrap}
+ .top b{font-size:15px}
+ .top .tag{font-size:12px;color:#9a9aa0}
+ .wrap{display:flex;height:calc(100% - 48px)}
+ .pane{flex:1 1 50%;min-width:0;display:flex;flex-direction:column;border-right:1px solid #2c2c2e}
+ .pane:last-child{border-right:0}
+ .pane .bar{height:34px;display:flex;align-items:center;padding:0 14px;color:#e5e5ea;background:#141416;font-size:13px;font-weight:600;border-bottom:1px solid #2c2c2e}
+ .pane .bar .dot{width:8px;height:8px;border-radius:50%;margin-right:8px}
+ .pane .bar a{margin-left:auto;font-size:12px;font-weight:500;color:#0a84ff;text-decoration:none}
+ iframe{flex:1;width:100%;border:0;background:#fff}
+ @media(max-width:900px){.wrap{flex-direction:column;height:auto}.pane{height:90vh;border-right:0;border-bottom:1px solid #2c2c2e}}
+</style></head><body>
+ <div class="top"><b>Depth Anything 3</b>
+  <span class="tag">左：官方 Gradio（点云 / 网格 / 3D 量距）　·　右：扩展面板（深度图 · 电子秤）　·　同一 8060 端口</span></div>
+ <div class="wrap">
+  <div class="pane">
+   <div class="bar"><span class="dot" style="background:#34c759"></span>官方 Gradio UI
+    <a href="/gradio" target="_blank">单独打开 ↗</a></div>
+   <iframe src="/gradio" title="官方 Gradio"></iframe>
+  </div>
+  <div class="pane">
+   <div class="bar"><span class="dot" style="background:#0a84ff"></span>扩展面板（自研）
+    <a href="/panel" target="_blank">单独打开 ↗</a></div>
+   <iframe src="/panel" title="扩展面板"></iframe>
+  </div>
+ </div>
+</body></html>"""
+
+
 PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Depth Anything 3 · 深度图</title>
@@ -152,11 +195,12 @@ PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .meta{{font-size:13px;color:#6b6b70;margin-top:8px}}
  a{{color:#0071e3;text-decoration:none}}
  @media(max-width:720px){{.grid{{grid-template-columns:1fr}}}}
- .nav{{display:flex;gap:18px;margin-bottom:18px;font-size:14px}}
+ .nav{{display:flex;gap:18px;margin-bottom:18px;font-size:14px;align-items:center}}
  .nav a{{padding:6px 14px;border-radius:980px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}}
  .nav a.active{{background:#0071e3;color:#fff}}
+ .nav .home{{margin-left:auto;box-shadow:none;background:transparent;color:#6b6b70}}
 </style></head><body>
-<div class="nav"><a class="active" href="/">深度图</a><a href="/weight">电子秤实时重量</a></div>
+<div class="nav"><a class="active" href="/panel">深度图</a><a href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <h1>Depth Anything 3 · 单图深度估计</h1>
 <div class="sub">上传一张图片，返回彩色深度图（越亮 = 越近）。模型：DA3NESTED-GIANT-LARGE-1.1</div>
 <div class="card">
@@ -170,7 +214,14 @@ PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def home():
+    """左右分栏对比首页。"""
+    return SPLIT_PAGE
+
+
+@app.get("/panel", response_class=HTMLResponse)
+def panel():
+    """扩展面板：单图深度图上传页（旧首页内容）。"""
     return PAGE.format(result="")
 
 
@@ -206,7 +257,7 @@ async def infer(file: UploadFile = File(...)):
   <figure><img src="{to_data_uri_rgb(base_rgb)}"><figcaption>输入图</figcaption></figure>
   <figure><img src="{to_data_uri_bgr(depth_color)}"><figcaption>深度图（越亮=越近）</figcaption></figure>
  </div>
- <div class="meta">推理耗时 {dt:.2f}s ｜ 深度范围 {dmin:.3f} ~ {dmax:.3f} ｜ 分辨率 {depth.shape[1]}×{depth.shape[0]} ｜ <a href="/">← 再传一张</a></div>
+ <div class="meta">推理耗时 {dt:.2f}s ｜ 深度范围 {dmin:.3f} ~ {dmax:.3f} ｜ 分辨率 {depth.shape[1]}×{depth.shape[0]} ｜ <a href="/panel">← 再传一张</a></div>
 </div>"""
     return PAGE.format(result=result)
 
@@ -229,10 +280,11 @@ WEIGHT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <style>
  body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:1100px;margin:32px auto;padding:0 16px;color:#1c1c1e;background:#f5f5f7}
  h1{font-size:22px} .sub{color:#6b6b70;font-size:14px;margin-bottom:24px}
- .nav{display:flex;gap:18px;margin-bottom:18px;font-size:14px}
+ .nav{display:flex;gap:18px;margin-bottom:18px;font-size:14px;align-items:center}
  .nav a{padding:6px 14px;border-radius:980px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08);color:#0071e3;text-decoration:none}
  .nav a.active{background:#0071e3;color:#fff}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:20px}
+ .nav .home{margin-left:auto;box-shadow:none;background:transparent;color:#6b6b70}
+ .grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
  .card{background:#fff;border-radius:14px;padding:24px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
  .head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
  .name{font-size:16px;font-weight:600;color:#1c1c1e}
@@ -245,7 +297,7 @@ WEIGHT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .off .weight{color:#c7c7cc}
  @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style></head><body>
-<div class="nav"><a href="/">深度图</a><a class="active" href="/weight">电子秤实时重量</a></div>
+<div class="nav"><a href="/panel">深度图</a><a class="active" href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <h1>电子秤 · 实时重量</h1>
 <div class="sub">数据每 0.4s 由服务端轮询 · 页面每 0.5s 刷新</div>
 <div class="grid" id="grid"></div>
@@ -280,3 +332,42 @@ fetch('/api/weights').then(r=>r.json()).then(j=>{
 @app.get("/weight", response_class=HTMLResponse)
 def weight_page():
     return WEIGHT_PAGE
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 把官方 Gradio UI 挂到同一 FastAPI（同端口，路径 /gradio）
+#   - 复用本地模型档 DA3NESTED-GIANT-LARGE-1.1，避免联网下载
+#   - 模型懒加载：仅在官方 UI 首次推理时才占显存（与右栏深度图各自独立一份）
+# ══════════════════════════════════════════════════════════════════════
+# 兼容 shim：DA3 的 Gradio UI 按旧版 gradio 写的，本机装的是 gradio 6.1.0，
+# 部分纯装饰性关键字（如 Gallery 的 show_download_button）已被移除。这里包一层
+# 构造函数，静默丢弃这些已废弃 kwargs，避免改动上游 DA3 源码。
+_GRADIO6_REMOVED_KWARGS = {"show_download_button", "show_share_button"}
+
+
+def _shim_gradio_component(cls):
+    """包裹组件 __init__：丢弃 gradio 6 已移除的装饰性 kwargs。"""
+    _orig_init = cls.__init__
+
+    def __init__(self, *args, **kwargs):
+        for _k in _GRADIO6_REMOVED_KWARGS:
+            kwargs.pop(_k, None)
+        return _orig_init(self, *args, **kwargs)
+
+    cls.__init__ = __init__
+
+
+for _cls in (gr.Gallery, gr.Image, gr.Video, gr.Model3D):
+    _shim_gradio_component(_cls)
+
+os.environ.setdefault("DA3_MODEL_DIR", MODEL_DIR)
+_GRADIO_WORKSPACE = str(Path("/home/odyss/da3-web/workspace/gradio"))
+_GRADIO_GALLERY = str(Path("/home/odyss/da3-web/workspace/gallery"))
+Path(_GRADIO_WORKSPACE).mkdir(parents=True, exist_ok=True)
+Path(_GRADIO_GALLERY).mkdir(parents=True, exist_ok=True)
+
+_da3_gradio_app = DepthAnything3App(
+    model_dir=MODEL_DIR, workspace_dir=_GRADIO_WORKSPACE, gallery_dir=_GRADIO_GALLERY)
+_gradio_blocks = _da3_gradio_app.create_app()
+_gradio_blocks.queue(max_size=20)
+app = gr.mount_gradio_app(app, _gradio_blocks, path="/gradio")

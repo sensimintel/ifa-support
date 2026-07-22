@@ -3,6 +3,9 @@ fastapi
 uvicorn
 python-multipart
 
+# 官方 Gradio UI（挂在 /gradio）；本机实测 6.1.0，app.py 内有 gradio 6 兼容 shim
+gradio
+
 # 图像/数值处理
 numpy
 opencv-python
