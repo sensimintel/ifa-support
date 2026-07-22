@@ -380,6 +380,13 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
         pc_pts, pc_cols = pc_pts[keep], pc_cols[keep]
     if pc_pts.shape[0] > 0:
         scene.add_geometry(trimesh.points.PointCloud(vertices=pc_pts, colors=pc_cols))
+        # model-viewer 的 load 事件与 getDimensions/取景依赖场景里存在三角面 mesh——纯点云(POINTS)
+        # + 相机线框(LINES) 无 mesh 时不触发 load、getDimensions 返回 0 → 画面全黑（无检测框那几帧）。
+        # 加一个 1mm 极小三角面作 mesh 锚（几乎不可见），确保触发 load；包围盒仍含点云范围，取景不受影响。
+        _anchor = trimesh.Trimesh(
+            vertices=np.array([[0, 0, 0], [1e-3, 0, 0], [0, 1e-3, 0]], dtype=np.float32),
+            faces=np.array([[0, 1, 2]]), process=False)
+        scene.add_geometry(_anchor)
 
     scene_scale = _glb._estimate_scene_scale(pc_pts, fallback=1.0)
     radius = max(scene_scale * 0.004, 1e-4)            # 框线粗细随场景尺度
