@@ -709,13 +709,20 @@ async function tick(){
 
   // 右框：DA3 产物（图片=深度图；模型=GLB）
   const prodKey=(s.product_kind||'')+':'+(s.product_url||'')+':'+s.product_seq;
-  if(s.product_kind && prodKey!==lastProdKey){lastProdKey=prodKey;
+  if(s.product_kind && prodKey!==lastProdKey){
     if(s.product_kind==='image'){
+      lastProdKey=prodKey;
       $('prodimg').src='/api/frame/latest-product?t='+s.product_seq;
       $('prodimg').style.display='block';$('mv').style.display='none';$('prodwait').style.display='none';
     }else if(s.product_kind==='model' && s.product_url){
-      $('mv').src=s.product_url;
-      $('mv').style.display='block';$('prodimg').style.display='none';$('prodwait').style.display='none';
+      // 点云 GLB 较大、加载/解析慢；上一个没加载完(mv.loaded=false)就别换 src，
+      // 否则高帧率(如 1fps)下每帧新 GLB 不断打断加载→loaded 永远 false→右框黑。
+      // 跳过时不更新 lastProdKey，下个轮询周期(500ms)再重试，届时多半已加载完。
+      if(mv.loaded || !mv.getAttribute('src')){
+        lastProdKey=prodKey;
+        mv.src=s.product_url;
+        mv.style.display='block';$('prodimg').style.display='none';$('prodwait').style.display='none';
+      }
     }
   }
   // 产物元信息 + 处理状态
