@@ -531,14 +531,14 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="fld" style="flex:0 0 auto"><label style="display:inline;margin:0"><input type="checkbox" id="crot"> 自动旋转（默认关，勾选才转）</label></div>
  </div>
  <div class="row">
-  <div class="fld"><label>方位角 θ <span class="rngval" id="cthv">0</span>°</label>
-   <input type="range" id="cth" min="-180" max="180" step="1" value="0"></div>
-  <div class="fld"><label>俯仰角 φ <span class="rngval" id="cphv">80</span>°</label>
-   <input type="range" id="cph" min="0" max="180" step="1" value="80"></div>
-  <div class="fld"><label>距离 radius <span class="rngval" id="crdv">30</span>%</label>
-   <input type="range" id="crd" min="5" max="400" step="1" value="30"></div>
-  <div class="fld"><label>视场 FOV <span class="rngval" id="cfvv">28</span>°</label>
-   <input type="range" id="cfv" min="10" max="60" step="1" value="28"></div>
+  <div class="fld"><label>方位角 θ <span class="rngval" id="cthv">-17</span>°</label>
+   <input type="range" id="cth" min="-180" max="180" step="1" value="-17"></div>
+  <div class="fld"><label>俯仰角 φ <span class="rngval" id="cphv">49</span>°</label>
+   <input type="range" id="cph" min="0" max="180" step="1" value="49"></div>
+  <div class="fld"><label>距离 radius <span class="rngval" id="crdv">8</span>%</label>
+   <input type="range" id="crd" min="5" max="400" step="1" value="8"></div>
+  <div class="fld"><label>视场 FOV <span class="rngval" id="cfvv">45.5</span>°</label>
+   <input type="range" id="cfv" min="10" max="60" step="0.5" value="45.5"></div>
  </div>
  <div class="hint">拖动右侧 3D 视图或调滑块调整视角；下方是当前相机的<b>实测量化参数</b>（绝对值，可直接作为默认视角）。调到满意后点「复制」把参数发给我。</div>
  <div class="status" style="border-top:1px solid #f0f0f2;margin-top:8px">当前相机：<code id="camnow" style="font-size:12px;word-break:break-all;color:#0071e3">—（先切到点云/网格产物并拖一下视图）</code></div>
@@ -554,7 +554,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="box">
    <img id="prodimg" style="display:none">
    <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y"
-     camera-orbit="0deg 80deg 30%" field-of-view="28deg"
+     camera-orbit="-17deg 49deg 8%" field-of-view="45.5deg" camera-target="-0.389m -0.923m 1.582m"
      min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
      min-field-of-view="10deg" max-field-of-view="60deg"
      interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
@@ -582,7 +582,7 @@ function syncOpts(){const f=$('fmt').value;
 // 治法：① 锁定绝对 camera-target + camera-orbit(米) + fov；② 只在「用户手动交互」时更新锁定值
 //（忽略 auto-frame 触发的 camera-change，避免把漂移固化）；③ 每帧 load 后强制 apply 锁定视角。
 const mv=$('mv');
-const camState={theta:0,phi:80,radius:30,fov:28};
+const camState={theta:-17,phi:49,radius:8,fov:45.5};  // 默认视角（用户在真实点云上调定）
 let locked=null, lastCam='';   // locked: {orbit,target,fov} 绝对值字符串；null=尚未锁定（用初始默认）
 let interacting=false, interactTimer;   // 「用户正在调」标志：交互期间新帧 load 不拉回，避免打断
 function markInteract(){interacting=true;clearTimeout(interactTimer);interactTimer=setTimeout(()=>{interacting=false;},600);}
