@@ -11,6 +11,9 @@ numpy
 opencv-python
 Pillow
 
+# 网格 mesh 产物导出 GLB（/panel 的 mesh 模式，由深度反投影自建三角网格）
+trimesh
+
 # 深度模型推理（需 CUDA 环境）
 torch
 

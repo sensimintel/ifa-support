@@ -3,11 +3,15 @@
 5090 服务器上跑在 `0.0.0.0:8060` 的运维/演示 Web 服务（原目录 `~/da3-web`），单文件 FastAPI 应用，纯服务端渲染、零前端构建。一个端口同时挂官方 Gradio 与自研面板：
 
 - **`/` 分栏首页**：左右两栏 iframe 对比 —— 左栏嵌官方 Gradio UI（`/gradio`），右栏嵌自研扩展面板（`/panel`）。
-- **`/gradio` 官方 Gradio UI**：通过 `gr.mount_gradio_app` 挂在同一 FastAPI 上，复用本地模型档（点云 / 网格 / 3D 量距等）。app.py 内含 gradio 6 兼容 shim，静默丢弃已废弃 kwargs，避免改动上游 DA3 源码。
-- **`/panel` 深度图**：浏览器上传一张图 → 用 Depth Anything 3（DA3NESTED-GIANT-LARGE-1.1）返回彩色深度图（越亮 = 越近）。模型懒加载到 GPU。
+- **`/gradio` 官方 Gradio UI**：通过 `gr.mount_gradio_app` 挂在同一 FastAPI 上（点云 / 网格 / 3D 量距等）。app.py 内含 gradio 6 兼容 shim，静默丢弃已废弃 kwargs，避免改动上游 DA3 源码。
+- **`/panel` 扩展面板（深度 / 点云 / 网格）**：浏览器上传一张图 + 选产物类型 + 调参，用 Depth Anything 3（DA3NESTED-GIANT-LARGE-1.1）出三种产物：
+  - **深度图**：彩色深度图（越亮 = 越近）；
+  - **点云 + 相机（GLB）**：DA3 官方 `scene.glb` 导出（点云 + 相机线框），网页内 `<model-viewer>` 可鼠标 3D 转视角；
+  - **网格 mesh（GLB）**：由深度反投影自建带顶点色的三角网格，同样可 3D 转视角。
+  - 可调参数：`process_res`、`conf_thresh_percentile`、`num_max_points`、`show_cameras`。`/api/infer` 出 JSON，GLB 经 `/glb/{token}/scene.glb` 提供（只保留最近若干次、自动清理）。
 - **`/weight` 电子秤实时重量**：后台线程手写 Modbus TCP 轮询两台电子秤（秤A SJ101CX @ 192.168.0.80、秤B Y31X04 @ 192.168.0.90），`/api/weights` 出 JSON，看板页每 0.5s 刷新并画迷你趋势线。
 
-> 模型均为**懒加载**：启动时不占显存，`/gradio` 与 `/panel` 各自在首次推理时加载一份权重。
+> **模型单例 + GPU 共存**：`/gradio` 与 `/panel` **共用同一份 DA3 模型权重**（官方 UI 的 `ModelInference.initialize_model` 被改为复用本服务的共享单例），并用一把 GPU 锁串行化推理——因为 5090 显存与产线服务共享，进程内加载两份权重（约 2×6.5GB）会撑爆显存。模型懒加载：启动不占显存，首次推理才加载一份（约 6.5GB，推理峰值约 8.6GB@process_res=504）。process_res 调太高或产线显存吃紧时可能 OOM，此时调低 process_res 重试。
 
 ## 文件
 

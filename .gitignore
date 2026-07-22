@@ -13,6 +13,14 @@ __pycache__/
 # Gradio 运行时目录（app.py 启动时自动创建）
 workspace/
 
+# /panel 生成的 GLB/mesh 产物（运行时自动创建、自动清理）
+glb_out/
+
+# 本地测试/临时脚本与样图
+app_new.py
+measure.py
+test_food.jpg
+
 # 虚拟环境
 .venv/
 venv/

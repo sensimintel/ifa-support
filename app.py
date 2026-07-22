@@ -1,29 +1,37 @@
 # -*- coding: utf-8 -*-
 """
 Depth Anything 3 Web 服务：一个页面、一个 8060 端口，左右两栏对比。
-- 左栏：官方 Gradio UI（点云/网格/3D 量距等），通过 gr.mount_gradio_app 挂在同一 FastAPI 的 /gradio。
-- 右栏：自研扩展面板（单图彩色深度图 + 电子秤实时重量），路径 /panel。
+- 左栏：官方 Gradio UI（点云 / 网格 / 3D 量距等），通过 gr.mount_gradio_app 挂在同一 FastAPI 的 /gradio。
+- 右栏：自研扩展面板（/panel），可在网页上调参对比，支持三种产物：
+    · 深度图      —— 彩色深度图（越亮=越近）
+    · 点云+相机    —— DA3 导出 scene.glb（点云 + 相机线框），可 3D 转视角
+    · 网格 mesh   —— 由深度反投影自建三角网格 GLB，可 3D 转视角
+  可调参数：process_res、conf_thresh_percentile、num_max_points、show_cameras。
 - 顶层 / 是左右分栏首页，用两个同源 iframe 分别嵌入 /gradio 与 /panel。
-- 启动时不加载模型；两个功能都在首次推理时各自懒加载权重到 GPU。
+- 关键约束：5090 GPU 与产线服务共享，官方 Gradio 与右栏共用同一个模型单例（进程内只加载一份
+  权重），并用 GPU 锁串行化推理，避免加载两份权重撑爆显存。
 - 绑定 0.0.0.0，局域网内可直接用 http://<5090局域网IP>:8060 访问。
 """
 import base64
 import io
 import json
 import os
+import shutil
 import socket
 import struct
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import cv2
 import gradio as gr
 import numpy as np
 import torch
-from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+import trimesh
+from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from PIL import Image, ImageOps
 
 # 把 DA3 源码目录加入 import 路径（本服务独立于 DA3 仓，只引用其 src）
@@ -36,8 +44,15 @@ MODEL_DIR = str(DA3_ROOT / "models" / "DA3NESTED-GIANT-LARGE-1.1")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PROCESS_RES = 504  # DA3 默认处理分辨率
 
+# GLB / mesh 产物落盘目录（每次推理一个子目录，超量自动清理）
+GLB_DIR = Path("/home/odyss/da3-web/glb_out")
+GLB_DIR.mkdir(parents=True, exist_ok=True)
+GLB_KEEP = 24  # 最多保留最近多少次产物
+
 app = FastAPI(title="DA3 Depth Web")
 _model = None
+_model_lock = threading.Lock()   # 保护模型单例的加载
+_gpu_lock = threading.Lock()     # 串行化所有 GPU 推理（右栏 + 官方 Gradio 共用同一模型）
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -107,13 +122,18 @@ threading.Thread(target=_scale_poller, daemon=True).start()
 
 
 def get_model():
-    """懒加载并缓存模型；首次调用会把权重搬到 GPU（约需十几到几十秒）。"""
+    """懒加载并缓存 DA3 模型单例（fp32 权重；forward 内部用 autocast bf16 计算）。
+
+    右栏推理与官方 Gradio 都复用这同一个实例，进程内只占一份权重（约 6.5GB）。
+    """
     global _model
     if _model is None:
-        print(f"[da3-web] 正在从 {MODEL_DIR} 加载模型到 {DEVICE} ...", flush=True)
-        t0 = time.time()
-        _model = DepthAnything3.from_pretrained(MODEL_DIR).to(DEVICE).eval()
-        print(f"[da3-web] 模型加载完成，耗时 {time.time() - t0:.1f}s", flush=True)
+        with _model_lock:
+            if _model is None:
+                print(f"[da3-web] 正在从 {MODEL_DIR} 加载模型到 {DEVICE} ...", flush=True)
+                t0 = time.time()
+                _model = DepthAnything3.from_pretrained(MODEL_DIR).to(DEVICE).eval()
+                print(f"[da3-web] 模型加载完成，耗时 {time.time() - t0:.1f}s", flush=True)
     return _model
 
 
@@ -141,6 +161,77 @@ def to_data_uri_rgb(rgb: np.ndarray) -> str:
     return to_data_uri_bgr(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
 
+def _rgb_uint8(pred, arr_fallback):
+    """从 prediction 取与深度同尺寸的 RGB（uint8）；缺省回退原图。"""
+    if getattr(pred, "processed_images", None) is not None:
+        rgb = np.asarray(pred.processed_images)[0]
+        if rgb.dtype != np.uint8:
+            rgb = np.clip(rgb * (255 if rgb.max() <= 1.0 else 1), 0, 255).astype(np.uint8)
+        return rgb
+    return arr_fallback
+
+
+def build_mesh_glb(pred, out_path, conf_thresh_percentile=40.0, edge_ratio=0.06):
+    """由单视图 depth + 内参反投影出结构化点，构建带顶点色的三角网格并导出为 GLB。
+
+    - 用 intrinsics 把每个像素反投影到相机坐标；剔除天空 / 低置信 / 深度不连续（避免边缘拉丝）。
+    - 顶点色取 processed_images。model-viewer 可直接 3D 转视角查看。
+    """
+    depth = np.asarray(pred.depth)[0].astype(np.float32)  # H,W
+    H, W = depth.shape
+    K = np.asarray(pred.intrinsics)[0].astype(np.float32)  # 3x3
+    fx, fy, cx, cy = float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+    rgb = _rgb_uint8(pred, None)
+    if rgb is None or rgb.shape[:2] != depth.shape:
+        rgb = np.full((H, W, 3), 180, np.uint8)
+
+    valid = np.isfinite(depth) & (depth > 0)
+    if getattr(pred, "sky", None) is not None:
+        valid &= ~np.asarray(pred.sky)[0].astype(bool)
+    if getattr(pred, "conf", None) is not None:
+        conf = np.asarray(pred.conf)[0].astype(np.float32)
+        finite = np.isfinite(conf)
+        if finite.any():
+            thr = np.percentile(conf[finite], conf_thresh_percentile)
+            valid &= conf >= thr
+
+    us, vs = np.meshgrid(np.arange(W), np.arange(H))
+    z = depth
+    x = (us - cx) / fx * z
+    y = (vs - cy) / fy * z
+    # gltf 约定 +Y 向上、相机看 -Z：翻转 y/z 让默认视角更自然（用户仍可自由转）
+    verts = np.stack([x, -y, -z], axis=-1).reshape(-1, 3).astype(np.float32)
+    cols = rgb.reshape(-1, 3)
+
+    idx = np.arange(H * W).reshape(H, W)
+    tl, tr = idx[:-1, :-1], idx[:-1, 1:]
+    bl, br = idx[1:, :-1], idx[1:, 1:]
+    quad_valid = valid[:-1, :-1] & valid[:-1, 1:] & valid[1:, :-1] & valid[1:, 1:]
+    d4 = np.stack([depth[:-1, :-1], depth[:-1, 1:], depth[1:, :-1], depth[1:, 1:]])
+    dmax, dmin, dmed = d4.max(0), d4.min(0), np.median(d4, 0)
+    cont = (dmax - dmin) <= (edge_ratio * np.maximum(dmed, 1e-6))  # 深度不连续处不连面
+    keep = quad_valid & cont
+    tl, tr, bl, br = tl[keep], tr[keep], bl[keep], br[keep]
+    faces = np.concatenate(
+        [np.stack([tl, bl, tr], -1), np.stack([tr, bl, br], -1)], axis=0)
+    if len(faces) == 0:
+        raise RuntimeError("有效网格面为 0（可能置信阈值过高或深度不连续过多）")
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, vertex_colors=cols, process=False)
+    mesh.export(out_path)
+    return len(verts), len(faces)
+
+
+def _prune_glb():
+    """只保留最近 GLB_KEEP 个产物子目录，清理旧的。"""
+    try:
+        dirs = sorted([p for p in GLB_DIR.iterdir() if p.is_dir()],
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in dirs[GLB_KEEP:]:
+            shutil.rmtree(p, ignore_errors=True)
+    except Exception:
+        pass
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 顶层分栏首页：左 iframe=官方 Gradio(/gradio)，右 iframe=扩展面板(/panel)
 # ══════════════════════════════════════════════════════════════════════
@@ -163,7 +254,7 @@ SPLIT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  @media(max-width:900px){.wrap{flex-direction:column;height:auto}.pane{height:90vh;border-right:0;border-bottom:1px solid #2c2c2e}}
 </style></head><body>
  <div class="top"><b>Depth Anything 3</b>
-  <span class="tag">左：官方 Gradio（点云 / 网格 / 3D 量距）　·　右：扩展面板（深度图 · 电子秤）　·　同一 8060 端口</span></div>
+  <span class="tag">左：官方 Gradio（点云 / 网格 / 3D 量距）　·　右：扩展面板（深度图 · 点云 · 网格 · 电子秤，可调参转视角）　·　同一 8060 端口</span></div>
  <div class="wrap">
   <div class="pane">
    <div class="bar"><span class="dot" style="background:#34c759"></span>官方 Gradio UI
@@ -179,37 +270,117 @@ SPLIT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </body></html>"""
 
 
-PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+# ══════════════════════════════════════════════════════════════════════
+# 扩展面板：调参 + 三种产物（深度图 / 点云GLB / 网格GLB），前端 fetch + model-viewer
+# ══════════════════════════════════════════════════════════════════════
+PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Depth Anything 3 · 深度图</title>
+<title>DA3 扩展面板 · 深度/点云/网格</title>
+<script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
 <style>
- body{{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:1100px;margin:32px auto;padding:0 16px;color:#1c1c1e;background:#f5f5f7}}
- h1{{font-size:22px}} .sub{{color:#6b6b70;font-size:14px;margin-bottom:24px}}
- .card{{background:#fff;border-radius:14px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:20px}}
- input[type=file]{{margin:8px 0}}
- button{{background:#0071e3;color:#fff;border:0;border-radius:980px;padding:10px 22px;font-size:15px;cursor:pointer}}
- button:disabled{{opacity:.5}}
- .grid{{display:grid;grid-template-columns:1fr 1fr;gap:16px}}
- .grid figure{{margin:0}} .grid img{{width:100%;border-radius:10px;display:block}}
- figcaption{{font-size:13px;color:#6b6b70;margin-top:6px;text-align:center}}
- .meta{{font-size:13px;color:#6b6b70;margin-top:8px}}
- a{{color:#0071e3;text-decoration:none}}
- @media(max-width:720px){{.grid{{grid-template-columns:1fr}}}}
- .nav{{display:flex;gap:18px;margin-bottom:18px;font-size:14px;align-items:center}}
- .nav a{{padding:6px 14px;border-radius:980px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}}
- .nav a.active{{background:#0071e3;color:#fff}}
- .nav .home{{margin-left:auto;box-shadow:none;background:transparent;color:#6b6b70}}
+ body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:1180px;margin:24px auto;padding:0 16px;color:#1c1c1e;background:#f5f5f7}
+ h1{font-size:21px;margin:.2em 0} .sub{color:#6b6b70;font-size:13px;margin-bottom:18px}
+ .nav{display:flex;gap:14px;margin-bottom:16px;font-size:14px;align-items:center}
+ .nav a{padding:6px 14px;border-radius:980px;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08);color:#0071e3;text-decoration:none}
+ .nav a.active{background:#0071e3;color:#fff}
+ .nav .home{margin-left:auto;box-shadow:none;background:transparent;color:#6b6b70}
+ .card{background:#fff;border-radius:14px;padding:18px 20px;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:18px}
+ label{font-size:13px;color:#3a3a3c;display:block;margin:0 0 4px}
+ .row{display:flex;flex-wrap:wrap;gap:18px;align-items:flex-end}
+ .fld{flex:1 1 180px;min-width:150px}
+ select,input[type=file]{width:100%;font-size:14px}
+ select{padding:8px;border:1px solid #d0d0d5;border-radius:8px;background:#fff}
+ input[type=range]{width:100%}
+ .rngval{font-variant-numeric:tabular-nums;color:#0071e3;font-weight:600}
+ .glbopts{border-top:1px dashed #e0e0e5;margin-top:14px;padding-top:14px}
+ button{background:#0071e3;color:#fff;border:0;border-radius:980px;padding:10px 26px;font-size:15px;cursor:pointer;margin-top:6px}
+ button:disabled{opacity:.5;cursor:default}
+ .hint{font-size:12px;color:#8e8e93;margin-top:6px}
+ .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+ .grid figure{margin:0} .grid img{width:100%;border-radius:10px;display:block;background:#000}
+ figcaption{font-size:13px;color:#6b6b70;margin-top:6px;text-align:center}
+ model-viewer{width:100%;height:520px;background:#111319;border-radius:12px;--poster-color:transparent}
+ .meta{font-size:13px;color:#6b6b70;margin-top:10px}
+ a.dl{color:#0071e3;text-decoration:none}
+ .err{color:#c1121f}
+ @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style></head><body>
-<div class="nav"><a class="active" href="/panel">深度图</a><a href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
-<h1>Depth Anything 3 · 单图深度估计</h1>
-<div class="sub">上传一张图片，返回彩色深度图（越亮 = 越近）。模型：DA3NESTED-GIANT-LARGE-1.1</div>
+<div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
+<h1>Depth Anything 3 · 扩展面板</h1>
+<div class="sub">上传一张图，选产物类型 + 调参，右侧点云 / 网格可用鼠标 3D 转视角。模型：DA3NESTED-GIANT-LARGE-1.1</div>
+
 <div class="card">
- <form action="/infer" method="post" enctype="multipart/form-data" onsubmit="this.querySelector('button').disabled=true;this.querySelector('button').innerText='推理中…约几秒';">
-  <input type="file" name="file" accept="image/*" required><br>
-  <button type="submit">生成深度图</button>
- </form>
+ <div class="row">
+  <div class="fld"><label>图片</label><input type="file" id="file" accept="image/*"></div>
+  <div class="fld"><label>产物类型 export_format</label>
+   <select id="fmt">
+    <option value="depth">深度图（彩色）</option>
+    <option value="glb">点云 + 相机（GLB · 可转视角）</option>
+    <option value="mesh">网格 mesh（GLB · 可转视角）</option>
+   </select></div>
+  <div class="fld"><label>处理分辨率 process_res <span class="rngval" id="prv">504</span></label>
+   <input type="range" id="pr" min="196" max="896" step="28" value="504"></div>
+ </div>
+ <div class="glbopts" id="glbopts">
+  <div class="row">
+   <div class="fld"><label>置信度裁剪分位 conf_thresh_percentile <span class="rngval" id="ctv">40</span>%</label>
+    <input type="range" id="ct" min="0" max="90" step="5" value="40"></div>
+   <div class="fld" id="nmpwrap"><label>点云最大点数 num_max_points <span class="rngval" id="nmv">0.8</span>M</label>
+    <input type="range" id="nmp" min="0.1" max="2" step="0.1" value="0.8"></div>
+   <div class="fld" id="camwrap"><label>相机线框 show_cameras</label>
+    <select id="cam"><option value="1">显示</option><option value="0">隐藏</option></select></div>
+  </div>
+  <div class="hint" id="glbhint">点云用 DA3 官方 scene.glb 导出；网格由深度反投影自建三角面（conf 分位越高越干净，num_max_points 仅点云生效）。</div>
+ </div>
+ <button id="go">生成</button>
+ <span class="hint" id="tip"></span>
 </div>
-{result}
+
+<div class="card" id="out" style="display:none"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+$('pr').oninput=()=>$('prv').textContent=$('pr').value;
+$('ct').oninput=()=>$('ctv').textContent=$('ct').value;
+$('nmp').oninput=()=>$('nmv').textContent=(+$('nmp').value).toFixed(1);
+function syncOpts(){const f=$('fmt').value;
+ $('glbopts').style.display=(f==='depth')?'none':'block';
+ $('nmpwrap').style.display=(f==='glb')?'block':'none';
+ $('camwrap').style.display=(f==='glb')?'block':'none';}
+$('fmt').onchange=syncOpts;syncOpts();
+
+$('go').onclick=async()=>{
+ const f=$('file').files[0];
+ if(!f){$('tip').textContent='请先选择图片';return;}
+ const fd=new FormData();
+ fd.append('file',f);
+ fd.append('export_format',$('fmt').value);
+ fd.append('process_res',$('pr').value);
+ fd.append('conf_thresh_percentile',$('ct').value);
+ fd.append('num_max_points',Math.round(+$('nmp').value*1e6));
+ fd.append('show_cameras',$('cam').value);
+ $('go').disabled=true;$('go').textContent='推理中…';$('tip').textContent='';
+ const out=$('out');out.style.display='block';out.innerHTML='<div class="meta">⏳ GPU 推理中，请稍候…</div>';
+ try{
+  const r=await fetch('/api/infer',{method:'POST',body:fd});
+  const j=await r.json();
+  if(!r.ok||j.error){out.innerHTML='<div class="err">出错：'+(j.error||('HTTP '+r.status))+'</div>';}
+  else if(j.mode==='depth'){
+   out.innerHTML=`<div class="grid">
+     <figure><img src="${j.input_uri}"><figcaption>输入图（已按 EXIF 转正）</figcaption></figure>
+     <figure><img src="${j.depth_uri}"><figcaption>深度图（越亮=越近）</figcaption></figure></div>
+    <div class="meta">推理耗时 ${j.dt.toFixed(2)}s ｜ 深度范围 ${j.dmin.toFixed(3)} ~ ${j.dmax.toFixed(3)} ｜ 分辨率 ${j.shape[0]}×${j.shape[1]}</div>`;
+  }else{
+   out.innerHTML=`<model-viewer src="${j.glb_url}" camera-controls touch-action="pan-y" auto-rotate
+      camera-orbit="0deg 80deg 30%" field-of-view="28deg" min-camera-orbit="auto auto 3%"
+      interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
+    <div class="meta">${j.label} ｜ 推理耗时 ${j.dt.toFixed(2)}s ｜ ${j.stat} ｜
+      <a class="dl" href="${j.glb_url}" download>下载 GLB ↓</a> ｜ 用鼠标拖拽转视角、滚轮缩放</div>`;
+  }
+ }catch(e){out.innerHTML='<div class="err">请求失败：'+e+'</div>';}
+ $('go').disabled=false;$('go').textContent='生成';
+};
+</script>
 </body></html>"""
 
 
@@ -221,45 +392,97 @@ def home():
 
 @app.get("/panel", response_class=HTMLResponse)
 def panel():
-    """扩展面板：单图深度图上传页（旧首页内容）。"""
-    return PAGE.format(result="")
+    """扩展面板：调参 + 深度图/点云/网格。"""
+    return PANEL_PAGE
 
 
-@app.post("/infer", response_class=HTMLResponse)
-async def infer(file: UploadFile = File(...)):
+@app.post("/api/infer")
+async def api_infer(
+    file: UploadFile = File(...),
+    export_format: str = Form("depth"),          # depth | glb | mesh
+    process_res: int = Form(504),
+    conf_thresh_percentile: float = Form(40.0),
+    num_max_points: int = Form(800000),
+    show_cameras: str = Form("1"),
+):
+    """统一推理入口：按 export_format 返回深度图 data-uri 或 GLB 下载地址。"""
     raw = await file.read()
     try:
-        img = Image.open(io.BytesIO(raw))
-        img = ImageOps.exif_transpose(img).convert("RGB")  # 修正手机拍照方向
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
     except Exception as e:
-        return PAGE.format(result=f'<div class="card">读取图片失败：{e}</div>')
-
+        return JSONResponse({"error": f"读取图片失败：{e}"}, status_code=400)
     arr = np.array(img)
+    res = int(max(140, min(896, process_res)))
+    show_cam = str(show_cameras) in ("1", "true", "True", "on")
+
     model = get_model()
-    t0 = time.time()
-    with torch.no_grad():
-        pred = model.inference([arr], process_res=PROCESS_RES, export_format="mini_npz")
-    dt = time.time() - t0
+    try:
+        with _gpu_lock:  # 与官方 Gradio 共用同一模型，串行化 GPU 推理
+            t0 = time.time()
+            if export_format in ("glb", "mesh"):
+                token = uuid.uuid4().hex
+                outdir = GLB_DIR / token
+                outdir.mkdir(parents=True, exist_ok=True)
+                if export_format == "glb":
+                    with torch.no_grad():
+                        pred = model.inference(
+                            [arr], process_res=res, export_dir=str(outdir),
+                            export_format="glb",
+                            conf_thresh_percentile=float(conf_thresh_percentile),
+                            num_max_points=int(num_max_points), show_cameras=show_cam)
+                    dt = time.time() - t0
+                    glb = outdir / "scene.glb"
+                    sz = glb.stat().st_size / 1024 if glb.exists() else 0
+                    depth = np.asarray(pred.depth)[0]
+                    _prune_glb()
+                    return JSONResponse({
+                        "mode": "glb", "glb_url": f"/glb/{token}/scene.glb", "dt": dt,
+                        "label": "点云 + 相机线框", "stat": f"GLB {sz:.0f}KB",
+                        "shape": [int(depth.shape[1]), int(depth.shape[0])]})
+                else:  # mesh：先出 prediction（含 intrinsics），再自建网格
+                    with torch.no_grad():
+                        pred = model.inference([arr], process_res=res, export_format="mini_npz")
+                    glb = outdir / "scene.glb"
+                    nv, nf = build_mesh_glb(
+                        pred, str(glb), conf_thresh_percentile=float(conf_thresh_percentile))
+                    dt = time.time() - t0
+                    sz = glb.stat().st_size / 1024 if glb.exists() else 0
+                    _prune_glb()
+                    return JSONResponse({
+                        "mode": "mesh", "glb_url": f"/glb/{token}/scene.glb", "dt": dt,
+                        "label": "三角网格 mesh",
+                        "stat": f"顶点 {nv:,} · 面 {nf:,} · GLB {sz:.0f}KB"})
+            else:  # depth
+                with torch.no_grad():
+                    pred = model.inference([arr], process_res=res, export_format="mini_npz")
+                dt = time.time() - t0
+                depth = np.asarray(pred.depth)[0]
+                base_rgb = _rgb_uint8(pred, arr)
+                return JSONResponse({
+                    "mode": "depth",
+                    "input_uri": to_data_uri_rgb(base_rgb),
+                    "depth_uri": to_data_uri_bgr(colorize_depth(depth)),
+                    "dt": dt,
+                    "dmin": float(np.nanmin(depth)), "dmax": float(np.nanmax(depth)),
+                    "shape": [int(depth.shape[1]), int(depth.shape[0])]})
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return JSONResponse(
+            {"error": "GPU 显存不足（5090 与产线共享）。请调低 process_res 或稍后重试。"},
+            status_code=507)
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
 
-    depth = np.asarray(pred.depth)[0]  # (N,H,W) 取第一帧
-    # 用推理内部处理过的图做对比（与深度图同尺寸）；缺省则用原图
-    if getattr(pred, "processed_images", None) is not None:
-        base_rgb = np.asarray(pred.processed_images)[0]
-        if base_rgb.dtype != np.uint8:
-            base_rgb = np.clip(base_rgb * (255 if base_rgb.max() <= 1.0 else 1), 0, 255).astype(np.uint8)
-    else:
-        base_rgb = arr
 
-    depth_color = colorize_depth(depth)
-    dmin, dmax = float(np.nanmin(depth)), float(np.nanmax(depth))
-    result = f"""<div class="card">
- <div class="grid">
-  <figure><img src="{to_data_uri_rgb(base_rgb)}"><figcaption>输入图</figcaption></figure>
-  <figure><img src="{to_data_uri_bgr(depth_color)}"><figcaption>深度图（越亮=越近）</figcaption></figure>
- </div>
- <div class="meta">推理耗时 {dt:.2f}s ｜ 深度范围 {dmin:.3f} ~ {dmax:.3f} ｜ 分辨率 {depth.shape[1]}×{depth.shape[0]} ｜ <a href="/panel">← 再传一张</a></div>
-</div>"""
-    return PAGE.format(result=result)
+@app.get("/glb/{token}/{name}")
+def serve_glb(token: str, name: str):
+    """按 token 提供生成的 GLB（校验为 32 位 hex，仅允许 scene.glb，防目录穿越）。"""
+    if len(token) != 32 or any(c not in "0123456789abcdef" for c in token) or name != "scene.glb":
+        return JSONResponse({"error": "非法路径"}, status_code=400)
+    p = GLB_DIR / token / "scene.glb"
+    if not p.exists():
+        return JSONResponse({"error": "产物已过期或不存在"}, status_code=404)
+    return FileResponse(str(p), media_type="model/gltf-binary", filename="scene.glb")
 
 
 # ── 电子秤：JSON 接口 + 实时看板页 ─────────────────────────────────────
@@ -297,7 +520,7 @@ WEIGHT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .off .weight{color:#c7c7cc}
  @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style></head><body>
-<div class="nav"><a href="/panel">深度图</a><a class="active" href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
+<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <h1>电子秤 · 实时重量</h1>
 <div class="sub">数据每 0.4s 由服务端轮询 · 页面每 0.5s 刷新</div>
 <div class="grid" id="grid"></div>
@@ -335,18 +558,13 @@ def weight_page():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 把官方 Gradio UI 挂到同一 FastAPI（同端口，路径 /gradio）
-#   - 复用本地模型档 DA3NESTED-GIANT-LARGE-1.1，避免联网下载
-#   - 模型懒加载：仅在官方 UI 首次推理时才占显存（与右栏深度图各自独立一份）
+# 兼容 shim：DA3 的 Gradio UI 按旧版 gradio 写，本机是 gradio 6.1.0，
+# 丢弃已移除的装饰性 kwargs（如 Gallery 的 show_download_button），避免改上游源码。
 # ══════════════════════════════════════════════════════════════════════
-# 兼容 shim：DA3 的 Gradio UI 按旧版 gradio 写的，本机装的是 gradio 6.1.0，
-# 部分纯装饰性关键字（如 Gallery 的 show_download_button）已被移除。这里包一层
-# 构造函数，静默丢弃这些已废弃 kwargs，避免改动上游 DA3 源码。
 _GRADIO6_REMOVED_KWARGS = {"show_download_button", "show_share_button"}
 
 
 def _shim_gradio_component(cls):
-    """包裹组件 __init__：丢弃 gradio 6 已移除的装饰性 kwargs。"""
     _orig_init = cls.__init__
 
     def __init__(self, *args, **kwargs):
@@ -360,6 +578,34 @@ def _shim_gradio_component(cls):
 for _cls in (gr.Gallery, gr.Image, gr.Video, gr.Model3D):
     _shim_gradio_component(_cls)
 
+
+# ══════════════════════════════════════════════════════════════════════
+# 让官方 Gradio 复用同一个模型单例并串行化 GPU（避免进程内两份权重撑爆显存）
+# ══════════════════════════════════════════════════════════════════════
+import depth_anything_3.app.modules.model_inference as _mi_mod  # noqa: E402
+
+
+def _shared_initialize_model(self, device="cuda"):
+    """官方 UI 的模型初始化改为复用本服务的共享单例。"""
+    self.model = get_model()
+
+
+_orig_run_inference = _mi_mod.ModelInference.run_inference
+
+
+def _locked_run_inference(self, *args, **kwargs):
+    """官方 UI 的推理也走同一把 GPU 锁，与右栏串行，避免并发撞显存。"""
+    with _gpu_lock:
+        return _orig_run_inference(self, *args, **kwargs)
+
+
+_mi_mod.ModelInference.initialize_model = _shared_initialize_model
+_mi_mod.ModelInference.run_inference = _locked_run_inference
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 挂载官方 Gradio UI 到同一 FastAPI（同端口，路径 /gradio）
+# ══════════════════════════════════════════════════════════════════════
 os.environ.setdefault("DA3_MODEL_DIR", MODEL_DIR)
 _GRADIO_WORKSPACE = str(Path("/home/odyss/da3-web/workspace/gradio"))
 _GRADIO_GALLERY = str(Path("/home/odyss/da3-web/workspace/gallery"))
