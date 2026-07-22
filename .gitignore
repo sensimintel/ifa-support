@@ -5,6 +5,10 @@ __pycache__/
 
 # 备份文件
 *.bak
+*.bak.*
+
+# 运行时日志
+*.log
 
 # Gradio 运行时目录（app.py 启动时自动创建）
 workspace/

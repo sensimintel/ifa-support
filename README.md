@@ -15,6 +15,8 @@
 |---|---|
 | `app.py` | 全部服务端逻辑（FastAPI 应用 `app:app`，含深度推理 + 电子秤模块 + 内嵌 HTML 页面） |
 | `run.sh` | 用 `da3` conda 环境在 `0.0.0.0:8060` 起服务的启动脚本 |
+| `deploy.sh` | 5090 上一键部署：`git pull` + 重启服务（systemd 优先，否则 kill+nohup） |
+| `da3-web.service` | 可选 systemd 单元（正规化开机自启/重启） |
 | `requirements.txt` | pip 依赖（不含 `depth_anything_3`，见下） |
 
 ## 运行
@@ -27,6 +29,18 @@
 ```
 
 局域网内访问 `http://<5090局域网IP>:8060`。
+
+## 部署（git 部署源模式）
+
+5090 上的运行目录 `~/da3-web` 是本仓的 checkout，**只 pull、不 commit/push**（用只读 deploy key）。开发流程：
+
+```
+本地改代码 → push 到 GitHub → 登录 5090 → cd ~/da3-web && ./deploy.sh
+```
+
+`deploy.sh` 会 `git pull --ff-only` 后重启 8060 服务并做健康检查。
+
+首次把 5090 目录接成 checkout / 配 deploy key 的步骤，见部署纪律：deploy key 为**只读**，5090 不承担任何提交。
 
 ## 外部依赖（不随本仓分发）
 
