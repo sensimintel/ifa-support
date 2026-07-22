@@ -315,12 +315,11 @@ def _box_wireframe_meshes(lo, hi, color_rgb, radius):
 
 def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentile=40.0,
                                num_max_points=800000, show_cameras=True):
-    """自建单视图点云（复用 DA3 官方反投影 + 同一 glTF 对齐变换 A），并把 food/drink
-    检测框内点云的 3D 轴对齐包围盒画成彩色粗线框，一并导出 GLB。
+    """自建单视图点云并叠加 food/drink 3D 检测框，导出 GLB。
 
-    点云与框来自同一套反投影 + 同一个 A 变换，故框必与点云严格对齐（不赌坐标系）。
-    detections 为 _locate_food_drink 的归一化框（相对 processed 图宽高）。
-    返回命中的 label 列表（用于状态展示）。"""
+    坐标系用「相机坐标系」（相机=原点/拍摄位置、光轴固定，仅 flip Y/Z 到 glTF 约定），
+    不套 DA3 逐帧 pose、不做中位数居中——相机不动则坐标系帧间固定，点云不漂。
+    点云与框来自同一套反投影，框严格与点云对齐。返回命中的 label 列表。"""
     from depth_anything_3.utils.export import glb as _glb  # 复用官方对齐/相机/降采样
 
     depth = np.asarray(pred.depth).astype(np.float32)       # (N,H,W)
@@ -347,25 +346,27 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
                                         conf_thresh_percentile, 90.0)
         valid &= conf[i] >= conf_thr
 
-    # 反投影全部像素到 world（保留像素网格，便于按检测框索引），与官方 glb 同款公式
+    # 反投影到「相机坐标系」（相机=原点、光轴固定），不套 DA3 pose、不减中位数中心——
+    # 坐标系帧间固定：相机物理不动 → 点云只随真实场景深度变，切断两个漂移源：
+    #   (a) 中位数居中把局部变化放大成整帧平移；(c) 单图 pose 估计逐帧漂。
+    # glTF 约定翻转 Y/Z（相机看 -Z、Y 向上）。残留 (b) 深度尺度呼吸后续再治。
     us, vs = np.meshgrid(np.arange(W), np.arange(H))
     pix = np.stack([us, vs, np.ones_like(us)], -1).reshape(-1, 3).astype(np.float64)
     K_inv = np.linalg.inv(K[i])
-    c2w = np.linalg.inv(_glb._as_homogeneous44(ext[i]))
     rays = K_inv @ pix.T                                # (3, H*W)
-    Xc = rays * d.reshape(-1)[None, :]                  # (3, H*W)
-    Xw = (c2w @ np.vstack([Xc, np.ones((1, Xc.shape[1]))]))[:3].T  # (H*W, 3) world
-
-    vmask = valid.reshape(-1)
-    # A：与官方一致——按第一相机对齐 glTF 轴系 + 以全部有效点中位数居中
-    A = _glb._compute_alignment_transform_first_cam_glTF_center_by_points(ext[i], Xw[vmask])
-    Xa = trimesh.transform_points(Xw, A)               # (H*W, 3) 对齐后
+    Xc = (rays * d.reshape(-1)[None, :]).T              # (H*W, 3) 相机坐标（原点=相机光心）
+    Xa = Xc.copy()
+    Xa[:, 1] *= -1.0                                    # flip Y（图像 y 向下 → glTF Y 向上）
+    Xa[:, 2] *= -1.0                                    # flip Z（相机光轴 +Z → glTF 相机看 -Z）
     Xa_grid = Xa.reshape(H, W, 3)
+    vmask = valid.reshape(-1)
 
     scene = trimesh.Scene()
     if scene.metadata is None:
         scene.metadata = {}
-    scene.metadata["hf_alignment"] = A                 # 供相机线框复用
+    # 相机线框的对齐矩阵：仅 flip Y/Z（相机固定在原点），与点云同坐标系
+    A_cam = np.eye(4); A_cam[1, 1] = -1.0; A_cam[2, 2] = -1.0
+    scene.metadata["hf_alignment"] = A_cam
 
     # 点云（降采样后加入场景）
     pc_pts = Xa[vmask].astype(np.float32)
@@ -412,11 +413,12 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
             scene.add_geometry(m)
         hit_labels.append(label)
 
-    # 相机线框（复用官方逻辑，从 metadata 读同一个 A）
+    # 相机线框（相机固定在原点：用 identity pose，配合 metadata 的 A_cam 只做 flip）
     if show_cameras:
         try:
+            _ext_id = np.tile(np.eye(4, dtype=np.float64), (N, 1, 1))
             _glb._add_cameras_to_scene(
-                scene=scene, K=K, ext_w2c=ext,
+                scene=scene, K=K, ext_w2c=_ext_id,
                 image_sizes=[(H, W)] * N, scale=scene_scale * 0.03)
         except Exception:
             pass
