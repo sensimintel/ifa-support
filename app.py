@@ -583,6 +583,8 @@ function syncOpts(){const f=$('fmt').value;
 const mv=$('mv');
 const camState={theta:0,phi:80,radius:30,fov:28};
 let locked=null, lastCam='';   // locked: {orbit,target,fov} 绝对值字符串；null=尚未锁定（用初始默认）
+let interacting=false, interactTimer;   // 「用户正在调」标志：交互期间新帧 load 不拉回，避免打断
+function markInteract(){interacting=true;clearTimeout(interactTimer);interactTimer=setTimeout(()=>{interacting=false;},600);}
 
 function readNow(){  // 读当前实测相机（角度→deg，距离/中心→米，绝对值）
   const o=mv.getCameraOrbit(), t=mv.getCameraTarget(), f=mv.getFieldOfView();
@@ -613,17 +615,18 @@ function applyFromSliders(){  // 滑块档位 → 设相机（radius 用 %），
   setTimeout(lockFromNow, 50);   // 待相机就位后读回米值锁定
 }
 [['cth','theta'],['cph','phi'],['crd','radius'],['cfv','fov']].forEach(([id,key])=>{
-  $(id).addEventListener('input',()=>{camState[key]=+$(id).value;$(id+'v').textContent=$(id).value;applyFromSliders();});
+  $(id).addEventListener('input',()=>{markInteract();camState[key]=+$(id).value;$(id+'v').textContent=$(id).value;applyFromSliders();});
 });
 $('crot').addEventListener('change',()=>{$('crot').checked?mv.setAttribute('auto-rotate',''):mv.removeAttribute('auto-rotate');});
 // 只在「用户手动拖动」时更新锁定视角；auto-frame/程序化触发的 camera-change 一律忽略（否则会追着漂移跑）
 let camDebounce;
 mv.addEventListener('camera-change',(e)=>{
   if(!(e.detail && e.detail.source==='user-interaction'))return;
+  markInteract();
   clearTimeout(camDebounce); camDebounce=setTimeout(lockFromNow, 120);
 });
-// 每帧点云载入完成后：有锁定视角就强制拉回；首帧还没锁定则以当前 auto-frame 视角建立初始锁定
-mv.addEventListener('load',()=>{ locked ? applyLocked() : lockFromNow(); });
+// 每帧点云载入后：用户正在调则不打断；否则有锁定就强制拉回，首帧未锁定则以当前 auto-frame 视角建立初始锁定
+mv.addEventListener('load',()=>{ if(interacting)return; locked ? applyLocked() : lockFromNow(); });
 $('camcopy').addEventListener('click',()=>{
   if(!lastCam)return;
   if(navigator.clipboard)navigator.clipboard.writeText(lastCam).catch(()=>{});
