@@ -556,6 +556,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y"
      camera-orbit="0deg 80deg 30%" field-of-view="28deg"
      min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
+     min-field-of-view="10deg" max-field-of-view="60deg"
      interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
    <span class="wait" id="prodwait">等待产物…</span>
   </div>
