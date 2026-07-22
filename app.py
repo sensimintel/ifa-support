@@ -575,33 +575,55 @@ function syncOpts(){const f=$('fmt').value;
  $('camwrap').style.display=(f==='glb')?'block':'none';
  $('camcard').style.display=(f==='depth')?'none':'block';}  // 相机视角调节仅对 model-viewer 产物
 
-// ── 3D 视角调节（仅点云/网格）：滑块精调 + 鼠标拖动 + 实时读回实测量化参数 + 复制 ──
+// ── 3D 视角调节（仅点云/网格）：滑块/鼠标调视角，锁定绝对视角，每帧 reload 强制拉回，杜绝漂移 ──
+// 漂移根因：camera-orbit 是相对 camera-target(模型中心) 的球坐标；每帧新点云中心/尺度不同，
+// model-viewer 载入新模型会 auto-frame 重新对准中心，故角度数值不变、看向的点变了 → 画面飘。
+// 治法：① 锁定绝对 camera-target + camera-orbit(米) + fov；② 只在「用户手动交互」时更新锁定值
+//（忽略 auto-frame 触发的 camera-change，避免把漂移固化）；③ 每帧 load 后强制 apply 锁定视角。
 const mv=$('mv');
 const camState={theta:0,phi:80,radius:30,fov:28};
-function applyCam(){  // 把滑块档位写进 model-viewer（radius 用 %，跨帧取景更鲁棒）
+let locked=null, lastCam='';   // locked: {orbit,target,fov} 绝对值字符串；null=尚未锁定（用初始默认）
+
+function readNow(){  // 读当前实测相机（角度→deg，距离/中心→米，绝对值）
+  const o=mv.getCameraOrbit(), t=mv.getCameraTarget(), f=mv.getFieldOfView();
+  return {th:o.theta*180/Math.PI, ph:o.phi*180/Math.PI, r:o.radius,
+          tx:t.x, ty:t.y, tz:t.z, fov:f};
+}
+function lockFromNow(){  // 把「当前实测视角」固化为锁定视角，并刷新只读框
+  try{
+    const n=readNow();
+    locked={orbit:n.th.toFixed(2)+'deg '+n.ph.toFixed(2)+'deg '+n.r.toFixed(4)+'m',
+            target:n.tx.toFixed(4)+'m '+n.ty.toFixed(4)+'m '+n.tz.toFixed(4)+'m',
+            fov:n.fov.toFixed(2)+'deg'};
+    lastCam='camera-orbit="'+n.th.toFixed(1)+'deg '+n.ph.toFixed(1)+'deg '+n.r.toFixed(3)+'m" '
+           +'field-of-view="'+n.fov.toFixed(1)+'deg" '
+           +'camera-target="'+n.tx.toFixed(3)+'m '+n.ty.toFixed(3)+'m '+n.tz.toFixed(3)+'m"';
+    $('camnow').textContent=lastCam;
+  }catch(e){}
+}
+function applyLocked(){  // 强制把相机拉回锁定视角（压制 auto-frame）
+  if(!locked)return;
+  mv.cameraTarget=locked.target; mv.cameraOrbit=locked.orbit; mv.fieldOfView=locked.fov;
+  if(mv.jumpCameraToGoal)mv.jumpCameraToGoal();
+}
+function applyFromSliders(){  // 滑块档位 → 设相机（radius 用 %），随后固化为绝对锁定值
   mv.cameraOrbit=camState.theta+'deg '+camState.phi+'deg '+camState.radius+'%';
   mv.fieldOfView=camState.fov+'deg';
   if(mv.jumpCameraToGoal)mv.jumpCameraToGoal();
+  setTimeout(lockFromNow, 50);   // 待相机就位后读回米值锁定
 }
 [['cth','theta'],['cph','phi'],['crd','radius'],['cfv','fov']].forEach(([id,key])=>{
-  $(id).addEventListener('input',()=>{camState[key]=+$(id).value;$(id+'v').textContent=$(id).value;applyCam();});
+  $(id).addEventListener('input',()=>{camState[key]=+$(id).value;$(id+'v').textContent=$(id).value;applyFromSliders();});
 });
 $('crot').addEventListener('change',()=>{$('crot').checked?mv.setAttribute('auto-rotate',''):mv.removeAttribute('auto-rotate');});
-// 鼠标拖动/滑块变更后读回「实测」相机参数（绝对值：deg + 米），并持久化到属性防新帧 reload 重置
-let camReadTimer,lastCam='';
-mv.addEventListener('camera-change',()=>{clearTimeout(camReadTimer);camReadTimer=setTimeout(()=>{
-  try{
-    const o=mv.getCameraOrbit(),fov=mv.getFieldOfView(),t=mv.getCameraTarget();
-    const th=o.theta*180/Math.PI, ph=o.phi*180/Math.PI;
-    lastCam='camera-orbit="'+th.toFixed(1)+'deg '+ph.toFixed(1)+'deg '+o.radius.toFixed(3)+'m" '
-           +'field-of-view="'+fov.toFixed(1)+'deg" '
-           +'camera-target="'+t.x.toFixed(3)+'m '+t.y.toFixed(3)+'m '+t.z.toFixed(3)+'m"';
-    $('camnow').textContent=lastCam;
-    // 用实测绝对值持久化视角，避免下一帧点云 reload 后跳回初始角度
-    mv.setAttribute('camera-orbit',th.toFixed(2)+'deg '+ph.toFixed(2)+'deg '+o.radius.toFixed(4)+'m');
-    mv.setAttribute('field-of-view',fov.toFixed(2)+'deg');
-  }catch(e){}
-},160);});
+// 只在「用户手动拖动」时更新锁定视角；auto-frame/程序化触发的 camera-change 一律忽略（否则会追着漂移跑）
+let camDebounce;
+mv.addEventListener('camera-change',(e)=>{
+  if(!(e.detail && e.detail.source==='user-interaction'))return;
+  clearTimeout(camDebounce); camDebounce=setTimeout(lockFromNow, 120);
+});
+// 每帧点云载入完成后：有锁定视角就强制拉回；首帧还没锁定则以当前 auto-frame 视角建立初始锁定
+mv.addEventListener('load',()=>{ locked ? applyLocked() : lockFromNow(); });
 $('camcopy').addEventListener('click',()=>{
   if(!lastCam)return;
   if(navigator.clipboard)navigator.clipboard.writeText(lastCam).catch(()=>{});
