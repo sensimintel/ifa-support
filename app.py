@@ -40,6 +40,8 @@ sys.path.append(str(DA3_ROOT / "src"))
 from depth_anything_3.api import DepthAnything3  # noqa: E402
 from depth_anything_3.app.gradio_app import DepthAnything3App  # noqa: E402
 
+from frame_relay import router as frame_router, set_processor  # noqa: E402
+
 MODEL_DIR = str(DA3_ROOT / "models" / "DA3NESTED-GIANT-LARGE-1.1")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 PROCESS_RES = 504  # DA3 默认处理分辨率
@@ -472,6 +474,27 @@ async def api_infer(
             status_code=507)
     except Exception as e:
         return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+# ── 设备实时帧中继：接收 mobile 直发的帧 → 缓存展示 + DA3 深度处理 ──────────
+def _da3_depth_processor(raw: bytes) -> bytes:
+    """把收到的一帧跑 DA3 出彩色深度图（JPEG 字节）。与官方 Gradio 共用同一模型、
+    同一把 GPU 锁串行化，避免撞显存。首帧到达时才触发模型懒加载。"""
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    arr = np.array(img)
+    model = get_model()
+    with _gpu_lock:
+        with torch.no_grad():
+            pred = model.inference([arr], process_res=PROCESS_RES, export_format="mini_npz")
+    depth = np.asarray(pred.depth)[0]
+    ok, buf = cv2.imencode(".jpg", colorize_depth(depth))
+    if not ok:
+        raise RuntimeError("深度图编码失败")
+    return buf.tobytes()
+
+
+app.include_router(frame_router)
+set_processor(_da3_depth_processor, content_type="image/jpeg")
 
 
 @app.get("/glb/{token}/{name}")
