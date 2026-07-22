@@ -371,6 +371,13 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
     pc_pts = Xa[vmask].astype(np.float32)
     pc_cols = rgb.reshape(-1, 3)[vmask].astype(np.uint8)
     pc_pts, pc_cols = _glb._filter_and_downsample(pc_pts, pc_cols, int(num_max_points))
+    # 裁离群点：个别深度估计异常的远点会把点云包围盒撑爆，导致 model-viewer 取景距离算成
+    # 负/极小值、画面全黑（尤其自适应/近距视角）。按到中位数中心的距离去掉最远 ~1.5%，让包围盒紧致。
+    if pc_pts.shape[0] > 200:
+        c = np.median(pc_pts, axis=0)
+        dist = np.linalg.norm(pc_pts - c, axis=1)
+        keep = dist <= np.percentile(dist, 98.5)
+        pc_pts, pc_cols = pc_pts[keep], pc_cols[keep]
     if pc_pts.shape[0] > 0:
         scene.add_geometry(trimesh.points.PointCloud(vertices=pc_pts, colors=pc_cols))
 
