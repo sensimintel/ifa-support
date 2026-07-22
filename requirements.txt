@@ -1,0 +1,15 @@
+# Web 服务框架
+fastapi
+uvicorn
+python-multipart
+
+# 图像/数值处理
+numpy
+opencv-python
+Pillow
+
+# 深度模型推理（需 CUDA 环境）
+torch
+
+# 注意：depth_anything_3 不在 PyPI，需从本地 DA3 源码目录引入，
+# 见 README「外部依赖」一节（app.py 通过 sys.path 引用 DA3/src）。

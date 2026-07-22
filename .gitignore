@@ -1,0 +1,17 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 备份文件
+*.bak
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/
