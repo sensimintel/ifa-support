@@ -526,6 +526,25 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="status" id="status">等待设备帧… 请让手机 App（或模拟脚本）向 /api/frame 发帧。</div>
 </div>
 
+<div class="card" id="camcard" style="display:none">
+ <div class="row" style="align-items:center;margin-bottom:2px">
+  <div class="fld" style="flex:0 0 auto"><label style="display:inline;margin:0"><input type="checkbox" id="crot"> 自动旋转（默认关，勾选才转）</label></div>
+ </div>
+ <div class="row">
+  <div class="fld"><label>方位角 θ <span class="rngval" id="cthv">0</span>°</label>
+   <input type="range" id="cth" min="-180" max="180" step="1" value="0"></div>
+  <div class="fld"><label>俯仰角 φ <span class="rngval" id="cphv">80</span>°</label>
+   <input type="range" id="cph" min="0" max="180" step="1" value="80"></div>
+  <div class="fld"><label>距离 radius <span class="rngval" id="crdv">30</span>%</label>
+   <input type="range" id="crd" min="5" max="400" step="1" value="30"></div>
+  <div class="fld"><label>视场 FOV <span class="rngval" id="cfvv">28</span>°</label>
+   <input type="range" id="cfv" min="10" max="60" step="1" value="28"></div>
+ </div>
+ <div class="hint">拖动右侧 3D 视图或调滑块调整视角；下方是当前相机的<b>实测量化参数</b>（绝对值，可直接作为默认视角）。调到满意后点「复制」把参数发给我。</div>
+ <div class="status" style="border-top:1px solid #f0f0f2;margin-top:8px">当前相机：<code id="camnow" style="font-size:12px;word-break:break-all;color:#0071e3">—（先切到点云/网格产物并拖一下视图）</code></div>
+ <button id="camcopy" style="margin-top:10px;padding:7px 16px;border:0;border-radius:8px;background:#0071e3;color:#fff;font-size:13px;cursor:pointer">复制当前视角参数</button>
+</div>
+
 <div class="grid">
  <figure>
   <div class="box"><img id="raw" style="display:none"><span class="wait" id="rawwait">等待设备帧…</span></div>
@@ -534,8 +553,9 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <figure>
   <div class="box">
    <img id="prodimg" style="display:none">
-   <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y" auto-rotate
-     camera-orbit="0deg 80deg 30%" field-of-view="28deg" min-camera-orbit="auto auto 3%"
+   <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y"
+     camera-orbit="0deg 80deg 30%" field-of-view="28deg"
+     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
      interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
    <span class="wait" id="prodwait">等待产物…</span>
   </div>
@@ -552,7 +572,41 @@ $('nmp').oninput=()=>$('nmv').textContent=(+$('nmp').value).toFixed(1);
 function syncOpts(){const f=$('fmt').value;
  $('glbopts').style.display=(f==='depth')?'none':'block';
  $('nmpwrap').style.display=(f==='glb')?'block':'none';
- $('camwrap').style.display=(f==='glb')?'block':'none';}
+ $('camwrap').style.display=(f==='glb')?'block':'none';
+ $('camcard').style.display=(f==='depth')?'none':'block';}  // 相机视角调节仅对 model-viewer 产物
+
+// ── 3D 视角调节（仅点云/网格）：滑块精调 + 鼠标拖动 + 实时读回实测量化参数 + 复制 ──
+const mv=$('mv');
+const camState={theta:0,phi:80,radius:30,fov:28};
+function applyCam(){  // 把滑块档位写进 model-viewer（radius 用 %，跨帧取景更鲁棒）
+  mv.cameraOrbit=camState.theta+'deg '+camState.phi+'deg '+camState.radius+'%';
+  mv.fieldOfView=camState.fov+'deg';
+  if(mv.jumpCameraToGoal)mv.jumpCameraToGoal();
+}
+[['cth','theta'],['cph','phi'],['crd','radius'],['cfv','fov']].forEach(([id,key])=>{
+  $(id).addEventListener('input',()=>{camState[key]=+$(id).value;$(id+'v').textContent=$(id).value;applyCam();});
+});
+$('crot').addEventListener('change',()=>{$('crot').checked?mv.setAttribute('auto-rotate',''):mv.removeAttribute('auto-rotate');});
+// 鼠标拖动/滑块变更后读回「实测」相机参数（绝对值：deg + 米），并持久化到属性防新帧 reload 重置
+let camReadTimer,lastCam='';
+mv.addEventListener('camera-change',()=>{clearTimeout(camReadTimer);camReadTimer=setTimeout(()=>{
+  try{
+    const o=mv.getCameraOrbit(),fov=mv.getFieldOfView(),t=mv.getCameraTarget();
+    const th=o.theta*180/Math.PI, ph=o.phi*180/Math.PI;
+    lastCam='camera-orbit="'+th.toFixed(1)+'deg '+ph.toFixed(1)+'deg '+o.radius.toFixed(3)+'m" '
+           +'field-of-view="'+fov.toFixed(1)+'deg" '
+           +'camera-target="'+t.x.toFixed(3)+'m '+t.y.toFixed(3)+'m '+t.z.toFixed(3)+'m"';
+    $('camnow').textContent=lastCam;
+    // 用实测绝对值持久化视角，避免下一帧点云 reload 后跳回初始角度
+    mv.setAttribute('camera-orbit',th.toFixed(2)+'deg '+ph.toFixed(2)+'deg '+o.radius.toFixed(4)+'m');
+    mv.setAttribute('field-of-view',fov.toFixed(2)+'deg');
+  }catch(e){}
+},160);});
+$('camcopy').addEventListener('click',()=>{
+  if(!lastCam)return;
+  if(navigator.clipboard)navigator.clipboard.writeText(lastCam).catch(()=>{});
+  const b=$('camcopy');b.textContent='已复制 ✓';setTimeout(()=>b.textContent='复制当前视角参数',1200);
+});
 
 function currentConfig(){return {
   export_format:$('fmt').value,
