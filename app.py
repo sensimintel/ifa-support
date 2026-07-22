@@ -625,7 +625,8 @@ function applyAdaptive(){  // 自适应：保留角度 θ/φ 与 FOV；每帧按
   // 关键用绝对米（getDimensions/getBoundingBoxCenter 可靠）；不用 %/auto——它们对点云会算负距离/全黑。
   const d=mv.getDimensions(), c=mv.getBoundingBoxCenter();
   const maxDim=Math.max(d.x, d.y, d.z) || 2;
-  const dist=(maxDim / 2) / Math.tan(camState.fov * Math.PI / 360) * 1.15;  // FOV 恰好框住 maxDim + 15% 边距
+  const ADAPT_FILL=0.8;  // 取景充满度：1.0=恰好框住 maxDim；<1 拉近放大(点云填满/略出血)
+  const dist=(maxDim / 2) / Math.tan(camState.fov * Math.PI / 360) * ADAPT_FILL;
   mv.cameraTarget=c.x+'m '+c.y+'m '+c.z+'m';
   mv.cameraOrbit=camState.theta+'deg '+camState.phi+'deg '+dist.toFixed(3)+'m';
   mv.fieldOfView=camState.fov+'deg';
