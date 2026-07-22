@@ -550,8 +550,8 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="row">
   <div class="fld"><label>方位角 θ <span class="rngval" id="cthv">-17</span>°</label>
    <input type="range" id="cth" min="-180" max="180" step="1" value="-17"></div>
-  <div class="fld"><label>俯仰角 φ <span class="rngval" id="cphv">40</span>°</label>
-   <input type="range" id="cph" min="0" max="180" step="1" value="40"></div>
+  <div class="fld"><label>俯仰角 φ <span class="rngval" id="cphv">49</span>°</label>
+   <input type="range" id="cph" min="0" max="180" step="1" value="49"></div>
   <div class="fld"><label>距离 radius <span class="rngval" id="crdv">1.5</span>m</label>
    <input type="range" id="crd" min="0.3" max="10" step="0.1" value="1.5"></div>
   <div class="fld"><label>视场 FOV <span class="rngval" id="cfvv">45.5</span>°</label>
@@ -571,7 +571,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="box">
    <img id="prodimg" style="display:none">
    <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y"
-     camera-orbit="-17deg 40deg 1.5m" field-of-view="45.5deg" camera-target="-0.389m -1.223m 1.582m"
+     camera-orbit="-17deg 49deg 1.5m" field-of-view="45.5deg" camera-target="-0.389m -0.923m 1.582m"
      min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
      min-field-of-view="10deg" max-field-of-view="60deg"
      interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
@@ -599,7 +599,7 @@ function syncOpts(){const f=$('fmt').value;
 // 治法：① 锁定绝对 camera-target + camera-orbit(米) + fov；② 只在「用户手动交互」时更新锁定值
 //（忽略 auto-frame 触发的 camera-change，避免把漂移固化）；③ 每帧 load 后强制 apply 锁定视角。
 const mv=$('mv');
-const camState={theta:-17,phi:40,radius:1.5,fov:45.5};  // 默认视角（角度/FOV=用户调定；radius 改绝对米，% 在 model-viewer 对点云换算不稳）
+const camState={theta:-17,phi:49,radius:1.5,fov:45.5};  // 默认视角（角度/FOV=用户调定；radius 改绝对米，% 在 model-viewer 对点云换算不稳）
 let locked=null, lastCam='';   // locked: {orbit,target,fov} 绝对值字符串；null=尚未锁定（用初始默认）
 let interacting=false, interactTimer;   // 「用户正在调」标志：交互期间新帧 load 不拉回，避免打断
 function markInteract(){interacting=true;clearTimeout(interactTimer);interactTimer=setTimeout(()=>{interacting=false;},600);}
