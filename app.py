@@ -277,7 +277,7 @@ SPLIT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 # ══════════════════════════════════════════════════════════════════════
 PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DA3 扩展面板 · 深度/点云/网格</title>
+<title>DA3 扩展面板 · 设备实时帧</title>
 <script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
 <style>
  body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;max-width:1180px;margin:24px auto;padding:0 16px;color:#1c1c1e;background:#f5f5f7}
@@ -290,30 +290,31 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  label{font-size:13px;color:#3a3a3c;display:block;margin:0 0 4px}
  .row{display:flex;flex-wrap:wrap;gap:18px;align-items:flex-end}
  .fld{flex:1 1 180px;min-width:150px}
- select,input[type=file]{width:100%;font-size:14px}
- select{padding:8px;border:1px solid #d0d0d5;border-radius:8px;background:#fff}
+ select{width:100%;font-size:14px;padding:8px;border:1px solid #d0d0d5;border-radius:8px;background:#fff}
  input[type=range]{width:100%}
  .rngval{font-variant-numeric:tabular-nums;color:#0071e3;font-weight:600}
  .glbopts{border-top:1px dashed #e0e0e5;margin-top:14px;padding-top:14px}
- button{background:#0071e3;color:#fff;border:0;border-radius:980px;padding:10px 26px;font-size:15px;cursor:pointer;margin-top:6px}
- button:disabled{opacity:.5;cursor:default}
  .hint{font-size:12px;color:#8e8e93;margin-top:6px}
+ .status{font-size:13px;color:#3a3a3c;margin-top:14px;padding-top:12px;border-top:1px solid #f0f0f2}
+ .status b{font-variant-numeric:tabular-nums}
+ .status .err{color:#c1121f}
+ .status .dim{color:#8e8e93}
  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
- .grid figure{margin:0} .grid img{width:100%;border-radius:10px;display:block;background:#000}
- figcaption{font-size:13px;color:#6b6b70;margin-top:6px;text-align:center}
- model-viewer{width:100%;height:520px;background:#111319;border-radius:12px;--poster-color:transparent}
- .meta{font-size:13px;color:#6b6b70;margin-top:10px}
- a.dl{color:#0071e3;text-decoration:none}
- .err{color:#c1121f}
+ .grid figure{margin:0}
+ .box{width:100%;height:460px;background:#0b0d10;border-radius:12px;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center}
+ .box img{max-width:100%;max-height:100%;display:block}
+ .box model-viewer{width:100%;height:100%;--poster-color:transparent}
+ .wait{color:#7a828c;font-size:14px}
+ figcaption{font-size:13px;color:#6b6b70;margin-top:8px;text-align:center}
+ figcaption .m{color:#8e8e93}
  @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style></head><body>
-<div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/weight">电子秤实时重量</a><a href="/live" target="_top">设备实时帧</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
+<div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <h1>Depth Anything 3 · 扩展面板</h1>
-<div class="sub">上传一张图，选产物类型 + 调参，右侧点云 / 网格可用鼠标 3D 转视角。模型：DA3NESTED-GIANT-LARGE-1.1</div>
+<div class="sub">实时展示设备帧：左 = 接收到的帧，右 = DA3 产物（按下方控件实时生成）。改产物类型 / 分辨率 / 调参，右框即时重算。模型：DA3NESTED-GIANT-LARGE-1.1</div>
 
 <div class="card">
  <div class="row">
-  <div class="fld"><label>图片</label><input type="file" id="file" accept="image/*"></div>
   <div class="fld"><label>产物类型 export_format</label>
    <select id="fmt">
     <option value="depth">深度图（彩色）</option>
@@ -332,56 +333,99 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    <div class="fld" id="camwrap"><label>相机线框 show_cameras</label>
     <select id="cam"><option value="1">显示</option><option value="0">隐藏</option></select></div>
   </div>
-  <div class="hint" id="glbhint">点云用 DA3 官方 scene.glb 导出；网格由深度反投影自建三角面（conf 分位越高越干净，num_max_points 仅点云生效）。</div>
+  <div class="hint">点云用 DA3 官方 scene.glb 导出；网格由深度反投影自建三角面（conf 分位越高越干净，num_max_points 仅点云生效）。分辨率越高越细、越吃显存，OOM 时会提示调低。</div>
  </div>
- <button id="go">生成</button>
- <span class="hint" id="tip"></span>
+ <div class="status" id="status">等待设备帧… 请让手机 App（或模拟脚本）向 /api/frame 发帧。</div>
 </div>
 
-<div class="card" id="out" style="display:none"></div>
+<div class="grid">
+ <figure>
+  <div class="box"><img id="raw" style="display:none"><span class="wait" id="rawwait">等待设备帧…</span></div>
+  <figcaption>接收到的设备帧 <span class="m" id="rawmeta"></span></figcaption>
+ </figure>
+ <figure>
+  <div class="box">
+   <img id="prodimg" style="display:none">
+   <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y" auto-rotate
+     camera-orbit="0deg 80deg 30%" field-of-view="28deg" min-camera-orbit="auto auto 3%"
+     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
+   <span class="wait" id="prodwait">等待产物…</span>
+  </div>
+  <figcaption>DA3 产物 <span class="m" id="prodmeta"></span></figcaption>
+ </figure>
+</div>
 
 <script>
 const $=id=>document.getElementById(id);
 $('pr').oninput=()=>$('prv').textContent=$('pr').value;
 $('ct').oninput=()=>$('ctv').textContent=$('ct').value;
 $('nmp').oninput=()=>$('nmv').textContent=(+$('nmp').value).toFixed(1);
+
 function syncOpts(){const f=$('fmt').value;
  $('glbopts').style.display=(f==='depth')?'none':'block';
  $('nmpwrap').style.display=(f==='glb')?'block':'none';
  $('camwrap').style.display=(f==='glb')?'block':'none';}
-$('fmt').onchange=syncOpts;syncOpts();
 
-$('go').onclick=async()=>{
- const f=$('file').files[0];
- if(!f){$('tip').textContent='请先选择图片';return;}
- const fd=new FormData();
- fd.append('file',f);
- fd.append('export_format',$('fmt').value);
- fd.append('process_res',$('pr').value);
- fd.append('conf_thresh_percentile',$('ct').value);
- fd.append('num_max_points',Math.round(+$('nmp').value*1e6));
- fd.append('show_cameras',$('cam').value);
- $('go').disabled=true;$('go').textContent='推理中…';$('tip').textContent='';
- const out=$('out');out.style.display='block';out.innerHTML='<div class="meta">⏳ GPU 推理中，请稍候…</div>';
+function currentConfig(){return {
+  export_format:$('fmt').value,
+  process_res:+$('pr').value,
+  conf_thresh_percentile:+$('ct').value,
+  num_max_points:Math.round(+$('nmp').value*1e6),
+  show_cameras:$('cam').value
+};}
+
+let pushTimer=null;
+function pushConfig(){
+  clearTimeout(pushTimer);
+  pushTimer=setTimeout(()=>{
+    fetch('/api/frame/config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(currentConfig())}).catch(()=>{});
+  },300);
+}
+// 控件任意改动 → 同步显隐 + 推配置（debounce）
+['fmt','pr','ct','nmp','cam'].forEach(id=>{
+  $(id).addEventListener('change',()=>{syncOpts();pushConfig();});
+  $(id).addEventListener('input',pushConfig);
+});
+syncOpts();pushConfig();  // 首次把面板初值下发后端
+
+let lastSeq=-1,lastProdKey='';
+async function tick(){
  try{
-  const r=await fetch('/api/infer',{method:'POST',body:fd});
-  const j=await r.json();
-  if(!r.ok||j.error){out.innerHTML='<div class="err">出错：'+(j.error||('HTTP '+r.status))+'</div>';}
-  else if(j.mode==='depth'){
-   out.innerHTML=`<div class="grid">
-     <figure><img src="${j.input_uri}"><figcaption>输入图（已按 EXIF 转正）</figcaption></figure>
-     <figure><img src="${j.depth_uri}"><figcaption>深度图（越亮=越近）</figcaption></figure></div>
-    <div class="meta">推理耗时 ${j.dt.toFixed(2)}s ｜ 深度范围 ${j.dmin.toFixed(3)} ~ ${j.dmax.toFixed(3)} ｜ 分辨率 ${j.shape[0]}×${j.shape[1]}</div>`;
-  }else{
-   out.innerHTML=`<model-viewer src="${j.glb_url}" camera-controls touch-action="pan-y" auto-rotate
-      camera-orbit="0deg 80deg 30%" field-of-view="28deg" min-camera-orbit="auto auto 3%"
-      interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
-    <div class="meta">${j.label} ｜ 推理耗时 ${j.dt.toFixed(2)}s ｜ ${j.stat} ｜
-      <a class="dl" href="${j.glb_url}" download>下载 GLB ↓</a> ｜ 用鼠标拖拽转视角、滚轮缩放</div>`;
+  const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
+  // 左框：接收帧
+  if(s.has_frame && s.seq!==lastSeq){lastSeq=s.seq;
+    $('raw').src='/api/frame/latest?t='+s.seq;$('raw').style.display='block';$('rawwait').style.display='none';}
+  $('rawmeta').textContent = s.has_frame ? ('帧 '+s.seq+(s.interval?(' · 间隔 '+s.interval.toFixed(1)+'s'):'')) : '';
+
+  // 右框：DA3 产物（图片=深度图；模型=GLB）
+  const prodKey=(s.product_kind||'')+':'+(s.product_url||'')+':'+s.product_seq;
+  if(s.product_kind && prodKey!==lastProdKey){lastProdKey=prodKey;
+    if(s.product_kind==='image'){
+      $('prodimg').src='/api/frame/latest-product?t='+s.product_seq;
+      $('prodimg').style.display='block';$('mv').style.display='none';$('prodwait').style.display='none';
+    }else if(s.product_kind==='model' && s.product_url){
+      $('mv').src=s.product_url;
+      $('mv').style.display='block';$('prodimg').style.display='none';$('prodwait').style.display='none';
+    }
   }
- }catch(e){out.innerHTML='<div class="err">请求失败：'+e+'</div>';}
- $('go').disabled=false;$('go').textContent='生成';
-};
+  // 产物元信息 + 处理状态
+  let pm='';
+  if(s.product_error){pm='<span class="err">'+s.product_error+'</span>';}
+  else if(s.product_meta){const m=s.product_meta;
+    pm=(m.label||'')+(m.dt?(' · '+m.dt.toFixed(2)+'s'):'')+(m.stat?(' · '+m.stat):'')
+      +(m.shape?(' · '+m.shape[0]+'×'+m.shape[1]):'');}
+  if(s.has_frame && s.product_seq<s.seq && !s.product_error) pm+=' <span class="dim">（处理中…）</span>';
+  $('prodmeta').innerHTML=pm;
+
+  // 顶部状态行
+  if(!s.processor){$('status').innerHTML='<span class="err">未接入 DA3 模型（纯中继）。</span>';}
+  else if(!s.has_frame){$('status').textContent='等待设备帧… 请让手机 App（或模拟脚本）向 /api/frame 发帧。';}
+  else{$('status').innerHTML='接收帧 <b>'+s.seq+'</b>'+(s.interval?(' · 到达间隔 <b>'+s.interval.toFixed(1)+'s</b>'):'')
+     +' · 产物帧 <b>'+s.product_seq+'</b>'+(s.product_error?' · <span class="err">'+s.product_error+'</span>':'');}
+ }catch(e){/* 单次轮询失败忽略，下个周期重试 */}
+}
+setInterval(tick,500);tick();
 </script>
 </body></html>"""
 
@@ -477,24 +521,72 @@ async def api_infer(
 
 
 # ── 设备实时帧中继：接收 mobile 直发的帧 → 缓存展示 + DA3 深度处理 ──────────
-def _da3_depth_processor(raw: bytes) -> bytes:
-    """把收到的一帧跑 DA3 出彩色深度图（JPEG 字节）。与官方 Gradio 共用同一模型、
-    同一把 GPU 锁串行化，避免撞显存。首帧到达时才触发模型懒加载。"""
-    img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+def _da3_frame_processor(raw: bytes, config: dict) -> dict:
+    """把收到的一帧按「面板控件配置」跑 DA3，产出：
+      - export_format=depth → 彩色深度图（图片类产物，返回 JPEG 字节）
+      - export_format=glb   → DA3 官方点云+相机 scene.glb（模型类产物，返回 url）
+      - export_format=mesh  → 深度反投影自建网格 GLB（模型类产物，返回 url）
+    与官方 Gradio 共用同一模型、同一把 GPU 锁串行化，避免撞显存。首帧到达才懒加载模型。"""
+    try:
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    except Exception as e:
+        raise RuntimeError(f"读取图片失败：{e}")
     arr = np.array(img)
+
+    fmt = str(config.get("export_format", "depth"))
+    res = int(max(140, min(896, int(float(config.get("process_res", PROCESS_RES))))))
+    conf = float(config.get("conf_thresh_percentile", 40.0))
+    nmp = int(float(config.get("num_max_points", 800000)))
+    show_cam = str(config.get("show_cameras", "1")) in ("1", "true", "True", "on", "显示")
+
     model = get_model()
-    with _gpu_lock:
-        with torch.no_grad():
-            pred = model.inference([arr], process_res=PROCESS_RES, export_format="mini_npz")
-    depth = np.asarray(pred.depth)[0]
-    ok, buf = cv2.imencode(".jpg", colorize_depth(depth))
-    if not ok:
-        raise RuntimeError("深度图编码失败")
-    return buf.tobytes()
+    try:
+        with _gpu_lock:  # 与官方 Gradio 共用同一模型，串行化 GPU 推理
+            t0 = time.time()
+            if fmt in ("glb", "mesh"):
+                token = uuid.uuid4().hex
+                outdir = GLB_DIR / token
+                outdir.mkdir(parents=True, exist_ok=True)
+                if fmt == "glb":
+                    with torch.no_grad():
+                        pred = model.inference(
+                            [arr], process_res=res, export_dir=str(outdir),
+                            export_format="glb", conf_thresh_percentile=conf,
+                            num_max_points=nmp, show_cameras=show_cam)
+                    glb = outdir / "scene.glb"
+                    sz = glb.stat().st_size / 1024 if glb.exists() else 0
+                    _prune_glb()
+                    return {"kind": "model", "url": f"/glb/{token}/scene.glb",
+                            "meta": {"label": "点云 + 相机线框", "dt": time.time() - t0,
+                                     "stat": f"GLB {sz:.0f}KB · res {res}"}}
+                else:  # mesh：先出 prediction（含 intrinsics），再自建网格
+                    with torch.no_grad():
+                        pred = model.inference([arr], process_res=res, export_format="mini_npz")
+                    glb = outdir / "scene.glb"
+                    nv, nf = build_mesh_glb(pred, str(glb), conf_thresh_percentile=conf)
+                    sz = glb.stat().st_size / 1024 if glb.exists() else 0
+                    _prune_glb()
+                    return {"kind": "model", "url": f"/glb/{token}/scene.glb",
+                            "meta": {"label": "三角网格 mesh", "dt": time.time() - t0,
+                                     "stat": f"顶点 {nv:,} · 面 {nf:,} · GLB {sz:.0f}KB · res {res}"}}
+            else:  # depth
+                with torch.no_grad():
+                    pred = model.inference([arr], process_res=res, export_format="mini_npz")
+                depth = np.asarray(pred.depth)[0]
+                ok, buf = cv2.imencode(".jpg", colorize_depth(depth))
+                if not ok:
+                    raise RuntimeError("深度图编码失败")
+                return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
+                        "meta": {"label": "彩色深度图（越亮=越近）", "dt": time.time() - t0,
+                                 "dmin": float(np.nanmin(depth)), "dmax": float(np.nanmax(depth)),
+                                 "shape": [int(depth.shape[1]), int(depth.shape[0])], "res": res}}
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        raise RuntimeError("GPU 显存不足（5090 与产线共享），请调低处理分辨率后重试")
 
 
 app.include_router(frame_router)
-set_processor(_da3_depth_processor, content_type="image/jpeg")
+set_processor(_da3_frame_processor)
 
 
 @app.get("/glb/{token}/{name}")
