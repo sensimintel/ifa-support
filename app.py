@@ -1189,7 +1189,7 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .meta{font-size:10.5px;color:var(--faint);font-family:var(--mono);font-variant-numeric:tabular-nums;display:flex;gap:12px}
  .caret{display:inline-block;width:2px;height:1em;background:var(--accent);vertical-align:-1px;margin-left:1px;animation:blink 1s step-end infinite}
  @keyframes blink{50%{opacity:0}}
- #shot{position:fixed;top:0;left:0;width:208px;height:277px;opacity:0;pointer-events:none;z-index:-1}
+ #shot{position:fixed;top:0;left:0;width:208px;height:277px;opacity:.01;pointer-events:none;z-index:0}
  @media (prefers-reduced-motion:reduce){*{animation:none!important}}
 </style></head><body>
 <div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
@@ -1229,18 +1229,24 @@ function pumpShot(){
   if(shotBusy||!shotQ.length)return; shotBusy=true;
   const {id,url}=shotQ.shift(); const st=state.get(id);
   if(!st||!url){shotBusy=false;return pumpShot();}
-  const onload=()=>{ shot.removeEventListener('load',onload);
+  const onload=async()=>{ shot.removeEventListener('load',onload);
     try{ const c=shot.getBoundingBoxCenter(); const cz=(c.z<-0.001)?c.z:-1.5;
       shot.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
       shot.cameraOrbit='0deg 80deg '+(Math.abs(cz)*1.25).toFixed(4)+'m';
       shot.jumpCameraToGoal&&shot.jumpCameraToGoal();
     }catch(e){}
-    requestAnimationFrame(()=>requestAnimationFrame(()=>{
-      let uri=''; try{uri=shot.toDataURL('image/png');}catch(e){}
-      const img=st.el&&st.el.querySelector('.thumb img');
-      if(uri&&img){img.src=uri; img.style.opacity=1;}
-      shotBusy=false; setTimeout(pumpShot,40);
-    }));
+    try{ if(shot.updateComplete) await shot.updateComplete; }catch(e){}
+    // 点云 GLB 大，load 后 webgl 还没画完那一帧就截会得到空白图；重试直到拿到非空白(len 够大)
+    let uri='';
+    for(let k=0;k<12;k++){
+      await new Promise(r=>setTimeout(r,120));
+      try{ uri=shot.toDataURL('image/png'); }catch(e){ console.error('[recog] toDataURL',e); uri=''; }
+      if(uri && uri.length>3000) break;
+    }
+    const img=st.el&&st.el.querySelector('.thumb img');
+    if(uri && uri.length>3000 && img){ img.src=uri; img.style.opacity=1; }
+    else console.warn('[recog] 缩略图截图空白/失败 len=',uri.length);
+    shotBusy=false; setTimeout(pumpShot,40);
   };
   shot.addEventListener('load',onload); shot.src=url;
 }
