@@ -1163,6 +1163,14 @@ def recog_list():
     return JSONResponse({"enabled": bool(RECOG_ENDPOINT), "cards": cards})
 
 
+@app.post("/api/recog/clear")
+def recog_clear():
+    """清空所有识别卡片。"""
+    with _recog_lock:
+        _recog_cards.clear()
+    return JSONResponse({"ok": True})
+
+
 @app.get("/glb/{token}/{name}")
 def serve_glb(token: str, name: str):
     """按 token 提供生成的 GLB（校验为 32 位 hex，仅允许 scene.glb，防目录穿越）。"""
@@ -1273,6 +1281,8 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .live{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;color:#1a9e5f;
    background:rgba(26,158,95,.12);padding:3px 9px;border-radius:999px;margin-left:auto}
  .live.off{color:var(--faint);background:rgba(120,130,145,.12)}
+ .clr{margin-left:10px;font-size:12px;font-weight:600;color:var(--muted);background:var(--panel2);border:1px solid var(--line);padding:5px 13px;border-radius:8px;cursor:pointer}
+ .clr:hover{color:var(--food);border-color:var(--food)}
  .live i{width:7px;height:7px;border-radius:50%;background:currentColor;animation:pulse 1.4s infinite}
  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
  .head .sub{font-size:12px;color:var(--muted);margin-top:3px}
@@ -1334,7 +1344,7 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </style></head><body>
 <div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <div class="head">
-  <div class="l1"><h2>实时识别 · Live Recognition</h2><span class="live" id="live"><i></i>识别中</span></div>
+  <div class="l1"><h2>实时识别 · Live Recognition</h2><span class="live" id="live"><i></i>识别中</span><button class="clr" id="clr">清空</button></div>
   <div class="sub">food/drink 命中某帧 → <code id="model">Qwen3-VL</code> 识别四字段 · 同一物 30 秒内去重合并（缩略图叠加，点击看图集）· 最新卡在最上</div>
 </div>
 <div class="feed" id="feed"><div class="empty" id="empty">等待 food/drink 命中…</div></div>
@@ -1476,6 +1486,13 @@ document.addEventListener('keydown',e=>{ if(!$('lb').classList.contains('on'))re
   if(e.key==='Escape')$('lb').classList.remove('on');
   if(e.key==='ArrowRight'){lbIdx=(lbIdx+1)%lbShots.length;renderLB();}
   if(e.key==='ArrowLeft'){lbIdx=(lbIdx-1+lbShots.length)%lbShots.length;renderLB();} });
+
+// 清空：后端清卡 + 前端清 feed/state + 关 lightbox
+$('clr').onclick=async()=>{
+  try{ await fetch('/api/recog/clear',{method:'POST'}); }catch(e){}
+  feed.querySelectorAll('.rcard').forEach(n=>n.remove()); state.clear();
+  $('lb').classList.remove('on'); $('empty').style.display='block';
+};
 
 async function tick(){
  try{
