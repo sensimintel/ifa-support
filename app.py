@@ -307,6 +307,34 @@ def _locate_food_drink(rgb: np.ndarray):
     return dets
 
 
+# 检测异步化：cloudimg 每帧渲染不等检测(检测占整段 ~280ms)；用最近缓存的框，后台线程按 TTL 异步刷新。
+LOCATE_CACHE_TTL = 2.0
+_locate_cache = {"dets": [], "ts": 0.0, "running": False}
+_locate_cache_lock = threading.Lock()
+
+
+def _locate_refresh(arr):
+    try:
+        d = _locate_food_drink(arr)
+        with _locate_cache_lock:
+            _locate_cache["dets"] = d
+            _locate_cache["ts"] = time.time()
+    finally:
+        with _locate_cache_lock:
+            _locate_cache["running"] = False
+
+
+def _detections_async(arr):
+    """返回最近缓存的 food/drink 框（不阻塞渲染）；缓存过期且无在跑则后台异步刷新一次。"""
+    now = time.time()
+    with _locate_cache_lock:
+        dets = _locate_cache["dets"]
+        if now - _locate_cache["ts"] > LOCATE_CACHE_TTL and not _locate_cache["running"]:
+            _locate_cache["running"] = True
+            threading.Thread(target=_locate_refresh, args=(arr.copy(),), daemon=True).start()
+    return dets
+
+
 def _box_wireframe_meshes(lo, hi, color_rgb, radius):
     """用细圆柱拼一个 3D 轴对齐包围盒（AABB）的 12 条棱，返回 mesh 列表。
 
@@ -461,7 +489,7 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
 
 
 def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
-                             view_tilt=18.0, view_zoom=1.25, splat=2, out_size=760):
+                             view_tilt=18.0, view_zoom=1.0, splat=2, out_size=760):
     """方案A·服务端渲染：5090 就地把点云用 torch(GPU) 投影 + 画家算法 z-buffer + splat 渲成 2D 图，
     跳过 GLB 序列化与前端 model-viewer 全量加载。叠 food/drink 框。返回 RGB uint8；点云为空返回 None。
 
@@ -1201,10 +1229,9 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
         infer_ms = (time.time() - t0) * 1000.0     # DA3 推理耗时（收到帧→推理完）
 
         if fmt == "cloudimg":
-            # 方案A：服务端(5090 GPU)把点云渲成 2D 图，前端只显示图片；仍叠 food/drink 框
-            _td = time.time()
-            detections = _locate_food_drink(arr)
-            detect_ms = (time.time() - _td) * 1000.0
+            # 方案A：服务端(5090 GPU)把点云渲成 2D 图，前端只显示图片。
+            # 检测异步：渲染不等 LocateAnything，用最近缓存的框(后台按 TTL 刷新)→ 整段砍到 ~100ms。
+            detections = _detections_async(arr)
             _tr = time.time()
             cimg = _render_pointcloud_image(pred, detections, conf_thresh_percentile=conf)
             render_ms = (time.time() - _tr) * 1000.0
@@ -1218,10 +1245,9 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
             n_food = sum(1 for d in detections if d[0] == "food")
             n_drink = len(detections) - n_food
             return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
-                    "meta": {"label": f"点云图·服务端渲染（food×{n_food}·drink×{n_drink}）",
+                    "meta": {"label": f"点云图·服务端渲染（food×{n_food}·drink×{n_drink}·框异步）",
                              "dt": time.time() - t0, "infer_ms": round(infer_ms, 1),
-                             "detect_ms": round(detect_ms, 1), "render_ms": round(render_ms, 1),
-                             "encode_ms": round(encode_ms, 1),
+                             "render_ms": round(render_ms, 1), "encode_ms": round(encode_ms, 1),
                              "res": res, "shape": [cimg.shape[1], cimg.shape[0]]}}
         elif fmt == "glb":
             token = uuid.uuid4().hex
