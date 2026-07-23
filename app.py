@@ -873,27 +873,42 @@ _SIG_CANON = {s.lower(): s for s in FOOD_SIGNALS}
 RECOG_MAX_TAGS = 3          # 每个物品最多几个营养标签
 RECOG_DESC_MAX = 20         # 一句话描述最大字数
 
-_RECOG_PROMPT = (
-    "你会看到若干张图：图1=当前画面原图；图2=当前画面带检测框版本（红框=疑似食物，蓝框=疑似液体/容器）；"
-    "从图3开始（若有）=最近30秒已记录物品的参考图，依次编号 [1][2]…（每张对应一个已记录物品）。\n"
-    "任务一·识别：识别图2画面里所有的食物、以及所有的液体/饮料（咖啡/水/可乐/茶/杯装饮品等），"
-    "逐一分别输出，食物和液体必须拆成不同 item；不要局限于框，画面里明显的都要识别。每个物品输出：\n"
-    "  name：具体名称（简短，优先英文或品牌名，如 Banana、Snickers）；\n"
-    "  type：只能是“食物”或“液体”；\n"
-    "  description：一句话中文描述（不超过" + str(RECOG_DESC_MAX) + "字，如“快速补能的小食”）；\n"
-    "  nutrition_tags：营养标签数组，最多" + str(RECOG_MAX_TAGS) + "个，只能从这些里选："
-    + "、".join(NUTRITION_TAGS) + "；\n"
-    "  food_signal：食物信号，只能从这些里选一个：" + "、".join(FOOD_SIGNALS) + "。\n"
-    "任务二·去重：对识别出的每个物品，对照参考图判断它是不是其中某一个的『同一个物理实例』"
-    "（同一根香蕉被继续吃、同一杯咖啡，而不是同类的另一份——两根不同的香蕉算不同）：\n"
-    "  是同一个 → duplicate=true, match=该参考图编号；新的（含同类的另一份）→ duplicate=false, match=null。"
-    "不确定时倾向 false（宁可新建，不误合并）。\n"
-    "只输出 JSON，不要任何解释："
-    "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
-    "\"nutrition_tags\":[\"Carbs\",\"Fiber\",\"Potassium\"],\"food_signal\":\"Quick energy\","
-    "\"duplicate\":false,\"match\":null}]}。"
-    "画面里没有食物也没有液体时，items 为空数组。"
-)
+def _build_recog_prompt(candidates):
+    """按候选动态生成「识别 + 去重」prompt。
+    去重三分工：文本清单(名称+描述)=主依据判断是否已存在；参考图=辅助/否决；倾向匹配。"""
+    p = (
+        "图1=当前画面原图；图2=当前画面带检测框版本（红框=疑似食物，蓝框=疑似液体/容器）。\n"
+        "任务一·识别：识别图2画面里所有的食物、以及所有的液体/饮料（咖啡/水/可乐/茶/杯装饮品等），"
+        "逐一分别输出，食物和液体必须拆成不同 item；不要局限于框，画面里明显的都要识别。每个物品输出：\n"
+        "  name：具体名称（简短，优先英文或品牌名，如 Banana、Snickers）；\n"
+        "  type：只能是“食物”或“液体”；\n"
+        "  description：一句话中文描述（不超过" + str(RECOG_DESC_MAX) + "字，如“快速补能的小食”）；\n"
+        "  nutrition_tags：营养标签数组，最多" + str(RECOG_MAX_TAGS) + "个，只能从这些里选："
+        + "、".join(NUTRITION_TAGS) + "；\n"
+        "  food_signal：食物信号，只能从这些里选一个：" + "、".join(FOOD_SIGNALS) + "。\n"
+    )
+    if candidates:
+        lines = "\n".join("  [%d] %s —— %s" % (i + 1, c.get("name", ""), c.get("desc") or "无描述")
+                          for i, c in enumerate(candidates))
+        p += (
+            "任务二·去重：以下是最近30秒已记录的物品清单（编号·名称·描述），其参考图依次是图3、图4…"
+            "（图3=[1]、图4=[2]，以此类推）：\n" + lines + "\n"
+            "对识别出的每个物品，判断它是不是清单里已有的那一个（同一个东西在持续出现）：\n"
+            "  · 主要看名称/描述是否指向同一物品——吻合就 match=该编号"
+            "（如 Chicken sandwich 与 Fried chicken sandwich 视为同一个，别因轻微措辞差异当成新的）；\n"
+            "  · 参考图仅用于否决：只有当参考图明显是另一份 / 完全不同的东西时，才判为新的；\n"
+            "  · 确实在清单里找不到对应的，才是新物品，match=null。整体倾向匹配。\n"
+        )
+    else:
+        p += "任务二·去重：当前没有已记录的物品，识别到的都是新的，match 一律为 null。\n"
+    p += (
+        "只输出 JSON，不要任何解释："
+        "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
+        "\"nutrition_tags\":[\"Carbs\",\"Fiber\",\"Potassium\"],\"food_signal\":\"Quick energy\","
+        "\"match\":null}]}。"
+        "画面里没有食物也没有液体时，items 为空数组。"
+    )
+    return p
 
 
 def _img_data_uri(rgb):
@@ -949,14 +964,12 @@ def _parse_recog(content):
                 tags.append(canon)
         tags = tags[:RECOG_MAX_TAGS]
         sig = _SIG_CANON.get(str(it.get("food_signal", "")).strip().lower(), "")  # 非法→置空
-        dup = bool(it.get("duplicate"))
         try:
-            match = int(it.get("match"))     # 参考图编号；范围校验在 worker（要对齐候选数）
+            match = int(it.get("match"))     # 命中的候选编号；范围校验在 worker（要对齐候选数）
         except (TypeError, ValueError):
             match = None
         out.append({"name": name, "type": "液体" if is_liquid else "食物",
-                    "description": desc, "nutrition_tags": tags, "food_signal": sig,
-                    "duplicate": dup, "match": match})
+                    "description": desc, "nutrition_tags": tags, "food_signal": sig, "match": match})
     return out
 
 
@@ -971,10 +984,10 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates):
         return []
     content = [{"type": "image_url", "image_url": {"url": u1}},
                {"type": "image_url", "image_url": {"url": u2}}]
-    for c in candidates:                       # 从图3起：候选带框参考图，供视觉判「同一物理实例」
+    for c in candidates:                       # 从图3起：候选带框参考图（辅助/否决），编号对应清单
         if c.get("ref_img"):
             content.append({"type": "image_url", "image_url": {"url": c["ref_img"]}})
-    content.append({"type": "text", "text": _RECOG_PROMPT})
+    content.append({"type": "text", "text": _build_recog_prompt(candidates)})
     payload = {"model": RECOG_MODEL,
                "messages": [{"role": "user", "content": content}],
                "max_tokens": 768, "temperature": 0.2}
@@ -1008,8 +1021,8 @@ def _recog_worker():
         with _recog_lock:
             for it in items:
                 target = None
-                m = it.get("match")
-                if it.get("duplicate") and isinstance(m, int) and 1 <= m <= len(candidates):
+                m = it.get("match")              # 命中候选编号 → 合并；null/越界 → 新建
+                if isinstance(m, int) and 1 <= m <= len(candidates):
                     cid = candidates[m - 1]["id"]
                     target = next((c for c in _recog_cards if c["id"] == cid), None)
                 if target is not None:           # 去重命中：合并（内容不改）
