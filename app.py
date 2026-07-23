@@ -522,7 +522,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="fld"><label>产物类型 export_format</label>
    <select id="fmt">
     <option value="depth">深度图（彩色）</option>
-    <option value="glb">点云 + food/drink 框（GLB · 可转视角）</option>
+    <option value="glb" selected>点云 + food/drink 框（GLB · 可转视角）</option>
     <option value="mesh">网格 mesh（GLB · 可转视角）</option>
    </select></div>
   <div class="fld"><label>处理分辨率 process_res <span class="rngval" id="prv">504</span></label>
@@ -541,6 +541,8 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  </div>
  <div class="status" id="status">等待设备帧… 请让手机 App（或模拟脚本）向 /api/frame 发帧。</div>
 </div>
+
+<label id="camtglwrap" style="display:none;margin:4px 2px 8px;font-size:13px;cursor:pointer;user-select:none"><input type="checkbox" id="camtoggle"> 相机视角调节（默认收起 · 调默认视角用）</label>
 
 <div class="card" id="camcard" style="display:none">
  <div class="row" style="align-items:center;margin-bottom:2px;gap:22px">
@@ -586,12 +588,15 @@ const $=id=>document.getElementById(id);
 $('pr').oninput=()=>$('prv').textContent=$('pr').value;
 $('ct').oninput=()=>$('ctv').textContent=$('ct').value;
 $('nmp').oninput=()=>$('nmv').textContent=(+$('nmp').value).toFixed(1);
+$('camtoggle').addEventListener('change',syncOpts);  // 开关切换即展开/收起相机视角调节卡
 
 function syncOpts(){const f=$('fmt').value;
  $('glbopts').style.display=(f==='depth')?'none':'block';
  $('nmpwrap').style.display=(f==='glb')?'block':'none';
  $('camwrap').style.display=(f==='glb')?'block':'none';
- $('camcard').style.display=(f==='depth')?'none':'block';}  // 相机视角调节仅对 model-viewer 产物
+ // 相机视角调节：非深度图产物才有意义；卡片默认收起，由开关控制展开（代码保留、仅隐藏）
+ $('camtglwrap').style.display=(f==='depth')?'none':'block';
+ $('camcard').style.display=(f!=='depth' && $('camtoggle').checked)?'block':'none';}
 
 // ── 3D 视角调节（仅点云/网格）：滑块/鼠标调视角，锁定绝对视角，每帧 reload 强制拉回，杜绝漂移 ──
 // 漂移根因：camera-orbit 是相对 camera-target(模型中心) 的球坐标；每帧新点云中心/尺度不同，
