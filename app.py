@@ -461,10 +461,12 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
 
 
 def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
-                             view_phi=78.0, view_k=1.28, splat=2, out_size=760):
+                             view_tilt=18.0, view_zoom=1.25, splat=2, out_size=760):
     """方案A·服务端渲染：5090 就地把点云用 torch(GPU) 投影 + 画家算法 z-buffer + splat 渲成 2D 图，
-    跳过 GLB 序列化与前端 model-viewer 全量加载。视角=调优视角（后上方俯视）。叠 food/drink 框。
-    返回 RGB uint8 (H,W,3)；点云为空返回 None。"""
+    跳过 GLB 序列化与前端 model-viewer 全量加载。叠 food/drink 框。返回 RGB uint8；点云为空返回 None。
+
+    视角固定不飘：相机钉在光心(原点)、真实相机 fov×view_zoom 投影(主体大小=真实成像→天然稳定)、
+    视线绕 x 轴俯视固定角 view_tilt(立体感)。完全不依赖每帧点云的中心/深度统计，故不会忽大忽小。"""
     import math
     depth = np.asarray(pred.depth)[0].astype(np.float32)
     H0, W0 = depth.shape
@@ -493,20 +495,13 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
     with torch.no_grad():
         P = torch.from_numpy(np.ascontiguousarray(Xc)).to(dev).float()
         C = torch.from_numpy(np.ascontiguousarray(cols)).to(dev)
-        center = P.median(0).values
-        cz = float(center[2])
-        r = (abs(cz) if abs(cz) > 1e-3 else 1.5) * view_k
-        phi = math.radians(view_phi)
-        # 虚拟相机放在中心的「上方(-y) + 后方(-z)」，看向中心（φ<90 俯视）
-        off = torch.tensor([0.0, -math.cos(phi), -math.sin(phi)], device=dev)
-        eye = center + r * off
-        fwd = center - eye
-        fwd = fwd / fwd.norm()
-        world_up = torch.tensor([0.0, -1.0, 0.0], device=dev)     # 世界"上" = -y
-        right = torch.cross(world_up, fwd)
-        right = right / right.norm()
-        up = torch.cross(fwd, right)
-        Rm = torch.stack([right, up, fwd], 0)                     # 行基：世界 → 虚拟相机(x右 y上 z前)
+        # 固定虚拟相机（不依赖点云统计 → 不飘）：相机在光心(原点)，视线在正视 +z 上绕 x 轴俯视固定角 tilt。
+        tilt = math.radians(view_tilt)
+        eye = torch.zeros(3, device=dev)
+        fwd = torch.tensor([0.0, math.sin(tilt), math.cos(tilt)], device=dev)   # y 向下为正 → 视线向下俯视
+        right = torch.tensor([1.0, 0.0, 0.0], device=dev)
+        up = torch.cross(right, fwd)                             # 相机"上"(世界 -y 方向)
+        Rm = torch.stack([right, up, fwd], 0)                    # 行基：世界 → 相机(x右 y上 z前)
 
         def project(pts):
             Pv = (pts - eye) @ Rm.T
@@ -517,7 +512,8 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
 
         Hout = int(out_size)
         Wout = max(1, int(round(out_size * W0 / H0)))
-        fov = math.radians(min(115.0, math.degrees(2 * math.atan(H0 / (2 * K[1, 1]))) + 8))
+        real_fov = 2 * math.atan(H0 / (2 * K[1, 1]))             # 真实相机垂直 fov
+        fov = min(math.radians(130.0), real_fov * view_zoom)     # ×zoom 拉远留白；主体大小仍随真实成像稳定
         f = (Hout / 2.0) / math.tan(fov / 2.0)
         u, v, zc = project(P)
         inb = (zc > 1e-3) & (u >= 0) & (u < Wout) & (v >= 0) & (v < Hout)
@@ -1202,23 +1198,30 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
         with _gpu_lock:  # 与官方 Gradio 共用同一模型，串行化 GPU 推理
             with torch.no_grad():
                 pred = model.inference([arr], process_res=res, export_format="mini_npz")
+        infer_ms = (time.time() - t0) * 1000.0     # DA3 推理耗时（收到帧→推理完）
 
         if fmt == "cloudimg":
             # 方案A：服务端(5090 GPU)把点云渲成 2D 图，前端只显示图片；仍叠 food/drink 框
+            _td = time.time()
             detections = _locate_food_drink(arr)
+            detect_ms = (time.time() - _td) * 1000.0
             _tr = time.time()
             cimg = _render_pointcloud_image(pred, detections, conf_thresh_percentile=conf)
             render_ms = (time.time() - _tr) * 1000.0
             if cimg is None:
                 raise RuntimeError("点云为空，无法渲染")
+            _te = time.time()
             ok, buf = cv2.imencode(".jpg", cv2.cvtColor(cimg, cv2.COLOR_RGB2BGR))
+            encode_ms = (time.time() - _te) * 1000.0
             if not ok:
                 raise RuntimeError("点云图编码失败")
             n_food = sum(1 for d in detections if d[0] == "food")
             n_drink = len(detections) - n_food
             return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
                     "meta": {"label": f"点云图·服务端渲染（food×{n_food}·drink×{n_drink}）",
-                             "dt": time.time() - t0, "render_ms": round(render_ms, 1),
+                             "dt": time.time() - t0, "infer_ms": round(infer_ms, 1),
+                             "detect_ms": round(detect_ms, 1), "render_ms": round(render_ms, 1),
+                             "encode_ms": round(encode_ms, 1),
                              "res": res, "shape": [cimg.shape[1], cimg.shape[0]]}}
         elif fmt == "glb":
             token = uuid.uuid4().hex
