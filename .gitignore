@@ -21,6 +21,9 @@ app_new.py
 measure.py
 test_food.jpg
 
+# 本地运维配置（RECOG_ENDPOINT/RECOG_API_KEY 等，run.sh 启动时读取）
+.env
+
 # 虚拟环境
 .venv/
 venv/
