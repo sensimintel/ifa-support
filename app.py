@@ -685,7 +685,8 @@ function pushConfig(){
 });
 syncOpts();pushConfig();  // 首次把面板初值下发后端
 
-let lastSeq=-1,lastProdKey='';
+let lastSeq=-1,lastProdKey='',lastSwap=0;
+const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显示，避免高帧率下一直卡在"加载中"(黑屏)
 async function tick(){
  try{
   const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
@@ -702,10 +703,12 @@ async function tick(){
       $('prodimg').src='/api/frame/latest-product?t='+s.product_seq;
       $('prodimg').style.display='block';$('mv').style.display='none';$('prodwait').style.display='none';
     }else if(s.product_kind==='model' && s.product_url){
-      // 点云 GLB 较大、加载/解析慢；上一个没加载完(mv.loaded=false)就别换 src，
-      // 否则高帧率(如 1fps)下每帧新 GLB 不断打断加载→loaded 永远 false→右框黑。
-      // 跳过时不更新 lastProdKey，下个轮询周期(500ms)再重试，届时多半已加载完。
-      if(mv.loaded || !mv.getAttribute('src')){
+      // 点云 GLB 较大、加载/解析慢。两道防护：
+      //  (1) 上一个没加载完(mv.loaded=false)就别换 src，否则高帧率下不断打断加载→loaded 永远 false→黑；
+      //  (2) 换一次后至少停留 MIN_SWAP_MS 再换，让加载完的点云停住显示——否则高帧率(如 10fps)下
+      //      刚 loaded 就立刻换最新，几乎一直卡在"加载中"(黑)。跳过时不更新 lastProdKey，下周期重试。
+      if((mv.loaded || !mv.getAttribute('src')) && Date.now()-lastSwap>=MIN_SWAP_MS){
+        lastSwap=Date.now();
         lastProdKey=prodKey;
         preApplyView();   // 换模型前先摆好视角，让新点云加载首帧就在锁定视角，消除抖动
         mv.src=s.product_url;
