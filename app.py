@@ -845,6 +845,8 @@ RECOG_MODEL = os.environ.get("RECOG_MODEL", "Qwen3.6-35B-A3B-FP8").strip()
 RECOG_MIN_INTERVAL = float(os.environ.get("RECOG_MIN_INTERVAL", "4.0"))  # 两次识别最小间隔(秒)，节流防刷屏
 RECOG_TIMEOUT = 30.0
 RECOG_MAX_CARDS = 200
+RECOG_ACTIVE_WINDOW = 30.0   # 去重活跃窗口(秒)：只在最后出现≤此窗口的卡里找重复(滑动窗口)
+RECOG_MAX_CANDIDATES = 8     # 每次最多带几张候选参考图(带框图)喂 VLM，控多图请求成本
 
 _recog_lock = threading.Lock()
 _recog_cv = threading.Condition(_recog_lock)
@@ -872,19 +874,24 @@ RECOG_MAX_TAGS = 3          # 每个物品最多几个营养标签
 RECOG_DESC_MAX = 20         # 一句话描述最大字数
 
 _RECOG_PROMPT = (
-    "识别画面中所有的食物、以及所有的液体/饮料（咖啡/水/可乐/茶/杯装饮品等），逐一分别输出。"
-    "图2是检测框辅助参考（红框=疑似食物，蓝框=疑似液体/容器），可帮助定位，但不要局限于框——"
-    "画面里明显的食物或液体都要识别出来；食物和液体必须拆成不同的 item。\n"
-    "每个物品输出以下字段：\n"
+    "你会看到若干张图：图1=当前画面原图；图2=当前画面带检测框版本（红框=疑似食物，蓝框=疑似液体/容器）；"
+    "从图3开始（若有）=最近30秒已记录物品的参考图，依次编号 [1][2]…（每张对应一个已记录物品）。\n"
+    "任务一·识别：识别图2画面里所有的食物、以及所有的液体/饮料（咖啡/水/可乐/茶/杯装饮品等），"
+    "逐一分别输出，食物和液体必须拆成不同 item；不要局限于框，画面里明显的都要识别。每个物品输出：\n"
     "  name：具体名称（简短，优先英文或品牌名，如 Banana、Snickers）；\n"
     "  type：只能是“食物”或“液体”；\n"
     "  description：一句话中文描述（不超过" + str(RECOG_DESC_MAX) + "字，如“快速补能的小食”）；\n"
     "  nutrition_tags：营养标签数组，最多" + str(RECOG_MAX_TAGS) + "个，只能从这些里选："
     + "、".join(NUTRITION_TAGS) + "；\n"
     "  food_signal：食物信号，只能从这些里选一个：" + "、".join(FOOD_SIGNALS) + "。\n"
+    "任务二·去重：对识别出的每个物品，对照参考图判断它是不是其中某一个的『同一个物理实例』"
+    "（同一根香蕉被继续吃、同一杯咖啡，而不是同类的另一份——两根不同的香蕉算不同）：\n"
+    "  是同一个 → duplicate=true, match=该参考图编号；新的（含同类的另一份）→ duplicate=false, match=null。"
+    "不确定时倾向 false（宁可新建，不误合并）。\n"
     "只输出 JSON，不要任何解释："
     "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
-    "\"nutrition_tags\":[\"Carbs\",\"Fiber\",\"Potassium\"],\"food_signal\":\"Quick energy\"}]}。"
+    "\"nutrition_tags\":[\"Carbs\",\"Fiber\",\"Potassium\"],\"food_signal\":\"Quick energy\","
+    "\"duplicate\":false,\"match\":null}]}。"
     "画面里没有食物也没有液体时，items 为空数组。"
 )
 
@@ -942,67 +949,90 @@ def _parse_recog(content):
                 tags.append(canon)
         tags = tags[:RECOG_MAX_TAGS]
         sig = _SIG_CANON.get(str(it.get("food_signal", "")).strip().lower(), "")  # 非法→置空
+        dup = bool(it.get("duplicate"))
+        try:
+            match = int(it.get("match"))     # 参考图编号；范围校验在 worker（要对齐候选数）
+        except (TypeError, ValueError):
+            match = None
         out.append({"name": name, "type": "液体" if is_liquid else "食物",
-                    "description": desc, "nutrition_tags": tags, "food_signal": sig})
+                    "description": desc, "nutrition_tags": tags, "food_signal": sig,
+                    "duplicate": dup, "match": match})
     return out
 
 
-def _recognize_items(orig_rgb, boxed_rgb):
-    """调 Qwen3-VL（原图 + 带框图）识别，返回 [{name,type}]；任何失败返回 []。"""
+def _recognize_dedup(orig_rgb, boxed_rgb, candidates):
+    """调 Qwen3-VL 识别 + 去重。一次多图请求：图1原图 + 图2带框图 + 各候选参考图(带框图，编号1..N)。
+    candidates: [{"id","name","desc","ref_img"}...]（顺序即参考图编号）。
+    返回 [{name,type,description,nutrition_tags,food_signal,duplicate,match}]；任何失败返回 []。"""
     if not RECOG_ENDPOINT:
         return []
     u1, u2 = _img_data_uri(orig_rgb), _img_data_uri(boxed_rgb)
     if not u1 or not u2:
         return []
-    payload = {
-        "model": RECOG_MODEL,
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": u1}},
-            {"type": "image_url", "image_url": {"url": u2}},
-            {"type": "text", "text": _RECOG_PROMPT},
-        ]}],
-        "max_tokens": 512, "temperature": 0.2,
-    }
+    content = [{"type": "image_url", "image_url": {"url": u1}},
+               {"type": "image_url", "image_url": {"url": u2}}]
+    for c in candidates:                       # 从图3起：候选带框参考图，供视觉判「同一物理实例」
+        if c.get("ref_img"):
+            content.append({"type": "image_url", "image_url": {"url": c["ref_img"]}})
+    content.append({"type": "text", "text": _RECOG_PROMPT})
+    payload = {"model": RECOG_MODEL,
+               "messages": [{"role": "user", "content": content}],
+               "max_tokens": 768, "temperature": 0.2}
     headers = {"Content-Type": "application/json"}
     if RECOG_API_KEY:
         headers["Authorization"] = f"Bearer {RECOG_API_KEY}"
     try:
         req = urllib.request.Request(RECOG_ENDPOINT, data=json.dumps(payload).encode(), headers=headers)
         with urllib.request.urlopen(req, timeout=RECOG_TIMEOUT) as r:
-            content = json.loads(r.read().decode())["choices"][0]["message"]["content"]
+            out = json.loads(r.read().decode())["choices"][0]["message"]["content"]
     except Exception as e:
         print(f"[da3-web] 识别调用失败：{type(e).__name__}: {e}", flush=True)
         return []
-    return _parse_recog(content)
+    return _parse_recog(out)
 
 
 def _recog_worker():
-    """后台单线程：取最新识别任务、丢弃积压，识别完回填 pending 卡 + 追加多目标卡。"""
+    """后台单线程：取最新识别任务、丢弃积压，识别 + 去重：
+      duplicate 命中 → 合并到那张卡（只追加缩略图 glb、刷新 last_ts、rev+1，内容不改）；
+      否则 → 新建卡（ref_img=本帧带框图，供后续做去重视觉比对）。"""
     global _recog_id
     while True:
         with _recog_cv:
             while not _recog_pending:
                 _recog_cv.wait()
-            orig, boxed, glb_url, pending_id, frame, t = _recog_pending.pop()  # 最新优先
+            orig, boxed, glb_url, frame, t, candidates = _recog_pending.pop()  # 最新优先
             _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
-        items = _recognize_items(orig, boxed)
+        boxed_uri = _img_data_uri(boxed)         # 本帧带框图：新卡的代表图(ref_img)
+        items = _recognize_dedup(orig, boxed, candidates)
+        now = time.time()
         with _recog_lock:
-            card = next((c for c in _recog_cards if c["id"] == pending_id), None)
-            if not items:
-                if card:
-                    card["status"] = "empty"     # 没识别出东西：标记后前端不展示
-                continue
-            if card:
-                card.update(status="done", **items[0])   # name/type/description/nutrition_tags/food_signal
-            for it in items[1:]:                 # 一帧多目标：其余各追加一张卡
-                _recog_id += 1
-                _recog_cards.append({"id": _recog_id, "status": "done", **it,
-                                     "glb_url": glb_url, "frame": frame, "t": t})
+            for it in items:
+                target = None
+                m = it.get("match")
+                if it.get("duplicate") and isinstance(m, int) and 1 <= m <= len(candidates):
+                    cid = candidates[m - 1]["id"]
+                    target = next((c for c in _recog_cards if c["id"] == cid), None)
+                if target is not None:           # 去重命中：合并（内容不改）
+                    target["shots"].append(glb_url)
+                    target["last_ts"] = now
+                    target["t"] = t
+                    target["rev"] = target.get("rev", 0) + 1
+                else:                            # 新食物：新建卡
+                    _recog_id += 1
+                    _recog_cards.append({
+                        "id": _recog_id, "status": "done",
+                        "name": it["name"], "type": it["type"], "description": it["description"],
+                        "nutrition_tags": it["nutrition_tags"], "food_signal": it["food_signal"],
+                        "shots": [glb_url], "ref_img": boxed_uri,
+                        "frame": frame, "t": t, "last_ts": now, "rev": 0})
+            if len(_recog_cards) > RECOG_MAX_CARDS:
+                del _recog_cards[:len(_recog_cards) - RECOG_MAX_CARDS]
 
 
 def _maybe_recognize(orig_rgb, detections, glb_url, frame):
-    """detections 非空 + 节流通过 → 先加 pending 卡、提交异步识别。在 processor 里调用，不阻塞产线。"""
-    global _recog_id, _recog_last_ts, _recog_worker_started
+    """detections 非空 + 节流通过 → 取活跃卡快照作去重候选、提交异步识别。processor 里调用，不阻塞产线。
+    不再加 pending 占位卡（去重后归属不定），识别中用前端顶部 live 指示。"""
+    global _recog_last_ts, _recog_worker_started
     if not detections or not RECOG_ENDPOINT:
         return
     now = time.time()
@@ -1013,17 +1043,17 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame):
         if not _recog_worker_started:
             _recog_worker_started = True
             threading.Thread(target=_recog_worker, daemon=True).start()
-        _recog_id += 1
-        pending_id = _recog_id
-        t = time.strftime("%H:%M:%S")
-        _recog_cards.append({"id": pending_id, "status": "pending", "name": "", "type": "",
-                             "description": "", "nutrition_tags": [], "food_signal": "",
-                             "glb_url": glb_url, "frame": frame, "t": t})
-        if len(_recog_cards) > RECOG_MAX_CARDS:
-            del _recog_cards[:len(_recog_cards) - RECOG_MAX_CARDS]
+        # 活跃卡快照(最后出现≤30s、有代表图)作去重候选，取最近的至多 N 张（顺序=参考图编号）
+        active = [c for c in _recog_cards
+                  if c.get("status") == "done" and c.get("ref_img")
+                  and now - c.get("last_ts", 0) <= RECOG_ACTIVE_WINDOW]
+        active.sort(key=lambda c: c.get("last_ts", 0), reverse=True)
+        candidates = [{"id": c["id"], "name": c.get("name", ""), "desc": c.get("description", ""),
+                       "ref_img": c["ref_img"]} for c in active[:RECOG_MAX_CANDIDATES]]
+    t = time.strftime("%H:%M:%S")
     boxed = _draw_boxes(orig_rgb, detections)
     with _recog_cv:
-        _recog_pending.append((orig_rgb.copy(), boxed, glb_url, pending_id, frame, t))
+        _recog_pending.append((orig_rgb.copy(), boxed, glb_url, frame, t, candidates))
         _recog_cv.notify()
 
 
@@ -1113,7 +1143,9 @@ set_processor(_da3_frame_processor)
 def recog_list():
     """识别卡片列表（最新在前）；enabled=false 表示识别服务未接入。"""
     with _recog_lock:
-        cards = [dict(c) for c in _recog_cards if c.get("status") != "empty"]
+        # 剔除 ref_img（大 dataURI，仅后端去重比对用）；shots(点云 glb 列表) + rev 下发给前端
+        cards = [{k: v for k, v in c.items() if k != "ref_img"}
+                 for c in _recog_cards if c.get("status") != "empty"]
     cards.reverse()   # 最新在前，前端 prepend 到顶部
     return JSONResponse({"enabled": bool(RECOG_ENDPOINT), "cards": cards})
 
@@ -1234,7 +1266,7 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .head .sub code{font-family:var(--mono);font-size:11px;color:var(--accent);background:var(--accent-soft);padding:1px 6px;border-radius:5px}
  .feed{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
  .empty{color:var(--faint);font-size:13px;text-align:center;margin:36px 10px}
- .rcard{display:grid;grid-template-columns:104px 1fr;gap:14px;padding:12px;border:1px solid var(--line);
+ .rcard{position:relative;display:grid;grid-template-columns:118px 1fr;gap:15px;padding:12px;border:1px solid var(--line);
    border-radius:13px;background:var(--panel2);animation:rise .34s cubic-bezier(.2,.7,.3,1)}
  @keyframes rise{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:none}}
  .thumb{position:relative;width:104px;aspect-ratio:3/4;border-radius:9px;overflow:hidden;border:1px solid var(--line);
@@ -1259,63 +1291,70 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .meta{margin-top:2px;font-size:10.5px;color:var(--faint);font-family:var(--mono);font-variant-numeric:tabular-nums;display:flex;gap:12px}
  .caret{display:inline-block;width:2px;height:1em;background:var(--accent);vertical-align:-1px;margin-left:1px;animation:blink 1s step-end infinite}
  @keyframes blink{50%{opacity:0}}
+ /* 扇形叠卡缩略图（一食物 30 秒内去重合并的多帧点云截图） */
+ .stack{position:relative;width:118px;height:150px;cursor:pointer;flex:0 0 auto}
+ .stack .sh{position:absolute;left:9px;top:3px;width:100px;height:133px;border-radius:9px;border:2px solid var(--panel);
+   background-color:#10141a;overflow:hidden;box-shadow:0 2px 8px rgba(15,22,34,.22);transition:transform .28s cubic-bezier(.2,.7,.3,1);
+   background-image:radial-gradient(58% 42% at 50% 60%,rgba(196,204,218,.4),transparent 72%),radial-gradient(rgba(205,214,228,.4) .6px,transparent .8px);background-size:auto,4px 4px}
+ .stack .sh img{width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity .3s}
+ .stack .cnt{position:absolute;right:-2px;bottom:-2px;z-index:30;font-size:11px;font-weight:700;font-family:var(--mono);color:#fff;background:var(--accent);padding:2px 8px;border-radius:999px;box-shadow:0 1px 4px rgba(0,0,0,.3)}
+ .stack .shint{position:absolute;left:0;right:0;bottom:-16px;text-align:center;font-size:9.5px;color:var(--faint)}
+ .stack:hover .sh{box-shadow:0 4px 14px rgba(15,22,34,.3)}
+ /* 去重命中：卡片闪 + 右上角“更新”提示 */
+ .updated{position:absolute;top:10px;right:10px;z-index:6;font-size:11px;font-weight:700;color:#fff;background:var(--accent);padding:3px 10px;border-radius:999px;opacity:0;transform:translateY(-4px);transition:opacity .25s,transform .25s;pointer-events:none}
+ .updated.on{opacity:1;transform:none}
+ .flash{animation:cardflash .85s ease}
+ @keyframes cardflash{0%{box-shadow:0 0 0 0 var(--accent-soft)}35%{box-shadow:0 0 0 3px var(--accent)}100%{box-shadow:0 0 0 0 transparent}}
+ /* lightbox 看图集 */
+ .lb{position:fixed;inset:0;background:rgba(10,14,20,.82);display:none;flex-direction:column;align-items:center;justify-content:center;gap:13px;z-index:100;padding:24px}
+ .lb.on{display:flex}
+ .lb .big{width:min(70vw,320px);aspect-ratio:3/4;border-radius:14px;overflow:hidden;border:2px solid rgba(255,255,255,.15);background:#10141a}
+ .lb .big img{width:100%;height:100%;object-fit:cover;display:block}
+ .lb .cap{color:#dfe4ea;font-size:13px;font-family:var(--mono)}
+ .lb .strip{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;max-width:min(82vw,420px)}
+ .lb .th{width:50px;height:66px;border-radius:7px;overflow:hidden;border:2px solid transparent;cursor:pointer;opacity:.55;background:#10141a}
+ .lb .th img{width:100%;height:100%;object-fit:cover;display:block}
+ .lb .th.sel{border-color:var(--accent);opacity:1}
+ .lb .x{position:absolute;top:16px;right:20px;color:#fff;font-size:26px;cursor:pointer;opacity:.85;line-height:1}
  #shot{position:fixed;top:0;left:0;width:208px;height:277px;opacity:.01;pointer-events:none;z-index:0}
- @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+ @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
 <div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <div class="head">
   <div class="l1"><h2>实时识别 · Live Recognition</h2><span class="live" id="live"><i></i>识别中</span></div>
-  <div class="sub">food/drink 命中某帧 → <code id="model">Qwen3-VL</code> 多模态识别 · 名称/类型流式生成 · 最新卡在最上</div>
+  <div class="sub">food/drink 命中某帧 → <code id="model">Qwen3-VL</code> 识别四字段 · 同一物 30 秒内去重合并（缩略图叠加，点击看图集）· 最新卡在最上</div>
 </div>
 <div class="feed" id="feed"><div class="empty" id="empty">等待 food/drink 命中…</div></div>
+<div class="lb" id="lb"><span class="x" id="lbx">✕</span>
+ <div class="big"><img id="lbBig" alt=""></div>
+ <div class="cap" id="lbCap"></div>
+ <div class="strip" id="lbStrip"></div>
+</div>
 <model-viewer id="shot" camera-controls="false" interaction-prompt="none" exposure="1.3" shadow-intensity="0"></model-viewer>
 <script>
 const $=id=>document.getElementById(id);
 const feed=$('feed'), shot=$('shot');
-const state=new Map();   // id -> {el, typed, shot, status}
-
-const typeLabel=t=> t==='液体' ? '液体' : '食物';
+const state=new Map();   // id -> {el, rev, shots:[glb_url...]}
 const typeCls=t=> t==='液体' ? 'liquid' : 'food';
 
-function cardEl(c){
-  const el=document.createElement('div'); el.className='rcard';
-  el.innerHTML='<div class="thumb"><img><span class="tag">整张点云 #'+(c.frame||'')+'</span></div>'
-    +'<div class="rbody">'
-    +'  <div class="fld"><div class="flab">识别对象 / Detected Food</div>'
-    +'    <div class="name pending"><span class="tdot"></span><span class="nm">识别中…</span></div></div>'
-    +'  <div class="fld f-desc hide"><div class="flab">一句话描述 / Description</div><div class="desc"></div></div>'
-    +'  <div class="fld f-tags hide"><div class="flab">营养标签 / Nutrition Tags</div><div class="tags"></div></div>'
-    +'  <div class="fld f-sig hide"><div class="flab">食物信号 / Food Signal</div><div class="sig"></div></div>'
-    +'  <div class="meta"><span>帧 '+(c.frame||'')+'</span><span>'+(c.t||'')+'</span></div>'
-    +'</div>';
-  return el;
-}
-// 打字机
-function typeInto(node,text){
-  let i=0; node.textContent='';
-  const caret=document.createElement('span'); caret.className='caret'; node.appendChild(caret);
-  const timer=setInterval(()=>{ i++; caret.remove(); node.textContent=text.slice(0,i); node.appendChild(caret);
-    if(i>=text.length){clearInterval(timer); caret.remove();}}, 46);
-}
-// 点云缩略图截图队列（串行）
+// —— 点云截图队列（串行，按 url 缓存；一个 url 截好后回调所有等待者）——
 const shotQ=[]; let shotBusy=false;
-const shotCache=new Map();     // url -> dataURI：同帧多卡/重复 url 只截一次、其余复用
-const shotWaiters=new Map();   // url -> [卡id]：同一 url 截好后一次性回填所有等待的卡
-function applyShot(id,uri){ const st=state.get(id); if(!st)return;
-  const img=st.el&&st.el.querySelector('.thumb img'); if(uri&&img){img.src=uri; img.style.opacity=1;} }
-function enqueueShot(id,url){
-  if(!url||!state.get(id))return;
-  if(shotCache.has(url)){ applyShot(id,shotCache.get(url)); return; }   // 同 url 已截 → 直接复用
-  if(!shotWaiters.has(url)){ shotWaiters.set(url,[]); shotQ.push(url); }
-  shotWaiters.get(url).push(id); pumpShot();
+const shotCache=new Map();      // glb_url -> dataURI
+const shotQueued=new Set();     // 已入队的 url（避免重复排队）
+const shotCbs=[];               // {url, cb} 截好后回调
+function enqueueShot(url,cb){
+  if(!url)return;
+  if(shotCache.has(url)){ cb&&cb(shotCache.get(url)); return; }
+  if(cb) shotCbs.push({url,cb});
+  if(!shotQueued.has(url)){ shotQueued.add(url); shotQ.push(url); pumpShot(); }
 }
 function pumpShot(){
   if(shotBusy||!shotQ.length)return; shotBusy=true;
   const url=shotQ.shift(); let done=false;
   const finish=(uri)=>{ if(done)return; done=true;
-    if(uri&&uri.length>3000){ shotCache.set(url,uri); (shotWaiters.get(url)||[]).forEach(id=>applyShot(id,uri)); }
-    else console.warn('[recog] 缩略图截图空白 len=',uri?uri.length:0);
-    shotWaiters.delete(url); shotBusy=false; setTimeout(pumpShot,40);
+    if(uri&&uri.length>3000){ shotCache.set(url,uri);
+      for(let i=shotCbs.length-1;i>=0;i--){ if(shotCbs[i].url===url){ shotCbs[i].cb(uri); shotCbs.splice(i,1); } } }
+    shotQueued.delete(url); shotBusy=false; setTimeout(pumpShot,40);
   };
   const onload=async()=>{ shot.removeEventListener('load',onload);
     try{ const c=shot.getBoundingBoxCenter(); const cz=(c.z<-0.001)?c.z:-1.5;
@@ -1324,20 +1363,93 @@ function pumpShot(){
       shot.jumpCameraToGoal&&shot.jumpCameraToGoal();
     }catch(e){}
     try{ if(shot.updateComplete) await shot.updateComplete; }catch(e){}
-    // 点云 GLB 大，load 后 webgl 还没画完那一帧就截会得到空白图；重试直到拿到非空白(len 够大)
     let uri='';
-    for(let k=0;k<12;k++){
-      await new Promise(r=>setTimeout(r,120));
+    for(let k=0;k<12;k++){ await new Promise(r=>setTimeout(r,120));
       try{ uri=shot.toDataURL('image/png'); }catch(e){ uri=''; }
-      if(uri && uri.length>3000) break;
-    }
+      if(uri && uri.length>3000) break; }
     finish(uri);
   };
   shot.addEventListener('load',onload);
   setTimeout(()=>{ if(!done){ shot.removeEventListener('load',onload); finish(''); } }, 8000);  // 死锁兜底
-  if(shot.getAttribute('src')===url) shot.removeAttribute('src');   // 同 url 强制重载(否则 load 不触发→死锁)
+  if(shot.getAttribute('src')===url) shot.removeAttribute('src');   // 同 url 强制重载
   shot.src=url;
 }
+
+// —— 打字机 ——
+function typeInto(node,text){ let i=0; node.textContent='';
+  const caret=document.createElement('span'); caret.className='caret'; node.appendChild(caret);
+  const timer=setInterval(()=>{ i++; caret.remove(); node.textContent=text.slice(0,i); node.appendChild(caret);
+    if(i>=text.length){clearInterval(timer); caret.remove();}}, 46);
+}
+
+// —— 扇形叠卡：对每个 glb_url 截点云图，扇形叠，>5 张右下角显示数字，点击开 lightbox ——
+function renderStack(el, name, shots){
+  const stack=el.querySelector('.stack');
+  stack.querySelectorAll('.sh,.cnt,.shint').forEach(n=>n.remove());
+  const show=shots.slice(-5);                 // 最多露 5 张边角
+  show.forEach((url,i)=>{
+    const isTop=i===show.length-1, off=show.length-1-i, dir=(off%2?-1:1);
+    const d=document.createElement('div'); d.className='sh';
+    d.style.transform='rotate('+(isTop?0:dir*(4+off*3))+'deg) translate('+(isTop?0:dir*(5+off*3))+'px,'+(off*2)+'px)';
+    d.style.zIndex=String(i+1);
+    const img=document.createElement('img'); d.appendChild(img);
+    const cached=shotCache.get(url);
+    if(cached){ img.src=cached; img.style.opacity=1; }
+    else enqueueShot(url,(uri)=>{ img.src=uri; img.style.opacity=1; });
+    stack.appendChild(d);
+  });
+  if(shots.length>5){ const b=document.createElement('span'); b.className='cnt'; b.textContent='×'+shots.length; stack.appendChild(b); }
+  const h=document.createElement('span'); h.className='shint'; h.textContent='点击看 '+shots.length+' 张'; stack.appendChild(h);
+  stack.onclick=()=>openLB(name, shots);
+}
+
+function cardEl(c){
+  const el=document.createElement('div'); el.className='rcard';
+  el.innerHTML='<div class="updated">更新</div><div class="stack"></div>'
+    +'<div class="rbody">'
+    +'  <div class="fld"><div class="flab">识别对象 / Detected Food</div>'
+    +'    <div class="name"><span class="tdot '+typeCls(c.type)+'"></span><span class="nm"></span></div></div>'
+    +'  <div class="fld f-desc hide"><div class="flab">一句话描述 / Description</div><div class="desc"></div></div>'
+    +'  <div class="fld f-tags hide"><div class="flab">营养标签 / Nutrition Tags</div><div class="tags"></div></div>'
+    +'  <div class="fld f-sig hide"><div class="flab">食物信号 / Food Signal</div><div class="sig"></div></div>'
+    +'  <div class="meta"><span>帧 '+(c.frame||'')+'</span><span>'+(c.t||'')+'</span></div>'
+    +'</div>';
+  typeInto(el.querySelector('.nm'), c.name||'');
+  if(c.description){ el.querySelector('.f-desc').classList.remove('hide'); el.querySelector('.desc').textContent=c.description; }
+  const tags=c.nutrition_tags||[];
+  if(tags.length){ el.querySelector('.f-tags').classList.remove('hide');
+    el.querySelector('.tags').innerHTML=tags.map(t=>'<span class="chip">'+t+'</span>').join(''); }
+  if(c.food_signal){ el.querySelector('.f-sig').classList.remove('hide'); el.querySelector('.sig').textContent=c.food_signal; }
+  return el;
+}
+function flashUpdate(el){
+  el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+  const u=el.querySelector('.updated'); u.classList.add('on');
+  clearTimeout(el._ut); el._ut=setTimeout(()=>u.classList.remove('on'), 1600);
+}
+
+// —— lightbox 看图集 ——
+let lbShots=[], lbIdx=0, lbName='';
+function openLB(name, shots){ if(!shots.length)return;
+  lbShots=shots.slice(); lbIdx=lbShots.length-1; lbName=name||'';
+  const strip=$('lbStrip'); strip.innerHTML='';
+  lbShots.forEach((url,i)=>{ const t=document.createElement('div'); t.className='th'+(i===lbIdx?' sel':'');
+    const img=document.createElement('img'); const u=shotCache.get(url);
+    if(u)img.src=u; else enqueueShot(url,(uri)=>{img.src=uri;}); t.appendChild(img);
+    t.onclick=()=>{lbIdx=i; renderLB();}; strip.appendChild(t); });
+  $('lb').classList.add('on'); renderLB();
+}
+function renderLB(){ const url=lbShots[lbIdx], big=$('lbBig'), u=shotCache.get(url);
+  if(u)big.src=u; else enqueueShot(url,(uri)=>{ if(lbShots[lbIdx]===url)big.src=uri; });
+  $('lbCap').textContent=lbName+' · '+(lbIdx+1)+' / '+lbShots.length+' 张点云截图';
+  [...$('lbStrip').children].forEach((t,i)=>t.classList.toggle('sel',i===lbIdx));
+}
+$('lbx').onclick=()=>$('lb').classList.remove('on');
+$('lb').onclick=e=>{ if(e.target===$('lb'))$('lb').classList.remove('on'); };
+document.addEventListener('keydown',e=>{ if(!$('lb').classList.contains('on'))return;
+  if(e.key==='Escape')$('lb').classList.remove('on');
+  if(e.key==='ArrowRight'){lbIdx=(lbIdx+1)%lbShots.length;renderLB();}
+  if(e.key==='ArrowLeft'){lbIdx=(lbIdx-1+lbShots.length)%lbShots.length;renderLB();} });
 
 async function tick(){
  try{
@@ -1348,36 +1460,21 @@ async function tick(){
   else { live.className='live'; live.innerHTML='<i></i>识别中'; }
   const cards=d.cards||[];
   const seen=new Set(cards.map(c=>c.id));
-  // 移除已消失(empty)的卡
   for(const [id,st] of state){ if(!seen.has(id)){ st.el.remove(); state.delete(id); } }
-  $('empty').style.display = (cards.length||!d.enabled)?'none':'block';
-  if(!d.enabled && !cards.length) $('empty').style.display='block';
-  // 新卡：保持“最新在前”，逆序 prepend 使最新落在最上
-  const fresh=cards.filter(c=>!state.has(c.id)).reverse();
-  fresh.forEach(c=>{ const el=cardEl(c); feed.insertBefore(el, feed.firstChild);
-    state.set(c.id,{el,typed:false,shot:false,status:c.status});
-    if(c.glb_url){ state.get(c.id).shot=true; enqueueShot(c.id,c.glb_url); } });
-  // 更新已存在卡：pending→done 时填四字段（识别对象名称流式打字，其余淡入）
+  $('empty').style.display = cards.length ? 'none' : 'block';
+  // 新卡：逆序 prepend 使最新在最上
+  cards.filter(c=>!state.has(c.id)).reverse().forEach(c=>{
+    const el=cardEl(c); feed.insertBefore(el, feed.firstChild);
+    const shots=c.shots||[]; state.set(c.id,{el, rev:c.rev||0, shots});
+    renderStack(el, c.name||'', shots);
+  });
+  // 已存在卡：rev 变化=去重合并了新缩略图 → 更新叠卡 + 闪 + “更新”提示（内容不改）
   cards.forEach(c=>{ const st=state.get(c.id); if(!st)return;
-    if(c.status==='done'&&!st.typed){ st.typed=true; const el=st.el;
-      // 识别对象：色点(食物红/液体蓝) + 名称打字机
-      el.querySelector('.tdot').className='tdot '+typeCls(c.type);
-      el.querySelector('.name').classList.remove('pending');
-      typeInto(el.querySelector('.nm'), c.name||'');
-      // 一句话描述
-      if(c.description){ el.querySelector('.f-desc').classList.remove('hide');
-        el.querySelector('.desc').textContent=c.description; }
-      // 营养标签 chips
-      const tags=c.nutrition_tags||[];
-      if(tags.length){ el.querySelector('.f-tags').classList.remove('hide');
-        el.querySelector('.tags').innerHTML=tags.map(t=>'<span class="chip">'+t+'</span>').join(''); }
-      // 食物信号
-      if(c.food_signal){ el.querySelector('.f-sig').classList.remove('hide');
-        el.querySelector('.sig').textContent=c.food_signal; }
-    }});
+    if((c.rev||0)!==st.rev){ st.rev=c.rev||0; st.shots=c.shots||[];
+      renderStack(st.el, c.name||'', st.shots); flashUpdate(st.el); } });
  }catch(e){}
 }
-setInterval(tick,600); tick();
+setInterval(tick,700); tick();
 </script>
 </body></html>"""
 
