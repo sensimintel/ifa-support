@@ -235,7 +235,13 @@ def build_mesh_glb(pred, out_path, conf_thresh_percentile=40.0, edge_ratio=0.06)
 # ══════════════════════════════════════════════════════════════════════
 LOCATE_ENDPOINT = "http://127.0.0.1:8000/v1/chat/completions"
 LOCATE_MODEL = "nvidia/LocateAnything-3B"
-LOCATE_TARGETS = ["food", "drink"]        # 两类各发一个独立请求(并发)、各自专注一类、召回更稳
+# 每项 =（LocateAnything 查询词, 显示/颜色 label）。液体改用具体容器词(bottle/glass)替代抽象 "drink"：
+# "drink" 抽象词召回差(实测饮料罐召回 0)，bottle/glass 具体词召回更稳，命中都归 "drink"(蓝框/液体语义)。
+LOCATE_TARGETS = [
+    ("food", "food"),        # 食物 → 红框
+    ("bottle", "drink"),     # 瓶装 → 蓝框(液体)
+    ("glass", "drink"),      # 杯装 → 蓝框(液体)
+]
 LOCATE_TIMEOUT = 20.0                     # 单次检测超时（秒）；已挪到 GPU 锁外，不阻塞产线
 LOCATE_COLORS = {"food": (222, 52, 52),   # food = 红
                  "drink": (46, 120, 235)}  # drink = 蓝
@@ -243,11 +249,11 @@ _LOCATE_RE = re.compile(r"<ref>(.*?)</ref>\s*<box>(.*?)</box>", re.S)
 _LOCATE_INT_RE = re.compile(r"<(-?\d+)>")
 
 
-def _locate_one(rgb: np.ndarray, target: str):
-    """单类 LocateAnything 检测：只定位一个类别（food 或 drink）。
+def _locate_one(rgb: np.ndarray, query: str, label: str):
+    """单类 LocateAnything 检测：用 query 词定位，命中框统一归到 label（决定颜色/语义）。
 
-    入参 rgb 为 uint8 RGB。返回 [(target, nx1, ny1, nx2, ny2), ...]，坐标归一化 0-1（左上、右下）；
-    未命中/失败返回 []。label 统一用请求的 target（单类请求，避免模型 ref 措辞漂移影响下游颜色映射）。"""
+    入参 rgb 为 uint8 RGB。返回 [(label, nx1, ny1, nx2, ny2), ...]，坐标归一化 0-1（左上、右下）；
+    未命中/失败返回 []。label 用调用方指定值（如 bottle/glass 查询都归 "drink"），不看模型 ref。"""
     try:
         ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
         if not ok:
@@ -258,7 +264,7 @@ def _locate_one(rgb: np.ndarray, target: str):
             "messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                 {"type": "text",
-                 "text": f"Locate all the instances that matches the following description: {target}."},
+                 "text": f"Locate all the instances that matches the following description: {query}."},
             ]}],
             "max_tokens": 2048, "temperature": 0.0,   # 大 token 上限避免多目标时截断→漏检
         }
@@ -268,10 +274,10 @@ def _locate_one(rgb: np.ndarray, target: str):
         with urllib.request.urlopen(req, timeout=LOCATE_TIMEOUT) as r:
             content = json.loads(r.read().decode())["choices"][0]["message"]["content"]
     except Exception as e:
-        print(f"[da3-web] LocateAnything({target}) 调用失败：{type(e).__name__}: {e}", flush=True)
+        print(f"[da3-web] LocateAnything({query}) 调用失败：{type(e).__name__}: {e}", flush=True)
         return []
     dets = []
-    for _label, box in _LOCATE_RE.findall(content):
+    for _ref, box in _LOCATE_RE.findall(content):
         if "none" in box.lower():
             continue
         ints = [int(x) for x in _LOCATE_INT_RE.findall(box)]
@@ -282,19 +288,19 @@ def _locate_one(rgb: np.ndarray, target: str):
             nx2, ny2 = max(x1, x2) / 1000.0, max(y1, y2) / 1000.0
             if nx2 - nx1 < 0.01 or ny2 - ny1 < 0.01:  # 退化框丢弃
                 continue
-            dets.append((target, nx1, ny1, nx2, ny2))
+            dets.append((label, nx1, ny1, nx2, ny2))
     return dets
 
 
 def _locate_food_drink(rgb: np.ndarray):
-    """并发对 food / drink 各发一个独立单类请求，聚合两类的框。
+    """并发对 LOCATE_TARGETS 每个（查询词, label）各发独立单类请求，聚合成 food/drink 框。
 
-    拆分理由：合并一次多类检测（food</c>drink）两类会相互抑制（drink 召回常被 food 压低）；
-    独立单类各自专注一类、召回更稳。两请求走线程池并发，总耗时≈单次而非两次之和。
+    液体用具体容器词 bottle/glass 替代抽象 "drink"（"drink" 召回差、实测饮料罐召回 0）；
+    每项独立请求各自专注、召回更稳，且都走线程池并发，总耗时≈单次而非累加。
     入参 rgb 为 uint8 RGB（应传与点云同视图的图）。返回 [(label, nx1, ny1, nx2, ny2), ...]
     归一化 0-1；全失败返回 []（点云仍能出、只是没框）。"""
     with ThreadPoolExecutor(max_workers=len(LOCATE_TARGETS)) as ex:
-        results = list(ex.map(lambda t: _locate_one(rgb, t), LOCATE_TARGETS))
+        results = list(ex.map(lambda ql: _locate_one(rgb, ql[0], ql[1]), LOCATE_TARGETS))
     dets = []
     for r in results:
         dets.extend(r)
