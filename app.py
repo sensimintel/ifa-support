@@ -460,6 +460,107 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
     return hit_labels
 
 
+def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
+                             view_phi=78.0, view_k=1.28, splat=2, out_size=760):
+    """方案A·服务端渲染：5090 就地把点云用 torch(GPU) 投影 + 画家算法 z-buffer + splat 渲成 2D 图，
+    跳过 GLB 序列化与前端 model-viewer 全量加载。视角=调优视角（后上方俯视）。叠 food/drink 框。
+    返回 RGB uint8 (H,W,3)；点云为空返回 None。"""
+    import math
+    depth = np.asarray(pred.depth)[0].astype(np.float32)
+    H0, W0 = depth.shape
+    K = np.asarray(pred.intrinsics)[0].astype(np.float32)
+    rgb = _rgb_uint8(pred, None)
+    if rgb is None or rgb.shape[:2] != (H0, W0):
+        rgb = np.full((H0, W0, 3), 180, np.uint8)
+    valid = np.isfinite(depth) & (depth > 0)
+    if getattr(pred, "sky", None) is not None:
+        valid &= ~np.asarray(pred.sky)[0].astype(bool)
+    if pred.conf is not None:
+        from depth_anything_3.utils.export import glb as _glb
+        conf = np.asarray(pred.conf).astype(np.float32)
+        thr = _glb.get_conf_thresh(pred, None, 0.0, conf_thresh_percentile, 90.0)
+        valid &= conf[0] >= thr
+    # 反投影到相机坐标系（z>0 前方、y 向下）
+    us, vs = np.meshgrid(np.arange(W0), np.arange(H0))
+    pix = np.stack([us, vs, np.ones_like(us)], -1).reshape(-1, 3).astype(np.float32)
+    Xc_all = ((np.linalg.inv(K) @ pix.T) * depth.reshape(-1)[None, :]).T   # (HW,3)
+    m = valid.reshape(-1)
+    Xc = Xc_all[m]
+    cols = rgb.reshape(-1, 3)[m]
+    if Xc.shape[0] < 50:
+        return None
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    with torch.no_grad():
+        P = torch.from_numpy(np.ascontiguousarray(Xc)).to(dev).float()
+        C = torch.from_numpy(np.ascontiguousarray(cols)).to(dev)
+        center = P.median(0).values
+        cz = float(center[2])
+        r = (abs(cz) if abs(cz) > 1e-3 else 1.5) * view_k
+        phi = math.radians(view_phi)
+        # 虚拟相机放在中心的「上方(-y) + 后方(-z)」，看向中心（φ<90 俯视）
+        off = torch.tensor([0.0, -math.cos(phi), -math.sin(phi)], device=dev)
+        eye = center + r * off
+        fwd = center - eye
+        fwd = fwd / fwd.norm()
+        world_up = torch.tensor([0.0, -1.0, 0.0], device=dev)     # 世界"上" = -y
+        right = torch.cross(world_up, fwd)
+        right = right / right.norm()
+        up = torch.cross(fwd, right)
+        Rm = torch.stack([right, up, fwd], 0)                     # 行基：世界 → 虚拟相机(x右 y上 z前)
+
+        def project(pts):
+            Pv = (pts - eye) @ Rm.T
+            z = Pv[:, 2].clamp(min=1e-3)
+            u = f * Pv[:, 0] / z + Wout / 2.0
+            v = -f * Pv[:, 1] / z + Hout / 2.0                    # y上 → 图像 v 下
+            return u, v, Pv[:, 2]
+
+        Hout = int(out_size)
+        Wout = max(1, int(round(out_size * W0 / H0)))
+        fov = math.radians(min(115.0, math.degrees(2 * math.atan(H0 / (2 * K[1, 1]))) + 8))
+        f = (Hout / 2.0) / math.tan(fov / 2.0)
+        u, v, zc = project(P)
+        inb = (zc > 1e-3) & (u >= 0) & (u < Wout) & (v >= 0) & (v < Hout)
+        u = u[inb].long(); v = v[inb].long(); zc = zc[inb]; Cin = C[inb]
+        order = torch.argsort(zc, descending=True)               # 远→近：近点后写覆盖远点(z-buffer)
+        u = u[order]; v = v[order]; Cin = Cin[order]
+        img = torch.zeros(Hout, Wout, 3, dtype=torch.uint8, device=dev)
+        for dy in range(splat):                                  # splat：每点画 splat×splat 像素，稠密些
+            for dx in range(splat):
+                vv = (v + dy).clamp(0, Hout - 1)
+                uu = (u + dx).clamp(0, Wout - 1)
+                img[vv, uu] = Cin
+        out = img.cpu().numpy()
+    # 叠 food/drink 框：框内近侧主簇的 3D AABB → 8 角投影 → 画线
+    if detections:
+        for (label, nx1, ny1, nx2, ny2) in detections:
+            u1, u2 = int(nx1 * W0), int(np.ceil(nx2 * W0))
+            v1, v2 = int(ny1 * H0), int(np.ceil(ny2 * H0))
+            u1, u2 = max(0, u1), min(W0, u2); v1, v2 = max(0, v1), min(H0, v2)
+            if u2 <= u1 or v2 <= v1:
+                continue
+            sub_m = valid[v1:v2, u1:u2].reshape(-1)
+            sub = Xc_all.reshape(H0, W0, 3)[v1:v2, u1:u2].reshape(-1, 3)[sub_m]
+            if sub.shape[0] < 20:
+                continue
+            zc2 = sub[:, 2]
+            z0 = np.percentile(zc2, 10)
+            fg = zc2 <= max(z0 * 1.7, z0 + 0.08)                 # 近侧前景，剔除框内远背景
+            if int(fg.sum()) >= 20:
+                sub = sub[fg]
+            lo = np.percentile(sub, 2, axis=0); hi = np.percentile(sub, 98, axis=0)
+            corners = np.array([[lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]], [hi[0], hi[1], lo[2]], [lo[0], hi[1], lo[2]],
+                                [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]], [hi[0], hi[1], hi[2]], [lo[0], hi[1], hi[2]]], np.float32)
+            with torch.no_grad():
+                cu, cv, cz3 = project(torch.from_numpy(corners).to(dev).float())
+            cu = cu.cpu().numpy(); cv = cv.cpu().numpy()
+            color = (222, 52, 52) if label == "food" else (46, 120, 235)
+            edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
+            for a, b in edges:
+                cv2.line(out, (int(cu[a]), int(cv[a])), (int(cu[b]), int(cv[b])), color, 2, cv2.LINE_AA)
+    return out
+
+
 def _prune_glb():
     """只保留最近 GLB_KEEP 个产物子目录，清理旧的。"""
     try:
@@ -556,6 +657,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    <select id="fmt">
     <option value="depth">深度图（彩色）</option>
     <option value="glb" selected>点云 + food/drink 框（GLB · 可转视角）</option>
+    <option value="cloudimg">点云图（服务端渲染 · 快）</option>
     <option value="mesh">网格 mesh（GLB · 可转视角）</option>
    </select></div>
   <div class="fld"><label>处理分辨率 process_res <span class="rngval" id="prv">504</span></label>
@@ -614,12 +716,12 @@ $('nmp').oninput=()=>$('nmv').textContent=(+$('nmp').value).toFixed(1);
 $('camtoggle').addEventListener('change',syncOpts);  // 开关切换即展开/收起相机视角调节卡
 
 function syncOpts(){const f=$('fmt').value;
- $('glbopts').style.display=(f==='depth')?'none':'block';
+ $('glbopts').style.display=(f==='depth')?'none':'block';   // cloudimg 也显示(conf 有用)
  $('nmpwrap').style.display=(f==='glb')?'block':'none';
  $('camwrap').style.display=(f==='glb')?'block':'none';
- // 相机视角调节：非深度图产物才有意义；卡片默认收起，由开关控制展开（代码保留、仅隐藏）
- $('camtglwrap').style.display=(f==='depth')?'none':'block';
- $('camcard').style.display=(f!=='depth' && $('camtoggle').checked)?'block':'none';}
+ // 相机视角调节：仅可转视角的 GLB 产物有意义；cloudimg 是服务端渲好的图，无前端 3D 视角
+ $('camtglwrap').style.display=(f==='depth'||f==='cloudimg')?'none':'block';
+ $('camcard').style.display=(f!=='depth' && f!=='cloudimg' && $('camtoggle').checked)?'block':'none';}
 
 // ── 固定视角（二选一）：调优视角 / 原始视角。不再有滑块/锁定/自适应/复制，仅两个预设 ──
 // 两预设都沿光轴、对准点云中心、FOV 用后端真实相机内参；每帧 load 后回到所选预设。
@@ -720,7 +822,7 @@ async function tick(){
   let pm='';
   if(s.product_error){pm='<span class="err">'+s.product_error+'</span>';}
   else if(s.product_meta){const m=s.product_meta;
-    pm=(m.label||'')+(m.dt?(' · '+m.dt.toFixed(2)+'s'):'')+(m.stat?(' · '+m.stat):'')
+    pm=(m.label||'')+(m.dt?(' · '+m.dt.toFixed(2)+'s'):'')+(m.render_ms?(' · 渲染'+m.render_ms+'ms'):'')+(m.stat?(' · '+m.stat):'')
       +(m.shape?(' · '+m.shape[0]+'×'+m.shape[1]):'');
     // 真实相机 FOV 到手 → 更新缓存；若用户未在拖动，按真实 FOV 重摆当前所选视角
     if(m.fov_deg && m.fov_deg!==photoFov){photoFov=m.fov_deg;
@@ -1101,7 +1203,24 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
             with torch.no_grad():
                 pred = model.inference([arr], process_res=res, export_format="mini_npz")
 
-        if fmt == "glb":
+        if fmt == "cloudimg":
+            # 方案A：服务端(5090 GPU)把点云渲成 2D 图，前端只显示图片；仍叠 food/drink 框
+            detections = _locate_food_drink(arr)
+            _tr = time.time()
+            cimg = _render_pointcloud_image(pred, detections, conf_thresh_percentile=conf)
+            render_ms = (time.time() - _tr) * 1000.0
+            if cimg is None:
+                raise RuntimeError("点云为空，无法渲染")
+            ok, buf = cv2.imencode(".jpg", cv2.cvtColor(cimg, cv2.COLOR_RGB2BGR))
+            if not ok:
+                raise RuntimeError("点云图编码失败")
+            n_food = sum(1 for d in detections if d[0] == "food")
+            n_drink = len(detections) - n_food
+            return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
+                    "meta": {"label": f"点云图·服务端渲染（food×{n_food}·drink×{n_drink}）",
+                             "dt": time.time() - t0, "render_ms": round(render_ms, 1),
+                             "res": res, "shape": [cimg.shape[1], cimg.shape[0]]}}
+        elif fmt == "glb":
             token = uuid.uuid4().hex
             outdir = GLB_DIR / token
             outdir.mkdir(parents=True, exist_ok=True)
