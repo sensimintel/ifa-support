@@ -342,7 +342,10 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
     conf = pred.conf
     if conf is not None:
         conf = np.asarray(conf).astype(np.float32)
-        conf_thr = _glb.get_conf_thresh(pred, None, 1.05,
+        # 绝对下限传 0（原为 1.05）：get_conf_thresh 内部 min(max(conf_thresh, p_low), p90)，
+        # 写死 1.05 会把阈值钉在 1.05 上限、让分位滑块失效——远景像素 conf 天然 <1.05 被整片砍掉。
+        # 传 0 后阈值 = min(p_low, p90)，分位滑块=0 即保留全部点（远景回来）。
+        conf_thr = _glb.get_conf_thresh(pred, None, 0.0,
                                         conf_thresh_percentile, 90.0)
         valid &= conf[i] >= conf_thr
 
@@ -373,11 +376,14 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
     pc_cols = rgb.reshape(-1, 3)[vmask].astype(np.uint8)
     pc_pts, pc_cols = _glb._filter_and_downsample(pc_pts, pc_cols, int(num_max_points))
     # 裁离群点：个别深度估计异常的远点会把点云包围盒撑爆，导致 model-viewer 取景距离算成
-    # 负/极小值、画面全黑（尤其自适应/近距视角）。按到中位数中心的距离去掉最远 ~1.5%，让包围盒紧致。
+    # 负/极小值、画面全黑（尤其自适应/近距视角）。
+    # 只挡「深度爆炸」的极端离群点，用深度(Z)方向的 MAD 稳健界；不再按到中心的欧氏距离切 98.5 分位——
+    # 那会把连续的远景层当离群整片误删（这正是远景点云消失+取景抖动的第二把刀）。
     if pc_pts.shape[0] > 200:
-        c = np.median(pc_pts, axis=0)
-        dist = np.linalg.norm(pc_pts - c, axis=1)
-        keep = dist <= np.percentile(dist, 98.5)
+        zc = -pc_pts[:, 2]                                   # 相机看 -Z，深度值 = -z（正）
+        med = float(np.median(zc))
+        mad = float(np.median(np.abs(zc - med))) + 1e-6
+        keep = zc <= med + 12.0 * mad                        # 远端只砍极端离群，保留连续远景
         pc_pts, pc_cols = pc_pts[keep], pc_cols[keep]
     if pc_pts.shape[0] > 0:
         scene.add_geometry(trimesh.points.PointCloud(vertices=pc_pts, colors=pc_cols))
