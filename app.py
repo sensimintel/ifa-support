@@ -1308,8 +1308,8 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  /* lightbox 看图集 */
  .lb{position:fixed;inset:0;background:rgba(10,14,20,.82);display:none;flex-direction:column;align-items:center;justify-content:center;gap:13px;z-index:100;padding:24px}
  .lb.on{display:flex}
- .lb .big{width:min(70vw,320px);aspect-ratio:3/4;border-radius:14px;overflow:hidden;border:2px solid rgba(255,255,255,.15);background:#10141a}
- .lb .big img{width:100%;height:100%;object-fit:cover;display:block}
+ .lb .big{width:min(88vw,600px);max-height:74vh;aspect-ratio:3/4;border-radius:14px;overflow:hidden;border:2px solid rgba(255,255,255,.15);background:#10141a}
+ .lb .big img{width:100%;height:100%;object-fit:cover;display:block;cursor:zoom-in;transform-origin:center center;will-change:transform;transition:transform .12s ease-out}
  .lb .cap{color:#dfe4ea;font-size:13px;font-family:var(--mono)}
  .lb .strip{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;max-width:min(82vw,420px)}
  .lb .th{width:50px;height:66px;border-radius:7px;overflow:hidden;border:2px solid transparent;cursor:pointer;opacity:.55;background:#10141a}
@@ -1430,6 +1430,10 @@ function flashUpdate(el){
 
 // —— lightbox 看图集 ——
 let lbShots=[], lbIdx=0, lbName='';
+let lbScale=1, lbX=0, lbY=0, lbDrag=false, lbSx=0, lbSy=0;
+function lbApply(){ const b=$('lbBig'); b.style.transform='translate('+lbX+'px,'+lbY+'px) scale('+lbScale+')';
+  b.style.cursor= lbScale>1 ? (lbDrag?'grabbing':'grab') : 'zoom-in'; }
+function lbReset(){ lbScale=1; lbX=0; lbY=0; lbApply(); }
 function openLB(name, shots){ if(!shots.length)return;
   lbShots=shots.slice(); lbIdx=lbShots.length-1; lbName=name||'';
   const strip=$('lbStrip'); strip.innerHTML='';
@@ -1441,9 +1445,18 @@ function openLB(name, shots){ if(!shots.length)return;
 }
 function renderLB(){ const url=lbShots[lbIdx], big=$('lbBig'), u=shotCache.get(url);
   if(u)big.src=u; else enqueueShot(url,(uri)=>{ if(lbShots[lbIdx]===url)big.src=uri; });
-  $('lbCap').textContent=lbName+' · '+(lbIdx+1)+' / '+lbShots.length+' 张点云截图';
+  $('lbCap').textContent=lbName+' · '+(lbIdx+1)+' / '+lbShots.length+' 张 · 滚轮缩放·拖动·双击';
   [...$('lbStrip').children].forEach((t,i)=>t.classList.toggle('sel',i===lbIdx));
+  lbReset();
 }
+// 缩放：滚轮缩放(1~6x)、放大后拖动平移、双击放大/还原
+$('lbBig').addEventListener('wheel',e=>{ e.preventDefault();
+  lbScale=Math.max(1,Math.min(6, lbScale*(e.deltaY<0?1.18:0.85)));
+  if(lbScale===1){lbX=0;lbY=0;} lbApply(); },{passive:false});
+$('lbBig').addEventListener('mousedown',e=>{ if(lbScale<=1)return; lbDrag=true; lbSx=e.clientX-lbX; lbSy=e.clientY-lbY; lbApply(); e.preventDefault(); });
+window.addEventListener('mousemove',e=>{ if(!lbDrag)return; lbX=e.clientX-lbSx; lbY=e.clientY-lbSy; lbApply(); });
+window.addEventListener('mouseup',()=>{ if(lbDrag){lbDrag=false; lbApply();} });
+$('lbBig').addEventListener('dblclick',()=>{ lbScale=lbScale>1?1:2.5; lbX=0; lbY=0; lbApply(); });
 $('lbx').onclick=()=>$('lb').classList.remove('on');
 $('lb').onclick=e=>{ if(e.target===$('lb'))$('lb').classList.remove('on'); };
 document.addEventListener('keydown',e=>{ if(!$('lb').classList.contains('on'))return;
