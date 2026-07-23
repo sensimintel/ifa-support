@@ -558,8 +558,8 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="row">
   <div class="fld"><label>方位角 θ <span class="rngval" id="cthv">0</span>°</label>
    <input type="range" id="cth" min="-180" max="180" step="1" value="0"></div>
-  <div class="fld"><label>俯仰角 φ <span class="rngval" id="cphv">90</span>°</label>
-   <input type="range" id="cph" min="0" max="180" step="1" value="90"></div>
+  <div class="fld"><label>俯仰角 φ <span class="rngval" id="cphv">80</span>°</label>
+   <input type="range" id="cph" min="0" max="180" step="1" value="80"></div>
   <div class="fld"><label>距离 radius <span class="rngval" id="crdv">1.5</span>m</label>
    <input type="range" id="crd" min="0.3" max="10" step="0.1" value="1.5"></div>
   <div class="fld"><label>视场 FOV <span class="rngval" id="cfvv">45.5</span>°</label>
@@ -610,7 +610,7 @@ function syncOpts(){const f=$('fmt').value;
 // 治法：① 锁定绝对 camera-target + camera-orbit(米) + fov；② 只在「用户手动交互」时更新锁定值
 //（忽略 auto-frame 触发的 camera-change，避免把漂移固化）；③ 每帧 load 后强制 apply 锁定视角。
 const mv=$('mv');
-const camState={theta:0,phi:90,radius:1.5,fov:55};  // 默认=拍摄视角（正视 -Z：θ=0/φ=90，FOV 由后端真实相机内参覆盖）
+const camState={theta:0,phi:80,radius:1.5,fov:55};  // 默认档位：θ=0/φ=80（俯视微调，与 applyPhotoView 的 VIEW_PHI 对齐），FOV 由后端真实相机内参覆盖
 let photoFov=55;   // 后端传来的真实相机垂直 FOV（fov_deg），拿到前用占位
 let locked=null, lastCam='';   // locked: {orbit,target,fov} 绝对值字符串；null=尚未锁定（用初始默认=拍摄视角）
 let interacting=false, interactTimer;   // 「用户正在调」标志：交互期间新帧 load 不拉回，避免打断
@@ -660,17 +660,20 @@ function applyAdaptive(){  // 自适应：保留角度 θ/φ 与 FOV；每帧按
          +'camera-target="'+lastAdaptive.target+'"  （自适应：每帧跟随点云中心/尺度）';
   $('camnow').textContent=lastCam;
 }
-function applyPhotoView(){  // 拍摄视角（默认）：相机放回点云光心、沿光轴正视 -Z，FOV=真实相机内参
-  // → 点云成像与深度图/原图同一视角。相机恒在原点（与距离 R 无关），点云深度怎么变都不飘。
+// 默认视角相对「拍摄正视」的微调量（演示更立体）：俯视 = φ 降到 90 以下、拉远/抬高 = radius 放大。
+// 注：φ≠90 后相机不再恒在原点、会随点云深度轻微漂移（幅度小）；真嫌飘就把这两值调回 90/1.0。
+const VIEW_PHI=80;      // 俯仰角(°)：<90 即从上往下俯视，90=正视。80≈俯视 10°
+const VIEW_K=1.25;      // radius 放大系数：>1 拉远、并随 φ 抬高相机。1.0=贴脸正视
+function applyPhotoView(){  // 默认视角：以拍摄正视为基准，抬高+拉远+俯视一点，FOV=真实相机内参
   const c=mv.getBoundingBoxCenter();      // 点云中心，z<0（点云在 -Z 前方）
   const cz=(c.z<-0.001)?c.z:-1.5;         // 光轴上取点云中心深度；异常时回落
-  const R=Math.abs(cz);
-  // target 强制落在光轴 (0,0,cz)：θ=0/φ=90 时相机位置 = target+R·(0,0,1) = 原点，正视 -Z
+  const R=Math.abs(cz)*VIEW_K;
+  // target 仍落在光轴 (0,0,cz) 对准点云中心；θ=0 不左右偏，φ<90 从后上方俯视
   mv.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
-  mv.cameraOrbit='0deg 90deg '+R.toFixed(4)+'m';
+  mv.cameraOrbit='0deg '+VIEW_PHI+'deg '+R.toFixed(4)+'m';
   mv.fieldOfView=photoFov+'deg';
   if(mv.jumpCameraToGoal)mv.jumpCameraToGoal();
-  lastCam='拍摄视角(正视 -Z)：orbit 0° 90° '+R.toFixed(2)+'m · fov '+photoFov+'° · target 0 0 '+cz.toFixed(2)+'m';
+  lastCam='默认视角(抬高·拉远·俯视)：orbit 0° '+VIEW_PHI+'° '+R.toFixed(2)+'m · fov '+photoFov+'° · target 0 0 '+cz.toFixed(2)+'m';
   $('camnow').textContent=lastCam;
 }
 function preApplyView(){  // 换新点云「之前」先把镜头摆到当前锁定/自适应视角（设成属性），
