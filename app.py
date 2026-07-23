@@ -482,9 +482,9 @@ SPLIT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    <iframe src="/panel" title="设备实时帧 + DA3 产物"></iframe>
   </div>
   <div class="pane">
-   <div class="bar"><span class="dot" style="background:#34c759"></span>电子秤实时重量
-    <a href="/weight" target="_blank">单独打开 ↗</a></div>
-   <iframe src="/weight" title="电子秤实时重量"></iframe>
+   <div class="bar"><span class="dot" style="background:#34c759"></span>实时识别 · food/drink 命中 → Qwen3-VL
+    <a href="/recog" target="_blank">单独打开 ↗</a></div>
+   <iframe src="/recog" title="实时识别卡片流"></iframe>
   </div>
  </div>
 </body></html>"""
@@ -812,6 +812,155 @@ async def api_infer(
 
 
 # ── 设备实时帧中继：接收 mobile 直发的帧 → 缓存展示 + DA3 深度处理 ──────────
+# ══════════════════════════════════════════════════════════════════════
+# 实时识别（Qwen3-VL 多模态）：LocateAnything 命中某帧 → 取原图 + 带框图，送 GCP g4-01 的
+# Qwen3-VL（OpenAI 兼容）识别「具体是什么」，产出 名称 + 类型(食物/液体)。
+#   · 识别是慢操作（多模态 LLM 数秒），放独立后台线程 + 节流，绝不阻塞 DA3 产线。
+#   · 结果进 _recog_cards，前端 /recog 轮询 /api/recog/list 渲染卡片、名称流式打字。
+#   · endpoint 经环境变量配置（默认空=不接入，右栏显示「识别服务未接入」）：
+#       RECOG_ENDPOINT / RECOG_API_KEY / RECOG_MODEL / RECOG_MIN_INTERVAL
+# ══════════════════════════════════════════════════════════════════════
+RECOG_ENDPOINT = os.environ.get("RECOG_ENDPOINT", "").strip()
+RECOG_API_KEY = os.environ.get("RECOG_API_KEY", "").strip()
+RECOG_MODEL = os.environ.get("RECOG_MODEL", "Qwen3.6-35B-A3B-FP8").strip()
+RECOG_MIN_INTERVAL = float(os.environ.get("RECOG_MIN_INTERVAL", "4.0"))  # 两次识别最小间隔(秒)，节流防刷屏
+RECOG_TIMEOUT = 30.0
+RECOG_MAX_CARDS = 200
+
+_recog_lock = threading.Lock()
+_recog_cv = threading.Condition(_recog_lock)
+_recog_cards = []          # [{id,status,name,type,glb_url,frame,t}]，append 顺序=时间顺序
+_recog_id = 0              # 卡片自增 id
+_recog_last_ts = 0.0       # 上次触发识别的时刻(节流用)
+_recog_pending = []        # 待识别任务队列(单线程消费，最新优先、丢弃积压)
+_recog_worker_started = False
+
+_RECOG_PROMPT = (
+    "图1是原始画面，图2是同一画面标注了检测框的版本（红框=疑似食物，蓝框=疑似液体/容器）。"
+    "请识别每个框内的具体物品。对每个能确认的物品输出：name=具体名称（尽量精确到品类或品牌），"
+    "type=类型（只能是“食物”或“液体”二选一）。无法确认的框忽略。"
+    "只输出 JSON，不要任何解释：{\"items\":[{\"name\":\"…\",\"type\":\"食物\"}]}。"
+)
+
+
+def _img_data_uri(rgb):
+    """RGB ndarray → data URI（JPEG）。"""
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    return ("data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()) if ok else None
+
+
+def _draw_boxes(rgb, detections):
+    """在原图上画 food(红)/drink(蓝) 检测框，返回带框图(RGB)。"""
+    out = rgb.copy()
+    H, W = out.shape[:2]
+    for (label, nx1, ny1, nx2, ny2) in detections:
+        color = (222, 52, 52) if label == "food" else (46, 120, 235)  # RGB
+        cv2.rectangle(out, (int(nx1 * W), int(ny1 * H)), (int(nx2 * W), int(ny2 * H)),
+                      color, max(2, W // 300))
+    return out
+
+
+def _parse_recog(content):
+    """从模型输出里抽 items（容错：截第一个 JSON 对象；type 归一到 食物/液体）。"""
+    try:
+        obj = json.loads(content[content.index("{"): content.rindex("}") + 1])
+    except Exception:
+        return []
+    items = obj.get("items") if isinstance(obj, dict) else None
+    if not isinstance(items, list):
+        return []
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name", "")).strip()
+        if not name:
+            continue
+        typ = str(it.get("type", "")).strip().lower()
+        is_liquid = ("液" in typ or "饮" in typ or "drink" in typ or "liquid" in typ)
+        out.append({"name": name, "type": "液体" if is_liquid else "食物"})
+    return out
+
+
+def _recognize_items(orig_rgb, boxed_rgb):
+    """调 Qwen3-VL（原图 + 带框图）识别，返回 [{name,type}]；任何失败返回 []。"""
+    if not RECOG_ENDPOINT:
+        return []
+    u1, u2 = _img_data_uri(orig_rgb), _img_data_uri(boxed_rgb)
+    if not u1 or not u2:
+        return []
+    payload = {
+        "model": RECOG_MODEL,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": u1}},
+            {"type": "image_url", "image_url": {"url": u2}},
+            {"type": "text", "text": _RECOG_PROMPT},
+        ]}],
+        "max_tokens": 512, "temperature": 0.2,
+    }
+    headers = {"Content-Type": "application/json"}
+    if RECOG_API_KEY:
+        headers["Authorization"] = f"Bearer {RECOG_API_KEY}"
+    try:
+        req = urllib.request.Request(RECOG_ENDPOINT, data=json.dumps(payload).encode(), headers=headers)
+        with urllib.request.urlopen(req, timeout=RECOG_TIMEOUT) as r:
+            content = json.loads(r.read().decode())["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"[da3-web] 识别调用失败：{type(e).__name__}: {e}", flush=True)
+        return []
+    return _parse_recog(content)
+
+
+def _recog_worker():
+    """后台单线程：取最新识别任务、丢弃积压，识别完回填 pending 卡 + 追加多目标卡。"""
+    global _recog_id
+    while True:
+        with _recog_cv:
+            while not _recog_pending:
+                _recog_cv.wait()
+            orig, boxed, glb_url, pending_id, frame, t = _recog_pending.pop()  # 最新优先
+            _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
+        items = _recognize_items(orig, boxed)
+        with _recog_lock:
+            card = next((c for c in _recog_cards if c["id"] == pending_id), None)
+            if not items:
+                if card:
+                    card["status"] = "empty"     # 没识别出东西：标记后前端不展示
+                continue
+            if card:
+                card.update(status="done", name=items[0]["name"], type=items[0]["type"])
+            for it in items[1:]:                 # 一帧多目标：其余各追加一张卡
+                _recog_id += 1
+                _recog_cards.append({"id": _recog_id, "status": "done", "name": it["name"],
+                                     "type": it["type"], "glb_url": glb_url, "frame": frame, "t": t})
+
+
+def _maybe_recognize(orig_rgb, detections, glb_url, frame):
+    """detections 非空 + 节流通过 → 先加 pending 卡、提交异步识别。在 processor 里调用，不阻塞产线。"""
+    global _recog_id, _recog_last_ts, _recog_worker_started
+    if not detections or not RECOG_ENDPOINT:
+        return
+    now = time.time()
+    with _recog_lock:
+        if now - _recog_last_ts < RECOG_MIN_INTERVAL:
+            return
+        _recog_last_ts = now
+        if not _recog_worker_started:
+            _recog_worker_started = True
+            threading.Thread(target=_recog_worker, daemon=True).start()
+        _recog_id += 1
+        pending_id = _recog_id
+        t = time.strftime("%H:%M:%S")
+        _recog_cards.append({"id": pending_id, "status": "pending", "name": "", "type": "",
+                             "glb_url": glb_url, "frame": frame, "t": t})
+        if len(_recog_cards) > RECOG_MAX_CARDS:
+            del _recog_cards[:len(_recog_cards) - RECOG_MAX_CARDS]
+    boxed = _draw_boxes(orig_rgb, detections)
+    with _recog_cv:
+        _recog_pending.append((orig_rgb.copy(), boxed, glb_url, pending_id, frame, t))
+        _recog_cv.notify()
+
+
 def _da3_frame_processor(raw: bytes, config: dict) -> dict:
     """把收到的一帧按「面板控件配置」跑 DA3，产出：
       - export_format=depth → 彩色深度图（图片类产物，返回 JPEG 字节）
@@ -854,6 +1003,8 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
             sz = glb.stat().st_size / 1024 if glb.exists() else 0
             _prune_glb()
             n_food, n_drink = labels.count("food"), labels.count("drink")
+            # LocateAnything 命中 → 异步送 Qwen3-VL 识别「具体是什么」（节流、后台线程，不阻塞产线）
+            _maybe_recognize(arr, detections, f"/glb/{token}/scene.glb", token[:6])
             # 真实相机垂直 FOV（复现拍摄视角用）：fov_y = 2·atan(H/(2·fy))，fy=K[1,1]。
             # 前端据此把点云相机摆回光心正视 -Z，使点云成像与深度图/原图同视角。
             _K = np.asarray(pred.intrinsics)[0]
@@ -890,6 +1041,15 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
 
 app.include_router(frame_router)
 set_processor(_da3_frame_processor)
+
+
+@app.get("/api/recog/list")
+def recog_list():
+    """识别卡片列表（最新在前）；enabled=false 表示识别服务未接入。"""
+    with _recog_lock:
+        cards = [dict(c) for c in _recog_cards if c.get("status") != "empty"]
+    cards.reverse()   # 最新在前，前端 prepend 到顶部
+    return JSONResponse({"enabled": bool(RECOG_ENDPOINT), "cards": cards})
 
 
 @app.get("/glb/{token}/{name}")
@@ -973,6 +1133,152 @@ fetch('/api/weights').then(r=>r.json()).then(j=>{
 @app.get("/weight", response_class=HTMLResponse)
 def weight_page():
     return WEIGHT_PAGE
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 实时识别卡片流页：轮询 /api/recog/list，最新卡在最上；缩略图=该帧整张点云视角
+# （隐藏 model-viewer 加载该帧 GLB 截图）；名称流式打字；食物红 / 液体蓝。
+# ══════════════════════════════════════════════════════════════════════
+RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>实时识别</title>
+<script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
+<style>
+ :root{--bg:#f4f5f7;--panel:#fff;--panel2:#f6f7f9;--ink:#1b1e24;--muted:#69707b;--faint:#98a0ac;
+   --line:#e5e8ec;--accent:#0071e3;--accent-soft:#e7f1fd;--food:#de3434;--food-soft:#fdeaea;
+   --liquid:#2e78eb;--liquid-soft:#e9f0fd;--mono:ui-monospace,"SF Mono",Menlo,monospace;
+   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,"PingFang SC",sans-serif;}
+ *{box-sizing:border-box}
+ html,body{height:100%}
+ body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5;
+   -webkit-font-smoothing:antialiased;display:flex;flex-direction:column}
+ .nav{display:flex;gap:16px;align-items:center;padding:10px 16px;background:var(--panel);
+   border-bottom:1px solid var(--line);font-size:13px}
+ .nav a{color:var(--muted);text-decoration:none}.nav a.active{color:var(--accent);font-weight:600}
+ .nav a.home{margin-left:auto;color:var(--faint)}
+ .head{padding:14px 18px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+ .head .l1{display:flex;align-items:center;gap:9px}
+ .head h2{margin:0;font-size:16px;font-weight:650}
+ .live{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;color:#1a9e5f;
+   background:rgba(26,158,95,.12);padding:3px 9px;border-radius:999px;margin-left:auto}
+ .live.off{color:var(--faint);background:rgba(120,130,145,.12)}
+ .live i{width:7px;height:7px;border-radius:50%;background:currentColor;animation:pulse 1.4s infinite}
+ @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+ .head .sub{font-size:12px;color:var(--muted);margin-top:3px}
+ .head .sub code{font-family:var(--mono);font-size:11px;color:var(--accent);background:var(--accent-soft);padding:1px 6px;border-radius:5px}
+ .feed{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
+ .empty{color:var(--faint);font-size:13px;text-align:center;margin:36px 10px}
+ .rcard{display:grid;grid-template-columns:104px 1fr;gap:14px;padding:12px;border:1px solid var(--line);
+   border-radius:13px;background:var(--panel2);animation:rise .34s cubic-bezier(.2,.7,.3,1)}
+ @keyframes rise{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:none}}
+ .thumb{position:relative;width:104px;aspect-ratio:3/4;border-radius:9px;overflow:hidden;border:1px solid var(--line);
+   background-color:#10141a;
+   background-image:radial-gradient(58% 42% at 50% 60%,rgba(196,204,218,.5),rgba(120,130,150,.14) 55%,transparent 74%),
+     radial-gradient(rgba(205,214,228,.5) .6px,transparent .8px);background-size:auto,4px 4px}
+ .thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .3s}
+ .thumb .tag{position:absolute;left:6px;bottom:6px;font-size:9px;font-family:var(--mono);color:#fff;
+   background:rgba(10,14,20,.62);padding:1px 6px;border-radius:4px;z-index:2}
+ .rbody{min-width:0;display:flex;flex-direction:column;gap:9px;justify-content:center}
+ .name{font-size:15.5px;font-weight:650;letter-spacing:.2px;line-height:1.3}
+ .name.pending{color:var(--faint)}
+ .rtype{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:999px;width:fit-content}
+ .rtype.food{color:var(--food);background:var(--food-soft)}.rtype.liquid{color:var(--liquid);background:var(--liquid-soft)}
+ .rtype.hide{display:none}.rtype .d{width:6px;height:6px;border-radius:50%;background:currentColor}
+ .meta{font-size:10.5px;color:var(--faint);font-family:var(--mono);font-variant-numeric:tabular-nums;display:flex;gap:12px}
+ .caret{display:inline-block;width:2px;height:1em;background:var(--accent);vertical-align:-1px;margin-left:1px;animation:blink 1s step-end infinite}
+ @keyframes blink{50%{opacity:0}}
+ #shot{position:fixed;top:0;left:0;width:208px;height:277px;opacity:0;pointer-events:none;z-index:-1}
+ @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+</style></head><body>
+<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
+<div class="head">
+  <div class="l1"><h2>实时识别 · Live Recognition</h2><span class="live" id="live"><i></i>识别中</span></div>
+  <div class="sub">food/drink 命中某帧 → <code id="model">Qwen3-VL</code> 多模态识别 · 名称/类型流式生成 · 最新卡在最上</div>
+</div>
+<div class="feed" id="feed"><div class="empty" id="empty">等待 food/drink 命中…</div></div>
+<model-viewer id="shot" camera-controls="false" interaction-prompt="none" exposure="1.3" shadow-intensity="0"></model-viewer>
+<script>
+const $=id=>document.getElementById(id);
+const feed=$('feed'), shot=$('shot');
+const state=new Map();   // id -> {el, typed, shot, status}
+
+const typeLabel=t=> t==='液体' ? '液体' : '食物';
+const typeCls=t=> t==='液体' ? 'liquid' : 'food';
+
+function cardEl(c){
+  const el=document.createElement('div'); el.className='rcard';
+  el.innerHTML='<div class="thumb"><img><span class="tag">整张点云 #'+(c.frame||'')+'</span></div>'
+    +'<div class="rbody"><div class="name pending">识别中…</div>'
+    +'<span class="rtype hide"><span class="d"></span></span>'
+    +'<div class="meta"><span>帧 '+(c.frame||'')+'</span><span>'+(c.t||'')+'</span></div></div>';
+  return el;
+}
+// 打字机
+function typeInto(node,text){
+  let i=0; node.textContent='';
+  const caret=document.createElement('span'); caret.className='caret'; node.appendChild(caret);
+  const timer=setInterval(()=>{ i++; caret.remove(); node.textContent=text.slice(0,i); node.appendChild(caret);
+    if(i>=text.length){clearInterval(timer); caret.remove();}}, 46);
+}
+// 点云缩略图截图队列（串行）
+const shotQ=[]; let shotBusy=false;
+function enqueueShot(id,url){ shotQ.push({id,url}); pumpShot(); }
+function pumpShot(){
+  if(shotBusy||!shotQ.length)return; shotBusy=true;
+  const {id,url}=shotQ.shift(); const st=state.get(id);
+  if(!st||!url){shotBusy=false;return pumpShot();}
+  const onload=()=>{ shot.removeEventListener('load',onload);
+    try{ const c=shot.getBoundingBoxCenter(); const cz=(c.z<-0.001)?c.z:-1.5;
+      shot.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
+      shot.cameraOrbit='0deg 80deg '+(Math.abs(cz)*1.25).toFixed(4)+'m';
+      shot.jumpCameraToGoal&&shot.jumpCameraToGoal();
+    }catch(e){}
+    requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      let uri=''; try{uri=shot.toDataURL('image/png');}catch(e){}
+      const img=st.el&&st.el.querySelector('.thumb img');
+      if(uri&&img){img.src=uri; img.style.opacity=1;}
+      shotBusy=false; setTimeout(pumpShot,40);
+    }));
+  };
+  shot.addEventListener('load',onload); shot.src=url;
+}
+
+async function tick(){
+ try{
+  const d=await(await fetch('/api/recog/list',{cache:'no-store'})).json();
+  const live=$('live');
+  if(!d.enabled){ live.className='live off'; live.innerHTML='<i></i>未接入';
+    $('empty').textContent='识别服务未接入（RECOG_ENDPOINT 未配置）'; }
+  else { live.className='live'; live.innerHTML='<i></i>识别中'; }
+  const cards=d.cards||[];
+  const seen=new Set(cards.map(c=>c.id));
+  // 移除已消失(empty)的卡
+  for(const [id,st] of state){ if(!seen.has(id)){ st.el.remove(); state.delete(id); } }
+  $('empty').style.display = (cards.length||!d.enabled)?'none':'block';
+  if(!d.enabled && !cards.length) $('empty').style.display='block';
+  // 新卡：保持“最新在前”，逆序 prepend 使最新落在最上
+  const fresh=cards.filter(c=>!state.has(c.id)).reverse();
+  fresh.forEach(c=>{ const el=cardEl(c); feed.insertBefore(el, feed.firstChild);
+    state.set(c.id,{el,typed:false,shot:false,status:c.status});
+    if(c.glb_url){ state.get(c.id).shot=true; enqueueShot(c.id,c.glb_url); } });
+  // 更新已存在卡：pending→done 时打字名称 + 显示类型
+  cards.forEach(c=>{ const st=state.get(c.id); if(!st)return;
+    if(c.status==='done'&&!st.typed){ st.typed=true;
+      const nameNode=st.el.querySelector('.name'); nameNode.classList.remove('pending'); typeInto(nameNode,c.name||'');
+      const badge=st.el.querySelector('.rtype'); badge.className='rtype '+typeCls(c.type);
+      badge.innerHTML='<span class="d"></span>'+typeLabel(c.type);
+    }});
+ }catch(e){}
+}
+setInterval(tick,600); tick();
+</script>
+</body></html>"""
+
+
+@app.get("/recog", response_class=HTMLResponse)
+def recog_page():
+    """实时识别卡片流页（首页右栏 iframe）。"""
+    return RECOG_PAGE
 
 
 # ══════════════════════════════════════════════════════════════════════
