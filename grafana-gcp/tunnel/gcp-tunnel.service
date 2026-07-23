@@ -1,0 +1,31 @@
+# 可选：把 IAP 隧道正规化为 systemd 服务（开机自启 + 崩溃自愈）。
+# up.sh 默认用 nohup 拉起隧道即可；想开机自启再装这个单元。
+#
+# 安装（在本机，把占位符换成实际值）：
+#   sudo cp gcp-tunnel.service /etc/systemd/system/gcp-grafana-tunnel.service
+#   # 编辑 User / WorkingDirectory / gcloud 凭证路径（见下方占位符）
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now gcp-grafana-tunnel.service
+#   journalctl -u gcp-grafana-tunnel -f
+#
+# ⚠️ 关键：User= 必须是"已 gcloud 登录 Workforce 身份"的那个用户（凭证在其 $HOME/.config/gcloud），
+#   否则隧道认证不到。CLOUDSDK_CONFIG 显式指向该用户的 gcloud 配置目录更稳妥。
+[Unit]
+Description=IAP tunnel: GCP gpu-g4-01 Prometheus -> local (for grafana-gcp)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 换成本机上已登录 gcloud Workforce 身份的用户（5090 通常是 odyss）
+User=__USER__
+# 换成本仓 checkout 里 grafana-gcp/tunnel 的绝对路径
+WorkingDirectory=__DIR__/grafana-gcp/tunnel
+# 显式指向该用户的 gcloud 配置（含 Workforce 凭证）
+Environment=CLOUDSDK_CONFIG=/home/__USER__/.config/gcloud
+ExecStart=/usr/bin/env bash __DIR__/grafana-gcp/tunnel/gcp-tunnel.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

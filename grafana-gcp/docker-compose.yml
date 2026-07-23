@@ -1,0 +1,28 @@
+# 本机 Grafana（消费经 IAP 隧道转发过来的 GCP Prometheus）。
+# 用 network_mode: host——这样 Grafana 直接绑本机 0.0.0.0:${GRAFANA_PORT}（局域网 IP 可访问），
+# 且共享宿主 loopback，能直接读到隧道落地的 127.0.0.1:${LOCAL_PROM_PORT}。
+# ⚠️ host 网络模式仅 Linux 有效（5090 即 Linux）；host 模式下 ports: 会被忽略，端口由 GF_SERVER_HTTP_PORT 决定。
+services:
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: ifa-grafana-gcp
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      - GF_SERVER_HTTP_ADDR=0.0.0.0
+      - GF_SERVER_HTTP_PORT=${GRAFANA_PORT:-3001}
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      # 供数据源 provisioning 里 ${LOCAL_PROM_PORT} 插值用
+      - LOCAL_PROM_PORT=${LOCAL_PROM_PORT:-19090}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ifa-grafana-gcp-data:/var/lib/grafana
+
+volumes:
+  # 持久化 grafana.db（admin 账号 / 本地改动），避免每次重建丢状态
+  ifa-grafana-gcp-data:
