@@ -854,12 +854,37 @@ _recog_last_ts = 0.0       # 上次触发识别的时刻(节流用)
 _recog_pending = []        # 待识别任务队列(单线程消费，最新优先、丢弃积压)
 _recog_worker_started = False
 
+# 营养标签 / 食物信号的合法枚举（静态 guardrail 白名单：模型输出只保留集合内的值、其余丢弃）。
+# 想增删标签就改这两个列表即可（prompt 与校验都从这里派生，自动同步）。
+NUTRITION_TAGS = [
+    "Carbs", "Protein", "Fat", "Fiber", "Sugar", "Sodium", "Potassium", "Calcium",
+    "Iron", "Vitamin A", "Vitamin C", "Vitamin D", "Vitamin B", "Omega-3",
+    "Caffeine", "Water", "Electrolytes", "Antioxidants", "Probiotics",
+]
+FOOD_SIGNALS = [
+    "Quick energy", "Sustained energy", "High protein", "High fiber", "Hydration",
+    "Healthy fats", "Low calorie", "Sugar spike", "Caffeine boost", "Vitamin boost",
+    "Balanced nutrition", "Indulgent treat",
+]
+_NUTR_CANON = {t.lower(): t for t in NUTRITION_TAGS}   # 小写→规范写法，校验大小写不敏感
+_SIG_CANON = {s.lower(): s for s in FOOD_SIGNALS}
+RECOG_MAX_TAGS = 3          # 每个物品最多几个营养标签
+RECOG_DESC_MAX = 20         # 一句话描述最大字数
+
 _RECOG_PROMPT = (
     "识别画面中所有的食物、以及所有的液体/饮料（咖啡/水/可乐/茶/杯装饮品等），逐一分别输出。"
     "图2是检测框辅助参考（红框=疑似食物，蓝框=疑似液体/容器），可帮助定位，但不要局限于框——"
-    "画面里明显的食物或液体都要识别出来；食物和液体必须拆成不同的 item。"
-    "每个物品输出：name=具体名称（尽量精确到品类或品牌），type=类型（只能是“食物”或“液体”二选一）。"
-    "只输出 JSON，不要任何解释：{\"items\":[{\"name\":\"…\",\"type\":\"食物\"},{\"name\":\"…\",\"type\":\"液体\"}]}。"
+    "画面里明显的食物或液体都要识别出来；食物和液体必须拆成不同的 item。\n"
+    "每个物品输出以下字段：\n"
+    "  name：具体名称（简短，优先英文或品牌名，如 Banana、Snickers）；\n"
+    "  type：只能是“食物”或“液体”；\n"
+    "  description：一句话中文描述（不超过" + str(RECOG_DESC_MAX) + "字，如“快速补能的小食”）；\n"
+    "  nutrition_tags：营养标签数组，最多" + str(RECOG_MAX_TAGS) + "个，只能从这些里选："
+    + "、".join(NUTRITION_TAGS) + "；\n"
+    "  food_signal：食物信号，只能从这些里选一个：" + "、".join(FOOD_SIGNALS) + "。\n"
+    "只输出 JSON，不要任何解释："
+    "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
+    "\"nutrition_tags\":[\"Carbs\",\"Fiber\",\"Potassium\"],\"food_signal\":\"Quick energy\"}]}。"
     "画面里没有食物也没有液体时，items 为空数组。"
 )
 
@@ -882,7 +907,14 @@ def _draw_boxes(rgb, detections):
 
 
 def _parse_recog(content):
-    """从模型输出里抽 items（容错：截第一个 JSON 对象；type 归一到 食物/液体）。"""
+    """从模型输出里抽 items 并对每个字段做静态 guardrail 校验（容错：截第一个 JSON 对象）。
+
+    校验规则（每字段一个静态 guardrail）：
+      name           非空、限 40 字，否则丢弃该 item；
+      type           枚举 → 归一到 “食物”/“液体”；
+      description     字符串、去换行、限 RECOG_DESC_MAX 字；
+      nutrition_tags 枚举白名单 NUTRITION_TAGS（大小写不敏感、去重、限 RECOG_MAX_TAGS 个），非法值丢弃；
+      food_signal    枚举白名单 FOOD_SIGNALS，非法值置空。"""
     try:
         obj = json.loads(content[content.index("{"): content.rindex("}") + 1])
     except Exception:
@@ -894,12 +926,24 @@ def _parse_recog(content):
     for it in items:
         if not isinstance(it, dict):
             continue
-        name = str(it.get("name", "")).strip()
+        name = str(it.get("name", "")).strip()[:40]
         if not name:
             continue
         typ = str(it.get("type", "")).strip().lower()
         is_liquid = ("液" in typ or "饮" in typ or "drink" in typ or "liquid" in typ)
-        out.append({"name": name, "type": "液体" if is_liquid else "食物"})
+        desc = str(it.get("description", "")).strip().replace("\n", " ")[:RECOG_DESC_MAX]
+        raw_tags = it.get("nutrition_tags") or []
+        if isinstance(raw_tags, str):
+            raw_tags = [raw_tags]
+        tags = []
+        for x in (raw_tags if isinstance(raw_tags, list) else []):
+            canon = _NUTR_CANON.get(str(x).strip().lower())   # 枚举白名单校验 + 规范化
+            if canon and canon not in tags:
+                tags.append(canon)
+        tags = tags[:RECOG_MAX_TAGS]
+        sig = _SIG_CANON.get(str(it.get("food_signal", "")).strip().lower(), "")  # 非法→置空
+        out.append({"name": name, "type": "液体" if is_liquid else "食物",
+                    "description": desc, "nutrition_tags": tags, "food_signal": sig})
     return out
 
 
@@ -949,11 +993,11 @@ def _recog_worker():
                     card["status"] = "empty"     # 没识别出东西：标记后前端不展示
                 continue
             if card:
-                card.update(status="done", name=items[0]["name"], type=items[0]["type"])
+                card.update(status="done", **items[0])   # name/type/description/nutrition_tags/food_signal
             for it in items[1:]:                 # 一帧多目标：其余各追加一张卡
                 _recog_id += 1
-                _recog_cards.append({"id": _recog_id, "status": "done", "name": it["name"],
-                                     "type": it["type"], "glb_url": glb_url, "frame": frame, "t": t})
+                _recog_cards.append({"id": _recog_id, "status": "done", **it,
+                                     "glb_url": glb_url, "frame": frame, "t": t})
 
 
 def _maybe_recognize(orig_rgb, detections, glb_url, frame):
@@ -973,6 +1017,7 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame):
         pending_id = _recog_id
         t = time.strftime("%H:%M:%S")
         _recog_cards.append({"id": pending_id, "status": "pending", "name": "", "type": "",
+                             "description": "", "nutrition_tags": [], "food_signal": "",
                              "glb_url": glb_url, "frame": frame, "t": t})
         if len(_recog_cards) > RECOG_MAX_CARDS:
             del _recog_cards[:len(_recog_cards) - RECOG_MAX_CARDS]
@@ -1199,13 +1244,19 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .3s}
  .thumb .tag{position:absolute;left:6px;bottom:6px;font-size:9px;font-family:var(--mono);color:#fff;
    background:rgba(10,14,20,.62);padding:1px 6px;border-radius:4px;z-index:2}
- .rbody{min-width:0;display:flex;flex-direction:column;gap:9px;justify-content:center}
- .name{font-size:15.5px;font-weight:650;letter-spacing:.2px;line-height:1.3}
- .name.pending{color:var(--faint)}
- .rtype{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;padding:2px 9px;border-radius:999px;width:fit-content}
- .rtype.food{color:var(--food);background:var(--food-soft)}.rtype.liquid{color:var(--liquid);background:var(--liquid-soft)}
- .rtype.hide{display:none}.rtype .d{width:6px;height:6px;border-radius:50%;background:currentColor}
- .meta{font-size:10.5px;color:var(--faint);font-family:var(--mono);font-variant-numeric:tabular-nums;display:flex;gap:12px}
+ .rbody{min-width:0;display:flex;flex-direction:column;gap:11px}
+ .fld{display:flex;flex-direction:column;gap:3px;min-width:0}
+ .flab{font-size:10px;letter-spacing:.3px;color:var(--faint)}
+ .name{font-size:16px;font-weight:650;line-height:1.25;display:flex;align-items:center;gap:7px;min-width:0}
+ .name.pending .nm{color:var(--faint)}
+ .tdot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:0 0 auto}
+ .tdot.food{background:var(--food)}.tdot.liquid{background:var(--liquid)}
+ .desc{font-size:13px;color:var(--muted);line-height:1.5}
+ .tags{display:flex;flex-wrap:wrap;gap:6px}
+ .chip{font-size:11.5px;font-weight:600;color:var(--accent);background:var(--accent-soft);padding:2px 9px;border-radius:999px}
+ .sig{font-size:14px;font-weight:650;color:var(--ink)}
+ .hide{display:none}
+ .meta{margin-top:2px;font-size:10.5px;color:var(--faint);font-family:var(--mono);font-variant-numeric:tabular-nums;display:flex;gap:12px}
  .caret{display:inline-block;width:2px;height:1em;background:var(--accent);vertical-align:-1px;margin-left:1px;animation:blink 1s step-end infinite}
  @keyframes blink{50%{opacity:0}}
  #shot{position:fixed;top:0;left:0;width:208px;height:277px;opacity:.01;pointer-events:none;z-index:0}
@@ -1229,9 +1280,14 @@ const typeCls=t=> t==='液体' ? 'liquid' : 'food';
 function cardEl(c){
   const el=document.createElement('div'); el.className='rcard';
   el.innerHTML='<div class="thumb"><img><span class="tag">整张点云 #'+(c.frame||'')+'</span></div>'
-    +'<div class="rbody"><div class="name pending">识别中…</div>'
-    +'<span class="rtype hide"><span class="d"></span></span>'
-    +'<div class="meta"><span>帧 '+(c.frame||'')+'</span><span>'+(c.t||'')+'</span></div></div>';
+    +'<div class="rbody">'
+    +'  <div class="fld"><div class="flab">识别对象 / Detected Food</div>'
+    +'    <div class="name pending"><span class="tdot"></span><span class="nm">识别中…</span></div></div>'
+    +'  <div class="fld f-desc hide"><div class="flab">一句话描述 / Description</div><div class="desc"></div></div>'
+    +'  <div class="fld f-tags hide"><div class="flab">营养标签 / Nutrition Tags</div><div class="tags"></div></div>'
+    +'  <div class="fld f-sig hide"><div class="flab">食物信号 / Food Signal</div><div class="sig"></div></div>'
+    +'  <div class="meta"><span>帧 '+(c.frame||'')+'</span><span>'+(c.t||'')+'</span></div>'
+    +'</div>';
   return el;
 }
 // 打字机
@@ -1301,12 +1357,23 @@ async function tick(){
   fresh.forEach(c=>{ const el=cardEl(c); feed.insertBefore(el, feed.firstChild);
     state.set(c.id,{el,typed:false,shot:false,status:c.status});
     if(c.glb_url){ state.get(c.id).shot=true; enqueueShot(c.id,c.glb_url); } });
-  // 更新已存在卡：pending→done 时打字名称 + 显示类型
+  // 更新已存在卡：pending→done 时填四字段（识别对象名称流式打字，其余淡入）
   cards.forEach(c=>{ const st=state.get(c.id); if(!st)return;
-    if(c.status==='done'&&!st.typed){ st.typed=true;
-      const nameNode=st.el.querySelector('.name'); nameNode.classList.remove('pending'); typeInto(nameNode,c.name||'');
-      const badge=st.el.querySelector('.rtype'); badge.className='rtype '+typeCls(c.type);
-      badge.innerHTML='<span class="d"></span>'+typeLabel(c.type);
+    if(c.status==='done'&&!st.typed){ st.typed=true; const el=st.el;
+      // 识别对象：色点(食物红/液体蓝) + 名称打字机
+      el.querySelector('.tdot').className='tdot '+typeCls(c.type);
+      el.querySelector('.name').classList.remove('pending');
+      typeInto(el.querySelector('.nm'), c.name||'');
+      // 一句话描述
+      if(c.description){ el.querySelector('.f-desc').classList.remove('hide');
+        el.querySelector('.desc').textContent=c.description; }
+      // 营养标签 chips
+      const tags=c.nutrition_tags||[];
+      if(tags.length){ el.querySelector('.f-tags').classList.remove('hide');
+        el.querySelector('.tags').innerHTML=tags.map(t=>'<span class="chip">'+t+'</span>').join(''); }
+      // 食物信号
+      if(c.food_signal){ el.querySelector('.f-sig').classList.remove('hide');
+        el.querySelector('.sig').textContent=c.food_signal; }
     }});
  }catch(e){}
 }
