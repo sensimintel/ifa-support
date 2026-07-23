@@ -260,7 +260,7 @@ def _locate_food_drink(rgb: np.ndarray):
                 {"type": "text",
                  "text": f"Locate all the instances that matches the following description: {LOCATE_TARGETS}."},
             ]}],
-            "max_tokens": 512, "temperature": 0.0,
+            "max_tokens": 2048, "temperature": 0.0,   # 512 会在多目标时截断响应→后面目标漏检；官方建议大 token 上限避免截断
         }
         req = urllib.request.Request(
             LOCATE_ENDPOINT, data=json.dumps(payload).encode(),
@@ -411,6 +411,14 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
         sub_pts = Xa_grid[v1:v2, u1:u2].reshape(-1, 3)[sub_valid]
         if sub_pts.shape[0] < 20:        # 框内有效深度太少，无法定位 3D 盒
             continue
+        # 深度前景提取：2D 框边缘会漏进大量远处背景点（天花板/墙），若直接对全部框内点算
+        # AABB，深度跨度被背景撑爆 → 立体框巨大且中心被背景带偏。food/drink 是画面近处的
+        # 连续一簇，只保留近侧主簇（剔除远背景）再算盒子，框才贴合目标本身。
+        _zc = -sub_pts[:, 2]                                   # 相机看 -Z，深度值 = -z（正）
+        _z0 = float(np.percentile(_zc, 10))                   # 近侧参考深度（避开个别过近噪点）
+        _fg = _zc <= max(_z0 * 1.7, _z0 + 0.08)               # 保留近侧主簇：同物体深度跨度有限
+        if int(_fg.sum()) >= 20:                              # 前景点够则用之；太少退回全体避免空框
+            sub_pts = sub_pts[_fg]
         lo = np.percentile(sub_pts, 2, axis=0)
         hi = np.percentile(sub_pts, 98, axis=0)
         hi = np.where(hi - lo < 1e-3, lo + 1e-3, hi)   # 防退化成面/线
