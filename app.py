@@ -1224,11 +1224,24 @@ function typeInto(node,text){
 }
 // 点云缩略图截图队列（串行）
 const shotQ=[]; let shotBusy=false;
-function enqueueShot(id,url){ shotQ.push({id,url}); pumpShot(); }
+const shotCache=new Map();     // url -> dataURI：同帧多卡/重复 url 只截一次、其余复用
+const shotWaiters=new Map();   // url -> [卡id]：同一 url 截好后一次性回填所有等待的卡
+function applyShot(id,uri){ const st=state.get(id); if(!st)return;
+  const img=st.el&&st.el.querySelector('.thumb img'); if(uri&&img){img.src=uri; img.style.opacity=1;} }
+function enqueueShot(id,url){
+  if(!url||!state.get(id))return;
+  if(shotCache.has(url)){ applyShot(id,shotCache.get(url)); return; }   // 同 url 已截 → 直接复用
+  if(!shotWaiters.has(url)){ shotWaiters.set(url,[]); shotQ.push(url); }
+  shotWaiters.get(url).push(id); pumpShot();
+}
 function pumpShot(){
   if(shotBusy||!shotQ.length)return; shotBusy=true;
-  const {id,url}=shotQ.shift(); const st=state.get(id);
-  if(!st||!url){shotBusy=false;return pumpShot();}
+  const url=shotQ.shift(); let done=false;
+  const finish=(uri)=>{ if(done)return; done=true;
+    if(uri&&uri.length>3000){ shotCache.set(url,uri); (shotWaiters.get(url)||[]).forEach(id=>applyShot(id,uri)); }
+    else console.warn('[recog] 缩略图截图空白 len=',uri?uri.length:0);
+    shotWaiters.delete(url); shotBusy=false; setTimeout(pumpShot,40);
+  };
   const onload=async()=>{ shot.removeEventListener('load',onload);
     try{ const c=shot.getBoundingBoxCenter(); const cz=(c.z<-0.001)?c.z:-1.5;
       shot.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
@@ -1240,15 +1253,15 @@ function pumpShot(){
     let uri='';
     for(let k=0;k<12;k++){
       await new Promise(r=>setTimeout(r,120));
-      try{ uri=shot.toDataURL('image/png'); }catch(e){ console.error('[recog] toDataURL',e); uri=''; }
+      try{ uri=shot.toDataURL('image/png'); }catch(e){ uri=''; }
       if(uri && uri.length>3000) break;
     }
-    const img=st.el&&st.el.querySelector('.thumb img');
-    if(uri && uri.length>3000 && img){ img.src=uri; img.style.opacity=1; }
-    else console.warn('[recog] 缩略图截图空白/失败 len=',uri.length);
-    shotBusy=false; setTimeout(pumpShot,40);
+    finish(uri);
   };
-  shot.addEventListener('load',onload); shot.src=url;
+  shot.addEventListener('load',onload);
+  setTimeout(()=>{ if(!done){ shot.removeEventListener('load',onload); finish(''); } }, 8000);  // 死锁兜底
+  if(shot.getAttribute('src')===url) shot.removeAttribute('src');   // 同 url 强制重载(否则 load 不触发→死锁)
+  shot.src=url;
 }
 
 async function tick(){
