@@ -685,7 +685,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
     <option value="mesh">网格 mesh（GLB · 可转视角）</option>
    </select></div>
   <div class="fld"><label>处理分辨率 process_res <span class="rngval" id="prv">504</span></label>
-   <input type="range" id="pr" min="196" max="896" step="28" value="504"></div>
+   <input type="range" id="pr" min="196" max="1120" step="28" value="504"></div>
  </div>
  <div class="glbopts" id="glbopts">
   <div class="row">
@@ -894,7 +894,7 @@ async def api_infer(
     except Exception as e:
         return JSONResponse({"error": f"读取图片失败：{e}"}, status_code=400)
     arr = np.array(img)
-    res = int(max(140, min(896, process_res)))
+    res = int(max(140, min(1120, process_res)))
     show_cam = str(show_cameras) in ("1", "true", "True", "on")
 
     model = get_model()
@@ -1213,7 +1213,7 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
     arr = np.array(img)
 
     fmt = str(config.get("export_format", "depth"))
-    res = int(max(140, min(896, int(float(config.get("process_res", PROCESS_RES))))))
+    res = int(max(140, min(1120, int(float(config.get("process_res", PROCESS_RES))))))
     conf = float(config.get("conf_thresh_percentile", 40.0))
     nmp = int(float(config.get("num_max_points", 800000)))
     show_cam = str(config.get("show_cameras", "1")) in ("1", "true", "True", "on", "显示")
