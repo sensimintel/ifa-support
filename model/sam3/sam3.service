@@ -1,0 +1,26 @@
+# SAM3 推理服务 systemd 单元（8013）。
+# 安装（按机器改三处路径后）：
+#   sudo cp sam3.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#   sudo systemctl enable --now sam3.service
+# 查日志：journalctl -u sam3 -f
+[Unit]
+Description=SAM3 Inference Server (local, 8013)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=odyss
+WorkingDirectory=/home/odyss
+Environment=SAM3_CKPT=/home/odyss/models/sam3/sam3.pt
+Environment=SAM3_PORT=8013
+Environment=SAM3_HOST=127.0.0.1
+# 固定显存上限占比（0.28×32G≈9G），与同卡其他服务隔离
+Environment=SAM3_MEM_FRACTION=0.28
+# 服务代码走仓库 checkout（~/da3-web 即 ifa-support），部署=git pull + restart
+ExecStart=/home/odyss/sam3-env/bin/python -u /home/odyss/da3-web/model/sam3/sam3_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
