@@ -34,7 +34,7 @@ import numpy as np
 import torch
 import trimesh
 from fastapi import Body, FastAPI, File, Form, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from PIL import Image, ImageOps
 
 # 把 DA3 源码目录加入 import 路径（本服务独立于 DA3 仓，只引用其 src）
@@ -619,12 +619,16 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
 
 
 def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
-                             view_tilt=18.0, view_zoom=1.0, splat=2, out_size=760):
+                             view_tilt=18.0, view_zoom=1.0, splat=2, out_size=760,
+                             mask_overlays=None):
     """方案A·服务端渲染：5090 就地把点云用 torch(GPU) 投影 + 画家算法 z-buffer + splat 渲成 2D 图，
     跳过 GLB 序列化与前端 model-viewer 全量加载。叠 food/drink 框。返回 RGB uint8；点云为空返回 None。
 
     视角固定不飘：相机钉在光心(原点)、真实相机 fov×view_zoom 投影(主体大小=真实成像→天然稳定)、
-    视线绕 x 轴俯视固定角 view_tilt(立体感)。完全不依赖每帧点云的中心/深度统计，故不会忽大忽小。"""
+    视线绕 x 轴俯视固定角 view_tilt(立体感)。完全不依赖每帧点云的中心/深度统计，故不会忽大忽小。
+
+    mask_overlays：SAM3 mask 映射，[(label, color_rgb, mask_bool(H0,W0)), ...]——mask 命中的点
+    在投影前染成该词颜色，并按 mask 命中点算 3D AABB 画框+词名（与 detections 的 2D 框链路互不影响）。"""
     import math
     depth = np.asarray(pred.depth)[0].astype(np.float32)
     H0, W0 = depth.shape
@@ -640,6 +644,12 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
         conf = np.asarray(pred.conf).astype(np.float32)
         thr = _glb.get_conf_thresh(pred, None, 0.0, conf_thresh_percentile, 90.0)
         valid &= conf[0] >= thr
+    if mask_overlays:
+        # SAM3 mask 命中的像素在投影前染成该词颜色（半透明混合），把分割结果"染"进点云本体
+        rgb = rgb.copy()
+        for (_label, col, mk) in mask_overlays:
+            rgb[mk] = (rgb[mk].astype(np.float32) * 0.5
+                       + np.array(col, np.float32) * 0.5).astype(np.uint8)
     # 反投影到相机坐标系（z>0 前方、y 向下）
     us, vs = np.meshgrid(np.arange(W0), np.arange(H0))
     pix = np.stack([us, vs, np.ones_like(us)], -1).reshape(-1, 3).astype(np.float32)
@@ -712,7 +722,114 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
             edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
             for a, b in edges:
                 cv2.line(out, (int(cu[a]), int(cv[a])), (int(cu[b]), int(cv[b])), color, 2, cv2.LINE_AA)
+    # 叠 SAM3 mask 映射框：mask 命中的有效点直接就是目标本体（无需近侧前景启发式），
+    # 2%/98% 分位算 3D AABB → 8 角投影 → 画线 + 词名
+    if mask_overlays:
+        for (label, col, mk) in mask_overlays:
+            sel = (mk & valid).reshape(-1)
+            sub = Xc_all[sel]
+            if sub.shape[0] < 20:
+                continue
+            lo = np.percentile(sub, 2, axis=0); hi = np.percentile(sub, 98, axis=0)
+            corners = np.array([[lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]], [hi[0], hi[1], lo[2]], [lo[0], hi[1], lo[2]],
+                                [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]], [hi[0], hi[1], hi[2]], [lo[0], hi[1], hi[2]]], np.float32)
+            with torch.no_grad():
+                cu, cv, _cz = project(torch.from_numpy(corners).to(dev).float())
+            cu = cu.cpu().numpy(); cv = cv.cpu().numpy()
+            edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
+            for a, b in edges:
+                cv2.line(out, (int(cu[a]), int(cv[a])), (int(cu[b]), int(cv[b])), tuple(col), 2, cv2.LINE_AA)
+            cv2.putText(out, str(label), (max(0, int(cu.min())), max(14, int(cv.min()) - 5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, tuple(col), 2, cv2.LINE_AA)
     return out
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 第三图：DA3 → SAM3 → 点云映射。processor 每帧尝试触发（后台单任务、忙时跳过本帧，不阻塞产线）：
+# 取「当前帧 + 过去 N 帧」跑 SAM3 /v1/track 序列跟踪（与第二张图同语义：food红、bottle/glass→drink蓝），
+# 最后一帧(=当前帧)的 mask 解码后映射到同一帧的 DA3 点云——mask 点染色 + 3D AABB 框，
+# 用与 cloudimg 相同的固定相机服务端渲染成图，前端 /panel 第三框轮询展示。
+# ══════════════════════════════════════════════════════════════════════
+SAM3_CLOUD_TARGETS = LOCATE_TARGETS   # 与第二张图同一套目标词/颜色语义（LA 换成 SAM3）
+_sam3cloud_lock = threading.Lock()
+_sam3cloud = {"bytes": None, "seq": 0, "meta": None, "error": None, "running": False}
+
+
+def _sam3cloud_refresh(pred, frames, conf):
+    """后台任务：SAM3 track（多词并发）→ mask 解码/缩放到深度分辨率 → 点云映射渲染 → 缓存 JPEG。"""
+    try:
+        t0 = time.time()
+        nlast = str(len(frames) - 1)
+
+        def trk_one(ql):
+            query, label = ql
+            fr = _sam3_track(frames, query, prompt_frame_index=0)
+            last = fr.get(nlast)
+            if last is None and fr:
+                last = fr[sorted(fr.keys(), key=lambda k: int(k))[-1]]
+            return (label, last or [])
+
+        with ThreadPoolExecutor(max_workers=len(SAM3_CLOUD_TARGETS)) as ex:
+            results = list(ex.map(trk_one, SAM3_CLOUD_TARGETS))
+        track_ms = (time.time() - t0) * 1000.0
+
+        depth0 = np.asarray(pred.depth)[0]
+        H0, W0 = depth0.shape
+        overlays, counts = [], {"food": 0, "drink": 0}
+        for label, insts in results:
+            col = LOCATE_COLORS.get(label, (255, 200, 0))
+            for ins in insts:
+                rle = ins.get("mask_rle") or {}
+                if not (rle.get("counts") and rle.get("size")):
+                    continue
+                try:
+                    mk = _rle_decode(rle["size"], rle["counts"])
+                except Exception as e:
+                    print(f"[da3-web] SAM3 点云映射 mask 解码失败：{type(e).__name__}: {e}", flush=True)
+                    continue
+                if mk.shape != (H0, W0):
+                    mk = cv2.resize(mk, (W0, H0), interpolation=cv2.INTER_NEAREST)
+                mk = mk.astype(bool)
+                if not mk.any():
+                    continue
+                overlays.append((label, col, mk))
+                counts[label] = counts.get(label, 0) + 1
+
+        _tr = time.time()
+        img = _render_pointcloud_image(pred, None, conf_thresh_percentile=conf,
+                                       mask_overlays=overlays)
+        render_ms = (time.time() - _tr) * 1000.0
+        if img is None:
+            raise RuntimeError("点云为空，无法渲染")
+        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+        if not ok:
+            raise RuntimeError("SAM3 点云图编码失败")
+        with _sam3cloud_lock:
+            _sam3cloud["bytes"] = buf.tobytes()
+            _sam3cloud["seq"] += 1
+            _sam3cloud["error"] = None
+            _sam3cloud["meta"] = {
+                "label": f"SAM3 跟踪→点云（food×{counts['food']}·drink×{counts['drink']}）",
+                "n_frames": len(frames), "track_ms": round(track_ms, 1),
+                "render_ms": round(render_ms, 1), "dt": round(time.time() - t0, 2)}
+    except Exception as e:
+        with _sam3cloud_lock:
+            _sam3cloud["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        with _sam3cloud_lock:
+            _sam3cloud["running"] = False
+
+
+def _maybe_sam3cloud(pred, conf):
+    """processor 每帧调用：无在跑任务则用本帧 pred + 最近帧序列后台起一个 SAM3 点云映射任务。"""
+    frames = _get_recent_frames(SAM3_TRACK_FRAMES)
+    if not frames:
+        return
+    with _sam3cloud_lock:
+        if _sam3cloud["running"]:
+            return
+        _sam3cloud["running"] = True
+    threading.Thread(target=_sam3cloud_refresh, args=(pred, frames, conf), daemon=True).start()
 
 
 def _prune_glb():
@@ -791,7 +908,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .status b{font-variant-numeric:tabular-nums}
  .status .err{color:#c1121f}
  .status .dim{color:#8e8e93}
- .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+ .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
  .grid figure{margin:0}
  .box{width:100%;height:460px;background:#0b0d10;border-radius:12px;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center}
  .box img{max-width:100%;max-height:100%;display:block}
@@ -799,11 +916,12 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .wait{color:#7a828c;font-size:14px}
  figcaption{font-size:13px;color:#6b6b70;margin-top:8px;text-align:center}
  figcaption .m{color:#8e8e93}
+ @media(max-width:1000px){.grid{grid-template-columns:1fr 1fr}}
  @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style></head><body>
 <div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <h1>Depth Anything 3 · 扩展面板</h1>
-<div class="sub">实时展示设备帧：左 = 接收到的帧，右 = DA3 产物（按下方控件实时生成）。改产物类型 / 分辨率 / 调参，右框即时重算。模型：DA3NESTED-GIANT-LARGE-1.1</div>
+<div class="sub">实时展示设备帧：① 接收到的帧 · ② DA3 产物（按下方控件实时生成）· ③ DA3→SAM3→点云映射（原图+过去5帧走 /v1/track 序列，mask 染点 + 3D 框，food红/drink蓝）。改产物类型 / 分辨率 / 调参，②框即时重算。模型：DA3NESTED-GIANT-LARGE-1.1</div>
 
 <div class="card">
  <div class="row">
@@ -859,6 +977,10 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    <span class="wait" id="prodwait">等待产物…</span>
   </div>
   <figcaption>DA3 产物 <span class="m" id="prodmeta"></span></figcaption>
+ </figure>
+ <figure>
+  <div class="box"><img id="s3img" style="display:none"><span class="wait" id="s3wait">等待 SAM3 点云映射…</span></div>
+  <figcaption>SAM3→点云映射（原图+过去5帧跟踪）<span class="m" id="s3meta"></span></figcaption>
  </figure>
 </div>
 
@@ -941,7 +1063,7 @@ function pushConfig(){
 });
 syncOpts();pushConfig();  // 首次把面板初值下发后端
 
-let lastSeq=-1,lastProdKey='',lastSwap=0;
+let lastSeq=-1,lastProdKey='',lastSwap=0,lastS3=-1;
 const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显示，避免高帧率下一直卡在"加载中"(黑屏)
 async function tick(){
  try{
@@ -983,6 +1105,20 @@ async function tick(){
       if(mv.loaded && !interacting) applyView();}}
   if(s.has_frame && s.product_seq<s.seq && !s.product_error) pm+=' <span class="dim">（处理中…）</span>';
   $('prodmeta').innerHTML=pm;
+
+  // 第三框：DA3→SAM3→点云映射（后端异步渲好的图，seq 变化才拉新图）
+  try{
+    const s3=await(await fetch('/api/sam3cloud/status',{cache:'no-store'})).json();
+    if(s3.seq && s3.seq!==lastS3){lastS3=s3.seq;
+      $('s3img').src='/api/sam3cloud/latest?t='+s3.seq;
+      $('s3img').style.display='block';$('s3wait').style.display='none';}
+    let sm='';
+    if(s3.error){sm='<span class="err">'+s3.error+'</span>';}
+    else if(s3.meta){const m=s3.meta;
+      sm=(m.label||'')+(m.track_ms?(' · 跟踪'+m.track_ms+'ms'):'')+(m.render_ms?(' · 渲染'+m.render_ms+'ms'):'');}
+    if(s3.running) sm+=' <span class="dim">（处理中…）</span>';
+    $('s3meta').innerHTML=sm;
+  }catch(e){/* 第三框轮询失败忽略 */}
 
   // 顶部状态行
   if(!s.processor){$('status').innerHTML='<span class="err">未接入 DA3 模型（纯中继）。</span>';}
@@ -1364,6 +1500,9 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
                 pred = model.inference([arr], process_res=res, export_format="mini_npz")
         infer_ms = (time.time() - t0) * 1000.0     # DA3 推理耗时（收到帧→推理完）
 
+        # 第三图：DA3→SAM3→点云映射（任意产物类型都触发；后台异步跑、忙时跳过，不阻塞产线）
+        _maybe_sam3cloud(pred, conf)
+
         if fmt == "cloudimg":
             # 方案A：服务端(5090 GPU)把点云渲成 2D 图，前端只显示图片。
             # 检测异步：渲染不等 LocateAnything，用最近缓存的框(后台按 TTL 刷新)→ 整段砍到 ~100ms。
@@ -1517,6 +1656,27 @@ def sam3_health():
     except Exception as e:
         return JSONResponse({"ok": False, "endpoint": SAM3_ENDPOINT,
                              "error": f"{type(e).__name__}: {e}"})
+
+
+@app.get("/api/sam3cloud/status")
+def sam3cloud_status():
+    """第三图（DA3→SAM3→点云映射）的最新状态：seq 变化=有新图可拉。"""
+    with _sam3cloud_lock:
+        return JSONResponse({
+            "seq": _sam3cloud["seq"], "running": _sam3cloud["running"],
+            "meta": _sam3cloud["meta"], "error": _sam3cloud["error"],
+            "endpoint": SAM3_ENDPOINT})
+
+
+@app.get("/api/sam3cloud/latest")
+def sam3cloud_latest():
+    """第三图最新 JPEG 字节。"""
+    with _sam3cloud_lock:
+        data, seq = _sam3cloud["bytes"], _sam3cloud["seq"]
+    if not data:
+        return JSONResponse({"error": "暂无 SAM3 点云映射图"}, status_code=404)
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store", "X-Sam3cloud-Seq": str(seq)})
 
 
 @app.get("/glb/{token}/{name}")
