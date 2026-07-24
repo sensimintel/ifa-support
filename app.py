@@ -799,10 +799,10 @@ def _sam3cloud_refresh(pred, frames, conf):
                 counts[label] = counts.get(label, 0) + 1
 
         _tr = time.time()
-        # 点云观感：相机固定抬升0.45m/后撤0.35m（视差+遮挡黑缝）、俯视加大、splat=1 点状离散
+        # 点云观感：相机固定抬升0.4m/后撤0.3m（视差+遮挡黑缝）、俯视20°、splat=1 点状离散
         img = _render_pointcloud_image(pred, None, conf_thresh_percentile=conf,
-                                       view_tilt=26.0, view_zoom=1.15, splat=1,
-                                       eye_lift=0.45, eye_back=0.35,
+                                       view_tilt=20.0, view_zoom=1.0, splat=1,
+                                       eye_lift=0.4, eye_back=0.3,
                                        mask_overlays=overlays)
         render_ms = (time.time() - _tr) * 1000.0
         if img is None:
