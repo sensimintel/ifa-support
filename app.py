@@ -429,6 +429,41 @@ def _sam3_track(frames_rgb, text, prompt_frame_index=0):
     return (r or {}).get("frames", {}) or {}
 
 
+# ── SAM3 流式长记忆客户端（server 端滚动窗口 + 稳定公共 obj_id）───────────────
+# 每个词一个常驻 session：每步只传当前 1 帧，窗口与身份注册表养在 server；
+# obj_id 跨请求稳定（同一物体持续在场一直同 id）。窗口长度=显存/算力旋钮。
+SAM3_STREAM_WINDOW = int(os.environ.get("SAM3_STREAM_WINDOW", "5"))
+_sam3_stream_sessions = {}      # 词 -> session_id
+_sam3_stream_lock = threading.Lock()
+
+
+def _sam3_stream_start(word):
+    r = _sam3_post("/v1/stream/start", {"text": word, "window": SAM3_STREAM_WINDOW})
+    return (r or {}).get("session_id")
+
+
+def _sam3_stream_frame(word, rgb):
+    """流式步进一帧。session 不存在/过期自动重建一次。
+    返回 (instances, global_index)；流式不可用（老 server 等）返回 (None, None)。"""
+    b64 = _b64_jpg(rgb)
+    if not b64:
+        return None, None
+    with _sam3_stream_lock:
+        sid = _sam3_stream_sessions.get(word)
+    for _retry in range(2):
+        if not sid:
+            sid = _sam3_stream_start(word)
+            if not sid:
+                return None, None
+            with _sam3_stream_lock:
+                _sam3_stream_sessions[word] = sid
+        r = _sam3_post("/v1/stream/frame", {"session_id": sid, "image_b64": b64})
+        if r is not None:
+            return (r.get("instances") or [], r.get("global_index"))
+        sid = None                    # 失败（session 被回收/服务重启）：重建一次再试
+    return None, None
+
+
 _SAM3_COLORS = [(222, 52, 52), (46, 120, 235), (26, 158, 95), (240, 150, 20),
                 (160, 80, 220), (20, 180, 200), (230, 90, 160)]
 
@@ -791,21 +826,27 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam):
         nlast = str(len(frames) - 1)
 
         def trk_one(ql):
+            """优先走流式（server 端长记忆、obj_id 跨请求稳定、每步只传 1 帧）；
+            流式不可用（老 server）回退无状态短窗口 track（obj_id 每轮重排）。"""
             query, label = ql
+            inst, gidx = _sam3_stream_frame(query, frames[-1])
+            if inst is not None:
+                return (label, inst, gidx)
             fr = _sam3_track(frames, query, prompt_frame_index=0)
             last = fr.get(nlast)
             if last is None and fr:
                 last = fr[sorted(fr.keys(), key=lambda k: int(k))[-1]]
-            return (label, last or [])
+            return (label, last or [], None)
 
         with ThreadPoolExecutor(max_workers=len(SAM3_CLOUD_TARGETS)) as ex:
             results = list(ex.map(trk_one, SAM3_CLOUD_TARGETS))
         track_ms = (time.time() - t0) * 1000.0
+        is_stream = any(g is not None for (_l, _i, g) in results)
 
         depth0 = np.asarray(pred.depth)[0]
         H0, W0 = depth0.shape
-        overlays, counts = [], {"food": 0, "drink": 0}
-        for label, insts in results:
+        overlays, id_tags = [], []
+        for label, insts, _g in results:
             col = LOCATE_COLORS.get(label, (255, 200, 0))
             for ins in insts:
                 rle = ins.get("mask_rle") or {}
@@ -821,11 +862,13 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam):
                 mk = mk.astype(bool)
                 if not mk.any():
                     continue
-                overlays.append((label, col, mk))
-                counts[label] = counts.get(label, 0) + 1
+                tag = f"{label}#{ins.get('obj_id', '?')}"
+                overlays.append((tag, col, mk))
+                id_tags.append(tag)
 
         _tr = time.time()
-        lbl = f"SAM3 跟踪→点云（food×{counts['food']}·drink×{counts['drink']}）"
+        mode = f"流式·窗口{SAM3_STREAM_WINDOW}" if is_stream else "无状态"
+        lbl = f"SAM3 {mode}→点云（{'、'.join(id_tags) if id_tags else '无目标'}）"
         if fmt == "cloudimg":
             # 与第二图 cloudimg 完全同参渲染（默认视角/splat），点云长一个样，仅框/染色不同
             img = _render_pointcloud_image(pred, None, conf_thresh_percentile=conf,
