@@ -620,7 +620,7 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
 
 def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
                              view_tilt=18.0, view_zoom=1.0, splat=2, out_size=760,
-                             mask_overlays=None):
+                             mask_overlays=None, eye_lift=0.0, eye_back=0.0):
     """方案A·服务端渲染：5090 就地把点云用 torch(GPU) 投影 + 画家算法 z-buffer + splat 渲成 2D 图，
     跳过 GLB 序列化与前端 model-viewer 全量加载。叠 food/drink 框。返回 RGB uint8；点云为空返回 None。
 
@@ -628,7 +628,9 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
     视线绕 x 轴俯视固定角 view_tilt(立体感)。完全不依赖每帧点云的中心/深度统计，故不会忽大忽小。
 
     mask_overlays：SAM3 mask 映射，[(label, color_rgb, mask_bool(H0,W0)), ...]——mask 命中的点
-    在投影前染成该词颜色，并按 mask 命中点算 3D AABB 画框+词名（与 detections 的 2D 框链路互不影响）。"""
+    在投影前染成该词颜色，并按 mask 命中点算 3D AABB 画框+词名（与 detections 的 2D 框链路互不影响）。
+    eye_lift/eye_back：相机相对光心固定抬升/后撤（米，常量、不依赖点云统计→不飘）。抬离光心
+    才有真实视差与遮挡黑缝，点云的"点状/立体"感才出来；默认 0=钉在光心（重投影≈原图）。"""
     import math
     depth = np.asarray(pred.depth)[0].astype(np.float32)
     H0, W0 = depth.shape
@@ -665,7 +667,8 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
         C = torch.from_numpy(np.ascontiguousarray(cols)).to(dev)
         # 固定虚拟相机（不依赖点云统计 → 不飘）：相机在光心(原点)，视线在正视 +z 上绕 x 轴俯视固定角 tilt。
         tilt = math.radians(view_tilt)
-        eye = torch.zeros(3, device=dev)
+        # eye 固定偏移：y 向下为正 → 抬升取 -eye_lift；z 前方为正 → 后撤取 -eye_back
+        eye = torch.tensor([0.0, -float(eye_lift), -float(eye_back)], device=dev)
         fwd = torch.tensor([0.0, math.sin(tilt), math.cos(tilt)], device=dev)   # y 向下为正 → 视线向下俯视
         right = torch.tensor([1.0, 0.0, 0.0], device=dev)
         up = torch.cross(right, fwd)                             # 相机"上"(世界 -y 方向)
@@ -796,7 +799,10 @@ def _sam3cloud_refresh(pred, frames, conf):
                 counts[label] = counts.get(label, 0) + 1
 
         _tr = time.time()
+        # 点云观感：相机固定抬升0.45m/后撤0.35m（视差+遮挡黑缝）、俯视加大、splat=1 点状离散
         img = _render_pointcloud_image(pred, None, conf_thresh_percentile=conf,
+                                       view_tilt=26.0, view_zoom=1.15, splat=1,
+                                       eye_lift=0.45, eye_back=0.35,
                                        mask_overlays=overlays)
         render_ms = (time.time() - _tr) * 1000.0
         if img is None:
