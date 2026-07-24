@@ -433,12 +433,13 @@ _SAM3_COLORS = [(222, 52, 52), (46, 120, 235), (26, 158, 95), (240, 150, 20),
                 (160, 80, 220), (20, 180, 200), (230, 90, 160)]
 
 
-def _draw_instances(rgb, instances, alpha=0.45):
-    """把 SAM3 实例画到图上：mask 半透明填色 + 轮廓 + box + obj_id/score。返回新图(RGB)。"""
+def _draw_instances(rgb, instances, color=None, label_prefix="", alpha=0.45):
+    """把 SAM3 实例画到图上：mask 半透明填色 + 轮廓 + box + [词名] #obj_id/score。返回新图(RGB)。
+    color 指定则该组统一用它(多词时每个词一色)；否则按 obj_id 分配。多词可基于上次返回图叠加。"""
     out = rgb.copy()
     H, W = out.shape[:2]
     for i, ins in enumerate(instances or []):
-        color = _SAM3_COLORS[int(ins.get("obj_id", i)) % len(_SAM3_COLORS)]
+        col = color if color is not None else _SAM3_COLORS[int(ins.get("obj_id", i)) % len(_SAM3_COLORS)]
         rle = ins.get("mask_rle") or {}
         if rle.get("counts") and rle.get("size"):
             try:
@@ -448,18 +449,19 @@ def _draw_instances(rgb, instances, alpha=0.45):
                 sel = m.astype(bool)
                 if sel.any():
                     ov = out.copy()
-                    ov[sel] = color
+                    ov[sel] = col
                     out = cv2.addWeighted(ov, alpha, out, 1 - alpha, 0)
                     cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    cv2.drawContours(out, cs, -1, color, 2)
+                    cv2.drawContours(out, cs, -1, col, 2)
             except Exception as e:
                 print(f"[da3-web] mask 解码失败：{type(e).__name__}: {e}", flush=True)
         box = ins.get("box_xywh_px")
         if box and len(box) == 4:
             x, y, bw, bh = [int(round(float(v))) for v in box]
-            cv2.rectangle(out, (x, y), (x + bw, y + bh), color, 2)
-            cv2.putText(out, "#%s %.2f" % (ins.get("obj_id", i), float(ins.get("score", 0))),
-                        (x, max(14, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+            cv2.rectangle(out, (x, y), (x + bw, y + bh), col, 2)
+            lbl = (label_prefix + " " if label_prefix else "") + "#%s %.2f" % (
+                ins.get("obj_id", i), float(ins.get("score", 0)))
+            cv2.putText(out, lbl, (x, max(14, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2, cv2.LINE_AA)
     return out
 
 
@@ -1454,29 +1456,47 @@ def recog_clear():
 
 @app.post("/api/sam3/run")
 def sam3_run(body: dict = Body(default=None)):
-    """跑一次 SAM3：当前帧单图分割 + 最近 N 帧短视频跟踪，返回三张图（原图/分割/跟踪）。"""
+    """跑一次 SAM3：当前帧单图分割 + 最近 N 帧短视频跟踪，返回三张图（原图/分割/跟踪）。
+    text 支持多词（逗号/分号分隔）：每个词并发各调一次 SAM3，合并结果、每词一色 + 词名 label。"""
     text = str(((body or {}).get("text") or SAM3_TEXT_DEFAULT)).strip() or SAM3_TEXT_DEFAULT
+    words = [w.strip() for w in re.split(r"[,，;；\n]+", text) if w.strip()][:6] or [SAM3_TEXT_DEFAULT]
     frames = _get_recent_frames(SAM3_TRACK_FRAMES)
     if not frames:
         return JSONResponse({"ok": False, "error": "还没有设备帧（等设备传帧或先在 /panel 灌一帧）"},
                             status_code=400)
     cur = frames[-1]
+    nlast = str(len(frames) - 1)
+
+    def seg_one(w):
+        return (w, _sam3_segment(cur, w))
+
+    def trk_one(w):
+        fr = _sam3_track(frames, w, prompt_frame_index=0)
+        last = fr.get(nlast)
+        if last is None and fr:
+            last = fr[sorted(fr.keys(), key=lambda k: int(k))[-1]]
+        return (w, last or [])
+
     t0 = time.time()
-    inst = _sam3_segment(cur, text)
+    with ThreadPoolExecutor(max_workers=min(6, len(words))) as ex:
+        segs = list(ex.map(seg_one, words))       # 多词并发单图分割
     seg_ms = (time.time() - t0) * 1000.0
     t1 = time.time()
-    tr = _sam3_track(frames, text, prompt_frame_index=0)
+    with ThreadPoolExecutor(max_workers=min(6, len(words))) as ex:
+        trks = list(ex.map(trk_one, words))       # 多词并发短视频跟踪
     track_ms = (time.time() - t1) * 1000.0
-    # 跟踪结果取最后一帧（对应当前帧）画出来
-    last_objs = tr.get(str(len(frames) - 1))
-    if last_objs is None and tr:
-        last_objs = tr[sorted(tr.keys(), key=lambda k: int(k))[-1]]
-    img_seg = _draw_instances(cur, inst)
-    img_trk = _draw_instances(cur, last_objs or [])
+
+    img_seg, img_trk, n_seg, n_trk = cur, cur, 0, 0
+    for wi, (w, inst) in enumerate(segs):
+        img_seg = _draw_instances(img_seg, inst, color=_SAM3_COLORS[wi % len(_SAM3_COLORS)], label_prefix=w)
+        n_seg += len(inst)
+    for wi, (w, last) in enumerate(trks):
+        img_trk = _draw_instances(img_trk, last, color=_SAM3_COLORS[wi % len(_SAM3_COLORS)], label_prefix=w)
+        n_trk += len(last)
     return JSONResponse({
-        "ok": True, "text": text, "endpoint": SAM3_ENDPOINT,
+        "ok": True, "text": text, "words": len(words), "endpoint": SAM3_ENDPOINT,
         "seg_ms": round(seg_ms, 1), "track_ms": round(track_ms, 1),
-        "n_seg": len(inst), "n_track": len(last_objs or []), "n_frames": len(frames),
+        "n_seg": n_seg, "n_track": n_trk, "n_frames": len(frames),
         "raw": "data:image/jpeg;base64," + (_b64_jpg(cur) or ""),
         "seg": "data:image/jpeg;base64," + (_b64_jpg(img_seg) or ""),
         "track": "data:image/jpeg;base64," + (_b64_jpg(img_trk) or ""),
@@ -1892,10 +1912,10 @@ SAM3_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <h1>SAM3 效果 · 原图 / 单图分割 / 短视频跟踪</h1>
  <div class="sub">取设备最近 <b id="nf">5</b> 帧：当前帧跑 <code>/v1/segment</code> 单图分割；最近 N 帧跑 <code>/v1/track</code> 跟踪（在第 0 帧下 prompt，跨帧保持 obj_id），跟踪结果画在当前帧上。</div>
  <div class="bar">
-  <label>text（英文名词短语效果最好）</label>
-  <input type="text" id="text" value="food" placeholder="如 food / bowl of rice / person eating">
+  <label>text（英文名词，多词用逗号分隔，每词一色）</label>
+  <input type="text" id="text" value="food, bottle" placeholder="如 food, bottle, person / bowl of rice">
   <button class="btn" id="run">运行一次</button>
-  <button class="btn btn2" id="auto">自动（每 6s）</button>
+  <button class="btn btn2" id="auto">自动（连续）</button>
   <span class="st" id="st">就绪</span>
  </div>
  <div class="grid">
@@ -1906,7 +1926,7 @@ SAM3_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </div>
 <script>
 const $=id=>document.getElementById(id);
-let timer=null, busy=false;
+let auto=false, busy=false;
 function show(i,uri,meta){ if(uri&&uri.length>40){ $('i'+i).src=uri; $('i'+i).style.display='block'; $('e'+i).style.display='none'; }
   if(meta!==undefined) $('m'+i).textContent=meta; }
 async function run(){
@@ -1921,14 +1941,14 @@ async function run(){
       show(2,d.seg,d.n_seg+' 个实例 · '+d.seg_ms+'ms');
       show(3,d.track,d.n_track+' 个对象 · '+d.track_ms+'ms');
       $('nf').textContent=d.n_frames;
-      $('st').innerHTML='<span class="ok">OK</span> · text="'+d.text+'" · 分割'+d.seg_ms+'ms / 跟踪'+d.track_ms+'ms';
+      $('st').innerHTML='<span class="ok">OK</span> · '+d.words+' 词 · 分割'+d.seg_ms+'ms / 跟踪'+d.track_ms+'ms';
     }
   }catch(e){ $('st').innerHTML='<span class="err">请求失败：'+e+'</span>'; }
   busy=false; $('run').disabled=false;
+  if(auto) run();   // 自动模式：跑完立刻用当前最近 5 帧再跑（背靠背，不定时）
 }
 $('run').onclick=run;
-$('auto').onclick=()=>{ if(timer){clearInterval(timer);timer=null;$('auto').textContent='自动（每 6s）';}
-  else{ timer=setInterval(run,6000); $('auto').textContent='停止自动'; run(); } };
+$('auto').onclick=()=>{ auto=!auto; $('auto').textContent=auto?'停止自动':'自动（连续）'; if(auto)run(); };
 // 首次探活
 fetch('/api/sam3/health').then(r=>r.json()).then(d=>{
   $('st').innerHTML = d.ok ? '<span class="ok">SAM3 已接通</span> · '+d.endpoint
