@@ -22,6 +22,7 @@
 | `deploy.sh` | 5090 上一键部署：`git pull` + 重启服务（systemd 优先，否则 kill+nohup） |
 | `da3-web.service` | 可选 systemd 单元（正规化开机自启/重启） |
 | `requirements.txt` | pip 依赖（不含 `depth_anything_3`，见下） |
+| `model/` | **三个模型服务（DA3 / LocateAnything / SAM3）的一键拉起脚本与部署信息**，含 SAM3 推理服务源码（流式长记忆版）与 systemd 单元，见 `model/README.md` |
 
 ## 运行
 
