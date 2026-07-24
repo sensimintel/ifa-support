@@ -1288,7 +1288,11 @@ def _recog_worker():
                     target["shots"].append(glb_url)
                     target["last_ts"] = now
                     target["t"] = t
+                    target["frame"] = frame
                     target["rev"] = target.get("rev", 0) + 1
+                    # 有更新的卡移到列表末尾（下发时反转=置顶），顺序=最近更新在前
+                    _recog_cards.remove(target)
+                    _recog_cards.append(target)
                 else:                            # 新食物：新建卡
                     _recog_id += 1
                     _recog_cards.append({
@@ -1599,7 +1603,7 @@ def weight_page():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 实时识别卡片流页：轮询 /api/recog/list，最新卡在最上；缩略图=该帧整张点云视角
+# 实时识别卡片流页：轮询 /api/recog/list，最近新建/更新的卡在最上；缩略图=该帧整张点云视角
 # （隐藏 model-viewer 加载该帧 GLB 截图）；名称流式打字；食物红 / 液体蓝。
 # ══════════════════════════════════════════════════════════════════════
 RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
@@ -1689,7 +1693,7 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <div class="head">
   <div class="l1"><h2>实时识别 · Live Recognition</h2><span class="live" id="live"><i></i>识别中</span><button class="clr" id="clr">清空</button></div>
-  <div class="sub">food/drink 命中某帧 → <code id="model">Qwen3-VL</code> 识别四字段 · 同一物 30 秒内去重合并（缩略图叠加，点击看图集）· 最新卡在最上</div>
+  <div class="sub">food/drink 命中某帧 → <code id="model">Qwen3-VL</code> 识别四字段 · 同一物 30 秒内去重合并（缩略图叠加，点击看图集）· 有更新的卡自动置顶</div>
 </div>
 <div class="feed" id="feed"><div class="empty" id="empty">等待 food/drink 命中…</div></div>
 <div class="lb" id="lb"><span class="x" id="lbx">✕</span>
@@ -1855,9 +1859,12 @@ async function tick(){
     const shots=c.shots||[]; state.set(c.id,{el, rev:c.rev||0, shots});
     renderStack(el, c.name||'', shots);
   });
-  // 已存在卡：rev 变化=去重合并了新缩略图 → 更新叠卡 + 闪 + “更新”提示（内容不改）
+  // 已存在卡：rev 变化=去重合并了新缩略图 → 置顶 + 更新叠卡/帧信息 + 闪 + “更新”提示（内容不改）
   cards.forEach(c=>{ const st=state.get(c.id); if(!st)return;
     if((c.rev||0)!==st.rev){ st.rev=c.rev||0; st.shots=c.shots||[];
+      if(feed.firstChild!==st.el) feed.insertBefore(st.el, feed.firstChild);
+      const ms=st.el.querySelectorAll('.meta span');
+      if(ms[0]) ms[0].textContent='帧 '+(c.frame||''); if(ms[1]) ms[1].textContent=c.t||'';
       renderStack(st.el, c.name||'', st.shots); flashUpdate(st.el); } });
  }catch(e){}
 }
