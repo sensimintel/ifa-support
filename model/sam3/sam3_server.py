@@ -432,12 +432,18 @@ def _step_incremental(s, img, g):
             state = _pred._get_session(s["live_sid"])["state"]
             t_new = _append_frame_to_state(state, img)
             outs = None
+            yielded = []
             with _infer_ctx():
                 for res in _pred.propagate_in_video(
                         session_id=s["live_sid"], propagation_direction="forward",
                         start_frame_idx=t_new, max_frame_num_to_track=1):
-                    if int(res["frame_index"]) == t_new:
+                    fi = int(res["frame_index"])
+                    o = res["outputs"]
+                    yielded.append((fi, None if o is None else len(np.asarray(o["out_obj_ids"]).tolist())))
+                    if fi == t_new:
                         outs = res["outputs"]
+            logger.info("增量步 t_new=%d num_frames=%d yields=%s", t_new,
+                        state["num_frames"], yielded)
             W, H = img.size
             raw = _pack(outs, W, H) if outs is not None else []
             _prune_state_caches(state, keep_from=t_new - s["window"])
