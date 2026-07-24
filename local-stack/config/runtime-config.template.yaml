@@ -1,0 +1,103 @@
+# odyss-services 本地闭环运行配置模板。
+# bootstrap.sh 会复制本文件为 runtime-config.yaml，并替换以下占位符：
+#   __PASSWORD_KEY_ID__      密码加密 key 标识
+#   __PASSWORD_KEY_B64__     RSA 2048 私钥（base64）——App 登录必需，缺失则 App 端登录请求发不出
+#   __TOKEN_SECRET__         JWT 签发密钥（随机生成）
+# 其余凭据只作用于栈内容器（postgres/redis/minio 均不对公网暴露），保持默认即可。
+
+infra:
+  http:
+    addr: ":8080"
+    log_timezone: Asia/Shanghai
+    service_tokens:
+      device_image_uri_upload: local-image-uri-service-token
+  database:
+    url: postgres://odyss:odyssadmin@postgres:5432/odyss_services?sslmode=disable
+  redis:
+    url: redis://:odyssadmin@redis:6379/0
+  object_store:
+    endpoint: http://minio:9000
+    access_key_id: odyss
+    secret_access_key: odyssadmin
+    bucket: odyss-local
+    static_bucket: odyss-local
+    use_path_style: true
+    region: us-east-1
+  llm:
+    provider: odyss_llm
+    base_url: http://llm-mock:8081/v1
+    api_key: local-mock-key
+    retry_max_attempts: 3
+    retry_initial_delay_millis: 500
+    retry_max_delay_millis: 5000
+  geocoding:
+    provider: ""
+    base_url: ""
+    api_key: ""
+    language_code: en
+    region_code: US
+    request_timeout_seconds: 5
+  mail:
+    # 闭环环境不配 SMTP：配合 dev_expose_code=true，验证码直接从 send-code 响应返回
+    smtp_host: ""
+    smtp_port: 0
+    smtp_proxy_addr: ""
+    smtp_user: ""
+    smtp_password: ""
+    from_email: ""
+    use_ssl: false
+    start_tls: false
+    max_retries: 0
+    retry_delay_seconds: 0
+    connection_timeout_seconds: 0
+    send_timeout_seconds: 0
+  delivery:
+    mode: local_fake
+    request_timeout_seconds: 0
+    retry_delay_seconds: 60
+    user_state_refresh_interval_seconds: 30
+    user_state_refresh_limit: 100
+    cleanup_interval_seconds: 0
+    cleanup_limit: 1000
+    push_target_stale_days: 270
+    fcm:
+      enabled: false
+      endpoint: ""
+      project_id: ""
+      token_url: ""
+      access_token: ""
+      service_account_json: ""
+      service_account_file: ""
+domain:
+  analysis:
+    model: local-mock-realtime-v1
+    meal_model: local-mock-meal-v1
+    prompt_language: en
+    realtime_interval_seconds: 30
+    # 本地闭环没有 inhouse vLLM 基建：显式关闭 gate，chunk 分析走 mock 的远端 LLM。
+    chunk_inhouse:
+      enabled: false
+    realtime_chunk_concurrency: 3
+    media_read_timeout_seconds: 15
+  user:
+    auth:
+      token_secret: __TOKEN_SECRET__
+      access_token_ttl_seconds: 14400
+      refresh_token_ttl_seconds: 2592000
+      admin_refresh_token_ttl_seconds: 86400
+      verification_ttl_seconds: 600
+      reset_token_ttl_seconds: 300
+      # 验证码直接在 send-code 响应返回（无邮件通道的闭环环境必须为 true）
+      dev_expose_code: true
+      cloudflare_access:
+        team_domain: ""
+        audience: ""
+    subscription:
+      default_plan: premium
+    static_files:
+      base_url: ""
+    password:
+      key_id: __PASSWORD_KEY_ID__
+      private_key_b64: "__PASSWORD_KEY_B64__"
+      required: false
+      max_skew_seconds: 300

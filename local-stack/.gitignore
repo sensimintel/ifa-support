@@ -1,0 +1,5 @@
+# 构建产物、离线镜像包、备份、运行时生成的配置（含密钥）不入库
+artifacts/
+images/
+backups/
+config/runtime-config.yaml
