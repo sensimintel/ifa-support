@@ -491,12 +491,16 @@ def _box_wireframe_meshes(lo, hi, color_rgb, radius):
 
 
 def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentile=40.0,
-                               num_max_points=800000, show_cameras=True):
+                               num_max_points=800000, show_cameras=True, mask_overlays=None):
     """自建单视图点云并叠加 food/drink 3D 检测框，导出 GLB。
 
     坐标系用「相机坐标系」（相机=原点/拍摄位置、光轴固定，仅 flip Y/Z 到 glTF 约定），
     不套 DA3 逐帧 pose、不做中位数居中——相机不动则坐标系帧间固定，点云不漂。
-    点云与框来自同一套反投影，框严格与点云对齐。返回命中的 label 列表。"""
+    点云与框来自同一套反投影，框严格与点云对齐。返回命中的 label 列表。
+
+    mask_overlays：SAM3 mask 映射，[(label, color_rgb, mask_bool(H,W)), ...]——mask 命中的点
+    染成该词颜色，并按 mask 命中点算 3D AABB 画线框。同一函数/同一 pred 下点云几何与
+    detections 链路完全一致，保证第二/三图点云长一个样。"""
     from depth_anything_3.utils.export import glb as _glb  # 复用官方对齐/相机/降采样
 
     depth = np.asarray(pred.depth).astype(np.float32)       # (N,H,W)
@@ -510,6 +514,12 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
     rgb = _rgb_uint8(pred, None)
     if rgb is None or rgb.shape[:2] != (H, W):
         rgb = np.full((H, W, 3), 180, np.uint8)
+    if mask_overlays:
+        # SAM3 mask 命中的点染成该词颜色（半透明混合），把分割结果"染"进点云本体
+        rgb = rgb.copy()
+        for (_label, _col, _mk) in mask_overlays:
+            rgb[_mk] = (rgb[_mk].astype(np.float32) * 0.5
+                        + np.array(_col, np.float32) * 0.5).astype(np.uint8)
 
     i = 0  # DA3 单图推理，只处理第 0 帧
     d = depth[i]
@@ -601,6 +611,19 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
         hi = np.where(hi - lo < 1e-3, lo + 1e-3, hi)   # 防退化成面/线
         color = LOCATE_COLORS.get(label, (255, 200, 0))
         for m in _box_wireframe_meshes(lo, hi, color, radius):
+            scene.add_geometry(m)
+        hit_labels.append(label)
+
+    # 逐 SAM3 mask：mask 命中的有效点就是目标本体（无需前景启发式），2%/98% 分位 AABB 画线框
+    for (label, col, mk) in (mask_overlays or []):
+        sel = mk & valid
+        sub_pts = Xa_grid[sel]
+        if sub_pts.shape[0] < 20:
+            continue
+        lo = np.percentile(sub_pts, 2, axis=0)
+        hi = np.percentile(sub_pts, 98, axis=0)
+        hi = np.where(hi - lo < 1e-3, lo + 1e-3, hi)
+        for m in _box_wireframe_meshes(lo, hi, tuple(col), radius):
             scene.add_geometry(m)
         hit_labels.append(label)
 
@@ -755,11 +778,14 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
 # ══════════════════════════════════════════════════════════════════════
 SAM3_CLOUD_TARGETS = LOCATE_TARGETS   # 与第二张图同一套目标词/颜色语义（LA 换成 SAM3）
 _sam3cloud_lock = threading.Lock()
-_sam3cloud = {"bytes": None, "seq": 0, "meta": None, "error": None, "running": False}
+_sam3cloud = {"kind": None, "url": None, "bytes": None, "seq": 0,
+              "meta": None, "error": None, "running": False}
 
 
-def _sam3cloud_refresh(pred, frames, conf):
-    """后台任务：SAM3 track（多词并发）→ mask 解码/缩放到深度分辨率 → 点云映射渲染 → 缓存 JPEG。"""
+def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam):
+    """后台任务：SAM3 track（多词并发）→ mask 解码/缩放到深度分辨率 → 与第二图**同源**产出：
+    fmt=cloudimg → 与第二图完全相同参数的服务端渲染图；其余 → 与第二图同一条 GLB 构建链路
+    （同一 pred、同一降采样/裁剪 → 点云几何一模一样），前端 model-viewer 相机跟随第二图。"""
     try:
         t0 = time.time()
         nlast = str(len(frames) - 1)
@@ -799,24 +825,37 @@ def _sam3cloud_refresh(pred, frames, conf):
                 counts[label] = counts.get(label, 0) + 1
 
         _tr = time.time()
-        # 点云观感：相机固定抬升0.4m/后撤0.3m（视差+遮挡黑缝）、俯视20°、splat=1 点状离散
-        img = _render_pointcloud_image(pred, None, conf_thresh_percentile=conf,
-                                       view_tilt=20.0, view_zoom=1.0, splat=1,
-                                       eye_lift=0.4, eye_back=0.3,
+        lbl = f"SAM3 跟踪→点云（food×{counts['food']}·drink×{counts['drink']}）"
+        if fmt == "cloudimg":
+            # 与第二图 cloudimg 完全同参渲染（默认视角/splat），点云长一个样，仅框/染色不同
+            img = _render_pointcloud_image(pred, None, conf_thresh_percentile=conf,
+                                           mask_overlays=overlays)
+            render_ms = (time.time() - _tr) * 1000.0
+            if img is None:
+                raise RuntimeError("点云为空，无法渲染")
+            ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+            if not ok:
+                raise RuntimeError("SAM3 点云图编码失败")
+            with _sam3cloud_lock:
+                _sam3cloud.update({"kind": "image", "bytes": buf.tobytes(), "url": None})
+        else:
+            # 与第二图同一条 GLB 构建链路：同 pred/conf/降采样/裁剪 → 几何一致，仅框来自 SAM3
+            token = uuid.uuid4().hex
+            outdir = GLB_DIR / token
+            outdir.mkdir(parents=True, exist_ok=True)
+            glb = outdir / "scene.glb"
+            build_pointcloud_boxes_glb(pred, [], str(glb), conf_thresh_percentile=conf,
+                                       num_max_points=nmp, show_cameras=show_cam,
                                        mask_overlays=overlays)
-        render_ms = (time.time() - _tr) * 1000.0
-        if img is None:
-            raise RuntimeError("点云为空，无法渲染")
-        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-        if not ok:
-            raise RuntimeError("SAM3 点云图编码失败")
+            render_ms = (time.time() - _tr) * 1000.0
+            _prune_glb()
+            with _sam3cloud_lock:
+                _sam3cloud.update({"kind": "model", "url": f"/glb/{token}/scene.glb", "bytes": None})
         with _sam3cloud_lock:
-            _sam3cloud["bytes"] = buf.tobytes()
             _sam3cloud["seq"] += 1
             _sam3cloud["error"] = None
             _sam3cloud["meta"] = {
-                "label": f"SAM3 跟踪→点云（food×{counts['food']}·drink×{counts['drink']}）",
-                "n_frames": len(frames), "track_ms": round(track_ms, 1),
+                "label": lbl, "n_frames": len(frames), "track_ms": round(track_ms, 1),
                 "render_ms": round(render_ms, 1), "dt": round(time.time() - t0, 2)}
     except Exception as e:
         with _sam3cloud_lock:
@@ -826,8 +865,9 @@ def _sam3cloud_refresh(pred, frames, conf):
             _sam3cloud["running"] = False
 
 
-def _maybe_sam3cloud(pred, conf):
-    """processor 每帧调用：无在跑任务则用本帧 pred + 最近帧序列后台起一个 SAM3 点云映射任务。"""
+def _maybe_sam3cloud(pred, conf, fmt, nmp, show_cam):
+    """processor 每帧调用：无在跑任务则用本帧 pred + 最近帧序列后台起一个 SAM3 点云映射任务。
+    fmt/nmp/show_cam 透传面板当前配置，保证第三图与第二图同源同参。"""
     frames = _get_recent_frames(SAM3_TRACK_FRAMES)
     if not frames:
         return
@@ -835,7 +875,8 @@ def _maybe_sam3cloud(pred, conf):
         if _sam3cloud["running"]:
             return
         _sam3cloud["running"] = True
-    threading.Thread(target=_sam3cloud_refresh, args=(pred, frames, conf), daemon=True).start()
+    threading.Thread(target=_sam3cloud_refresh, args=(pred, frames, conf, fmt, nmp, show_cam),
+                     daemon=True).start()
 
 
 def _prune_glb():
@@ -985,8 +1026,16 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <figcaption>DA3 产物 <span class="m" id="prodmeta"></span></figcaption>
  </figure>
  <figure>
-  <div class="box"><img id="s3img" style="display:none"><span class="wait" id="s3wait">等待 SAM3 点云映射…</span></div>
-  <figcaption>SAM3→点云映射（原图+过去5帧跟踪）<span class="m" id="s3meta"></span></figcaption>
+  <div class="box">
+   <img id="s3img" style="display:none">
+   <model-viewer id="mv2" style="display:none" touch-action="none"
+     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
+     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
+     min-field-of-view="10deg" max-field-of-view="60deg"
+     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
+   <span class="wait" id="s3wait">等待 SAM3 点云映射…</span>
+  </div>
+  <figcaption>SAM3→点云映射（同②点云 · 相机跟随②）<span class="m" id="s3meta"></span></figcaption>
  </figure>
 </div>
 
@@ -1046,6 +1095,20 @@ mv.addEventListener('camera-change',(e)=>{ if(e.detail && e.detail.source==='use
 // 每帧点云载入后：用户正在拖则不打断，否则回到所选固定视角
 mv.addEventListener('load',()=>{ if(!interacting) applyView(); });
 
+// ── 第三框相机跟随第二框（单向同步：拖②、③跟着转，保证两团点云永远同一视角） ──
+const mv2=$('mv2');
+function syncS3Cam(){
+  if(mv2.style.display==='none'||!mv2.loaded)return;
+  try{
+    mv2.cameraOrbit=mv.getCameraOrbit().toString();
+    mv2.cameraTarget=mv.getCameraTarget().toString();
+    mv2.fieldOfView=mv.getFieldOfView()+'deg';
+    mv2.jumpCameraToGoal&&mv2.jumpCameraToGoal();
+  }catch(e){}
+}
+mv.addEventListener('camera-change',syncS3Cam);
+mv2.addEventListener('load',syncS3Cam);
+
 function currentConfig(){return {
   export_format:$('fmt').value,
   process_res:+$('pr').value,
@@ -1069,7 +1132,7 @@ function pushConfig(){
 });
 syncOpts();pushConfig();  // 首次把面板初值下发后端
 
-let lastSeq=-1,lastProdKey='',lastSwap=0,lastS3=-1;
+let lastSeq=-1,lastProdKey='',lastSwap=0,lastS3=-1,lastSwap3=0;
 const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显示，避免高帧率下一直卡在"加载中"(黑屏)
 async function tick(){
  try{
@@ -1112,12 +1175,23 @@ async function tick(){
   if(s.has_frame && s.product_seq<s.seq && !s.product_error) pm+=' <span class="dim">（处理中…）</span>';
   $('prodmeta').innerHTML=pm;
 
-  // 第三框：DA3→SAM3→点云映射（后端异步渲好的图，seq 变化才拉新图）
+  // 第三框：DA3→SAM3→点云映射（与②同源：model=GLB 相机跟随②；image=同参 cloudimg 渲染）
   try{
     const s3=await(await fetch('/api/sam3cloud/status',{cache:'no-store'})).json();
-    if(s3.seq && s3.seq!==lastS3){lastS3=s3.seq;
-      $('s3img').src='/api/sam3cloud/latest?t='+s3.seq;
-      $('s3img').style.display='block';$('s3wait').style.display='none';}
+    if(s3.seq && s3.seq!==lastS3){
+      if(s3.kind==='model' && s3.url){
+        // 与②同款换模型节流：上一个没加载完不换、加载完至少停 MIN_SWAP_MS
+        if((mv2.loaded || !mv2.getAttribute('src')) && Date.now()-lastSwap3>=MIN_SWAP_MS){
+          lastSwap3=Date.now(); lastS3=s3.seq;
+          mv2.src=s3.url;
+          mv2.style.display='block';$('s3img').style.display='none';$('s3wait').style.display='none';
+        }
+      }else if(s3.kind==='image'){
+        lastS3=s3.seq;
+        $('s3img').src='/api/sam3cloud/latest?t='+s3.seq;
+        $('s3img').style.display='block';mv2.style.display='none';$('s3wait').style.display='none';
+      }
+    }
     let sm='';
     if(s3.error){sm='<span class="err">'+s3.error+'</span>';}
     else if(s3.meta){const m=s3.meta;
@@ -1507,7 +1581,7 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
         infer_ms = (time.time() - t0) * 1000.0     # DA3 推理耗时（收到帧→推理完）
 
         # 第三图：DA3→SAM3→点云映射（任意产物类型都触发；后台异步跑、忙时跳过，不阻塞产线）
-        _maybe_sam3cloud(pred, conf)
+        _maybe_sam3cloud(pred, conf, fmt, nmp, show_cam)
 
         if fmt == "cloudimg":
             # 方案A：服务端(5090 GPU)把点云渲成 2D 图，前端只显示图片。
@@ -1666,10 +1740,12 @@ def sam3_health():
 
 @app.get("/api/sam3cloud/status")
 def sam3cloud_status():
-    """第三图（DA3→SAM3→点云映射）的最新状态：seq 变化=有新图可拉。"""
+    """第三图（DA3→SAM3→点云映射）的最新状态：seq 变化=有新产物可拉。
+    kind=model → url 给 model-viewer 加载（相机跟随第二图）；kind=image → 拉 /latest。"""
     with _sam3cloud_lock:
         return JSONResponse({
             "seq": _sam3cloud["seq"], "running": _sam3cloud["running"],
+            "kind": _sam3cloud["kind"], "url": _sam3cloud["url"],
             "meta": _sam3cloud["meta"], "error": _sam3cloud["error"],
             "endpoint": SAM3_ENDPOINT})
 
