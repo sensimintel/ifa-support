@@ -33,7 +33,7 @@ import gradio as gr
 import numpy as np
 import torch
 import trimesh
-from fastapi import FastAPI, File, Form, UploadFile
+from fastapi import Body, FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from PIL import Image, ImageOps
 
@@ -333,6 +333,134 @@ def _detections_async(arr):
             _locate_cache["running"] = True
             threading.Thread(target=_locate_refresh, args=(arr.copy(),), daemon=True).start()
     return dets
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SAM3（6000pro / GCP g4-01 的 8001，自定义 REST、无鉴权；经隧道映射到 5090 本地端口）
+#   · POST /v1/segment 单图分割：{image_b64, text} → instances[{obj_id,score,box_xywh_px,mask_rle}]
+#   · POST /v1/track   短视频跟踪：{frames_b64[], text, prompt_frame_index} → frames{帧idx:[objs]}
+#   · mask 是 COCO 压缩 RLE，本文件自带解码（5090 无 pycocotools，不额外装依赖）
+# ══════════════════════════════════════════════════════════════════════
+SAM3_ENDPOINT = os.environ.get("SAM3_ENDPOINT", "http://127.0.0.1:8012").rstrip("/")
+SAM3_TIMEOUT = float(os.environ.get("SAM3_TIMEOUT", "60"))
+SAM3_TEXT_DEFAULT = os.environ.get("SAM3_TEXT", "food")
+SAM3_TRACK_FRAMES = 5          # 跟踪用最近几帧
+
+_recent_frames = []            # 最近若干帧 RGB（供 SAM3 track）
+_recent_lock = threading.Lock()
+
+
+def _push_recent_frame(rgb):
+    """processor 每处理一帧就存一份，供 SAM3 track 取"过去 N 张图"。"""
+    with _recent_lock:
+        _recent_frames.append(rgb.copy())
+        keep = SAM3_TRACK_FRAMES + 3
+        if len(_recent_frames) > keep:
+            del _recent_frames[:len(_recent_frames) - keep]
+
+
+def _get_recent_frames(n):
+    with _recent_lock:
+        return list(_recent_frames[-n:])
+
+
+def _rle_decode(size, counts):
+    """COCO 压缩 RLE → (H,W) uint8 0/1（run-length 列优先）。"""
+    h, w = int(size[0]), int(size[1])
+    s = counts if isinstance(counts, str) else counts.decode()
+    cnts, p = [], 0
+    while p < len(s):
+        x, k, more = 0, 0, 1
+        while more:
+            c = ord(s[p]) - 48
+            x |= (c & 0x1f) << (5 * k)
+            more = c & 0x20
+            p += 1
+            k += 1
+            if not more and (c & 0x10):
+                x |= (-1) << (5 * k)
+        if len(cnts) > 2:
+            x += cnts[-2]
+        cnts.append(x)
+    mask = np.zeros(h * w, np.uint8)
+    idx, val = 0, 0
+    for c in cnts:
+        c = max(0, int(c))
+        if idx >= h * w:
+            break
+        mask[idx:idx + c] = val
+        idx += c
+        val ^= 1
+    return mask.reshape((h, w), order="F")
+
+
+def _b64_jpg(rgb):
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    return base64.b64encode(buf.tobytes()).decode() if ok else None
+
+
+def _sam3_post(path, payload):
+    try:
+        req = urllib.request.Request(SAM3_ENDPOINT + path, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=SAM3_TIMEOUT) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        print(f"[da3-web] SAM3 {path} 失败：{type(e).__name__}: {e}", flush=True)
+        return None
+
+
+def _sam3_segment(rgb, text):
+    """单图分割 → instances 列表；失败返回 []。"""
+    b64 = _b64_jpg(rgb)
+    if not b64:
+        return []
+    r = _sam3_post("/v1/segment", {"image_b64": b64, "text": text})
+    return (r or {}).get("instances", []) or []
+
+
+def _sam3_track(frames_rgb, text, prompt_frame_index=0):
+    """短视频跟踪（按时间顺序的多帧）→ {帧idx(str): [objs]}；失败返回 {}。"""
+    fb = [x for x in (_b64_jpg(f) for f in frames_rgb) if x]
+    if not fb:
+        return {}
+    r = _sam3_post("/v1/track", {"frames_b64": fb, "text": text,
+                                 "prompt_frame_index": int(prompt_frame_index)})
+    return (r or {}).get("frames", {}) or {}
+
+
+_SAM3_COLORS = [(222, 52, 52), (46, 120, 235), (26, 158, 95), (240, 150, 20),
+                (160, 80, 220), (20, 180, 200), (230, 90, 160)]
+
+
+def _draw_instances(rgb, instances, alpha=0.45):
+    """把 SAM3 实例画到图上：mask 半透明填色 + 轮廓 + box + obj_id/score。返回新图(RGB)。"""
+    out = rgb.copy()
+    H, W = out.shape[:2]
+    for i, ins in enumerate(instances or []):
+        color = _SAM3_COLORS[int(ins.get("obj_id", i)) % len(_SAM3_COLORS)]
+        rle = ins.get("mask_rle") or {}
+        if rle.get("counts") and rle.get("size"):
+            try:
+                m = _rle_decode(rle["size"], rle["counts"])
+                if m.shape != (H, W):
+                    m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+                sel = m.astype(bool)
+                if sel.any():
+                    ov = out.copy()
+                    ov[sel] = color
+                    out = cv2.addWeighted(ov, alpha, out, 1 - alpha, 0)
+                    cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(out, cs, -1, color, 2)
+            except Exception as e:
+                print(f"[da3-web] mask 解码失败：{type(e).__name__}: {e}", flush=True)
+        box = ins.get("box_xywh_px")
+        if box and len(box) == 4:
+            x, y, bw, bh = [int(round(float(v))) for v in box]
+            cv2.rectangle(out, (x, y), (x + bw, y + bh), color, 2)
+            cv2.putText(out, "#%s %.2f" % (ins.get("obj_id", i), float(ins.get("score", 0))),
+                        (x, max(14, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+    return out
 
 
 def _box_wireframe_meshes(lo, hi, color_rgb, radius):
@@ -1212,6 +1340,8 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
         raise RuntimeError(f"读取图片失败：{e}")
     arr = np.array(img)
 
+    _push_recent_frame(arr)        # 存最近帧，供 /sam3 的短视频跟踪取「过去 N 张图」
+
     fmt = str(config.get("export_format", "depth"))
     res = int(max(140, min(1120, int(float(config.get("process_res", PROCESS_RES))))))
     conf = float(config.get("conf_thresh_percentile", 40.0))
@@ -1320,6 +1450,49 @@ def recog_clear():
     with _recog_lock:
         _recog_cards.clear()
     return JSONResponse({"ok": True})
+
+
+@app.post("/api/sam3/run")
+def sam3_run(body: dict = Body(default=None)):
+    """跑一次 SAM3：当前帧单图分割 + 最近 N 帧短视频跟踪，返回三张图（原图/分割/跟踪）。"""
+    text = str(((body or {}).get("text") or SAM3_TEXT_DEFAULT)).strip() or SAM3_TEXT_DEFAULT
+    frames = _get_recent_frames(SAM3_TRACK_FRAMES)
+    if not frames:
+        return JSONResponse({"ok": False, "error": "还没有设备帧（等设备传帧或先在 /panel 灌一帧）"},
+                            status_code=400)
+    cur = frames[-1]
+    t0 = time.time()
+    inst = _sam3_segment(cur, text)
+    seg_ms = (time.time() - t0) * 1000.0
+    t1 = time.time()
+    tr = _sam3_track(frames, text, prompt_frame_index=0)
+    track_ms = (time.time() - t1) * 1000.0
+    # 跟踪结果取最后一帧（对应当前帧）画出来
+    last_objs = tr.get(str(len(frames) - 1))
+    if last_objs is None and tr:
+        last_objs = tr[sorted(tr.keys(), key=lambda k: int(k))[-1]]
+    img_seg = _draw_instances(cur, inst)
+    img_trk = _draw_instances(cur, last_objs or [])
+    return JSONResponse({
+        "ok": True, "text": text, "endpoint": SAM3_ENDPOINT,
+        "seg_ms": round(seg_ms, 1), "track_ms": round(track_ms, 1),
+        "n_seg": len(inst), "n_track": len(last_objs or []), "n_frames": len(frames),
+        "raw": "data:image/jpeg;base64," + (_b64_jpg(cur) or ""),
+        "seg": "data:image/jpeg;base64," + (_b64_jpg(img_seg) or ""),
+        "track": "data:image/jpeg;base64," + (_b64_jpg(img_trk) or ""),
+    })
+
+
+@app.get("/api/sam3/health")
+def sam3_health():
+    """SAM3 服务健康（经隧道）。"""
+    try:
+        with urllib.request.urlopen(SAM3_ENDPOINT + "/health", timeout=6) as r:
+            return JSONResponse({"ok": True, "endpoint": SAM3_ENDPOINT,
+                                 "health": json.loads(r.read().decode())})
+    except Exception as e:
+        return JSONResponse({"ok": False, "endpoint": SAM3_ENDPOINT,
+                             "error": f"{type(e).__name__}: {e}"})
 
 
 @app.get("/glb/{token}/{name}")
@@ -1677,6 +1850,98 @@ setInterval(tick,700); tick();
 def recog_page():
     """实时识别卡片流页（首页右栏 iframe）。"""
     return RECOG_PAGE
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SAM3 效果页：三图并排（原图 / 单图分割 / 短视频跟踪·过去 N 帧）
+# ══════════════════════════════════════════════════════════════════════
+SAM3_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SAM3 效果</title>
+<style>
+ :root{--bg:#f4f5f7;--panel:#fff;--ink:#1b1e24;--muted:#69707b;--faint:#98a0ac;--line:#e5e8ec;
+   --accent:#0071e3;--accent-soft:#e7f1fd;--ok:#1a9e5f;--err:#de3434;
+   --mono:ui-monospace,"SF Mono",Menlo,monospace;--sans:-apple-system,BlinkMacSystemFont,system-ui,"PingFang SC",sans-serif}
+ @media (prefers-color-scheme:dark){:root{--bg:#0c0e11;--panel:#15181d;--ink:#e8eaed;--muted:#98a1ad;--faint:#6b7480;--line:#262b32;--accent:#3b9bff;--accent-soft:#132436}}
+ *{box-sizing:border-box}
+ body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5}
+ .nav{display:flex;gap:16px;align-items:center;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);font-size:13px}
+ .nav a{color:var(--muted);text-decoration:none}.nav a.active{color:var(--accent);font-weight:600}
+ .wrap{padding:16px 18px 40px;max-width:1500px;margin:0 auto}
+ h1{font-size:17px;margin:2px 0 4px;font-weight:650}
+ .sub{font-size:12.5px;color:var(--muted);margin-bottom:14px}
+ .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:14px}
+ .bar label{font-size:12.5px;color:var(--muted)}
+ .bar input[type=text]{font-size:13px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);width:220px}
+ .btn{font-size:13px;font-weight:600;color:#fff;background:var(--accent);border:0;padding:7px 16px;border-radius:8px;cursor:pointer}
+ .btn:disabled{opacity:.5;cursor:default}
+ .btn2{background:var(--panel);color:var(--muted);border:1px solid var(--line)}
+ .st{font-size:12px;font-family:var(--mono);color:var(--faint);margin-left:auto}
+ .st .ok{color:var(--ok)}.st .err{color:var(--err)}
+ .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+ @media (max-width:1000px){.grid{grid-template-columns:1fr}}
+ figure{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+ figure .cap{padding:9px 12px;font-size:12.5px;font-weight:600;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
+ figure .cap span{font-weight:400;color:var(--faint);font-family:var(--mono);font-size:11px;margin-left:auto}
+ figure .box{background:#10141a;display:flex;align-items:center;justify-content:center;min-height:260px}
+ figure img{width:100%;display:block}
+ .empty{color:var(--faint);font-size:13px;padding:40px 10px;text-align:center}
+</style></head><body>
+<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a href="/recog">实时识别</a><a class="active" href="/sam3">SAM3 效果</a><a href="/" style="margin-left:auto">↗ 对比首页</a></div>
+<div class="wrap">
+ <h1>SAM3 效果 · 原图 / 单图分割 / 短视频跟踪</h1>
+ <div class="sub">取设备最近 <b id="nf">5</b> 帧：当前帧跑 <code>/v1/segment</code> 单图分割；最近 N 帧跑 <code>/v1/track</code> 跟踪（在第 0 帧下 prompt，跨帧保持 obj_id），跟踪结果画在当前帧上。</div>
+ <div class="bar">
+  <label>text（英文名词短语效果最好）</label>
+  <input type="text" id="text" value="food" placeholder="如 food / bowl of rice / person eating">
+  <button class="btn" id="run">运行一次</button>
+  <button class="btn btn2" id="auto">自动（每 6s）</button>
+  <span class="st" id="st">就绪</span>
+ </div>
+ <div class="grid">
+  <figure><div class="cap">① 原图 <span id="m1"></span></div><div class="box"><div class="empty" id="e1">点「运行一次」</div><img id="i1" style="display:none"></div></figure>
+  <figure><div class="cap">② 单图分割 /v1/segment <span id="m2"></span></div><div class="box"><div class="empty" id="e2">—</div><img id="i2" style="display:none"></div></figure>
+  <figure><div class="cap">③ 短视频跟踪 /v1/track <span id="m3"></span></div><div class="box"><div class="empty" id="e3">—</div><img id="i3" style="display:none"></div></figure>
+ </div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let timer=null, busy=false;
+function show(i,uri,meta){ if(uri&&uri.length>40){ $('i'+i).src=uri; $('i'+i).style.display='block'; $('e'+i).style.display='none'; }
+  if(meta!==undefined) $('m'+i).textContent=meta; }
+async function run(){
+  if(busy)return; busy=true; $('run').disabled=true; $('st').textContent='跑 SAM3 中…';
+  try{
+    const r=await fetch('/api/sam3/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:$('text').value||'food'})});
+    const d=await r.json();
+    if(!d.ok){ $('st').innerHTML='<span class="err">'+(d.error||'失败')+'</span>'; }
+    else{
+      show(1,d.raw,'最近 '+d.n_frames+' 帧');
+      show(2,d.seg,d.n_seg+' 个实例 · '+d.seg_ms+'ms');
+      show(3,d.track,d.n_track+' 个对象 · '+d.track_ms+'ms');
+      $('nf').textContent=d.n_frames;
+      $('st').innerHTML='<span class="ok">OK</span> · text="'+d.text+'" · 分割'+d.seg_ms+'ms / 跟踪'+d.track_ms+'ms';
+    }
+  }catch(e){ $('st').innerHTML='<span class="err">请求失败：'+e+'</span>'; }
+  busy=false; $('run').disabled=false;
+}
+$('run').onclick=run;
+$('auto').onclick=()=>{ if(timer){clearInterval(timer);timer=null;$('auto').textContent='自动（每 6s）';}
+  else{ timer=setInterval(run,6000); $('auto').textContent='停止自动'; run(); } };
+// 首次探活
+fetch('/api/sam3/health').then(r=>r.json()).then(d=>{
+  $('st').innerHTML = d.ok ? '<span class="ok">SAM3 已接通</span> · '+d.endpoint
+                           : '<span class="err">SAM3 未接通</span> · '+d.endpoint+' · '+(d.error||'');
+}).catch(()=>{});
+</script>
+</body></html>"""
+
+
+@app.get("/sam3", response_class=HTMLResponse)
+def sam3_page():
+    """SAM3 效果页：原图 / 单图分割 / 短视频跟踪 三图并排。"""
+    return SAM3_PAGE
 
 
 # ══════════════════════════════════════════════════════════════════════
