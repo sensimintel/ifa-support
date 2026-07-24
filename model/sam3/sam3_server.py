@@ -431,19 +431,17 @@ def _step_incremental(s, img, g):
         with _LOCK:
             state = _pred._get_session(s["live_sid"])["state"]
             t_new = _append_frame_to_state(state, img)
+            # 清空 action_history：上游按"交互 demo"语义解析它，第二次 propagate 起会判成
+            # propagation_fetch（只取缓存、不跑模型）→ 新帧无缓存输出恒空。清空则每步都走
+            # propagation_full（真检测+跟踪），处理范围仍被 start/max 钳在新帧这一帧。
+            state["action_history"].clear()
             outs = None
-            yielded = []
             with _infer_ctx():
                 for res in _pred.propagate_in_video(
                         session_id=s["live_sid"], propagation_direction="forward",
                         start_frame_idx=t_new, max_frame_num_to_track=1):
-                    fi = int(res["frame_index"])
-                    o = res["outputs"]
-                    yielded.append((fi, None if o is None else len(np.asarray(o["out_obj_ids"]).tolist())))
-                    if fi == t_new:
+                    if int(res["frame_index"]) == t_new:
                         outs = res["outputs"]
-            logger.info("增量步 t_new=%d num_frames=%d yields=%s", t_new,
-                        state["num_frames"], yielded)
             W, H = img.size
             raw = _pack(outs, W, H) if outs is not None else []
             _prune_state_caches(state, keep_from=t_new - s["window"])
