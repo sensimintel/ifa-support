@@ -1,0 +1,6 @@
+{
+  "id": "local-stack",
+  "label": "本地栈",
+  "apiBase": "/admin-api",
+  "features": ["device-observability", "device-bindings"]
+}
