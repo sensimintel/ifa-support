@@ -178,6 +178,12 @@ def _append_frame_to_state(state, pil_img):
     state["per_frame_geometric_prompt"].append(None)
     state["per_frame_cur_step"].append(0)
     state["num_frames"] = t + 1
+    # SAM2 层子 state（每个对象桶一个）也各自持有定长 num_frames——不同步扩，tracker 对新帧号
+    # 的 propagate 会得到空处理序列（实测 out_frame_idx 未赋值报错）。其余字段全是按帧号的字典，
+    # 无需扩容；之后新建的子 state 用外层 num_frames，天然是新值。
+    for ts_sub in state.get("tracker_inference_states", []):
+        if isinstance(ts_sub, dict) and "num_frames" in ts_sub:
+            ts_sub["num_frames"] = t + 1
     return t
 
 
