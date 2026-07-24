@@ -1,13 +1,20 @@
-# Grafana 数据源自动配置：指向 IAP 隧道在本机的落地端口。
-# network_mode: host 下容器共享宿主 loopback，127.0.0.1:${LOCAL_PROM_PORT} 即隧道落地口，
-# 隧道另一端是 GCP gpu-g4-01 上 loopback 的 Prometheus。
-# ${LOCAL_PROM_PORT} 由 docker-compose 注入容器环境后被 Grafana 插值。
+# Grafana 数据源自动配置（统一视图：两台服务器各一个 Prometheus 数据源）。
+# network_mode: host 下容器共享宿主 loopback，直接读 127.0.0.1 上的端口。
 apiVersion: 1
 datasources:
-  - name: Prometheus
+  # 数据源①：5090 本机 Prometheus（LocateAnything 观测栈）。默认 9091（9090 被 mihomo 占）
+  - name: 5090 Prometheus (本机)
     uid: prometheus
     type: prometheus
     access: proxy
     url: http://127.0.0.1:${LOCAL_PROM_PORT}
     isDefault: true
-    editable: true
+    editable: false
+  # 数据源②：g4-01（算力，GCP）Prometheus，经 frp STCP 隧道落地。默认 29090
+  - name: g4-01 Prometheus (算力)
+    uid: g4-01-prometheus
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:${G4_PROM_LOCAL_PORT}
+    isDefault: false
+    editable: false

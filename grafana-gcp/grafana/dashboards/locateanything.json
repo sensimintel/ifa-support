@@ -1,0 +1,234 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "title": "LocateAnything 服务观测",
+  "uid": "locateanything",
+  "tags": ["locateanything", "vllm"],
+  "time": { "from": "now-24h", "to": "now" },
+  "refresh": "30s",
+  "templating": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "接口 QPS(按端点)",
+      "description": "gateway 侧按接口统计的成功请求速率。batch=批量接口调用次数，batch_item=批量内实际推理次数，chat_completions=单请求。",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (endpoint) (rate(gateway_requests_total{status=\"ok\"}[5m]))", "legendFormat": "{{endpoint}} (5m)" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(gateway_requests_total{status=\"ok\"}[1m]))", "legendFormat": "总 (1m峰值敏感)" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "running / waiting(vLLM 队列)",
+      "description": "vLLM 正在执行(running)与排队等待(waiting)的请求数。waiting 持续>0 说明到达率超过处理能力。",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:num_requests_running", "legendFormat": "running" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:num_requests_waiting", "legendFormat": "waiting" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "端到端延时 p50/p95/p99(gateway，含ViT)",
+      "description": "gateway 端到端处理耗时分位，最贴近用户感知(含 ViT 视觉编码 + vLLM 生成)。",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(gateway_request_duration_seconds_bucket[5m])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_request_duration_seconds_bucket[5m])))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(gateway_request_duration_seconds_bucket[5m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "vLLM e2e 延时 p50/p95/p99",
+      "description": "vLLM 引擎侧端到端延时(不含 gateway 的 ViT 段)。",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[5m])))", "legendFormat": "p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[5m])))", "legendFormat": "p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, sum by (le) (rate(vllm:e2e_request_latency_seconds_bucket[5m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "ViT 执行/排队 · vLLM 段 p95",
+      "description": "ViT执行=纯 _build_embeds(不含排队)；ViT排队=等 VIT_SEM 限流锁(仅并发争用时显著)；vLLM=调 vLLM 生成。三者均不含图片下载。",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_vit_seconds_bucket[5m])))", "legendFormat": "ViT执行 p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_vit_queue_seconds_bucket[5m])))", "legendFormat": "ViT排队 p95" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_vllm_seconds_bucket[5m])))", "legendFormat": "vLLM p95" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "TTFT / 排队等待 p95(vLLM)",
+      "description": "首 token 时间与 WAITING 阶段排队时间的 p95。",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))", "legendFormat": "TTFT p95" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(vllm:request_queue_time_seconds_bucket[5m])))", "legendFormat": "queue p95" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "生成吞吐 tok/s",
+      "description": "vLLM 每秒生成 token 数。",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(vllm:generation_tokens_total[5m]))", "legendFormat": "generation tok/s" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "KV cache 使用率",
+      "description": "vLLM KV-cache 占用比例(1=100%)。",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:kv_cache_usage_perc", "legendFormat": "kv usage" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "gateway in-flight(按端点)",
+      "description": "gateway 侧正在处理中的请求数，区别于 vLLM 的 running。",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "gateway_inflight_requests", "legendFormat": "{{endpoint}}" }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "图片下载/其他开销 avg(端到端 − 推理段)",
+      "description": "两条线：端到端 avg 与 推理段(ViT执行+ViT排队+vLLM) avg。两者差距≈图片下载等 gateway 其他开销。若用国外图 URL 下载慢/超时，端到端会明显抬高、与推理段拉开；生产用 data URL/内网图应贴近推理段。样本口径略有差异，趋势参考。",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum(rate(gateway_request_duration_seconds_sum[5m]))/sum(rate(gateway_request_duration_seconds_count[5m]))", "legendFormat": "端到端 avg" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "(sum(rate(gateway_vit_seconds_sum[5m]))+sum(rate(gateway_vit_queue_seconds_sum[5m]))+sum(rate(gateway_vllm_seconds_sum[5m])))/sum(rate(gateway_vit_seconds_count[5m]))", "legendFormat": "推理段 avg(ViT+排队+vLLM)" }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "图片下载 / 解码耗时 p50/p95",
+      "description": "直接测量的图片下载(http/https 远程拉取)与 PIL 解码耗时，把端到端里最大的黑盒拆出来。下载 p95 高=图源慢/网络慢；data URL 内联请求下载记 0 不计入。",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.50, sum by (le) (rate(gateway_image_download_seconds_bucket[5m])))", "legendFormat": "下载 p50" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_image_download_seconds_bucket[5m])))", "legendFormat": "下载 p95" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_image_decode_seconds_bucket[5m])))", "legendFormat": "解码 p95" }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "executor 排队等待 p95 · 线程占用/容量",
+      "description": "gateway_executor_queue_seconds=请求在线程池外排队等待(p95)；active=正在占用的线程数，capacity=MAX_WORKERS。排队 p95>0 且 active 顶到 capacity=线程池打满、请求在排队，应调大 MAX_WORKERS。这是本次 MAX_WORKERS=1 串行瓶颈的直接监控点。",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [ { "matcher": { "id": "byName", "options": "排队 p95" }, "properties": [ { "id": "unit", "value": "s" } ] } ] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.95, sum by (le) (rate(gateway_executor_queue_seconds_bucket[5m])))", "legendFormat": "排队 p95" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "gateway_executor_active_threads", "legendFormat": "active 线程" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "gateway_executor_capacity", "legendFormat": "capacity(MAX_WORKERS)" }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "vLLM 并发利用率(running / max_num_seqs)",
+      "description": "vLLM 正在执行的请求数占其最大批并发(--max-num-seqs=16)的比例。长期贴近 0(如 running=1→6%)说明上游把请求串行喂进来了、16 路 batching 被架空;贴近 1 才是喂满。",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "vllm:num_requests_running / 16", "legendFormat": "利用率(running/16)" }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "网关错误率 / 超时(按 status)",
+      "description": "非 ok 请求速率(按 endpoint/status)。413=图过大、502=vLLM 后端错、error=未捕获异常、503=模型未就绪。任何一条持续>0 都要查。",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "sum by (endpoint, status) (rate(gateway_requests_total{status!=\"ok\"}[5m]))", "legendFormat": "{{endpoint}}/{{status}}" }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "GPU 利用率",
+      "description": "nvidia-smi 上报的 GPU 计算利用率(1=100%)。配合 KV cache/吞吐判断是算力打满还是空转。指标名随 exporter 版本可能不同，上线时以 9835/metrics 实际名为准。",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 56 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "nvidia_smi_utilization_gpu_ratio", "legendFormat": "GPU util" }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "GPU 显存占用",
+      "description": "GPU 已用显存(字节)。vLLM(0.30) + gateway ViT(0.40) 常驻约 15GB。",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 56 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "nvidia_smi_memory_used_bytes", "legendFormat": "used" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "nvidia_smi_memory_total_bytes", "legendFormat": "total" }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "GPU 功耗 / 温度",
+      "description": "GPU 功耗(W)与温度(°C)。空转时功耗应回落到个位/十位瓦。",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 56 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 5 } }, "overrides": [ { "matcher": { "id": "byName", "options": "功耗" }, "properties": [ { "id": "unit", "value": "watt" } ] }, { "matcher": { "id": "byName", "options": "温度" }, "properties": [ { "id": "unit", "value": "celsius" } ] } ] },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "nvidia_smi_power_draw_watts", "legendFormat": "功耗" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "nvidia_smi_temperature_gpu", "legendFormat": "温度" }
+      ]
+    }
+  ]
+}
