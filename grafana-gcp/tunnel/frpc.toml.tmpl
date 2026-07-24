@@ -1,0 +1,14 @@
+# frpc STCP visitor：把 g4-01 上 loopback 的 Prometheus 经 frp 服务器点对点拉到本机。
+# 由 frp-tunnel.sh 用 envsubst 从 .env 渲染成 frpc.toml。
+serverAddr = "${FRP_SERVER_ADDR}"
+serverPort = ${FRP_SERVER_PORT}
+auth.method = "token"
+auth.token = "${FRP_TOKEN}"
+
+[[visitors]]
+name = "g4-prometheus-visitor"
+type = "stcp"
+serverName = "${STCP_SERVER_NAME}"
+secretKey = "${STCP_SECRET}"
+bindAddr = "127.0.0.1"
+bindPort = ${G4_PROM_LOCAL_PORT}
