@@ -52,5 +52,6 @@ bash down.sh              # 停
 - `docker-compose.yml`：统一 Grafana（host 网络，0.0.0.0:3001）。
 - `grafana/provisioning/datasources/prometheus.yml`：两个数据源①②。
 - `grafana/dashboards/`：`locateanything.json`（→数据源①）、`g4-vllm.json`（→数据源②）。
-- `tunnel/frp-tunnel.sh` + `frpc.toml.tmpl`：frp STCP visitor（下载 frpc + 渲染配置 + 常驻）。
+- `tunnel/frpc.toml.tmpl`：frp STCP visitor 配置模板（up.sh 用 envsubst 渲染成 frpc.toml）。
+- 隧道由 **systemd 服务 `ifa-grafana-tunnel`** 常驻（clean env 不继承 shell 的 mihomo http_proxy，开机自启 + 崩溃自愈）；重启 `sudo systemctl restart ifa-grafana-tunnel`。
 - `up.sh` / `down.sh`：一步拉起 / 停。
