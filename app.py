@@ -1001,7 +1001,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .status b{font-variant-numeric:tabular-nums}
  .status .err{color:#c1121f}
  .status .dim{color:#8e8e93}
- .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+ .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
  .grid figure{margin:0}
  .box{width:100%;height:460px;background:#0b0d10;border-radius:12px;overflow:hidden;position:relative;display:flex;align-items:center;justify-content:center}
  .box img{max-width:100%;max-height:100%;display:block}
@@ -1009,17 +1009,12 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .wait{color:#7a828c;font-size:14px}
  figcaption{font-size:13px;color:#6b6b70;margin-top:8px;text-align:center}
  figcaption .m{color:#8e8e93}
- @media(max-width:1000px){.grid{grid-template-columns:1fr 1fr}}
  @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style></head><body>
 <div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <h1>Depth Anything 3 · 扩展面板</h1>
 
 <div class="grid">
- <figure>
-  <div class="box"><img id="raw" style="display:none"><span class="wait" id="rawwait">等待设备帧…</span></div>
-  <figcaption>接收到的设备帧 <span class="m" id="rawmeta"></span></figcaption>
- </figure>
  <figure>
   <div class="box">
    <img id="prodimg" style="display:none">
@@ -1043,6 +1038,10 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    <span class="wait" id="s3wait">等待 SAM3 点云映射…</span>
   </div>
   <figcaption>SAM3→点云映射（同②点云 · 相机跟随②）<span class="m" id="s3meta"></span></figcaption>
+ </figure>
+ <figure style="grid-column:1/-1">
+  <div class="box"><img id="raw" style="display:none"><span class="wait" id="rawwait">等待设备帧…</span></div>
+  <figcaption>接收到的设备帧 <span class="m" id="rawmeta"></span></figcaption>
  </figure>
 </div>
 
