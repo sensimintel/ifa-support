@@ -26,6 +26,7 @@ Workforce 凭证只在这台 Mac 上，所以隧道必须由 Mac 维持，链路
 """
 import json
 import os
+import socket
 import subprocess
 import time
 import urllib.error
@@ -75,6 +76,19 @@ def kill_stray():
         subprocess.run(["pkill", "-f", pat], check=False)
 
 
+def port_busy():
+    """本机 18011 是否仍有监听（旧隧道未放口时新 IAP 段会 ExitOnForwardFailure 起不来）。"""
+    s = socket.socket()
+    s.settimeout(0.5)
+    try:
+        s.connect(("127.0.0.1", LOCAL_PORT))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
 def creds_expired():
     """看 IAP 段日志尾部有没有 gcloud 凭证过期特征。"""
     try:
@@ -108,13 +122,24 @@ def rebuild(reason):
         if p and p.poll() is None:
             p.terminate()
     kill_stray()
-    time.sleep(1)
+    # 等旧隧道真正放掉 18011 再起新 IAP 段（否则 ExitOnForwardFailure 必败），最长 12s
+    for _ in range(6):
+        if not port_busy():
+            break
+        kill_stray()
+        time.sleep(2)
     start_iap()
-    for _ in range(40):          # IAP 段最长等 40s
+    for i in range(40):          # IAP 段最长等 40s
         if local_up():
             break
+        if iap_proc.poll() is not None:   # IAP 段进程已死，等下去没意义
+            break
+        if i % 5 == 4:
+            _try_heartbeat("重建中…")     # 重建期间保持心跳，网页别误判守护掉线
         time.sleep(1)
     else:
+        pass
+    if not local_up():
         msg = ("gcloud 凭证过期，需在 Mac 浏览器重登" if creds_expired()
                else "IAP 段起不来，看 Mac 上的 keeper 日志")
         log(f"重建失败：{msg}")
@@ -122,6 +147,14 @@ def rebuild(reason):
     start_rev()
     msg = ""
     log("隧道已重建")
+
+
+def _try_heartbeat(text):
+    """尽力而为的心跳（重建过程内用），失败忽略。"""
+    try:
+        heartbeat(text)
+    except Exception:
+        pass
 
 
 def heartbeat(cur_msg):
