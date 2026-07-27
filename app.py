@@ -778,11 +778,15 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
                                 [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]], [hi[0], hi[1], hi[2]], [lo[0], hi[1], hi[2]]], np.float32)
             with torch.no_grad():
                 cu, cv, cz3 = project(torch.from_numpy(corners).to(dev).float())
-            cu = cu.cpu().numpy(); cv = cv.cpu().numpy()
+            cu = cu.cpu().numpy(); cv = cv.cpu().numpy(); cz3 = cz3.cpu().numpy()
             color = (222, 52, 52) if label == "food" else (46, 120, 235)
             edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4), (0, 4), (1, 5), (2, 6), (3, 7)]
+            # 模拟②③ GLB 粗管线框的观感：线宽=管半径的透视投影（近粗远细），管半径随框体量走
+            tube_r = max(0.006, float(np.linalg.norm(hi - lo)) * 0.018)
             for a, b in edges:
-                cv2.line(out, (int(cu[a]), int(cv[a])), (int(cu[b]), int(cv[b])), color, 2, cv2.LINE_AA)
+                zm = max(1e-3, (cz3[a] + cz3[b]) / 2.0)
+                w = int(np.clip(f * 2.0 * tube_r / zm, 2, 14))
+                cv2.line(out, (int(cu[a]), int(cv[a])), (int(cu[b]), int(cv[b])), color, w, cv2.LINE_AA)
     # 叠 SAM3 mask 映射框：mask 命中的有效点直接就是目标本体（无需近侧前景启发式），
     # 2%/98% 分位算 3D AABB → 8 角投影 → 画线 + 词名
     if mask_overlays:
@@ -1531,7 +1535,7 @@ def _save_cloud_shot(pred, dets, conf):
         # 点云观感参数沿用 bc2bc8b 验收过的那组：相机抬离光心（视差遮挡缝）+ 俯视 20°
         # + splat=1 点状离散渲染；钉光心/大 splat 会退化成"重投影原图"（仓内已知坑）
         img = _render_pointcloud_image(pred, dets or None, conf_thresh_percentile=conf,
-                                       view_tilt=20.0, view_zoom=1.0, splat=1,
+                                       view_tilt=20.0, view_zoom=0.85, splat=1,
                                        eye_lift=0.4, eye_back=0.3)
     except Exception as e:
         print(f"[da3-web] 识别缩略图渲染失败：{type(e).__name__}: {e}", flush=True)
