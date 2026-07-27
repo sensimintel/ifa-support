@@ -1221,6 +1221,8 @@ const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显
 async function tick(){
  try{
   const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
+  // 服务端重启后配置清零（config_gen=0 → 回落 depth 模式、识别不触发）：自动重推当前面板配置
+  if(s.processor && s.config_gen===0) pushConfig();
   // 左框：接收帧
   if(s.has_frame && s.seq!==lastSeq){lastSeq=s.seq;
     $('raw').src='/api/frame/latest?t='+s.seq;$('raw').style.display='block';$('rawwait').style.display='none';}
