@@ -23,7 +23,12 @@
 
 窗口过期后分支规则回归各仓默认（main），届时更新本表。
 
-> **窗口内 test 环境冻结属预期，不是 CI 故障。** services 与 superadmin 的 CI 都只在 push `main` 时触发（前者构建镜像，后者部署 Cloudflare Pages 的 test 站点），而窗口内两仓的 PR 一律合 `ifa` 不合 `main`，因此 `superadmin-test.odyss.life` 会停在窗口前最后一次 main（2026-07-27 的 `41fc726`，已含 App 活性判定修复）。这是有意的隔离：ifa 的产物只经 `./stack build` 发往 5090，**窗口内的验证一律在 5090 做**。窗口结束合回 main 时 test 会自动追上。
+> **窗口内合进 ifa 的改动不会进 test 环境，这不是 CI 故障。** services 与 superadmin 的 CI 都只在 push `main` 时触发（前者构建镜像，后者部署 Cloudflare Pages 的 test 站点），而窗口内两仓的 PR 一律合 `ifa`，因此 ifa 上的改动不会出现在 `superadmin-test.odyss.life`。这是有意的隔离：ifa 的产物只经 `./stack build` 发往 5090，**窗口内的验证一律在 5090 做**。
+>
+> 由此引出两件必须人工盯的事：
+>
+> 1. **规则要全员生效才成立。** 只要还有人按旧习惯把 superadmin 的 PR 合进 `main`，test 就会继续跟着 main 走，而 `ifa` 会落后于 `main`——切换当日（2026-07-27）就发生过：`ifa` 从 `41fc726` 切出后 13 分钟，`main` 上又合入了 #343。窗口内需周知全员改用 `ifa` 作 base。
+> 2. **`ifa` 是否从 `main` 快进由人工决定。** `./stack build` 只认 `manifest.env` 的 `SUPERADMIN_REF`，不会自动跟随 main；要让 5090 拿到 main 上的新功能，需显式把 ifa 快进到目标点再构建。
 
 ## 3. 一套拉起的形态
 
