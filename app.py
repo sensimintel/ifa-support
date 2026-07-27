@@ -1477,7 +1477,9 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0):
         "  description：一句话中文描述（不超过" + str(RECOG_DESC_MAX) + "字，如“快速补能的小食”）；\n"
         "  nutrition_tags：营养标签数组，最多" + str(RECOG_MAX_TAGS) + "个，只能从这些里选："
         + "、".join(NUTRITION_TAGS) + "；\n"
-        "  food_signal：食物信号，只能从这些里选一个：" + "、".join(FOOD_SIGNALS) + "。\n"
+        "  food_signal：食物信号，只能从这些里选一个：" + "、".join(FOOD_SIGNALS) + "；\n"
+        "  box：该物品在图1中的包围框 [x1,y1,x2,y2]，0-1000 归一化整数（左上、右下），"
+        "框要紧贴物品本体。\n"
     )
     if candidates:
         lines = "\n".join("  [%d] %s —— %s" % (i + 1, c.get("name", ""), c.get("desc") or "无描述")
@@ -1503,6 +1505,7 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0):
         "只输出 JSON，不要任何解释："
         "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
         "\"nutrition_tags\":[\"Carbs\",\"Fiber\",\"Potassium\"],\"food_signal\":\"Quick energy\","
+        "\"box\":[412,530,668,845],"
         "\"match\":null,\"match_reason\":\"画面新出现的物品\",\"matched_name\":null,"
         "\"match_confidence\":null}]}。"
         "画面里没有食物也没有液体时，items 为空数组。"
@@ -1514,6 +1517,42 @@ def _img_data_uri(rgb):
     """RGB ndarray → data URI（JPEG）。"""
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
     return ("data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()) if ok else None
+
+
+SHOT_DIR = GLB_DIR.parent / "recog_shots"   # 识别裁剪缩略图目录（Qwen box 裁自原图）
+SHOT_KEEP = 160                             # 磁盘最多保留的裁剪图数量
+
+
+def _save_crop_shot(orig_rgb, box):
+    """按 Qwen 给的归一化框（0-1）裁剪原图存盘，返回可访问 url；框缺失/非法退回整帧。"""
+    H, W = orig_rgb.shape[:2]
+    crop = orig_rgb
+    if box:
+        nx1, ny1, nx2, ny2 = box
+        pad_x, pad_y = (nx2 - nx1) * 0.08, (ny2 - ny1) * 0.08   # 四周留 8% 呼吸边
+        x1, y1 = max(0, int((nx1 - pad_x) * W)), max(0, int((ny1 - pad_y) * H))
+        x2, y2 = min(W, int((nx2 + pad_x) * W)), min(H, int((ny2 + pad_y) * H))
+        if x2 - x1 > 4 and y2 - y1 > 4:
+            crop = orig_rgb[y1:y2, x1:x2]
+    h, w = crop.shape[:2]
+    scale = 480.0 / max(h, w)               # 最长边压到 480，控制体积
+    if scale < 1:
+        crop = cv2.resize(crop, (max(1, int(w * scale)), max(1, int(h * scale))),
+                          interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR),
+                           [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+    if not ok:
+        return None
+    SHOT_DIR.mkdir(parents=True, exist_ok=True)
+    name = uuid.uuid4().hex + ".jpg"
+    (SHOT_DIR / name).write_bytes(buf.tobytes())
+    files = sorted(SHOT_DIR.glob("*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for p in files[SHOT_KEEP:]:             # 只留最近 SHOT_KEEP 张
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    return f"/shotimg/{name}"
 
 
 def _make_ref_img(rgb):
@@ -1586,10 +1625,20 @@ def _parse_recog(content):
         mname = str(it.get("matched_name") or "").strip()[:40]
         conf = str(it.get("match_confidence") or "").strip().lower()
         conf = conf if conf in ("high", "low") else ""    # 非法/缺省按 low 语义处理（不合并）
+        box = None                                        # 物品包围框：0-1000 归一化 → 0-1 浮点
+        raw_box = it.get("box")
+        if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4:
+            try:
+                x1, y1, x2, y2 = [min(1000, max(0, int(v))) for v in raw_box]
+                if abs(x2 - x1) >= 10 and abs(y2 - y1) >= 10:   # 退化框丢弃
+                    box = (min(x1, x2) / 1000.0, min(y1, y2) / 1000.0,
+                           max(x1, x2) / 1000.0, max(y1, y2) / 1000.0)
+            except (TypeError, ValueError):
+                box = None
         out.append({"name": name, "type": "液体" if is_liquid else "食物",
                     "description": desc, "nutrition_tags": tags, "food_signal": sig,
                     "match": match, "match_reason": reason,
-                    "matched_name": mname, "match_confidence": conf})
+                    "matched_name": mname, "match_confidence": conf, "box": box})
     return out
 
 
@@ -1688,15 +1737,17 @@ def _recog_worker():
                     print("[da3-web] 识别新卡：『%s』(%s) match=%s｜理由：%s" % (
                         it["name"], it["type"], m,
                         it.get("match_reason") or "（模型未给）"), flush=True)
+                # 缩略图 = 本轮原图按 Qwen box 裁剪（无框退整帧）
+                shot_url = _save_crop_shot(orig, it.get("box"))
                 if target is not None:           # 去重命中：合并（显示名不改，本轮名称进合并史）
                     target.setdefault("merge_history", []).append({
                         "t": t, "name": it["name"],
                         "reason": it.get("match_reason", ""),
                         "confidence": it.get("match_confidence", "")})
                     del target["merge_history"][:-20]    # 只留最近 20 条
-                    target["shots"].append(glb_url)
-                    # shots 只留最近 8 张：GLB 产物目录只保留最近 GLB_KEEP(24) 个，
-                    # 更早的 url 已 404；且几十个 model-viewer 会耗尽 WebGL 上下文全变黑块
+                    if shot_url:
+                        target["shots"].append(shot_url)
+                    # shots 只留最近 8 张：磁盘只保留最近 SHOT_KEEP 张，太多前端也摆不下
                     del target["shots"][:-8]
                     target["last_ts"] = now
                     target["t"] = t
@@ -1711,7 +1762,8 @@ def _recog_worker():
                         "id": _recog_id, "status": "done",
                         "name": it["name"], "type": it["type"], "description": it["description"],
                         "nutrition_tags": it["nutrition_tags"], "food_signal": it["food_signal"],
-                        "shots": [glb_url], "ref_img": boxed_uri, "merge_history": [],
+                        "shots": [shot_url] if shot_url else [], "ref_img": boxed_uri,
+                        "merge_history": [],
                         "frame": frame, "t": t, "last_ts": now, "rev": 0})
             if len(_recog_cards) > RECOG_MAX_CARDS:
                 del _recog_cards[:len(_recog_cards) - RECOG_MAX_CARDS]
@@ -2036,6 +2088,17 @@ def sam3cloud_latest():
                     headers={"Cache-Control": "no-store", "X-Sam3cloud-Seq": str(seq)})
 
 
+@app.get("/shotimg/{name}")
+def shot_img(name: str):
+    """识别裁剪缩略图（Qwen box 裁自原图的 JPEG）。"""
+    if not re.fullmatch(r"[0-9a-f]{32}\.jpg", name):
+        return JSONResponse({"error": "非法文件名"}, status_code=400)
+    p = SHOT_DIR / name
+    if not p.exists():
+        return JSONResponse({"error": "不存在"}, status_code=404)
+    return FileResponse(str(p), media_type="image/jpeg")
+
+
 @app.get("/glb/{token}/{name}")
 def serve_glb(token: str, name: str):
     """按 token 提供生成的 GLB（校验为 32 位 hex，仅允许 scene.glb，防目录穿越）。"""
@@ -2120,13 +2183,12 @@ def weight_page():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 实时识别卡片流页：轮询 /api/recog/list，最近新建/更新的卡在最上；缩略图=该帧整张点云视角
-# （隐藏 model-viewer 加载该帧 GLB 截图）；名称流式打字；食物红 / 液体蓝。
+# 实时识别卡片流页：轮询 /api/recog/list，最近新建/更新的卡在最上；
+# 缩略图=Qwen 输出的 box 裁自原图的 JPEG（/shotimg/*）；名称流式打字；食物红 / 液体蓝。
 # ══════════════════════════════════════════════════════════════════════
 RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>实时识别</title>
-<script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
 <style>
  :root{--bg:#f4f5f7;--panel:#fff;--panel2:#f6f7f9;--ink:#1b1e24;--muted:#69707b;--faint:#98a0ac;
    --line:#e5e8ec;--accent:#0071e3;--accent-soft:#e7f1fd;--food:#de3434;--food-soft:#fdeaea;
@@ -2197,14 +2259,13 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .lb{position:fixed;inset:0;background:rgba(10,14,20,.82);display:none;flex-direction:column;align-items:center;justify-content:center;gap:13px;z-index:100;padding:24px}
  .lb.on{display:flex}
  .lb .big{width:min(88vw,600px);max-height:74vh;aspect-ratio:3/4;border-radius:14px;overflow:hidden;border:2px solid rgba(255,255,255,.15);background:#10141a}
- .lb .big img{width:100%;height:100%;object-fit:cover;display:block;cursor:zoom-in;transform-origin:center center;will-change:transform;transition:transform .12s ease-out}
+ .lb .big img{width:100%;height:100%;object-fit:contain;display:block;cursor:zoom-in;transform-origin:center center;will-change:transform;transition:transform .12s ease-out}
  .lb .cap{color:#dfe4ea;font-size:13px;font-family:var(--mono)}
  .lb .strip{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;max-width:min(82vw,420px)}
  .lb .th{width:50px;height:66px;border-radius:7px;overflow:hidden;border:2px solid transparent;cursor:pointer;opacity:.55;background:#10141a}
  .lb .th img{width:100%;height:100%;object-fit:cover;display:block}
  .lb .th.sel{border-color:var(--accent);opacity:1}
  .lb .x{position:absolute;top:16px;right:20px;color:#fff;font-size:26px;cursor:pointer;opacity:.85;line-height:1}
- #shot{position:fixed;top:0;left:0;width:208px;height:277px;opacity:.01;pointer-events:none;z-index:0}
  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
 <div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
@@ -2218,50 +2279,11 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="cap" id="lbCap"></div>
  <div class="strip" id="lbStrip"></div>
 </div>
-<model-viewer id="shot" camera-controls="false" interaction-prompt="none" exposure="1.3" shadow-intensity="0"></model-viewer>
 <script>
 const $=id=>document.getElementById(id);
-const feed=$('feed'), shot=$('shot');
-const state=new Map();   // id -> {el, rev, shots:[glb_url...]}
+const feed=$('feed');
+const state=new Map();   // id -> {el, rev, shots:[img_url...]}
 const typeCls=t=> t==='液体' ? 'liquid' : 'food';
-
-// —— 点云截图队列（串行，按 url 缓存；一个 url 截好后回调所有等待者）——
-const shotQ=[]; let shotBusy=false;
-const shotCache=new Map();      // glb_url -> dataURI
-const shotQueued=new Set();     // 已入队的 url（避免重复排队）
-const shotCbs=[];               // {url, cb} 截好后回调
-function enqueueShot(url,cb){
-  if(!url)return;
-  if(shotCache.has(url)){ cb&&cb(shotCache.get(url)); return; }
-  if(cb) shotCbs.push({url,cb});
-  if(!shotQueued.has(url)){ shotQueued.add(url); shotQ.push(url); pumpShot(); }
-}
-function pumpShot(){
-  if(shotBusy||!shotQ.length)return; shotBusy=true;
-  const url=shotQ.shift(); let done=false;
-  const finish=(uri)=>{ if(done)return; done=true;
-    if(uri&&uri.length>3000){ shotCache.set(url,uri);
-      for(let i=shotCbs.length-1;i>=0;i--){ if(shotCbs[i].url===url){ shotCbs[i].cb(uri); shotCbs.splice(i,1); } } }
-    shotQueued.delete(url); shotBusy=false; setTimeout(pumpShot,40);
-  };
-  const onload=async()=>{ shot.removeEventListener('load',onload);
-    try{ const c=shot.getBoundingBoxCenter(); const cz=(c.z<-0.001)?c.z:-1.5;
-      shot.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
-      shot.cameraOrbit='0deg 80deg '+(Math.abs(cz)*1.25).toFixed(4)+'m';
-      shot.jumpCameraToGoal&&shot.jumpCameraToGoal();
-    }catch(e){}
-    try{ if(shot.updateComplete) await shot.updateComplete; }catch(e){}
-    let uri='';
-    for(let k=0;k<12;k++){ await new Promise(r=>setTimeout(r,120));
-      try{ uri=shot.toDataURL('image/png'); }catch(e){ uri=''; }
-      if(uri && uri.length>3000) break; }
-    finish(uri);
-  };
-  shot.addEventListener('load',onload);
-  setTimeout(()=>{ if(!done){ shot.removeEventListener('load',onload); finish(''); } }, 8000);  // 死锁兜底
-  if(shot.getAttribute('src')===url) shot.removeAttribute('src');   // 同 url 强制重载
-  shot.src=url;
-}
 
 // —— 打字机 ——
 function typeInto(node,text){ let i=0; node.textContent='';
@@ -2270,7 +2292,7 @@ function typeInto(node,text){ let i=0; node.textContent='';
     if(i>=text.length){clearInterval(timer); caret.remove();}}, 46);
 }
 
-// —— 扇形叠卡：对每个 glb_url 截点云图，扇形叠，>5 张右下角显示数字，点击开 lightbox ——
+// —— 扇形叠卡：每张 = Qwen box 裁剪图（/shotimg/*），扇形叠，>5 张右下角显示数字，点击开 lightbox ——
 function renderStack(el, name, shots){
   const stack=el.querySelector('.stack');
   stack.querySelectorAll('.sh,.cnt,.shint').forEach(n=>n.remove());
@@ -2281,9 +2303,7 @@ function renderStack(el, name, shots){
     d.style.transform='rotate('+(isTop?0:dir*(4+off*3))+'deg) translate('+(isTop?0:dir*(5+off*3))+'px,'+(off*2)+'px)';
     d.style.zIndex=String(i+1);
     const img=document.createElement('img'); d.appendChild(img);
-    const cached=shotCache.get(url);
-    if(cached){ img.src=cached; img.style.opacity=1; }
-    else enqueueShot(url,(uri)=>{ img.src=uri; img.style.opacity=1; });
+    img.onload=()=>{img.style.opacity=1;}; img.src=url;
     stack.appendChild(d);
   });
   if(shots.length>5){ const b=document.createElement('span'); b.className='cnt'; b.textContent='×'+shots.length; stack.appendChild(b); }
@@ -2326,13 +2346,12 @@ function openLB(name, shots){ if(!shots.length)return;
   lbShots=shots.slice(); lbIdx=lbShots.length-1; lbName=name||'';
   const strip=$('lbStrip'); strip.innerHTML='';
   lbShots.forEach((url,i)=>{ const t=document.createElement('div'); t.className='th'+(i===lbIdx?' sel':'');
-    const img=document.createElement('img'); const u=shotCache.get(url);
-    if(u)img.src=u; else enqueueShot(url,(uri)=>{img.src=uri;}); t.appendChild(img);
+    const img=document.createElement('img'); img.src=url; t.appendChild(img);
     t.onclick=()=>{lbIdx=i; renderLB();}; strip.appendChild(t); });
   $('lb').classList.add('on'); renderLB();
 }
-function renderLB(){ const url=lbShots[lbIdx], big=$('lbBig'), u=shotCache.get(url);
-  if(u)big.src=u; else enqueueShot(url,(uri)=>{ if(lbShots[lbIdx]===url)big.src=uri; });
+function renderLB(){ const url=lbShots[lbIdx], big=$('lbBig');
+  big.src=url;
   $('lbCap').textContent=lbName+' · '+(lbIdx+1)+' / '+lbShots.length+' 张 · 滚轮缩放·拖动·双击';
   [...$('lbStrip').children].forEach((t,i)=>t.classList.toggle('sel',i===lbIdx));
   lbReset();
