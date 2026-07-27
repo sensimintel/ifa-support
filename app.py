@@ -2265,6 +2265,11 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .lb .th img{width:100%;height:100%;object-fit:cover;display:block}
  .lb .th.sel{border-color:var(--accent);opacity:1}
  .lb .x{position:absolute;top:16px;right:20px;color:#fff;font-size:26px;cursor:pointer;opacity:.85;line-height:1}
+ /* 智能跳顶：下翻时不打断，顶部浮「↑ 有新卡」按钮 */
+ .newpill{position:fixed;top:104px;left:50%;transform:translateX(-50%) translateY(-8px);z-index:60;
+   font-size:12px;font-weight:700;color:#fff;background:var(--accent);padding:6px 16px;border-radius:999px;
+   box-shadow:0 4px 14px rgba(0,0,0,.28);cursor:pointer;opacity:0;pointer-events:none;transition:opacity .25s,transform .25s}
+ .newpill.on{opacity:1;transform:translateX(-50%);pointer-events:auto}
  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
 <div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
@@ -2273,6 +2278,7 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="sub">food/drink 命中某帧 → <code id="model">Qwen3-VL</code> 识别四字段 · 同一物 30 秒内去重合并（缩略图叠加，点击看图集）· 有更新的卡自动置顶</div>
 </div>
 <div class="feed" id="feed"><div class="empty" id="empty">等待 food/drink 命中…</div></div>
+<div class="newpill" id="newpill">↑ 有新卡</div>
 <div class="lb" id="lb"><span class="x" id="lbx">✕</span>
  <div class="big"><img id="lbBig" alt=""></div>
  <div class="cap" id="lbCap"></div>
@@ -2377,6 +2383,14 @@ $('clr').onclick=async()=>{
   $('lb').classList.remove('on'); $('empty').style.display='block';
 };
 
+// —— 智能跳顶：接近顶部(<100px)时新内容自动回顶；正在下翻则浮出「↑ 有新卡」不打断 ——
+function bumpScroll(){
+  if(feed.scrollTop<100){ feed.scrollTop=0; $('newpill').classList.remove('on'); }
+  else $('newpill').classList.add('on');
+}
+$('newpill').onclick=()=>{ feed.scrollTo({top:0,behavior:'smooth'}); $('newpill').classList.remove('on'); };
+feed.addEventListener('scroll',()=>{ if(feed.scrollTop<10) $('newpill').classList.remove('on'); });
+
 async function tick(){
  try{
   const d=await(await fetch('/api/recog/list',{cache:'no-store'})).json();
@@ -2388,11 +2402,12 @@ async function tick(){
   const seen=new Set(cards.map(c=>c.id));
   for(const [id,st] of state){ if(!seen.has(id)){ st.el.remove(); state.delete(id); } }
   $('empty').style.display = cards.length ? 'none' : 'block';
+  let changed=false;
   // 新卡：逆序 prepend 使最新在最上
   cards.filter(c=>!state.has(c.id)).reverse().forEach(c=>{
     const el=cardEl(c); feed.insertBefore(el, feed.firstChild);
     const shots=c.shots||[]; state.set(c.id,{el, rev:c.rev||0, shots});
-    renderStack(el, c.name||'', shots);
+    renderStack(el, c.name||'', shots); changed=true;
   });
   // 已存在卡：rev 变化=去重合并了新缩略图 → 置顶 + 更新叠卡/帧信息 + 闪 + “更新”提示（内容不改）
   cards.forEach(c=>{ const st=state.get(c.id); if(!st)return;
@@ -2400,7 +2415,8 @@ async function tick(){
       if(feed.firstChild!==st.el) feed.insertBefore(st.el, feed.firstChild);
       const ms=st.el.querySelectorAll('.meta span');
       if(ms[0]) ms[0].textContent='帧 '+(c.frame||''); if(ms[1]) ms[1].textContent=c.t||'';
-      renderStack(st.el, c.name||'', st.shots); flashUpdate(st.el); } });
+      renderStack(st.el, c.name||'', st.shots); flashUpdate(st.el); changed=true; } });
+  if(changed) bumpScroll();
  }catch(e){}
 }
 setInterval(tick,700); tick();
