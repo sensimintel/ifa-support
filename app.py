@@ -1014,9 +1014,41 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </style></head><body>
 <div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <h1>Depth Anything 3 · 扩展面板</h1>
-<div class="sub">实时展示设备帧：① 接收到的帧 · ② DA3 产物（按下方控件实时生成）· ③ DA3→SAM3→点云映射（原图+过去5帧走 /v1/track 序列，mask 染点 + 3D 框，food红/drink蓝）。改产物类型 / 分辨率 / 调参，②框即时重算。模型：DA3NESTED-GIANT-LARGE-1.1</div>
 
-<div class="card">
+<div class="grid">
+ <figure>
+  <div class="box"><img id="raw" style="display:none"><span class="wait" id="rawwait">等待设备帧…</span></div>
+  <figcaption>接收到的设备帧 <span class="m" id="rawmeta"></span></figcaption>
+ </figure>
+ <figure>
+  <div class="box">
+   <img id="prodimg" style="display:none">
+   <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y"
+     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
+     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
+     min-field-of-view="10deg" max-field-of-view="60deg"
+     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
+   <span class="wait" id="prodwait">等待产物…</span>
+  </div>
+  <figcaption>DA3 产物 <span class="m" id="prodmeta"></span></figcaption>
+ </figure>
+ <figure>
+  <div class="box">
+   <img id="s3img" style="display:none">
+   <model-viewer id="mv2" style="display:none" touch-action="none"
+     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
+     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
+     min-field-of-view="10deg" max-field-of-view="60deg"
+     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
+   <span class="wait" id="s3wait">等待 SAM3 点云映射…</span>
+  </div>
+  <figcaption>SAM3→点云映射（同②点云 · 相机跟随②）<span class="m" id="s3meta"></span></figcaption>
+ </figure>
+</div>
+
+<label id="ctltglwrap" style="margin:18px 2px 8px;font-size:13px;cursor:pointer;user-select:none;display:block"><input type="checkbox" id="ctltoggle"> 产物参数调节（默认收起 · 改产物类型/分辨率用）</label>
+
+<div class="card" id="ctlcard" style="display:none">
  <div class="row">
   <div class="fld"><label>产物类型 export_format</label>
    <select id="fmt">
@@ -1054,43 +1086,13 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="hint">两个固定视角二选一：<b>调优视角</b>略俯视、更立体，适合演示；<b>原始视角</b>沿拍摄光轴正视、相机在原点不飘，与深度图同视角。仍可鼠标拖动临时查看，下一帧自动回到所选视角。</div>
 </div>
 
-<div class="grid">
- <figure>
-  <div class="box"><img id="raw" style="display:none"><span class="wait" id="rawwait">等待设备帧…</span></div>
-  <figcaption>接收到的设备帧 <span class="m" id="rawmeta"></span></figcaption>
- </figure>
- <figure>
-  <div class="box">
-   <img id="prodimg" style="display:none">
-   <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y"
-     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
-     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
-     min-field-of-view="10deg" max-field-of-view="60deg"
-     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
-   <span class="wait" id="prodwait">等待产物…</span>
-  </div>
-  <figcaption>DA3 产物 <span class="m" id="prodmeta"></span></figcaption>
- </figure>
- <figure>
-  <div class="box">
-   <img id="s3img" style="display:none">
-   <model-viewer id="mv2" style="display:none" touch-action="none"
-     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
-     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
-     min-field-of-view="10deg" max-field-of-view="60deg"
-     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
-   <span class="wait" id="s3wait">等待 SAM3 点云映射…</span>
-  </div>
-  <figcaption>SAM3→点云映射（同②点云 · 相机跟随②）<span class="m" id="s3meta"></span></figcaption>
- </figure>
-</div>
-
 <script>
 const $=id=>document.getElementById(id);
 $('pr').oninput=()=>$('prv').textContent=$('pr').value;
 $('ct').oninput=()=>$('ctv').textContent=$('ct').value;
 $('nmp').oninput=()=>$('nmv').textContent=(+$('nmp').value).toFixed(1);
 $('camtoggle').addEventListener('change',syncOpts);  // 开关切换即展开/收起相机视角调节卡
+$('ctltoggle').addEventListener('change',()=>{$('ctlcard').style.display=$('ctltoggle').checked?'block':'none';});  // 产物参数卡：勾选展开、默认收起
 
 function syncOpts(){const f=$('fmt').value;
  $('glbopts').style.display=(f==='depth')?'none':'block';   // cloudimg 也显示(conf 有用)
