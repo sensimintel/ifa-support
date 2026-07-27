@@ -1454,13 +1454,19 @@ _SIG_CANON = {s.lower(): s for s in FOOD_SIGNALS}
 RECOG_MAX_TAGS = 3          # 每个物品最多几个营养标签
 RECOG_DESC_MAX = 20         # 一句话描述最大字数
 
-def _build_recog_prompt(candidates):
+def _build_recog_prompt(candidates, n_food=0, n_drink=0):
     """按候选动态生成「识别 + 去重」prompt。
-    去重三分工：文本清单(名称+描述)=主依据判断是否已存在；参考图=辅助/否决；倾向匹配。"""
+    关键防线：历史参考图（图3起）带 HISTORY REF 横幅 + prompt 明令，防止参考图内容
+    泄漏进任务一被当成当前画面的物品（实测过：画面空无一物时模型照着参考图报 Snickers）。"""
     p = (
-        "图1=当前画面原图；图2=当前画面带检测框版本（红框=疑似食物，蓝框=疑似液体/容器）。\n"
-        "任务一·识别：识别图2画面里所有的食物、以及所有的液体/饮料（咖啡/水/可乐/茶/杯装饮品等），"
-        "逐一分别输出，食物和液体必须拆成不同 item；不要局限于框，画面里明显的都要识别。每个物品输出：\n"
+        "图1=当前画面原图；图2=当前画面带检测框版本（红框=疑似食物，蓝框=疑似液体/容器）。"
+        "从图3起（若有）全部是带“HISTORY REF”横幅的历史参考图，只用于任务二对照，**不是当前画面**。\n"
+        "检测器在当前画面的命中：食物框×" + str(n_food) + "、液体框×" + str(n_drink) + ""
+        "（检测器可能漏检，但当前画面里明显不存在的东西绝不要输出）。\n"
+        "任务一·识别：只识别图1/图2 当前画面里**真实存在**的食物、以及液体/饮料"
+        "（咖啡/水/可乐/茶/杯装饮品等），逐一分别输出，食物和液体必须拆成不同 item；"
+        "不要局限于框，画面里明显的都要识别；但**严禁**把只出现在历史参考图里的物品当成当前物品输出——"
+        "当前画面没有食物/液体时，即使参考图里有，items 也必须为空数组。每个物品输出：\n"
         "  name：具体名称（简短，优先英文或品牌名，如 Banana、Snickers）；\n"
         "  type：只能是“食物”或“液体”；\n"
         "  description：一句话中文描述（不超过" + str(RECOG_DESC_MAX) + "字，如“快速补能的小食”）；\n"
@@ -1503,6 +1509,21 @@ def _img_data_uri(rgb):
     """RGB ndarray → data URI（JPEG）。"""
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
     return ("data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()) if ok else None
+
+
+def _make_ref_img(rgb):
+    """历史参考图打显著视觉标记（顶部 HISTORY REF 横幅 + 灰边框）。
+    防线依据：实测画面空无一物时，模型会照着候选参考图把 Snickers 当当前画面物品输出——
+    视觉标记 + prompt 明令双管齐下，把「参考图」与「当前画面」硬隔离。"""
+    out = rgb.copy()
+    H, W = out.shape[:2]
+    bh = max(28, H // 12)
+    cv2.rectangle(out, (0, 0), (W, bh), (90, 90, 90), -1)
+    cv2.putText(out, "HISTORY REF - NOT CURRENT FRAME", (10, int(bh * 0.72)),
+                cv2.FONT_HERSHEY_SIMPLEX, bh / 44.0, (255, 255, 255),
+                max(1, bh // 16), cv2.LINE_AA)
+    cv2.rectangle(out, (0, 0), (W - 1, H - 1), (90, 90, 90), max(4, W // 100))
+    return out
 
 
 def _draw_boxes(rgb, detections):
@@ -1567,10 +1588,11 @@ def _parse_recog(content):
     return out
 
 
-def _recognize_dedup(orig_rgb, boxed_rgb, candidates):
-    """调 Qwen3-VL 识别 + 去重。一次多图请求：图1原图 + 图2带框图 + 各候选参考图(带框图，编号1..N)。
+def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0):
+    """调 Qwen3-VL 识别 + 去重。一次多图请求：图1原图 + 图2带框图 + 各候选参考图(带横幅标记)。
     candidates: [{"id","name","desc","ref_img"}...]（顺序即参考图编号）。
-    返回 [{name,type,description,nutrition_tags,food_signal,duplicate,match}]；任何失败返回 []。"""
+    n_food/n_drink：当前画面检测器命中数，作为软接地信息进 prompt。
+    返回 [{name,type,description,...,match,matched_name,match_confidence}]；任何失败返回 []。"""
     if not RECOG_ENDPOINT:
         return []
     u1, u2 = _img_data_uri(orig_rgb), _img_data_uri(boxed_rgb)
@@ -1578,10 +1600,10 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates):
         return []
     content = [{"type": "image_url", "image_url": {"url": u1}},
                {"type": "image_url", "image_url": {"url": u2}}]
-    for c in candidates:                       # 从图3起：候选带框参考图（辅助/否决），编号对应清单
+    for c in candidates:                       # 从图3起：候选参考图（带 HISTORY REF 横幅，仅供对照）
         if c.get("ref_img"):
             content.append({"type": "image_url", "image_url": {"url": c["ref_img"]}})
-    content.append({"type": "text", "text": _build_recog_prompt(candidates)})
+    content.append({"type": "text", "text": _build_recog_prompt(candidates, n_food, n_drink)})
     payload = {"model": RECOG_MODEL,
                "messages": [{"role": "user", "content": content}],
                "max_tokens": 768, "temperature": 0.2}
@@ -1617,10 +1639,12 @@ def _recog_worker():
         with _recog_cv:
             while not _recog_pending:
                 _recog_cv.wait()
-            orig, boxed, glb_url, frame, t, candidates = _recog_pending.pop()  # 最新优先
+            orig, boxed, glb_url, frame, t, candidates, n_food, n_drink = \
+                _recog_pending.pop()             # 最新优先
             _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
-        boxed_uri = _img_data_uri(boxed)         # 本帧带框图：新卡的代表图(ref_img)
-        items = _recognize_dedup(orig, boxed, candidates)
+        # 新卡代表图(ref_img)：带框图加 HISTORY REF 横幅标记，防止后续轮次被当成当前画面
+        boxed_uri = _img_data_uri(_make_ref_img(boxed))
+        items = _recognize_dedup(orig, boxed, candidates, n_food, n_drink)
         # 全链路审计日志：每轮识别的原始判定都落盘，出错误合并时可定位是「认错」还是「匹配错」
         if items:
             print("[da3-web] 识别返回 %d 项（去重候选 %d 个：%s）" % (
@@ -1664,6 +1688,9 @@ def _recog_worker():
                         "confidence": it.get("match_confidence", "")})
                     del target["merge_history"][:-20]    # 只留最近 20 条
                     target["shots"].append(glb_url)
+                    # shots 只留最近 8 张：GLB 产物目录只保留最近 GLB_KEEP(24) 个，
+                    # 更早的 url 已 404；且几十个 model-viewer 会耗尽 WebGL 上下文全变黑块
+                    del target["shots"][:-8]
                     target["last_ts"] = now
                     target["t"] = t
                     target["frame"] = frame
@@ -1706,8 +1733,11 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame):
                        "ref_img": c["ref_img"]} for c in active[:RECOG_MAX_CANDIDATES]]
     t = time.strftime("%H:%M:%S")
     boxed = _draw_boxes(orig_rgb, detections)
+    n_food = sum(1 for d in detections if d[0] == "food")
+    n_drink = len(detections) - n_food
     with _recog_cv:
-        _recog_pending.append((orig_rgb.copy(), boxed, glb_url, frame, t, candidates))
+        _recog_pending.append((orig_rgb.copy(), boxed, glb_url, frame, t, candidates,
+                               n_food, n_drink))
         _recog_cv.notify()
 
 
