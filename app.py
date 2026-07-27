@@ -237,11 +237,10 @@ def build_mesh_glb(pred, out_path, conf_thresh_percentile=40.0, edge_ratio=0.06)
 LOCATE_ENDPOINT = "http://127.0.0.1:8000/v1/chat/completions"
 LOCATE_MODEL = "nvidia/LocateAnything-3B"
 # 每项 =（LocateAnything 查询词, 显示/颜色 label）。液体改用具体容器词(bottle/glass)替代抽象 "drink"：
-# "drink" 抽象词召回差(实测饮料罐召回 0)，bottle/glass 具体词召回更稳，命中都归 "drink"(蓝框/液体语义)。
+# 检测分工（识别工作流）：食物走 LA（只发 food 一路）；液体走 SAM3 流式（bottle/glass，
+# 见 SAM3_CLOUD_TARGETS）。"drink" 抽象词召回差(实测饮料罐召回 0)，液体用具体容器词。
 LOCATE_TARGETS = [
     ("food", "food"),        # 食物 → 红框
-    ("bottle", "drink"),     # 瓶装 → 蓝框(液体)
-    ("glass", "drink"),      # 杯装 → 蓝框(液体)
 ]
 LOCATE_TIMEOUT = 20.0                     # 单次检测超时（秒）；已挪到 GPU 锁外，不阻塞产线
 LOCATE_COLORS = {"food": (222, 52, 52),   # food = 红
@@ -812,7 +811,25 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
 # 最后一帧(=当前帧)的 mask 解码后映射到同一帧的 DA3 点云——mask 点染色 + 3D AABB 框，
 # 用与 cloudimg 相同的固定相机服务端渲染成图，前端 /panel 第三框轮询展示。
 # ══════════════════════════════════════════════════════════════════════
-SAM3_CLOUD_TARGETS = LOCATE_TARGETS   # 与第二张图同一套目标词/颜色语义（LA 换成 SAM3）
+# SAM3 流式只追液体（bottle/glass → drink 蓝），食物由 LA 负责（LOCATE_TARGETS）。
+# 流式配置（窗口/关代周期等旋钮）不动，只改目标词。
+SAM3_CLOUD_TARGETS = [
+    ("bottle", "drink"),     # 瓶装 → 蓝(液体)
+    ("glass", "drink"),      # 杯装 → 蓝(液体)
+]
+# 最近一轮 SAM3 液体命中的归一化外接框缓存：识别工作流的液体证据来源。
+# SAM3 是异步后台任务，识别触发时读缓存（可能滞后一两帧），过期(TTL)即视为无液体。
+SAM3_DETS_TTL = 6.0
+_sam3_dets_lock = threading.Lock()
+_sam3_dets = {"dets": [], "ts": 0.0}
+
+
+def _sam3_recent_drinks():
+    """取最近一轮 SAM3 液体框 [(\"drink\",nx1,ny1,nx2,ny2)...]；超过 TTL 返回空。"""
+    with _sam3_dets_lock:
+        if time.time() - _sam3_dets["ts"] > SAM3_DETS_TTL:
+            return []
+        return list(_sam3_dets["dets"])
 _sam3cloud_lock = threading.Lock()
 _sam3cloud = {"kind": None, "url": None, "bytes": None, "seq": 0,
               "meta": None, "error": None, "running": False}
@@ -867,6 +884,19 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam):
                 tag = f"{label}#{ins.get('obj_id', '?')}"
                 overlays.append((tag, col, mk))
                 id_tags.append(tag)
+
+        # 液体证据缓存：mask → 归一化外接框，供识别工作流（食物走 LA、液体走 SAM3）取用。
+        # 深度图与原图等比无裁剪，归一化坐标可与 LA 框同系混用（偏差 <2% 可忽略）。
+        drink_dets = []
+        for (_tag, _col, mk) in overlays:
+            ys, xs = np.where(mk)
+            if xs.size == 0:
+                continue
+            drink_dets.append(("drink", float(xs.min()) / W0, float(ys.min()) / H0,
+                               float(xs.max() + 1) / W0, float(ys.max() + 1) / H0))
+        with _sam3_dets_lock:
+            _sam3_dets["dets"] = drink_dets
+            _sam3_dets["ts"] = time.time()
 
         _tr = time.time()
         _impl_cn = {"incremental": "增量", "replay": "重放"}
@@ -1059,7 +1089,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="fld"><label>产物类型 export_format</label>
    <select id="fmt">
     <option value="depth">深度图（彩色）</option>
-    <option value="glb" selected>点云 + food/drink 框（GLB · 可转视角）</option>
+    <option value="glb" selected>点云 + LA food 框（GLB · 可转视角）</option>
     <option value="cloudimg">点云图（服务端渲染 · 快）</option>
     <option value="mesh">网格 mesh（GLB · 可转视角）</option>
    </select></div>
@@ -1075,7 +1105,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    <div class="fld" id="camwrap"><label>相机线框 show_cameras</label>
     <select id="cam"><option value="1">显示</option><option value="0">隐藏</option></select></div>
   </div>
-  <div class="hint">点云由深度反投影自建，并叠加 LocateAnything 检测的 food（红框）/drink（蓝框）3D 包围盒；网格由深度反投影自建三角面（conf 分位越高越干净，num_max_points 仅点云生效）。分辨率越高越细、越吃显存，OOM 时会提示调低。</div>
+  <div class="hint">点云由深度反投影自建；②叠加 LocateAnything 检测的 food 红框（液体由③SAM3 负责）；网格由深度反投影自建三角面（conf 分位越高越干净，num_max_points 仅点云生效）。分辨率越高越细、越吃显存，OOM 时会提示调低。</div>
  </div>
  <div class="status" id="status">等待设备帧… 请让手机 App（或模拟脚本）向 /api/frame 发帧。</div>
 </div>
@@ -1444,19 +1474,21 @@ def _build_recog_prompt(candidates):
         p += (
             "任务二·去重：以下是最近30秒已记录的物品清单（编号·名称·描述），其参考图依次是图3、图4…"
             "（图3=[1]、图4=[2]，以此类推）：\n" + lines + "\n"
-            "对识别出的每个物品，判断它是不是清单里已有的那一个（同一个东西在持续出现）：\n"
-            "  · 主要看名称/描述是否指向同一物品——吻合就 match=该编号"
-            "（如 Chicken sandwich 与 Fried chicken sandwich 视为同一个，别因轻微措辞差异当成新的）；\n"
-            "  · 参考图仅用于否决：只有当参考图明显是另一份 / 完全不同的东西时，才判为新的；\n"
-            "  · 确实在清单里找不到对应的，才是新物品，match=null。整体倾向匹配。\n"
+            "对识别出的每个物品，判断它是否就是清单里某一项的**同一个具体物品**在持续出现：\n"
+            "  · 只有当它与该候选是同一个具体产品/同一份食物（同品牌同包装，或明显是同一份）时，才 match=该编号；\n"
+            "  · 同类目但不同产品必须判新：如巧克力棒 vs 谷物棒、可乐 vs 橙汁、品牌/口味/包装不同的同类零食，一律 match=null；\n"
+            "  · 用参考图核对：参考图与当前物品明显不是同一个东西时，必须 match=null；\n"
+            "  · 拿不准是否同一个时，判新（match=null）。\n"
+            "每个物品额外输出 match_reason：一句简短中文，给出 match 或判新的依据。\n"
         )
     else:
-        p += "任务二·去重：当前没有已记录的物品，识别到的都是新的，match 一律为 null。\n"
+        p += ("任务二·去重：当前没有已记录的物品，识别到的都是新的，match 一律为 null，"
+              "match_reason 写“无已记录物品”。\n")
     p += (
         "只输出 JSON，不要任何解释："
         "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
         "\"nutrition_tags\":[\"Carbs\",\"Fiber\",\"Potassium\"],\"food_signal\":\"Quick energy\","
-        "\"match\":null}]}。"
+        "\"match\":null,\"match_reason\":\"画面新出现的物品\"}]}。"
         "画面里没有食物也没有液体时，items 为空数组。"
     )
     return p
@@ -1519,8 +1551,10 @@ def _parse_recog(content):
             match = int(it.get("match"))     # 命中的候选编号；范围校验在 worker（要对齐候选数）
         except (TypeError, ValueError):
             match = None
+        reason = str(it.get("match_reason", "")).strip().replace("\n", " ")[:60]
         out.append({"name": name, "type": "液体" if is_liquid else "食物",
-                    "description": desc, "nutrition_tags": tags, "food_signal": sig, "match": match})
+                    "description": desc, "nutrition_tags": tags, "food_signal": sig,
+                    "match": match, "match_reason": reason})
     return out
 
 
@@ -1568,6 +1602,11 @@ def _recog_worker():
             _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
         boxed_uri = _img_data_uri(boxed)         # 本帧带框图：新卡的代表图(ref_img)
         items = _recognize_dedup(orig, boxed, candidates)
+        # 全链路审计日志：每轮识别的原始判定都落盘，出错误合并时可定位是「认错」还是「匹配错」
+        if items:
+            print("[da3-web] 识别返回 %d 项（去重候选 %d 个：%s）" % (
+                len(items), len(candidates), "、".join(c["name"] for c in candidates) or "无"),
+                flush=True)
         now = time.time()
         with _recog_lock:
             for it in items:
@@ -1576,6 +1615,14 @@ def _recog_worker():
                 if isinstance(m, int) and 1 <= m <= len(candidates):
                     cid = candidates[m - 1]["id"]
                     target = next((c for c in _recog_cards if c["id"] == cid), None)
+                if target is not None:
+                    print("[da3-web] 识别去重：『%s』match=%s → 合并到卡%s『%s』｜理由：%s" % (
+                        it["name"], m, target["id"], target["name"],
+                        it.get("match_reason") or "（模型未给）"), flush=True)
+                else:
+                    print("[da3-web] 识别新卡：『%s』(%s) match=%s｜理由：%s" % (
+                        it["name"], it["type"], m,
+                        it.get("match_reason") or "（模型未给）"), flush=True)
                 if target is not None:           # 去重命中：合并（内容不改）
                     target["shots"].append(glb_url)
                     target["last_ts"] = now
@@ -1674,9 +1721,8 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
             if not ok:
                 raise RuntimeError("点云图编码失败")
             n_food = sum(1 for d in detections if d[0] == "food")
-            n_drink = len(detections) - n_food
             return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
-                    "meta": {"label": f"点云图·服务端渲染（food×{n_food}·drink×{n_drink}·框异步）",
+                    "meta": {"label": f"点云图·服务端渲染（LA food×{n_food}·框异步·液体走③SAM3）",
                              "dt": time.time() - t0, "infer_ms": round(infer_ms, 1),
                              "render_ms": round(render_ms, 1), "encode_ms": round(encode_ms, 1),
                              "res": res, "shape": [cimg.shape[1], cimg.shape[0]]}}
@@ -1693,16 +1739,18 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
                 num_max_points=nmp, show_cameras=show_cam)
             sz = glb.stat().st_size / 1024 if glb.exists() else 0
             _prune_glb()
-            n_food, n_drink = labels.count("food"), labels.count("drink")
-            # LocateAnything 命中 → 异步送 Qwen3-VL 识别「具体是什么」（节流、后台线程，不阻塞产线）
-            _maybe_recognize(arr, detections, f"/glb/{token}/scene.glb", token[:6])
+            n_food = labels.count("food")
+            # 识别工作流：食物证据=LA food 框，液体证据=SAM3 流式命中（缓存框），
+            # 任一命中即异步送 Qwen3-VL 识别（节流、后台线程，不阻塞产线）
+            _maybe_recognize(arr, detections + _sam3_recent_drinks(),
+                             f"/glb/{token}/scene.glb", token[:6])
             # 真实相机垂直 FOV（复现拍摄视角用）：fov_y = 2·atan(H/(2·fy))，fy=K[1,1]。
             # 前端据此把点云相机摆回光心正视 -Z，使点云成像与深度图/原图同视角。
             _K = np.asarray(pred.intrinsics)[0]
             _H = int(np.asarray(pred.depth)[0].shape[0])
             _fov_deg = round(float(np.degrees(2 * np.arctan(_H / (2 * _K[1, 1])))), 2)
             return {"kind": "model", "url": f"/glb/{token}/scene.glb",
-                    "meta": {"label": f"点云 + food/drink 框（food×{n_food} · drink×{n_drink}）",
+                    "meta": {"label": f"点云 + LA food 框（food×{n_food} · 液体走③SAM3）",
                              "dt": time.time() - t0, "stat": f"GLB {sz:.0f}KB · res {res}",
                              "fov_deg": _fov_deg}}
         elif fmt == "mesh":
