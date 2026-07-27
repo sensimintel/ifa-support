@@ -237,7 +237,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by(status)(rate(http_request_duration_seconds_count{service=\"sam3\",status=~\"4..|5..\"}[1m]))",
+          "expr": "sum by(status)(rate(http_requests_total{service=\"sam3\",status=~\"4xx|5xx\"}[1m]))",
           "legendFormat": "{{status}}",
           "refId": "A",
           "range": true
