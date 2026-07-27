@@ -1,9 +1,14 @@
 # odyss-services 本地闭环运行配置模板。
-# bootstrap.sh 会复制本文件为 runtime-config.yaml，并替换以下占位符：
-#   __PASSWORD_KEY_ID__      密码加密 key 标识
-#   __PASSWORD_KEY_B64__     RSA 2048 私钥（base64）——App 登录必需，缺失则 App 端登录请求发不出
-#   __TOKEN_SECRET__         JWT 签发密钥（随机生成）
+# bootstrap.sh 每次执行都会从本模板重新渲染 runtime-config.yaml（密钥持久化在
+# config/secrets.env，重渲染不换密钥），替换以下占位符：
+#   __PASSWORD_KEY_ID__ / __PASSWORD_KEY_B64__ / __TOKEN_SECRET__   身份密钥（首次生成后不变）
+#   __LLM_BASE_URL__ / __LLM_API_KEY__                              LLM 端点（按 LLM_MODE 渲染）
+#   __REALTIME_MODEL__ / __MEAL_MODEL__ / __CHUNK_MODEL__           模型名（按 LLM_MODE 渲染）
+#   __CHUNK_INHOUSE_ENABLED__                                       real 模式 true，mock 模式 false
 # 其余凭据只作用于栈内容器（postgres/redis/minio 均不对公网暴露），保持默认即可。
+# ⚠️ meal 注意：services 内置 workflow 的 meal 节点硬编码模型名 gemini-3.1-pro-preview，
+# __MEAL_MODEL__ 只对使用 ${domain.analysis.meal_model} 占位符的 workflow 生效；real 模式
+# 下 vLLM 端必须配 served-model-name 别名兼容（见 manifest.env 的 VLM_REQUIRED_ALIAS）。
 
 infra:
   http:
@@ -25,8 +30,8 @@ infra:
     region: us-east-1
   llm:
     provider: odyss_llm
-    base_url: http://llm-mock:8081/v1
-    api_key: local-mock-key
+    base_url: __LLM_BASE_URL__
+    api_key: __LLM_API_KEY__
     retry_max_attempts: 3
     retry_initial_delay_millis: 500
     retry_max_delay_millis: 5000
@@ -70,13 +75,18 @@ infra:
       service_account_file: ""
 domain:
   analysis:
-    model: local-mock-realtime-v1
-    meal_model: local-mock-meal-v1
+    model: __REALTIME_MODEL__
+    meal_model: __MEAL_MODEL__
     prompt_language: en
     realtime_interval_seconds: 30
-    # 本地闭环没有 inhouse vLLM 基建：显式关闭 gate，chunk 分析走 mock 的远端 LLM。
+    # chunk 分析通道：mock 模式 gate 关闭（chunk 走 llm-mock 的远端通道）；
+    # real 模式 gate 开启，直连 llm-tunnel 后面的真实 vLLM。
     chunk_inhouse:
-      enabled: false
+      enabled: __CHUNK_INHOUSE_ENABLED__
+      base_url: __LLM_BASE_URL__
+      api_key: __LLM_API_KEY__
+      model: __CHUNK_MODEL__
+      request_timeout_seconds: 120
     realtime_chunk_concurrency: 3
     media_read_timeout_seconds: 15
   user:

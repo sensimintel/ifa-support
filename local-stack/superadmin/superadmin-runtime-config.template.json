@@ -1,6 +1,6 @@
 {
-  "id": "local-stack",
-  "label": "本地栈",
+  "id": "__STACK_ID__",
+  "label": "__STACK_LABEL__",
   "apiBase": "/admin-api",
   "features": ["device-observability", "device-bindings"]
 }

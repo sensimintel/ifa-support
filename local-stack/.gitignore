@@ -1,5 +1,10 @@
-# 构建产物、离线镜像包、备份、运行时生成的配置（含密钥）不入库
+# 构建产物、离线镜像包、备份、运行时渲染的配置（含密钥）不入库。
+# 入库的只有：模板（*.template.*）、manifest.env、脚本、compose、stack 入口。
 artifacts/
 images/
 backups/
+stack.env
 config/runtime-config.yaml
+config/secrets.env
+config/frpc-visitor.toml
+config/superadmin-runtime-config.json

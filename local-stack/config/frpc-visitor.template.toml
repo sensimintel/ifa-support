@@ -1,0 +1,15 @@
+# frp stcp visitor 模板：real 模式下由 bootstrap 渲染为 config/frpc-visitor.toml（不入库）。
+# llm-tunnel 容器加载渲染结果，栈内经 http://llm-tunnel:28000/v1 访问远端 vLLM。
+# 占位符值全部来自 stack.env（FRP_* / 见 stack.env.example），密钥不入库。
+serverAddr = "__FRP_SERVER_ADDR__"
+serverPort = __FRP_SERVER_PORT__
+auth.method = "token"
+auth.token = "__FRP_TOKEN__"
+
+[[visitors]]
+name = "svc-vllm-visitor"
+type = "stcp"
+serverName = "__FRP_STCP_SERVER_NAME__"
+secretKey = "__FRP_STCP_SECRET__"
+bindAddr = "0.0.0.0"
+bindPort = 28000

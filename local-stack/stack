@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# =============================================================================
+# local-stack 唯一入口：所有构建 / 拉起 / 运维动作都从这里走，不直接调脚本。
+#   开发机（有公网 + 代码仓）：./stack build && ./stack bundle
+#   目标机（离线）           ：./stack bootstrap
+#   日常                     ：./stack up|down|restart|ps|logs|backup|restore
+# 版本取 manifest.env（入库），本机差异与密钥取 stack.env（gitignored）。
+# =============================================================================
+set -euo pipefail
+STACK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$STACK_DIR"
+
+# ---- 统一装载：manifest（版本锚）→ stack.env（本机覆盖）→ 派生变量 ----
+set -a
+. "$STACK_DIR/manifest.env"
+[ -f "$STACK_DIR/stack.env" ] && . "$STACK_DIR/stack.env"
+set +a
+LLM_MODE="${LLM_MODE:-mock}"
+case "$LLM_MODE" in
+  mock) export COMPOSE_PROFILES="" ;;
+  real) export COMPOSE_PROFILES="real-vlm" ;;
+  *) echo "[stack] 无效 LLM_MODE=$LLM_MODE（只支持 mock|real）" >&2; exit 1 ;;
+esac
+
+usage() {
+  cat <<'EOF'
+用法: ./stack <命令>
+  build       【开发机】按 manifest 校验分支并构建业务产物（二进制 + 前端 dist）
+  bundle      【开发机】拉齐 base 镜像，打自包含离线包
+  bootstrap   【目标机】一键拉起/更新整套栈（幂等；LLM_MODE 由 stack.env 决定）
+  up          起栈（自动带当前模式的 compose profile）
+  down        停栈（数据在命名卷里，不丢）
+  restart     重启业务容器（services + superadmin）
+  ps          看容器状态
+  logs [svc]  看日志（默认 odyss-services，跟随最近 30 分钟）
+  backup      数据备份（pg + minio + 运行配置，滚动保留）
+  restore <目录>  从备份恢复（破坏性，需确认）
+  mode        显示当前 LLM 模式与生效配置摘要
+EOF
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  build)     exec ./scripts/build-artifacts.sh "$@" ;;
+  bundle)    exec ./scripts/make-offline-bundle.sh "$@" ;;
+  bootstrap) exec ./scripts/bootstrap.sh "$@" ;;
+  up)        exec docker compose up -d "$@" ;;
+  down)      exec docker compose down "$@" ;;
+  restart)   exec docker compose restart odyss-services superadmin "$@" ;;
+  ps)        exec docker compose ps "$@" ;;
+  logs)      svc="${1:-odyss-services}"; exec docker compose logs --since 30m -f "$svc" ;;
+  backup)    exec ./scripts/backup.sh "$@" ;;
+  restore)   exec ./scripts/restore.sh "$@" ;;
+  mode)
+    echo "LLM_MODE=$LLM_MODE (profile: ${COMPOSE_PROFILES:-无})"
+    echo "VLM_MODEL=$VLM_MODEL（real 模式生效；别名要求：$VLM_REQUIRED_ALIAS）"
+    [ -f config/runtime-config.yaml ] && grep -E "base_url|meal_model|enabled" config/runtime-config.yaml | sed 's/^/  runtime: /'
+    ;;
+  ""|-h|--help|help) usage ;;
+  *) echo "[stack] 未知命令: $cmd"; usage; exit 1 ;;
+esac

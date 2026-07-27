@@ -1,11 +1,15 @@
-# Odyss 全栈本地化冒烟栈：services + superadmin + 全部存储，局域网闭环运行。
-# 第一性：拉起后不依赖任何公网访问——镜像离线导入、LLM 走本地 mock、
-# 存储全部落本机命名卷（pg/minio/redis 数据在 volumes 里，容器重建不丢）。
+# Odyss 全栈本地化栈：services + superadmin + 全部存储，局域网闭环运行。
+# 第一性：拉起后不依赖任何公网访问——镜像离线导入、存储全部落本机命名卷。
+# LLM 两种模式（由 ./stack 依 stack.env 注入 COMPOSE_PROFILES）：
+#   mock（默认）    ：chunk/meal 全走栈内 llm-mock，零外部依赖
+#   real（profile real-vlm）：起 llm-tunnel（frp stcp visitor）接远端真实 VLM
+# 镜像 tag 一律 ${IMG_*} 取 manifest.env（./stack 统一注入）；默认值与 manifest 同步，
+# 仅兜底裸跑 docker compose 的场景。
 name: odyss-local-stack
 
 services:
   postgres:
-    image: postgres:18.4
+    image: ${IMG_POSTGRES:-postgres:18.4}
     container_name: odyss-local-postgres
     restart: unless-stopped
     environment:
@@ -24,7 +28,7 @@ services:
       - odyss-local-net
 
   redis:
-    image: valkey/valkey:9.1.0
+    image: ${IMG_REDIS:-valkey/valkey:9.1.0}
     container_name: odyss-local-redis
     restart: unless-stopped
     command: ["valkey-server", "--appendonly", "yes", "--requirepass", "odyssadmin"]
@@ -39,7 +43,7 @@ services:
       - odyss-local-net
 
   minio:
-    image: minio/minio:latest
+    image: ${IMG_MINIO:-minio/minio:latest}
     container_name: odyss-local-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -57,7 +61,7 @@ services:
       - odyss-local-net
 
   minio-init:
-    image: minio/mc:latest
+    image: ${IMG_MINIO_MC:-minio/mc:latest}
     container_name: odyss-local-minio-init
     depends_on:
       minio:
@@ -71,13 +75,27 @@ services:
     networks:
       - odyss-local-net
 
-  # mockllm 与服务共用同一镜像的第二入口：本地闭环里 LLM 全部走 mock。
+  # mockllm 与服务共用同一镜像的第二入口。real 模式下仍常驻：体积可忽略，
+  # 且保证 chunk_inhouse 之外的通道永远有兜底可切回（改 stack.env 重 bootstrap 即可）。
   llm-mock:
     image: odyss-services:local
     container_name: odyss-local-llm-mock
     restart: unless-stopped
     entrypoint: ["/app/mockllm"]
     command: ["-addr", "8081", "-realtime-labels", "eating,eating,not_eating,not_eating,not_eating", "-fail-first-realtime=false"]
+    networks:
+      - odyss-local-net
+
+  # real 模式专属：远端 vLLM 的 frp stcp visitor，栈内经 http://llm-tunnel:28000 访问。
+  # 做成栈内容器而非宿主端口：宿主防火墙（如 5090 的 INPUT policy DROP）不影响容器互访。
+  # frpc-visitor.toml 由 bootstrap 从模板渲染（密钥来自 stack.env，不入库）。
+  llm-tunnel:
+    image: ${IMG_FRPC:-snowdreamtech/frpc:0.61.1}
+    container_name: odyss-local-llm-tunnel
+    restart: unless-stopped
+    profiles: ["real-vlm"]
+    volumes:
+      - ./config/frpc-visitor.toml:/etc/frp/frpc.toml:ro
     networks:
       - odyss-local-net
 
@@ -97,9 +115,9 @@ services:
     image: odyss-services:local
     container_name: odyss-local-services
     restart: unless-stopped
-    # -workers=false 只跑 HTTP：outbox/realtime/delivery worker 依赖 inhouse preflight 等
-    # 额外基建，本地闭环用不到；实时分析链路数据因此不会产生（页面显示为空属预期）。
-    command: ["/app/odyss-services", "-config", "/app/runtime-config.yaml", "-workers=false"]
+    # workers 默认开启：outbox/realtime/delivery 全量运行，实时分析链路可用。
+    # mock 模式 chunk 走 llm-mock（chunk_inhouse gate 关闭），real 模式走 llm-tunnel。
+    command: ["/app/odyss-services", "-config", "/app/runtime-config.yaml"]
     ports:
       - "18090:8080"
     depends_on:
@@ -119,7 +137,7 @@ services:
       - odyss-local-net
 
   superadmin:
-    image: nginx:alpine
+    image: ${IMG_NGINX:-nginx:alpine}
     container_name: odyss-local-superadmin
     restart: unless-stopped
     ports:
@@ -127,7 +145,7 @@ services:
     volumes:
       - ./artifacts/superadmin-dist:/usr/share/nginx/html:ro
       - ./superadmin/superadmin.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./superadmin/superadmin-runtime-config.json:/usr/share/nginx/html/superadmin-runtime-config.json:ro
+      - ./config/superadmin-runtime-config.json:/usr/share/nginx/html/superadmin-runtime-config.json:ro
     depends_on:
       odyss-services:
         condition: service_started

@@ -1,5 +1,7 @@
 # ifa-support
 
+> 本仓同时是 Odyss 本地化组件的**编排管理仓**：全套管理规范见 [`MANAGEMENT.md`](MANAGEMENT.md)，全栈本地化 SOP（一套拉起）见 [`local-stack/`](local-stack/README.md)。以下为 DA3 演示服务说明。
+
 5090 服务器上跑在 `0.0.0.0:8060` 的运维/演示 Web 服务（原目录 `~/da3-web`），单文件 FastAPI 应用，纯服务端渲染、零前端构建。一个端口同时挂官方 Gradio 与自研面板：
 
 - **`/` 分栏首页**：左右两栏 iframe 对比 —— 左栏嵌官方 Gradio UI（`/gradio`），右栏嵌自研扩展面板（`/panel`）。
