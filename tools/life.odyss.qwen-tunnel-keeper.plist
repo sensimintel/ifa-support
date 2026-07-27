@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Qwen 识别隧道守护的 launchd 配置：开机自启、崩溃自拉。安装/卸载见 qwen_tunnel_keeper.py 头注 -->
+<plist version="1.0"><dict>
+ <key>Label</key><string>life.odyss.qwen-tunnel-keeper</string>
+ <key>ProgramArguments</key><array>
+  <string>/usr/bin/python3</string>
+  <string>/Users/yu/odyss-workspace-2/ifa-support/tools/qwen_tunnel_keeper.py</string>
+ </array>
+ <key>RunAtLoad</key><true/>
+ <key>KeepAlive</key><true/>
+ <key>StandardOutPath</key><string>/Users/yu/Library/Logs/qwen-tunnel-keeper.log</string>
+ <key>StandardErrorPath</key><string>/Users/yu/Library/Logs/qwen-tunnel-keeper.log</string>
+ <key>EnvironmentVariables</key><dict>
+  <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+ </dict>
+</dict></plist>

@@ -23,6 +23,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -1014,6 +1015,12 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/weight">电子秤实时重量</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <h1>Depth Anything 3 · 扩展面板</h1>
 
+<div id="tunbar" style="display:flex;gap:8px;align-items:center;font-size:13px;margin:2px 0 12px;color:#6b6b70">
+ <span id="tundot" style="width:8px;height:8px;border-radius:50%;background:#bbb;display:inline-block;flex:none"></span>
+ <span id="tuntxt">Qwen 识别隧道：检测中…</span>
+ <button id="tunbtn" style="display:none;font-size:12px;padding:3px 14px;border-radius:980px;border:1px solid #d0d0d5;background:#fff;cursor:pointer;color:#0071e3">一键重建</button>
+</div>
+
 <div class="grid">
  <figure>
   <div class="box">
@@ -1255,6 +1262,28 @@ async function tick(){
  }catch(e){/* 单次轮询失败忽略，下个周期重试 */}
 }
 setInterval(tick,500);tick();
+
+// ── Qwen 识别隧道状态：5s 轮询。断了给「一键重建」，指令由 Mac 上的守护进程领走执行 ──
+let tunReqAt=0;   // 本页最近一次下发重建指令的时刻，用于显示「重建中…」
+async function tunTick(){
+ try{
+  const t=await(await fetch('/api/tunnel/status',{cache:'no-store'})).json();
+  const dot=$('tundot'),txt=$('tuntxt'),btn=$('tunbtn');
+  const rebuilding=!t.up && (t.pending || Date.now()-tunReqAt<90000) && tunReqAt;
+  if(t.up){dot.style.background='#34c759';txt.textContent='Qwen 识别隧道：已连通';btn.style.display='none';}
+  else if(rebuilding){dot.style.background='#ff9f0a';
+   txt.textContent='Qwen 识别隧道：重建中…'+(t.keeper_msg?('（'+t.keeper_msg+'）'):'');btn.style.display='none';}
+  else{dot.style.background='#ff3b30';
+   txt.textContent='Qwen 识别隧道：已断开'
+     +(t.keeper_alive?'':' · Mac 守护不在线，网页无法远程重建（需在 Mac 上拉起 qwen_tunnel_keeper）')
+     +(t.keeper_msg?('（'+t.keeper_msg+'）'):'');
+   btn.style.display=t.keeper_alive?'inline-block':'none';}
+ }catch(e){/* 单次轮询失败忽略 */}
+}
+$('tunbtn').onclick=async()=>{tunReqAt=Date.now();$('tunbtn').style.display='none';
+ $('tuntxt').textContent='Qwen 识别隧道：已下发重建指令…';
+ try{await fetch('/api/tunnel/rebuild',{method:'POST'});}catch(e){}};
+setInterval(tunTick,5000);tunTick();
 </script>
 </body></html>"""
 
@@ -1722,6 +1751,80 @@ def recog_clear():
     with _recog_lock:
         _recog_cards.clear()
     return JSONResponse({"ok": True})
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Qwen 识别隧道监控 / 一键重建
+# 链路：5090:8011 ←反向SSH← Mac:18011 ←IAP← gpu-g4-01:8000(vllm)。
+# 隧道进程都在 Mac 上（GCP Workforce 凭证只在 Mac，5090 没有 GCP 身份），
+# 本服务只能做两件事：
+#   · 探测：请求本机 8011，凡有 HTTP 应答（含 401）即视为全链路通；
+#   · 转发指令：网页点「一键重建」→ 置 rebuild_requested 标志，Mac 上的守护
+#     进程（本仓 tools/qwen_tunnel_keeper.py，launchd 常驻）心跳时领走执行。
+# ══════════════════════════════════════════════════════════════════════
+TUNNEL_PROBE_URL = "http://127.0.0.1:8011/v1/models"
+TUNNEL_PROBE_CACHE = 2.0     # 探测结果缓存(秒)：多个前端轮询共享，避免每次都真探一枪
+TUNNEL_KEEPER_ALIVE = 15.0   # 守护心跳超时(秒)：超过视为 Mac 守护不在线
+
+_tunnel_lock = threading.Lock()
+_tunnel = {"up": False, "checked_at": 0.0, "last_ok": 0.0,
+           "rebuild_requested": False, "keeper_seen": 0.0, "keeper_msg": ""}
+
+
+def _tunnel_probe():
+    """探一次本机 8011（缓存期内直接复用上次结果）。有 HTTP 应答（含 4xx）=通。"""
+    now = time.time()
+    with _tunnel_lock:
+        if now - _tunnel["checked_at"] < TUNNEL_PROBE_CACHE:
+            return _tunnel["up"]
+    try:
+        with urllib.request.urlopen(TUNNEL_PROBE_URL, timeout=3.0):
+            up = True
+    except urllib.error.HTTPError:
+        up = True            # 服务有应答（如未带 key 的 401），链路本身是通的
+    except Exception:
+        up = False
+    with _tunnel_lock:
+        _tunnel["up"] = up
+        _tunnel["checked_at"] = time.time()
+        if up:
+            _tunnel["last_ok"] = _tunnel["checked_at"]
+            _tunnel["rebuild_requested"] = False   # 已恢复，撤销还没被领走的重建指令
+    return up
+
+
+@app.get("/api/tunnel/status")
+def tunnel_status():
+    """识别隧道状态（网页轮询）：up=5090→GCP Qwen 全链路是否通；keeper_alive=Mac 守护是否在线。"""
+    up = _tunnel_probe()
+    now = time.time()
+    with _tunnel_lock:
+        return JSONResponse({
+            "up": up, "last_ok": _tunnel["last_ok"],
+            "keeper_alive": now - _tunnel["keeper_seen"] <= TUNNEL_KEEPER_ALIVE,
+            "keeper_msg": _tunnel["keeper_msg"],
+            "pending": _tunnel["rebuild_requested"],
+        })
+
+
+@app.post("/api/tunnel/rebuild")
+def tunnel_rebuild():
+    """网页一键重建：置标志，等 Mac 守护下次心跳（≤5s）领走执行。"""
+    with _tunnel_lock:
+        _tunnel["rebuild_requested"] = True
+        alive = time.time() - _tunnel["keeper_seen"] <= TUNNEL_KEEPER_ALIVE
+    return JSONResponse({"ok": True, "keeper_alive": alive})
+
+
+@app.post("/api/tunnel/keeper")
+def tunnel_keeper(body: dict = Body(default=None)):
+    """Mac 守护心跳：上报状态文案、领取重建指令（领走即清标志），并带回 5090 侧探测结果。"""
+    with _tunnel_lock:
+        _tunnel["keeper_seen"] = time.time()
+        _tunnel["keeper_msg"] = str((body or {}).get("msg", ""))[:120]
+        req = _tunnel["rebuild_requested"]
+        _tunnel["rebuild_requested"] = False
+    return JSONResponse({"rebuild": req, "up": _tunnel_probe()})
 
 
 @app.post("/api/sam3/run")
