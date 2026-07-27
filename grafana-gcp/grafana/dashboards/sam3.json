@@ -69,7 +69,8 @@
           "refId": "A",
           "range": true
         }
-      ]
+      ],
+      "id": 1
     },
     {
       "type": "timeseries",
@@ -120,7 +121,8 @@
           "refId": "A",
           "range": true
         }
-      ]
+      ],
+      "id": 2
     },
     {
       "type": "timeseries",
@@ -191,7 +193,8 @@
           "refId": "C",
           "range": true
         }
-      ]
+      ],
+      "id": 3
     },
     {
       "type": "timeseries",
@@ -242,7 +245,8 @@
           "refId": "A",
           "range": true
         }
-      ]
+      ],
+      "id": 4
     },
     {
       "type": "timeseries",
@@ -293,7 +297,8 @@
           "refId": "A",
           "range": true
         }
-      ]
+      ],
+      "id": 5
     },
     {
       "type": "timeseries",
@@ -354,7 +359,8 @@
           "refId": "B",
           "range": true
         }
-      ]
+      ],
+      "id": 6
     },
     {
       "type": "timeseries",
@@ -405,7 +411,8 @@
           "refId": "A",
           "range": true
         }
-      ]
+      ],
+      "id": 7
     },
     {
       "type": "timeseries",
@@ -456,7 +463,8 @@
           "refId": "A",
           "range": true
         }
-      ]
+      ],
+      "id": 8
     }
   ]
 }
