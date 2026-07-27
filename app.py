@@ -1519,27 +1519,22 @@ def _img_data_uri(rgb):
     return ("data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()) if ok else None
 
 
-SHOT_DIR = GLB_DIR.parent / "recog_shots"   # 识别裁剪缩略图目录（Qwen box 裁自原图）
-SHOT_KEEP = 160                             # 磁盘最多保留的裁剪图数量
+SHOT_DIR = GLB_DIR.parent / "recog_shots"   # 识别缩略图目录（点云+Qwen框 服务端渲染图）
+SHOT_KEEP = 160                             # 磁盘最多保留的缩略图数量
 
 
-def _save_crop_shot(orig_rgb, box):
-    """按 Qwen 给的归一化框（0-1）裁剪原图存盘，返回可访问 url；框缺失/非法退回整帧。"""
-    H, W = orig_rgb.shape[:2]
-    crop = orig_rgb
-    if box:
-        nx1, ny1, nx2, ny2 = box
-        pad_x, pad_y = (nx2 - nx1) * 0.08, (ny2 - ny1) * 0.08   # 四周留 8% 呼吸边
-        x1, y1 = max(0, int((nx1 - pad_x) * W)), max(0, int((ny1 - pad_y) * H))
-        x2, y2 = min(W, int((nx2 + pad_x) * W)), min(H, int((ny2 + pad_y) * H))
-        if x2 - x1 > 4 and y2 - y1 > 4:
-            crop = orig_rgb[y1:y2, x1:x2]
-    h, w = crop.shape[:2]
-    scale = 480.0 / max(h, w)               # 最长边压到 480，控制体积
-    if scale < 1:
-        crop = cv2.resize(crop, (max(1, int(w * scale)), max(1, int(h * scale))),
-                          interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(crop, cv2.COLOR_RGB2BGR),
+def _save_cloud_shot(pred, dets, conf):
+    """识别缩略图：用该帧 DA3 pred 走与②/③相同的服务端点云渲染链路，
+    叠 Qwen 给的 box（食物红/液体蓝 3D 框），存盘返回 /shotimg url；渲染失败返回 None。
+    dets: [(label, nx1, ny1, nx2, ny2)]，坐标 0-1 归一化（同 LA 框约定）；空则渲无框点云。"""
+    try:
+        img = _render_pointcloud_image(pred, dets or None, conf_thresh_percentile=conf)
+    except Exception as e:
+        print(f"[da3-web] 识别缩略图渲染失败：{type(e).__name__}: {e}", flush=True)
+        return None
+    if img is None:
+        return None
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_RGB2BGR),
                            [int(cv2.IMWRITE_JPEG_QUALITY), 82])
     if not ok:
         return None
@@ -1693,7 +1688,7 @@ def _recog_worker():
         with _recog_cv:
             while not _recog_pending:
                 _recog_cv.wait()
-            orig, boxed, glb_url, frame, t, candidates, n_food, n_drink, enq_ts = \
+            orig, boxed, glb_url, frame, t, candidates, n_food, n_drink, enq_ts, pred, conf = \
                 _recog_pending.pop()             # 最新优先
             _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
         wait_ms = (time.time() - enq_ts) * 1000.0     # 在队列里等 worker 的时长
@@ -1737,8 +1732,12 @@ def _recog_worker():
                     print("[da3-web] 识别新卡：『%s』(%s) match=%s｜理由：%s" % (
                         it["name"], it["type"], m,
                         it.get("match_reason") or "（模型未给）"), flush=True)
-                # 缩略图 = 本轮原图按 Qwen box 裁剪（无框退整帧）
-                shot_url = _save_crop_shot(orig, it.get("box"))
+                # 缩略图 = 该帧点云 + Qwen box 的 3D 框（与②/③同一渲染链路；无框渲无框点云）
+                shot_dets = []
+                if it.get("box"):
+                    shot_dets = [(("drink" if it["type"] == "液体" else "food"),)
+                                 + tuple(it["box"])]
+                shot_url = _save_cloud_shot(pred, shot_dets, conf) if pred is not None else None
                 if target is not None:           # 去重命中：合并（显示名不改，本轮名称进合并史）
                     target.setdefault("merge_history", []).append({
                         "t": t, "name": it["name"],
@@ -1769,7 +1768,7 @@ def _recog_worker():
                 del _recog_cards[:len(_recog_cards) - RECOG_MAX_CARDS]
 
 
-def _maybe_recognize(orig_rgb, detections, glb_url, frame):
+def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0):
     """detections 非空 + 节流通过 → 取活跃卡快照作去重候选、提交异步识别。processor 里调用，不阻塞产线。
     不再加 pending 占位卡（去重后归属不定），识别中用前端顶部 live 指示。"""
     global _recog_last_ts, _recog_worker_started
@@ -1796,7 +1795,7 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame):
     n_drink = len(detections) - n_food
     with _recog_cv:
         _recog_pending.append((orig_rgb.copy(), boxed, glb_url, frame, t, candidates,
-                               n_food, n_drink, time.time()))
+                               n_food, n_drink, time.time(), pred, conf))
         _recog_cv.notify()
 
 
@@ -1871,7 +1870,7 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
             # 识别工作流：食物证据=LA food 框，液体证据=SAM3 流式命中（缓存框），
             # 任一命中即异步送 Qwen3-VL 识别（节流、后台线程，不阻塞产线）
             _maybe_recognize(arr, detections + _sam3_recent_drinks(),
-                             f"/glb/{token}/scene.glb", token[:6])
+                             f"/glb/{token}/scene.glb", token[:6], pred=pred, conf=conf)
             # 真实相机垂直 FOV（复现拍摄视角用）：fov_y = 2·atan(H/(2·fy))，fy=K[1,1]。
             # 前端据此把点云相机摆回光心正视 -Z，使点云成像与深度图/原图同视角。
             _K = np.asarray(pred.intrinsics)[0]
@@ -2184,7 +2183,7 @@ def weight_page():
 
 # ══════════════════════════════════════════════════════════════════════
 # 实时识别卡片流页：轮询 /api/recog/list，最近新建/更新的卡在最上；
-# 缩略图=Qwen 输出的 box 裁自原图的 JPEG（/shotimg/*）；名称流式打字；食物红 / 液体蓝。
+# 缩略图=该帧点云叠 Qwen box 的服务端渲染图（/shotimg/*）；名称流式打字；食物红 / 液体蓝。
 # ══════════════════════════════════════════════════════════════════════
 RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
