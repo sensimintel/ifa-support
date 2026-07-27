@@ -26,6 +26,7 @@ from pydantic import BaseModel
 import uvicorn
 from pycocotools import mask as mask_utils
 import sam3
+from prometheus_fastapi_instrumentator import Instrumentator
 
 # 增量路径依赖的 sam3 内部结构（上游若重构导致 import 失败，整体回退 replay，不影响服务可用性）
 try:
@@ -280,6 +281,8 @@ def _sweep_streams():
 threading.Thread(target=_sweep_streams, daemon=True).start()
 
 app = FastAPI(title="SAM3 Inference Server", version="2.0.0")
+# Prometheus 埋点：暴露 /metrics，含每端点 QPS/延时直方图/in-flight/错误率（对标 LocateAnything 观测）
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 @app.on_event("startup")
 def _startup():
