@@ -1528,7 +1528,11 @@ def _save_cloud_shot(pred, dets, conf):
     叠 Qwen 给的 box（食物红/液体蓝 3D 框），存盘返回 /shotimg url；渲染失败返回 None。
     dets: [(label, nx1, ny1, nx2, ny2)]，坐标 0-1 归一化（同 LA 框约定）；空则渲无框点云。"""
     try:
-        img = _render_pointcloud_image(pred, dets or None, conf_thresh_percentile=conf)
+        # 点云观感参数沿用 bc2bc8b 验收过的那组：相机抬离光心（视差遮挡缝）+ 俯视 20°
+        # + splat=1 点状离散渲染；钉光心/大 splat 会退化成"重投影原图"（仓内已知坑）
+        img = _render_pointcloud_image(pred, dets or None, conf_thresh_percentile=conf,
+                                       view_tilt=20.0, view_zoom=1.0, splat=1,
+                                       eye_lift=0.4, eye_back=0.3)
     except Exception as e:
         print(f"[da3-web] 识别缩略图渲染失败：{type(e).__name__}: {e}", flush=True)
         return None
