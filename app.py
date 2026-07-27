@@ -1789,7 +1789,8 @@ def _tunnel_probe():
         _tunnel["checked_at"] = time.time()
         if up:
             _tunnel["last_ok"] = _tunnel["checked_at"]
-            _tunnel["rebuild_requested"] = False   # 已恢复，撤销还没被领走的重建指令
+        # 注意：重建指令只由守护心跳领取消费，这里绝不代为撤销——
+        # 探测(2s缓存)比守护心跳(5s)勤，恢复瞬间撤销会把刚下发的指令静默吞掉。
     return up
 
 
