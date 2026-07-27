@@ -15,7 +15,7 @@
 | 组件 | 代码正源 | 分支规则（至 2026-08-21 窗口） | 发布方式 |
 |---|---|---|---|
 | 后端 API | odyss-services | PR base **ifa**，走 OLI | `./stack build` 编译进离线包 |
-| 设备观测前端 | odyss-superadmin | main，走 OLI publish | `./stack build` 出 dist 进离线包 |
+| 设备观测前端 | odyss-superadmin | PR base **ifa**，走 OLI | `./stack build` 出 dist 进离线包 |
 | 手机 App | odyss-frontend | **直推 ifa**，不走 OLI | ios-build 装机，App 内 base_url 指向栈地址 |
 | 传输内核 | react-native-odyss-capability_hub | **直推 ifa**，不走 OLI | 随 frontend 构建 |
 | 真实 VLM 服务端 | odyss-models `deploy/gcp-g4/` | main，走 OLI | 该仓 `deploy.sh`（IAP scp + 远程 setup） |
@@ -41,7 +41,7 @@
 | 部署点 | 状态 | 待办 |
 |---|---|---|
 | GCP gpu-g4-01（VLM） | 与 odyss-models 正源一致 | SERVED_ALIASES 别名随 odyss-models PR 落地 |
-| 5090 `~/odyss-services-ifa` | **手工演化的孤本**（容器名 odyss-ifa-*、pg/minio **无命名卷**、配置手改） | 下次维护窗口用本仓 SOP 重新拉起：`./stack backup` 思路导出数据 → 按 bundle 重部署 → restore；在此之前只允许对齐 nginx conf 等无状态文件 |
+| 5090 `~/odyss-services-ifa` | **手工演化的孤本**（容器名 odyss-ifa-*、pg/minio **无命名卷**、配置手改） | 下次维护窗口用本仓 SOP 重新拉起：`./stack backup` 思路导出数据 → 按 bundle 重部署 → restore；在此之前只允许对齐 nginx conf、superadmin `dist` 等无状态文件（`superadmin/dist` 是 bind mount，换文件即生效，不需重建容器） |
 
 ## 6. 违规即失败
 

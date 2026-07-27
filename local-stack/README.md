@@ -43,7 +43,7 @@
 
 ## 阶段 A：制作离线包（有公网的开发机）
 
-前置：Go 工具链、Node、docker；本机 clone 了两个业务仓（分支以 `manifest.env` 为准：services=ifa、superadmin=main；路径不同时在 `stack.env` 里配 `SERVICES_REPO`/`SUPERADMIN_REPO`）。
+前置：Go 工具链、Node、docker；本机 clone 了两个业务仓（分支以 `manifest.env` 为准：services=ifa、superadmin=ifa；路径不同时在 `stack.env` 里配 `SERVICES_REPO`/`SUPERADMIN_REPO`）。
 
 ```bash
 cd local-stack
