@@ -23,6 +23,8 @@
 
 窗口过期后分支规则回归各仓默认（main），届时更新本表。
 
+> **窗口内 test 环境冻结属预期，不是 CI 故障。** services 与 superadmin 的 CI 都只在 push `main` 时触发（前者构建镜像，后者部署 Cloudflare Pages 的 test 站点），而窗口内两仓的 PR 一律合 `ifa` 不合 `main`，因此 `superadmin-test.odyss.life` 会停在窗口前最后一次 main（2026-07-27 的 `41fc726`，已含 App 活性判定修复）。这是有意的隔离：ifa 的产物只经 `./stack build` 发往 5090，**窗口内的验证一律在 5090 做**。窗口结束合回 main 时 test 会自动追上。
+
 ## 3. 一套拉起的形态
 
 - **唯一入口**：`local-stack/stack`。开发机 `./stack build && ./stack bundle`；目标机 `./stack bootstrap`；日常 `./stack up|down|restart|ps|logs|backup|restore|mode`。README 之外不应存在需要背的命令。
