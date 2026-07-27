@@ -1642,17 +1642,19 @@ def _recog_worker():
         with _recog_cv:
             while not _recog_pending:
                 _recog_cv.wait()
-            orig, boxed, glb_url, frame, t, candidates, n_food, n_drink = \
+            orig, boxed, glb_url, frame, t, candidates, n_food, n_drink, enq_ts = \
                 _recog_pending.pop()             # 最新优先
             _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
+        wait_ms = (time.time() - enq_ts) * 1000.0     # 在队列里等 worker 的时长
         # 新卡代表图(ref_img)：带框图加 HISTORY REF 横幅标记，防止后续轮次被当成当前画面
         boxed_uri = _img_data_uri(_make_ref_img(boxed))
+        _tq = time.time()
         items = _recognize_dedup(orig, boxed, candidates, n_food, n_drink)
-        # 全链路审计日志：每轮识别的原始判定都落盘，出错误合并时可定位是「认错」还是「匹配错」
-        if items:
-            print("[da3-web] 识别返回 %d 项（去重候选 %d 个：%s）" % (
-                len(items), len(candidates), "、".join(c["name"] for c in candidates) or "无"),
-                flush=True)
+        qwen_ms = (time.time() - _tq) * 1000.0
+        # 全链路审计日志：每轮（含空返回）都落盘——耗时分段 + 原始判定，可定位慢在哪/错在哪
+        print("[da3-web] 识别一轮：排队%.0fms · Qwen %.0fms · 返回 %d 项（去重候选 %d 个：%s）" % (
+            wait_ms, qwen_ms, len(items), len(candidates),
+            "、".join(c["name"] for c in candidates) or "无"), flush=True)
         now = time.time()
         with _recog_lock:
             for it in items:
@@ -1740,7 +1742,7 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame):
     n_drink = len(detections) - n_food
     with _recog_cv:
         _recog_pending.append((orig_rgb.copy(), boxed, glb_url, frame, t, candidates,
-                               n_food, n_drink))
+                               n_food, n_drink, time.time()))
         _recog_cv.notify()
 
 
