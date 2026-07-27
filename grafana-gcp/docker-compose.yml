@@ -16,6 +16,9 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_ANALYTICS_REPORTING_ENABLED=false
       - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      # 局域网内看板免登录浏览(只读 Viewer)，对标 locateanything grafana；admin 仍需密码
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
       # 供数据源 provisioning 插值
       - LOCAL_PROM_PORT=${LOCAL_PROM_PORT:-9091}
       - G4_PROM_LOCAL_PORT=${G4_PROM_LOCAL_PORT:-29090}
