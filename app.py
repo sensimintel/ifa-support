@@ -1479,16 +1479,21 @@ def _build_recog_prompt(candidates):
             "  · 同类目但不同产品必须判新：如巧克力棒 vs 谷物棒、可乐 vs 橙汁、品牌/口味/包装不同的同类零食，一律 match=null；\n"
             "  · 用参考图核对：参考图与当前物品明显不是同一个东西时，必须 match=null；\n"
             "  · 拿不准是否同一个时，判新（match=null）。\n"
-            "每个物品额外输出 match_reason：一句简短中文，给出 match 或判新的依据。\n"
+            "每个物品额外输出三个字段：\n"
+            "  match_reason：一句简短中文，给出 match 或判新的依据；\n"
+            "  matched_name：match≠null 时，一字不差照抄清单里该编号的名称；match=null 时为 null；\n"
+            "  match_confidence：match≠null 时填“high”（确定是同一个）或“low”（不太确定）；"
+            "只有 high 会被合并，low 会按新物品处理。\n"
         )
     else:
         p += ("任务二·去重：当前没有已记录的物品，识别到的都是新的，match 一律为 null，"
-              "match_reason 写“无已记录物品”。\n")
+              "match_reason 写“无已记录物品”，matched_name 为 null。\n")
     p += (
         "只输出 JSON，不要任何解释："
         "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
         "\"nutrition_tags\":[\"Carbs\",\"Fiber\",\"Potassium\"],\"food_signal\":\"Quick energy\","
-        "\"match\":null,\"match_reason\":\"画面新出现的物品\"}]}。"
+        "\"match\":null,\"match_reason\":\"画面新出现的物品\",\"matched_name\":null,"
+        "\"match_confidence\":null}]}。"
         "画面里没有食物也没有液体时，items 为空数组。"
     )
     return p
@@ -1552,9 +1557,13 @@ def _parse_recog(content):
         except (TypeError, ValueError):
             match = None
         reason = str(it.get("match_reason", "")).strip().replace("\n", " ")[:60]
+        mname = str(it.get("matched_name") or "").strip()[:40]
+        conf = str(it.get("match_confidence") or "").strip().lower()
+        conf = conf if conf in ("high", "low") else ""    # 非法/缺省按 low 语义处理（不合并）
         out.append({"name": name, "type": "液体" if is_liquid else "食物",
                     "description": desc, "nutrition_tags": tags, "food_signal": sig,
-                    "match": match, "match_reason": reason})
+                    "match": match, "match_reason": reason,
+                    "matched_name": mname, "match_confidence": conf})
     return out
 
 
@@ -1589,6 +1598,16 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates):
     return _parse_recog(out)
 
 
+def _name_tokens(s):
+    """名称 → 词面 token 集（拉丁按词、中文按字符 2-gram，单字退化为单字）。
+    仅用于合并零重叠 WARN 观测，不做合并闸门（语义判同权在模型）。"""
+    s = (s or "").strip().lower()
+    toks = set(re.findall(r"[a-z0-9]+", s))
+    cjk = re.findall(r"[一-鿿]", s)
+    toks |= {a + b for a, b in zip(cjk, cjk[1:])} or set(cjk)
+    return toks
+
+
 def _recog_worker():
     """后台单线程：取最新识别任务、丢弃积压，识别 + 去重：
       duplicate 命中 → 合并到那张卡（只追加缩略图 glb、刷新 last_ts、rev+1，内容不改）；
@@ -1611,19 +1630,39 @@ def _recog_worker():
         with _recog_lock:
             for it in items:
                 target = None
-                m = it.get("match")              # 命中候选编号 → 合并；null/越界 → 新建
+                m = it.get("match")   # 命中候选编号；还要过「回显校验+置信度」两道闸才允许合并
                 if isinstance(m, int) and 1 <= m <= len(candidates):
-                    cid = candidates[m - 1]["id"]
-                    target = next((c for c in _recog_cards if c["id"] == cid), None)
+                    cand = candidates[m - 1]
+                    if (it.get("matched_name") or "").strip().casefold() \
+                            != cand["name"].strip().casefold():
+                        # 闸门一·回显校验：matched_name 必须照抄候选名——只校验编号↔名称
+                        # 指称对齐（抓编号幻觉/错位），零语义判断、零语义误伤
+                        print("[da3-web] 识别拒合并（回显不一致）：『%s』match=%s 回显『%s』≠候选『%s』→ 按新卡处理" % (
+                            it["name"], m, it.get("matched_name") or "空", cand["name"]), flush=True)
+                    elif it.get("match_confidence") != "high":
+                        # 闸门二·置信度：模型自报不确定 → 宁拒勿并（判断权在看过图的模型）
+                        print("[da3-web] 识别拒合并（低置信）：『%s』match=%s confidence=%s → 按新卡处理" % (
+                            it["name"], m, it.get("match_confidence") or "缺省"), flush=True)
+                    else:
+                        target = next((c for c in _recog_cards if c["id"] == cand["id"]), None)
                 if target is not None:
-                    print("[da3-web] 识别去重：『%s』match=%s → 合并到卡%s『%s』｜理由：%s" % (
+                    print("[da3-web] 识别去重：『%s』match=%s(high) → 合并到卡%s『%s』｜理由：%s" % (
                         it["name"], m, target["id"], target["name"],
                         it.get("match_reason") or "（模型未给）"), flush=True)
+                    if not (_name_tokens(it["name"]) & _name_tokens(target["name"])):
+                        # 仅观测不拦截：零重叠合并连续出现是错并的高危信号，供日志巡检
+                        print("[da3-web] ⚠️ 合并名称零重叠：『%s』→卡『%s』，请人工核对是否错并" % (
+                            it["name"], target["name"]), flush=True)
                 else:
                     print("[da3-web] 识别新卡：『%s』(%s) match=%s｜理由：%s" % (
                         it["name"], it["type"], m,
                         it.get("match_reason") or "（模型未给）"), flush=True)
-                if target is not None:           # 去重命中：合并（内容不改）
+                if target is not None:           # 去重命中：合并（显示名不改，本轮名称进合并史）
+                    target.setdefault("merge_history", []).append({
+                        "t": t, "name": it["name"],
+                        "reason": it.get("match_reason", ""),
+                        "confidence": it.get("match_confidence", "")})
+                    del target["merge_history"][:-20]    # 只留最近 20 条
                     target["shots"].append(glb_url)
                     target["last_ts"] = now
                     target["t"] = t
@@ -1638,7 +1677,7 @@ def _recog_worker():
                         "id": _recog_id, "status": "done",
                         "name": it["name"], "type": it["type"], "description": it["description"],
                         "nutrition_tags": it["nutrition_tags"], "food_signal": it["food_signal"],
-                        "shots": [glb_url], "ref_img": boxed_uri,
+                        "shots": [glb_url], "ref_img": boxed_uri, "merge_history": [],
                         "frame": frame, "t": t, "last_ts": now, "rev": 0})
             if len(_recog_cards) > RECOG_MAX_CARDS:
                 del _recog_cards[:len(_recog_cards) - RECOG_MAX_CARDS]
