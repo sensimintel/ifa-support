@@ -28,6 +28,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import gradio as gr
@@ -44,7 +45,8 @@ sys.path.append(str(DA3_ROOT / "src"))
 from depth_anything_3.api import DepthAnything3  # noqa: E402
 from depth_anything_3.app.gradio_app import DepthAnything3App  # noqa: E402
 
-from frame_relay import router as frame_router, set_processor  # noqa: E402
+from frame_relay import (  # noqa: E402
+    UNKNOWN_DEVICE, get_selected_device, router as frame_router, set_processor)
 
 MODEL_DIR = str(DA3_ROOT / "models" / "DA3NESTED-GIANT-LARGE-1.1")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -848,10 +850,12 @@ _sam3cloud = {"kind": None, "url": None, "bytes": None, "seq": 0,
               "meta": None, "error": None, "running": False}
 
 
-def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam):
+def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
     """后台任务：SAM3 track（多词并发）→ mask 解码/缩放到深度分辨率 → 与第二图**同源**产出：
     fmt=cloudimg → 与第二图完全相同参数的服务端渲染图；其余 → 与第二图同一条 GLB 构建链路
-    （同一 pred、同一降采样/裁剪 → 点云几何一模一样），前端 model-viewer 相机跟随第二图。"""
+    （同一 pred、同一降采样/裁剪 → 点云几何一模一样），前端 model-viewer 相机跟随第二图。
+    gen=发起时的流代号：任务在飞期间选中设备切换（代号推进）则丢弃写回，防旧设备产物/
+    液体框污染新设备。"""
     try:
         t0 = time.time()
         nlast = str(len(frames) - 1)
@@ -907,6 +911,8 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam):
                 continue
             drink_dets.append(("drink", float(xs.min()) / W0, float(ys.min()) / H0,
                                float(xs.max() + 1) / W0, float(ys.max() + 1) / H0))
+        if gen != _current_stream_gen():
+            return                    # 任务在飞期间切了设备：本轮结果属于旧设备，整体丢弃
         with _sam3_dets_lock:
             _sam3_dets["dets"] = drink_dets
             _sam3_dets["ts"] = time.time()
@@ -955,9 +961,9 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam):
             _sam3cloud["running"] = False
 
 
-def _maybe_sam3cloud(pred, conf, fmt, nmp, show_cam):
+def _maybe_sam3cloud(pred, conf, fmt, nmp, show_cam, gen):
     """processor 每帧调用：无在跑任务则用本帧 pred + 最近帧序列后台起一个 SAM3 点云映射任务。
-    fmt/nmp/show_cam 透传面板当前配置，保证第三图与第二图同源同参。"""
+    fmt/nmp/show_cam 透传面板当前配置，保证第三图与第二图同源同参；gen=当前流代号。"""
     frames = _get_recent_frames(SAM3_TRACK_FRAMES)
     if not frames:
         return
@@ -965,7 +971,8 @@ def _maybe_sam3cloud(pred, conf, fmt, nmp, show_cam):
         if _sam3cloud["running"]:
             return
         _sam3cloud["running"] = True
-    threading.Thread(target=_sam3cloud_refresh, args=(pred, frames, conf, fmt, nmp, show_cam),
+    threading.Thread(target=_sam3cloud_refresh,
+                     args=(pred, frames, conf, fmt, nmp, show_cam, gen),
                      daemon=True).start()
 
 
@@ -978,6 +985,58 @@ def _prune_glb():
             shutil.rmtree(p, ignore_errors=True)
     except Exception:
         pass
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 多设备单路处理：DA3/SAM3/识别 这条重链路同一时刻只跑「当前选中设备」一路，
+# 但 _recent_frames / LA 框缓存 / SAM3 流式长记忆等跨帧时序状态都是单流假设——
+# 切换选中设备时必须整组重置，防止上一台设备的帧污染新设备的时序语义。
+# _stream_gen 是流代号：切设备 +1；在飞的 SAM3 后台任务凭它丢弃过期写回。
+# ══════════════════════════════════════════════════════════════════════
+_stream_lock = threading.Lock()
+_stream_device = None     # 当前处理流的 device_id（None=还没处理过任何帧）
+_stream_gen = 0
+
+
+def _current_stream_gen():
+    with _stream_lock:
+        return _stream_gen
+
+
+def _reset_stream_state():
+    """清空所有跨帧时序状态（调用方须已判定发生了设备切换）。
+    SAM3 流式 session 直接废弃（server 端按空闲自回收），新设备首帧自动重建。"""
+    global _sam3_stream_sessions
+    with _recent_lock:
+        del _recent_frames[:]
+    with _locate_cache_lock:
+        _locate_cache["dets"] = []
+        _locate_cache["ts"] = 0.0
+    with _sam3_stream_lock:
+        _sam3_stream_sessions = {}
+    with _sam3_dets_lock:
+        _sam3_dets["dets"] = []
+        _sam3_dets["ts"] = 0.0
+    with _sam3cloud_lock:
+        _sam3cloud.update({"kind": None, "url": None, "bytes": None,
+                           "meta": None, "error": None})
+
+
+def _track_stream_device(device_id):
+    """processor 每帧调用：设备与上一帧不同则重置时序缓存并推进流代号。返回当前流代号。"""
+    global _stream_device, _stream_gen
+    with _stream_lock:
+        if device_id == _stream_device:
+            return _stream_gen
+        prev = _stream_device
+        _stream_device = device_id
+        _stream_gen += 1
+        gen = _stream_gen
+    if prev is not None:
+        print(f"[da3-web] 处理流切换设备：{prev} → {device_id}，重置时序缓存与 SAM3 会话",
+              flush=True)
+        _reset_stream_state()
+    return gen
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1062,6 +1121,12 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <span id="tundot" style="width:8px;height:8px;border-radius:50%;background:#bbb;display:inline-block;flex:none"></span>
  <span id="tuntxt">Qwen 识别隧道：检测中…</span>
  <button id="tunbtn" style="display:none;font-size:12px;padding:3px 14px;border-radius:980px;border:1px solid #d0d0d5;background:#fff;cursor:pointer;color:#0071e3">一键重建</button>
+</div>
+
+<div id="devbar" style="display:none;gap:8px;align-items:center;font-size:13px;margin:2px 0 12px;color:#6b6b70">
+ <span style="flex:none">设备：</span>
+ <select id="devsel" style="width:auto;min-width:200px;font-size:13px;padding:5px 8px;border:1px solid #d0d0d5;border-radius:8px;background:#fff"></select>
+ <span id="devinfo"></span>
 </div>
 
 <div class="grid">
@@ -1231,11 +1296,42 @@ syncOpts();pushConfig();  // 首次把面板初值下发后端
 
 let lastSeq=-1,lastProdKey='',lastSwap=0,lastS3=-1,lastSwap3=0;
 const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显示，避免高帧率下一直卡在"加载中"(黑屏)
+
+// ── 多设备：下拉选设备（服务端只处理选中设备一路；非选中设备的帧只进各自缓存） ──
+const devsel=$('devsel');
+let curDev=null, lastDevKey='';
+devsel.addEventListener('change',()=>{
+  fetch('/api/frame/select',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({device_id:devsel.value})}).catch(()=>{});
+});
+function renderDevices(s){
+  const devs=s.devices||[];
+  $('devbar').style.display=devs.length?'flex':'none';
+  if(document.activeElement!==devsel){   // 下拉展开操作中不重建选项，避免选择被打断
+    const key=devs.map(d=>d.device_id).join('|')+'#'+(s.selected||'');
+    if(key!==lastDevKey){ lastDevKey=key;
+      devsel.innerHTML=devs.map(d=>'<option value="'+d.device_id+'"'
+        +(d.device_id===s.selected?' selected':'')+'>'+d.device_id+'</option>').join('');
+    }
+  }
+  const sel=devs.find(d=>d.device_id===s.selected);
+  $('devinfo').textContent=(devs.length>1?('共 '+devs.length+' 台在传 · '):'')
+    +(sel&&sel.fps?('选中 '+sel.fps.toFixed(1)+' fps'):'');
+}
+function resetPanesForSwitch(){   // 切设备：清空三框显示与序号缓存，等新设备的帧/产物
+  lastSeq=-1;lastProdKey='';lastS3=-1;lastSwap=0;lastSwap3=0;
+  $('raw').style.display='none';$('rawwait').style.display='';
+  $('prodimg').style.display='none';$('mv').style.display='none';$('prodwait').style.display='';
+  $('s3img').style.display='none';$('mv2').style.display='none';$('s3wait').style.display='';
+}
 async function tick(){
  try{
   const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
   // 服务端重启后配置清零（config_gen=0 → 回落 depth 模式、识别不触发）：自动重推当前面板配置
   if(s.processor && s.config_gen===0) pushConfig();
+  // 设备下拉 + 切换检测（本页或其他页面触发的切换都会在这里被发现）
+  renderDevices(s);
+  if(s.device && s.device!==curDev){ if(curDev!==null) resetPanesForSwitch(); curDev=s.device; }
   // 左框：接收帧
   if(s.has_frame && s.seq!==lastSeq){lastSeq=s.seq;
     $('raw').src='/api/frame/latest?t='+s.seq;$('raw').style.display='block';$('rawwait').style.display='none';}
@@ -1446,8 +1542,10 @@ RECOG_MAX_CANDIDATES = 8     # 每次最多带几张候选参考图(带框图)�
 
 _recog_lock = threading.Lock()
 _recog_cv = threading.Condition(_recog_lock)
-_recog_cards = []          # [{id,status,name,type,glb_url,frame,t}]，append 顺序=时间顺序
-_recog_id = 0              # 卡片自增 id
+# device_id -> [{id,status,name,type,glb_url,frame,t}]，每设备一条独立卡片流（append 顺序=时间顺序）。
+# 切换设备时卡片不清空：/api/recog/list 默认下发当前选中设备的桶，切回来卡片还在。
+_recog_cards = {}
+_recog_id = 0              # 卡片自增 id（全设备共用一个计数器，保证 id 全局唯一）
 _recog_last_ts = 0.0       # 上次触发识别的时刻(节流用)
 _recog_pending = []        # 待识别任务队列(单线程消费，最新优先、丢弃积压)
 _recog_worker_started = False
@@ -1707,7 +1805,7 @@ def _recog_worker():
         with _recog_cv:
             while not _recog_pending:
                 _recog_cv.wait()
-            orig, boxed, glb_url, frame, t, candidates, n_food, n_drink, enq_ts, pred, conf = \
+            orig, boxed, glb_url, frame, t, candidates, n_food, n_drink, enq_ts, pred, conf, dev = \
                 _recog_pending.pop()             # 最新优先
             _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
         wait_ms = (time.time() - enq_ts) * 1000.0     # 在队列里等 worker 的时长
@@ -1722,6 +1820,7 @@ def _recog_worker():
             "、".join(c["name"] for c in candidates) or "无"), flush=True)
         now = time.time()
         with _recog_lock:
+            cards = _recog_cards.setdefault(dev, [])   # 该设备自己的卡片流
             for it in items:
                 target = None
                 m = it.get("match")   # 命中候选编号；还要过「回显校验+置信度」两道闸才允许合并
@@ -1738,7 +1837,7 @@ def _recog_worker():
                         print("[da3-web] 识别拒合并（低置信）：『%s』match=%s confidence=%s → 按新卡处理" % (
                             it["name"], m, it.get("match_confidence") or "缺省"), flush=True)
                     else:
-                        target = next((c for c in _recog_cards if c["id"] == cand["id"]), None)
+                        target = next((c for c in cards if c["id"] == cand["id"]), None)
                 if target is not None:
                     print("[da3-web] 识别去重：『%s』match=%s(high) → 合并到卡%s『%s』｜理由：%s" % (
                         it["name"], m, target["id"], target["name"],
@@ -1772,23 +1871,25 @@ def _recog_worker():
                     target["frame"] = frame
                     target["rev"] = target.get("rev", 0) + 1
                     # 有更新的卡移到列表末尾（下发时反转=置顶），顺序=最近更新在前
-                    _recog_cards.remove(target)
-                    _recog_cards.append(target)
+                    cards.remove(target)
+                    cards.append(target)
                 else:                            # 新食物：新建卡
                     _recog_id += 1
-                    _recog_cards.append({
+                    cards.append({
                         "id": _recog_id, "status": "done",
                         "name": it["name"], "type": it["type"], "description": it["description"],
                         "nutrition_tags": it["nutrition_tags"], "food_signal": it["food_signal"],
                         "shots": [shot_url] if shot_url else [], "ref_img": boxed_uri,
                         "merge_history": [],
                         "frame": frame, "t": t, "last_ts": now, "rev": 0})
-            if len(_recog_cards) > RECOG_MAX_CARDS:
-                del _recog_cards[:len(_recog_cards) - RECOG_MAX_CARDS]
+            if len(cards) > RECOG_MAX_CARDS:
+                del cards[:len(cards) - RECOG_MAX_CARDS]
 
 
-def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0):
-    """detections 非空 + 节流通过 → 取活跃卡快照作去重候选、提交异步识别。processor 里调用，不阻塞产线。
+def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
+                     device=UNKNOWN_DEVICE):
+    """detections 非空 + 节流通过 → 取该设备活跃卡快照作去重候选、提交异步识别。
+    processor 里调用，不阻塞产线。去重候选与新卡都落在 device 自己的卡片桶里。
     不再加 pending 占位卡（去重后归属不定），识别中用前端顶部 live 指示。"""
     global _recog_last_ts, _recog_worker_started
     if not detections or not RECOG_ENDPOINT:
@@ -1801,8 +1902,8 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0)
         if not _recog_worker_started:
             _recog_worker_started = True
             threading.Thread(target=_recog_worker, daemon=True).start()
-        # 活跃卡快照(最后出现≤30s、有代表图)作去重候选，取最近的至多 N 张（顺序=参考图编号）
-        active = [c for c in _recog_cards
+        # 该设备活跃卡快照(最后出现≤30s、有代表图)作去重候选，取最近的至多 N 张（顺序=参考图编号）
+        active = [c for c in _recog_cards.get(device, [])
                   if c.get("status") == "done" and c.get("ref_img")
                   and now - c.get("last_ts", 0) <= RECOG_ACTIVE_WINDOW]
         active.sort(key=lambda c: c.get("last_ts", 0), reverse=True)
@@ -1814,23 +1915,26 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0)
     n_drink = len(detections) - n_food
     with _recog_cv:
         _recog_pending.append((orig_rgb.copy(), boxed, glb_url, frame, t, candidates,
-                               n_food, n_drink, time.time(), pred, conf))
+                               n_food, n_drink, time.time(), pred, conf, device))
         _recog_cv.notify()
 
 
-def _da3_frame_processor(raw: bytes, config: dict) -> dict:
+def _da3_frame_processor(raw: bytes, config: dict, device_id: str) -> dict:
     """把收到的一帧按「面板控件配置」跑 DA3，产出：
       - export_format=depth → 彩色深度图（图片类产物，返回 JPEG 字节）
       - export_format=glb   → 点云 + food/drink 3D 检测框 + 相机线框 scene.glb（返回 url）
       - export_format=mesh  → 深度反投影自建网格 GLB（模型类产物，返回 url）
     与官方 Gradio 共用同一模型、同一把 GPU 锁串行化，避免撞显存。首帧到达才懒加载模型。
-    glb 分支额外调 5090 本地 LocateAnything 检测 food/drink，框与点云同坐标系严格对齐。"""
+    glb 分支额外调 5090 本地 LocateAnything 检测 food/drink，框与点云同坐标系严格对齐。
+    device_id=本帧来源设备（frame_relay 只把选中设备的帧送进来）：与上一帧不同即视为
+    切换，先重置全部跨帧时序缓存再处理，识别卡片落到该设备自己的桶。"""
     try:
         img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
     except Exception as e:
         raise RuntimeError(f"读取图片失败：{e}")
     arr = np.array(img)
 
+    gen = _track_stream_device(device_id)   # 切设备先重置时序缓存，再入队本帧
     _push_recent_frame(arr)        # 存最近帧，供 /sam3 的短视频跟踪取「过去 N 张图」
 
     fmt = str(config.get("export_format", "depth"))
@@ -1850,7 +1954,7 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
         infer_ms = (time.time() - t0) * 1000.0     # DA3 推理耗时（收到帧→推理完）
 
         # 第三图：DA3→SAM3→点云映射（任意产物类型都触发；后台异步跑、忙时跳过，不阻塞产线）
-        _maybe_sam3cloud(pred, conf, fmt, nmp, show_cam)
+        _maybe_sam3cloud(pred, conf, fmt, nmp, show_cam, gen)
 
         if fmt == "cloudimg":
             # 方案A：服务端(5090 GPU)把点云渲成 2D 图，前端只显示图片。
@@ -1889,7 +1993,8 @@ def _da3_frame_processor(raw: bytes, config: dict) -> dict:
             # 识别工作流：食物证据=LA food 框，液体证据=SAM3 流式命中（缓存框），
             # 任一命中即异步送 Qwen3-VL 识别（节流、后台线程，不阻塞产线）
             _maybe_recognize(arr, detections + _sam3_recent_drinks(),
-                             f"/glb/{token}/scene.glb", token[:6], pred=pred, conf=conf)
+                             f"/glb/{token}/scene.glb", token[:6], pred=pred, conf=conf,
+                             device=device_id)
             # 真实相机垂直 FOV（复现拍摄视角用）：fov_y = 2·atan(H/(2·fy))，fy=K[1,1]。
             # 前端据此把点云相机摆回光心正视 -Z，使点云成像与深度图/原图同视角。
             _K = np.asarray(pred.intrinsics)[0]
@@ -1929,22 +2034,25 @@ set_processor(_da3_frame_processor)
 
 
 @app.get("/api/recog/list")
-def recog_list():
-    """识别卡片列表（最新在前）；enabled=false 表示识别服务未接入。"""
+def recog_list(device: Optional[str] = None):
+    """指定设备（缺省=当前选中设备）的识别卡片列表（最新在前）；
+    enabled=false 表示识别服务未接入。响应带 device 字段，前端据此判断是否发生了设备切换。"""
+    dev = (device or "").strip() or get_selected_device()
     with _recog_lock:
         # 剔除 ref_img（大 dataURI，仅后端去重比对用）；shots(点云 glb 列表) + rev 下发给前端
         cards = [{k: v for k, v in c.items() if k != "ref_img"}
-                 for c in _recog_cards if c.get("status") != "empty"]
+                 for c in _recog_cards.get(dev, []) if c.get("status") != "empty"]
     cards.reverse()   # 最新在前，前端 prepend 到顶部
-    return JSONResponse({"enabled": bool(RECOG_ENDPOINT), "cards": cards})
+    return JSONResponse({"enabled": bool(RECOG_ENDPOINT), "device": dev, "cards": cards})
 
 
 @app.post("/api/recog/clear")
-def recog_clear():
-    """清空所有识别卡片。"""
+def recog_clear(device: Optional[str] = None):
+    """清空指定设备（缺省=当前选中设备）的识别卡片；其他设备的卡片不受影响。"""
+    dev = (device or "").strip() or get_selected_device()
     with _recog_lock:
-        _recog_cards.clear()
-    return JSONResponse({"ok": True})
+        _recog_cards.pop(dev, None)
+    return JSONResponse({"ok": True, "device": dev})
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2294,7 +2402,7 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <div class="head">
   <div class="l1"><h2>实时识别 · Live Recognition</h2><span class="live" id="live"><i></i>识别中</span><button class="clr" id="clr">清空</button></div>
-  <div class="sub">food/drink 命中某帧 → <code id="model">Qwen3-VL</code> 识别四字段 · 同一物 30 秒内去重合并（缩略图叠加，点击看图集）· 有更新的卡自动置顶</div>
+  <div class="sub">food/drink 命中某帧 → <code id="model">Qwen3-VL</code> 识别四字段 · 同一物 30 秒内去重合并（缩略图叠加，点击看图集）· 有更新的卡自动置顶 · 当前设备 <code id="devlab">–</code></div>
 </div>
 <div class="feed" id="feed"><div class="empty" id="empty">等待 food/drink 命中…</div></div>
 <div class="newpill" id="newpill">↑ 有新卡</div>
@@ -2410,6 +2518,7 @@ function bumpScroll(){
 $('newpill').onclick=()=>{ feed.scrollTo({top:0,behavior:'smooth'}); $('newpill').classList.remove('on'); };
 feed.addEventListener('scroll',()=>{ if(feed.scrollTop<10) $('newpill').classList.remove('on'); });
 
+let curDev=null;   // 卡片流跟随服务端选中设备：切换时列表自动换成新设备的桶（旧卡不丢，切回来还在）
 async function tick(){
  try{
   const d=await(await fetch('/api/recog/list',{cache:'no-store'})).json();
@@ -2417,6 +2526,10 @@ async function tick(){
   if(!d.enabled){ live.className='live off'; live.innerHTML='<i></i>未接入';
     $('empty').textContent='识别服务未接入（RECOG_ENDPOINT 未配置）'; }
   else { live.className='live'; live.innerHTML='<i></i>识别中'; }
+  // 设备切换（在 /panel 下拉触发）：关掉图集弹层，卡片由下方 seen 对账逻辑自动整体换桶
+  const dev=d.device||null;
+  if(curDev!==null && dev!==curDev) $('lb').classList.remove('on');
+  curDev=dev; $('devlab').textContent=dev||'–';
   const cards=d.cards||[];
   const seen=new Set(cards.map(c=>c.id));
   for(const [id,st] of state){ if(!seen.has(id)){ st.el.remove(); state.delete(id); } }
