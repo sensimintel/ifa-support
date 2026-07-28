@@ -1546,7 +1546,7 @@ def _save_cloud_shot(pred, dets, conf):
         img = _render_pointcloud_image(pred, dets or None, conf_thresh_percentile=conf,
                                        view_tilt=20.0, view_zoom=0.85, splat=1,
                                        eye_lift=0.4, eye_back=0.3,
-                                       color_grade=(0.60, 0.75))
+                                       color_grade=(0.0, 0.75))   # 饱和0=纯黑白点云
     except Exception as e:
         print(f"[da3-web] 识别缩略图渲染失败：{type(e).__name__}: {e}", flush=True)
         return None
