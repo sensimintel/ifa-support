@@ -678,7 +678,8 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
 
 def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
                              view_tilt=18.0, view_zoom=1.0, splat=2, out_size=760,
-                             mask_overlays=None, eye_lift=0.0, eye_back=0.0):
+                             mask_overlays=None, eye_lift=0.0, eye_back=0.0,
+                             color_grade=None):
     """方案A·服务端渲染：5090 就地把点云用 torch(GPU) 投影 + 画家算法 z-buffer + splat 渲成 2D 图，
     跳过 GLB 序列化与前端 model-viewer 全量加载。叠 food/drink 框。返回 RGB uint8；点云为空返回 None。
 
@@ -704,6 +705,14 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
         conf = np.asarray(pred.conf).astype(np.float32)
         thr = _glb.get_conf_thresh(pred, None, 0.0, conf_thresh_percentile, 90.0)
         valid &= conf[0] >= thr
+    if color_grade is not None:
+        # 点色调色 (饱和系数, 明度系数)：对齐 model-viewer 光照/色调映射的暗调点云观感；
+        # 只作用于点颜色，框/文字等 overlay 仍用原亮色
+        _gs, _gv = color_grade
+        _hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+        _hsv[..., 1] *= _gs
+        _hsv[..., 2] *= _gv
+        rgb = cv2.cvtColor(np.clip(_hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2RGB)
     if mask_overlays:
         # SAM3 mask 命中的像素在投影前染成该词颜色（半透明混合），把分割结果"染"进点云本体
         rgb = rgb.copy()
@@ -1536,7 +1545,8 @@ def _save_cloud_shot(pred, dets, conf):
         # + splat=1 点状离散渲染；钉光心/大 splat 会退化成"重投影原图"（仓内已知坑）
         img = _render_pointcloud_image(pred, dets or None, conf_thresh_percentile=conf,
                                        view_tilt=20.0, view_zoom=0.85, splat=1,
-                                       eye_lift=0.4, eye_back=0.3)
+                                       eye_lift=0.4, eye_back=0.3,
+                                       color_grade=(0.60, 0.75))
     except Exception as e:
         print(f"[da3-web] 识别缩略图渲染失败：{type(e).__name__}: {e}", flush=True)
         return None
