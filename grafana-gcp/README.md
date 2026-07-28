@@ -51,7 +51,7 @@ bash down.sh              # 停
 
 - `docker-compose.yml`：统一 Grafana（host 网络，0.0.0.0:3001）。
 - `grafana/provisioning/datasources/prometheus.yml`：两个数据源①②。
-- `grafana/dashboards/`：`locateanything.json`（→数据源①）、`g4-vllm.json`（→数据源②）。
+- `grafana/dashboards/`：`locateanything.json`、`sam3.json`、`gpu5090-server.json`（5090 服务器性能：CPU/内存/GPU/温度/磁盘/网络，→数据源①，依赖 odyss-models `deploy/gpu5090` 栈里的 node_exporter + gpu-exporter）、`g4-vllm.json`（→数据源②）。
 - `tunnel/frpc.toml.tmpl`：frp STCP visitor 配置模板（up.sh 用 envsubst 渲染成 frpc.toml）。
 - 隧道由 **systemd 服务 `ifa-grafana-tunnel`** 常驻（clean env 不继承 shell 的 mihomo http_proxy，开机自启 + 崩溃自愈）；重启 `sudo systemctl restart ifa-grafana-tunnel`。
 - `up.sh` / `down.sh`：一步拉起 / 停。
