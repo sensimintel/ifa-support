@@ -1543,9 +1543,10 @@ def _save_cloud_shot(pred, dets, conf):
     try:
         # 点云观感参数沿用 bc2bc8b 验收过的那组：相机抬离光心（视差遮挡缝）+ 俯视 20°
         # + splat=1 点状离散渲染；钉光心/大 splat 会退化成"重投影原图"（仓内已知坑）
+        # out_size 拉到 1140：点距>点径(1px)才处处离散成"碎点"，760 时中近距离会糊成片
         img = _render_pointcloud_image(pred, dets or None, conf_thresh_percentile=conf,
                                        view_tilt=20.0, view_zoom=0.85, splat=1,
-                                       eye_lift=0.4, eye_back=0.3,
+                                       out_size=1140, eye_lift=0.4, eye_back=0.3,
                                        color_grade=(0.0, 0.75))   # 饱和0=纯黑白点云
     except Exception as e:
         print(f"[da3-web] 识别缩略图渲染失败：{type(e).__name__}: {e}", flush=True)
