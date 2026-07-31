@@ -1,0 +1,65 @@
+# tools/health · 5090 全栈健康体检（三态期望清单 + 单元修复入口）
+
+一步体检 .50 上 ifa 演示栈的全部服务。**健康的定义是「能力可用」而不是「容器在跑」**——探测打到业务语义层（HTTP 语义码、隧道后 `/v1/models`），而非只看 `docker ps`。配套 Claude skill：`ifa-health-check`。
+
+```bash
+# 开发机一步执行（只读，不改现场）：
+ssh odyss-server-frpc 'bash -s' < tools/health/check.sh
+```
+
+输出每行 `状态|组件|详情`（OK / FAIL / WARN / INFO），有 FAIL 时退出码 1。
+
+## 三态期望清单（本表是唯一正源，改期望先改这里）
+
+### ① 应运行——按四种能力分组
+
+| 能力 | 组件 | 探测 | 所属单元 |
+|---|---|---|---|
+| A 业务闭环 | postgres / redis / minio | 容器 healthy | local-stack |
+| A | llm-mock / llm-tunnel | 容器 running | local-stack |
+| A | services | 容器 + 18090 空参 send-code 返回 **400** | local-stack |
+| A | superadmin | 18091=200 + `/admin-api` 非 000/502/504 | local-stack |
+| A | VLM 深链 | 栈内经 llm-tunnel 探远端 vLLM `/v1/models` 有应答 | local-stack + GCP |
+| B 演示 | da3-web | systemd active + 8060=200 | ifa-support 根目录 |
+| B | SAM3 | systemd active + 8013 监听 | model/sam3 |
+| B | LA vLLM / gateway-1 / LB | 容器 healthy + 8001 `/v1/models` + 8010 监听 + 8000 非 5xx | odyss-models gpu5090 |
+| C 观测 | 统一 Grafana | 容器 + 3001 `/api/health`=200 | grafana-gcp |
+| C | g4 联邦隧道 | systemd active + 29090 `/-/ready`=200 | grafana-gcp |
+| C | 本机 Prometheus + 双 exporter + LA-Grafana | 容器 + 9091 `/-/ready`=200 | odyss-models gpu5090 |
+| D 底座 | docker / GPU 驱动 / frp 公网入口 / 磁盘 | daemon、nvidia-smi、systemd frpc、根分区 <90% | 系统 |
+
+### ② 预期停止——在跑反而是异常（显存风险，报告用户，勿当健康）
+
+| 组件 | 停止原因 |
+|---|---|
+| locateanything-server-2（gateway-2, 8020） | 给 SAM3 腾显存（见 `model/README.md` 显存预算） |
+| clip-score-server（SigLIP, 7861） | 同上 |
+
+### ③ 一次性完成——Exited(0) 即健康
+
+`odyss-ifa-migrate`、`odyss-ifa-minio-init`。
+
+### 范围外（体检不管，也不要动）
+
+odyss-gitea、cpa-preview 两容器、comfyui / food-image-search / milvus / netalertx 等历史停用容器。
+
+## 单元修复入口（每个单元只有一个合法拉起方式）
+
+| 异常组件 | 唯一拉起入口 |
+|---|---|
+| local-stack 任何容器 | `cd ~/odyss-services-ifa && docker compose up -d`（幂等，一次拉齐全栈） |
+| da3-web | `sudo systemctl restart da3-web`；要更新代码用 `~/da3-web/deploy.sh` |
+| SAM3 | `sudo systemctl restart sam3` |
+| LA / 本机观测容器 | `cd ~/odyss-models/deploy/gpu5090 && docker compose -f compose.gpu.yml up -d locateanything-vllm locateanything-gateway-1 locateanything-lb prometheus grafana gpu-exporter node-exporter` ——**必须点名服务，严禁裸 `up -d`**（会拉起 gateway-2 与 siglip-score 抢显存） |
+| 统一 Grafana | `cd ~/da3-web/grafana-gcp && ./up.sh`（含隧道自检） |
+| g4 联邦隧道 | `sudo systemctl restart ifa-grafana-tunnel` |
+| frp 公网入口 | **不自动重启**：你若正经 frpc 连着，它必然活着；真挂了走局域网入口人工处理 |
+| VLM 深链失败 | 根因大概率在 GCP g4-01 侧（用 ssh-gcp-gpu 排查）；本机最多 `docker restart odyss-ifa-llm-tunnel` |
+| 预期停止组件在跑 | 不自动停，报告用户决策（可能有人临时在用） |
+
+修复后**必须重跑 check.sh 复验**，以复验结果为准出报告。
+
+## 纪律（继承 MANAGEMENT.md §1/§6）
+
+- 部署机上只探测 + 跑上表入口，**严禁改配置孤本、git commit/push、裸 docker 命令做部署级变更**。
+- 期望状态变了（如 gateway-2 恢复常驻）→ 先改本 README 与 check.sh 再执行，不允许现场口头例外。

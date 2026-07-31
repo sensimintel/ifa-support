@@ -36,6 +36,7 @@
 - **开发一致性靠源指针，不靠自觉**：`stack.env` 里 `SERVICES_REPO=...` 可把构建源指向本地工作区任意 checkout——开发与部署用**同一套编排与模板**，只有源指针不同。
 - **模式即配置**：`LLM_MODE=mock|real` 决定 LLM 链路（mock 全离线 / real 经 frp 隧道接真实 VLM）。切模式 = 改 `stack.env` + 重跑 bootstrap；密钥与数据不动。
 - **手机 App 是接入方不是栈内组件**：App 不进 compose，靠「App 内自定义后端地址」指向栈的 18090 完成接入。
+- **健康体检**：`tools/health/check.sh`（只读探活，三态期望清单与单元修复入口见 `tools/health/README.md`），配套 Claude skill `ifa-health-check`：体检 → 按单元唯一入口拉起异常 → 复验 → 报告。
 
 ## 4. 已知契约（跨仓约束，改动需过脑）
 
