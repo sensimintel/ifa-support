@@ -41,7 +41,7 @@
 
 ## 4. 已知契约（跨仓约束，改动需过脑）
 
-- **meal 模型别名契约**：odyss-services 内置 workflow 的 meal 节点硬编码 `gemini-3.1-pro-preview`（runtime-config 的 `meal_model` 对字面量无效，勿改 services 的 workflow YAML——生产走网关依赖该名）。因此真实 VLM 端必须以 `SERVED_ALIASES` 同时应答该名（正源：odyss-models `deploy/gcp-g4/serve_model.sh`），`manifest.env` 的 `VLM_REQUIRED_ALIAS` 记录此契约。
+- **meal 模型名对齐契约**（2026-07-31 起取代旧「别名契约」）：odyss-services（ifa 分支）workflow YAML 的 meal 节点直接写 `VLM_MODEL` 真名（如 `Qwen3.6-35B-A3B-FP8`），须与真实 VLM 端 `--served-model-name` 一致（正源：odyss-models `deploy/gcp-g4/serve_model.sh`），切模型时 services YAML 与 serve 侧同步改（注意 services YAML 变更会使 checkpoint 全量失效）。serve 侧的 `gemini-3.1-pro-preview` 别名仅为旧二进制回滚兼容保留。
 - **nginx 反代必须动态解析**：容器上游一律「resolver 127.0.0.11 + 变量 proxy_pass + compose 服务名」，静态 proxy_pass 会在上游容器重建后 502（已在 `superadmin/superadmin.conf` 固化）。
 - **跨机隧道做成栈内容器**：宿主防火墙（如 5090 INPUT policy DROP）不影响容器互访；不要 bind 宿主端口。
 

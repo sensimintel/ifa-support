@@ -86,7 +86,7 @@ if [ "$LLM_MODE" = "real" ]; then
       config/frpc-visitor.template.toml > config/frpc-visitor.toml
   chmod 600 config/frpc-visitor.toml
   echo "  real 模式：LLM 指向 llm-tunnel（$VLM_MODEL）；已渲染 frpc-visitor.toml"
-  echo "  ⚠️ 远端 vLLM 必须以别名同时应答 $VLM_REQUIRED_ALIAS（见 manifest.env 注释），否则整餐分析 404"
+  echo "  ⚠️ services(ifa) workflow YAML 的 chunk/meal 模型名均为 $VLM_MODEL，须与远端 vLLM served-model-name 一致，否则分析 404"
 else
   LLM_BASE_URL="http://llm-mock:8081/v1"
   LLM_API_KEY="local-mock-key"

@@ -6,9 +6,9 @@
 #   __REALTIME_MODEL__ / __MEAL_MODEL__ / __CHUNK_MODEL__           模型名（按 LLM_MODE 渲染）
 #   __CHUNK_INHOUSE_ENABLED__                                       real 模式 true，mock 模式 false
 # 其余凭据只作用于栈内容器（postgres/redis/minio 均不对公网暴露），保持默认即可。
-# ⚠️ meal 注意：services 内置 workflow 的 meal 节点硬编码模型名 gemini-3.1-pro-preview，
-# __MEAL_MODEL__ 只对使用 ${domain.analysis.meal_model} 占位符的 workflow 生效；real 模式
-# 下 vLLM 端必须配 served-model-name 别名兼容（见 manifest.env 的 VLM_REQUIRED_ALIAS）。
+# ⚠️ meal 注意：services（ifa）内置 workflow 的 meal 节点直接写 VLM_MODEL 真名（2026-07-31
+# 起不再用 gemini 别名），__MEAL_MODEL__ 只对使用 ${domain.analysis.meal_model} 占位符的
+# workflow 生效；模型名须与远端 vLLM 的 served-model-name 一致。
 
 infra:
   http:

@@ -39,7 +39,7 @@
 - **mock（默认）**：chunk / 整餐分析全走栈内 llm-mock，完全离线。
 - **real**：chunk（`chunk_inhouse`）与整餐都直连 `llm-tunnel` 背后的远端 vLLM（模型见 `manifest.env` 的 `VLM_MODEL`）。需在 `stack.env` 配齐 `VLM_API_KEY` 与 `FRP_*`（见 `stack.env.example`）。
   - VLM 服务端正源在 **odyss-models 仓 `deploy/gcp-g4/`**（勿复制，改动走该仓 PR + 其 `deploy.sh` 部署）。
-  - ⚠️ **别名契约**：odyss-services 内置 workflow 的 meal 节点硬编码模型名 `gemini-3.1-pro-preview`（runtime-config 的 `meal_model` 对其无效），vLLM 端必须用 `SERVED_ALIASES` 让同一模型同时应答该名字，否则整餐分析 404。
+  - ⚠️ **模型名对齐契约**（2026-07-31 起取代旧「别名契约」）：odyss-services（ifa）workflow YAML 的 chunk 与 meal 节点均直接写 `VLM_MODEL` 真名，须与 vLLM 的 `--served-model-name` 一致，否则分析 404；切模型时 services YAML 与 serve 侧同步改。serve 侧的 `gemini-3.1-pro-preview` 别名仅为旧二进制回滚兼容保留。
 
 ## 阶段 A：制作离线包（有公网的开发机）
 

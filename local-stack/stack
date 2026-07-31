@@ -53,7 +53,7 @@ case "$cmd" in
   restore)   exec ./scripts/restore.sh "$@" ;;
   mode)
     echo "LLM_MODE=$LLM_MODE (profile: ${COMPOSE_PROFILES:-无})"
-    echo "VLM_MODEL=$VLM_MODEL（real 模式生效；别名要求：$VLM_REQUIRED_ALIAS）"
+    echo "VLM_MODEL=$VLM_MODEL（real 模式生效；须与远端 vLLM served-model-name 一致）"
     [ -f config/runtime-config.yaml ] && grep -E "base_url|meal_model|enabled" config/runtime-config.yaml | sed 's/^/  runtime: /'
     ;;
   ""|-h|--help|help) usage ;;
