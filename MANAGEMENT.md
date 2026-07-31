@@ -19,6 +19,7 @@
 | 手机 App | odyss-frontend | **直推 ifa**，不走 OLI | ios-build 装机，App 内 base_url 指向栈地址 |
 | 传输内核 | react-native-odyss-capability_hub | **直推 ifa**，不走 OLI | 随 frontend 构建 |
 | 真实 VLM 服务端 | odyss-models `deploy/gcp-g4/` | main，走 OLI | 该仓 `deploy.sh`（IAP scp + 远程 setup） |
+| 观测平台（lumen） | odyss-lumen | main，走 OLI（不在 ifa 窗口规则内） | `local-stack/lumen/` overlay：`build-lumen-artifacts.sh` + `deploy-5090.sh` |
 | 编排 / SOP（本仓） | ifa-support `local-stack/` | **直推 main**，不发 PR | 目标机解离线包 / git pull 后 `./stack bootstrap` |
 
 窗口过期后分支规则回归各仓默认（main），届时更新本表。
@@ -50,6 +51,7 @@
 |---|---|---|
 | GCP gpu-g4-01（VLM） | 与 odyss-models 正源一致 | SERVED_ALIASES 别名随 odyss-models PR 落地 |
 | 5090 `~/odyss-services-ifa` | **手工演化的孤本**（容器名 odyss-ifa-*、pg/minio **无命名卷**、配置手改） | 下次维护窗口用本仓 SOP 重新拉起：`./stack backup` 思路导出数据 → 按 bundle 重部署 → restore；在此之前只允许对齐 nginx conf、superadmin `dist` 等无状态文件（`superadmin/dist` 是 bind mount，换文件即生效，不需重建容器） |
+| 5090 `~/odyss-ifa-lumen`（lumen overlay） | 由本仓 `local-stack/lumen/` 管理（独立 compose 项目挂 `odyss-ifa-network`，collector 以别名 `lumen-collector.odyss.internal:80` 接住 services 默认导出；lumen 数据在命名卷 `odyss-ifa-lumen-pg-data`） | 更新一律 `deploy-5090.sh` 重放；业务栈重拉为标准 local-stack 后把 `LUMEN_ATTACH_NETWORK` 换成 `odyss-local-network` 重挂 |
 
 ## 6. 违规即失败
 

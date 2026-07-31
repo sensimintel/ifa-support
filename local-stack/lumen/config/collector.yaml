@@ -1,0 +1,11 @@
+# lumen collector bootstrap 配置（栈内闭环，可入库：凭证只指向本 overlay 的 compose Postgres）。
+# 监听 :80：odyss-services 的 probe 默认导出地址是 http://lumen-collector.odyss.internal（无端口=80），
+# overlay 用网络别名 + 80 端口接住它，业务容器零改动即可上报。
+infra:
+  http:
+    addr: ":80"
+  postgres:
+    url: postgres://lumen:lumenadmin@lumen-postgres:5432/lumen?sslmode=disable
+  appconfig:
+    enabled: false
+    required: false

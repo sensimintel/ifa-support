@@ -1,0 +1,17 @@
+# lumen observation bootstrap 配置（栈内闭环，可入库：凭证只指向本 overlay 的 compose Postgres）。
+# - collector_url 指向 overlay 内 collector（observation 自身的 root span 上报，不配则拒绝启动）。
+# - s3.bucket 写业务栈 minio 的桶名，但 s3blob 走 AWS 默认凭证链、不支持 minio 端点覆盖，
+#   session-frames 帧轨道在本地栈会降级不挂（health 仍 ok，/api/ready 会列 degraded）——预期内。
+# - datahub / eval exec 未配置：对应控制面按设计降级，不影响 records/chunks 观测主功能。
+infra:
+  http:
+    addr: ":8090"
+  postgres:
+    url: postgres://lumen:lumenadmin@lumen-postgres:5432/lumen?sslmode=disable
+  tracing:
+    collector_url: http://lumen-collector.odyss.internal
+  s3:
+    bucket: odyss-local
+  appconfig:
+    enabled: false
+    required: false

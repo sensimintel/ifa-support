@@ -2,5 +2,16 @@
   "id": "__STACK_ID__",
   "label": "__STACK_LABEL__",
   "apiBase": "/admin-api",
-  "features": ["device-observability", "device-bindings"]
+  "lumenBase": "/lumen",
+  "features": [
+    "feedback",
+    "lumen",
+    "device-observability",
+    "device-bindings",
+    "diseases",
+    "firmware-versions",
+    "app-config",
+    "push-debugger",
+    "user-permissions"
+  ]
 }

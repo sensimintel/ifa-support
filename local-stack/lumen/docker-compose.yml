@@ -1,0 +1,86 @@
+# lumen overlay：把 lumen（collector + observation + 自有 Postgres）作为独立 compose 项目
+# 挂进既有业务栈网络，业务栈 compose 零改动：
+#   - collector 以网络别名 lumen-collector.odyss.internal 监听 :80，正好接住 odyss-services
+#     probe 的默认导出地址（http://lumen-collector.odyss.internal/v1/spans:batch），
+#     services 容器不需要任何 env / 配置变更，跑着就开始上报。
+#   - observation 以别名 lumen-observation 供 superadmin nginx 反代 /lumen/。
+#   - 挂接的网络名用 LUMEN_ATTACH_NETWORK 覆盖（5090 孤本栈=odyss-ifa-network（默认），
+#     标准 local-stack=odyss-local-network）。
+# 数据落命名卷 odyss-ifa-lumen-pg-data，容器重建不丢。
+name: odyss-ifa-lumen
+
+services:
+  lumen-postgres:
+    image: postgres:18.4
+    container_name: odyss-ifa-lumen-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: lumen
+      POSTGRES_PASSWORD: lumenadmin
+      POSTGRES_DB: lumen
+      TZ: Asia/Shanghai
+    volumes:
+      - lumen-pg-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lumen -d lumen"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - stack-net
+
+  # 一次性迁移：按 db/migrations 清单顺序应用，migrations 表记账幂等，重复 up 安全。
+  lumen-migrate:
+    image: postgres:18.4
+    container_name: odyss-ifa-lumen-migrate
+    entrypoint: ["/bin/sh", "/migrate/apply.sh"]
+    environment:
+      PGHOST: lumen-postgres
+      PGUSER: lumen
+      PGPASSWORD: lumenadmin
+      PGDATABASE: lumen
+    volumes:
+      - ./artifacts/migrations:/migrate/migrations:ro
+      - ./scripts/migrate-apply.sh:/migrate/apply.sh:ro
+    depends_on:
+      lumen-postgres:
+        condition: service_healthy
+    restart: "no"
+    networks:
+      - stack-net
+
+  lumen-collector:
+    image: odyss-lumen:ifa-stack
+    container_name: odyss-ifa-lumen-collector
+    restart: unless-stopped
+    command: ["/app/odyss-trace-collector", "-config", "/app/collector.yaml"]
+    depends_on:
+      lumen-migrate:
+        condition: service_completed_successfully
+    networks:
+      stack-net:
+        aliases:
+          - lumen-collector
+          - lumen-collector.odyss.internal
+
+  lumen-observation:
+    image: odyss-lumen:ifa-stack
+    container_name: odyss-ifa-lumen-observation
+    restart: unless-stopped
+    command: ["/app/odyss-lumen-observation", "-config", "/app/observation.yaml"]
+    depends_on:
+      lumen-migrate:
+        condition: service_completed_successfully
+    networks:
+      stack-net:
+        aliases:
+          - lumen-observation
+
+networks:
+  stack-net:
+    external: true
+    name: ${LUMEN_ATTACH_NETWORK:-odyss-ifa-network}
+
+volumes:
+  lumen-pg-data:
+    name: odyss-ifa-lumen-pg-data
