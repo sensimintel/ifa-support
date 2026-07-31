@@ -59,6 +59,26 @@ odyss-gitea、cpa-preview 两容器、comfyui / food-image-search / milvus / net
 
 修复后**必须重跑 check.sh 复验**，以复验结果为准出报告。
 
+## LAN 可达性（服务器侧 OK ≠ 用户打得开）
+
+5090 开着 ufw 且 INPUT 默认 DROP。**docker 端口映射的服务（18090/18091）走 FORWARD 链绕过 ufw**；**host 网络的服务（3001/3000/8000/9091 等）进 INPUT 链，必须逐端口放行**。因此体检除了在服务器上跑 check.sh，还要**在开发机（Mac）上**对用户入口做连通性探测：
+
+```bash
+for p in 18090 18091 8060 3001; do nc -z -G 3 192.168.0.50 $p && echo "$p 通" || echo "$p 不通"; done
+```
+
+不通且服务器侧 OK → 补 ufw 放行（仅限局域网网段，照现有模式）：
+
+```bash
+sudo ufw allow from 192.168.0.0/24 to any port <端口> proto tcp comment "<用途> LAN"
+```
+
+已放行：8060（da3-web）、3001（统一 Grafana，2026-07-31 补）。8000/3000 有意未放行（LA 由 da3-web 经 127.0.0.1 内部调用；旧 LA-Grafana 走公网 file.odyss.life/grafana）。
+
+## 已知坑：daemon-reload 吊销容器 NVML
+
+宿主执行 `systemctl daemon-reload`（装 systemd 单元、up.sh 都会触发）后，NVIDIA 容器内新起的进程会报 `Failed to initialize NVML: Unknown Error`：gpu-exporter 每次抓取新起 nvidia-smi → GPU 指标消失（但 exporter 进程与 Prometheus target 都显示正常）；vllm/gateway 等服务容器启动时已持有 GPU 句柄，**推理不受影响、无需重启**。修复：`docker restart locateanything-gpu-exporter`。2026-07-03 起反复出现，根治要动 nvidia-container-toolkit 配置（odyss-models 仓的部署层欠账）。
+
 ## 纪律（继承 MANAGEMENT.md §1/§6）
 
 - 部署机上只探测 + 跑上表入口，**严禁改配置孤本、git commit/push、裸 docker 命令做部署级变更**。

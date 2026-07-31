@@ -129,6 +129,13 @@ need_http "观测/本机Prometheus接口" "http://127.0.0.1:9091/-/ready" '^200$
 need_running locateanything-grafana "观测/LA-Grafana"
 need_running locateanything-node-exporter "观测/node-exporter"
 need_running locateanything-gpu-exporter "观测/gpu-exporter"
+# 语义探活：exporter 进程活着 ≠ 有 GPU 指标。容器内 NVML 会被宿主 systemctl daemon-reload
+# 吊销（现象：nvidia-smi "Failed to initialize NVML"，看板 GPU 面板 No data），必须查指标本体。
+if curl -sS -m 8 http://127.0.0.1:9835/metrics 2>/dev/null | grep -q nvidia_smi_memory_used_bytes; then
+  say OK "观测/GPU指标" "9835 有 nvidia_smi 指标"
+else
+  say FAIL "观测/GPU指标" "9835 无 GPU 指标——大概率容器内 NVML 被 daemon-reload 吊销，docker restart locateanything-gpu-exporter"
+fi
 
 # ---------------- 预期停止（反向异常检测：在跑才是问题） ----------------
 expect_stopped locateanything-server-2 "预期停止/LA-gateway2"
