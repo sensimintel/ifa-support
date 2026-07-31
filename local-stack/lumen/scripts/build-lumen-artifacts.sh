@@ -14,10 +14,10 @@ set -a
 set +a
 LUMEN_REPO="${LUMEN_REPO:-$STACK_DIR/../../odyss-lumen}"
 
-echo "== 校验 lumen 仓路径与分支（manifest：lumen=$LUMEN_REF）"
+echo "== 校验 lumen 仓路径与分支（manifest：lumen=${LUMEN_REF}）"
 [ -d "$LUMEN_REPO/tracing/collector" ] || { echo "找不到 odyss-lumen 仓：$LUMEN_REPO（stack.env 里 LUMEN_REPO 覆盖）"; exit 1; }
 cur=$(git -C "$LUMEN_REPO" branch --show-current 2>/dev/null || echo "?")
-[ "$cur" = "$LUMEN_REF" ] || echo "  ⚠️ odyss-lumen 当前分支 $cur ≠ manifest 要求 $LUMEN_REF（开发迭代可继续；发布前请对齐）"
+[ "$cur" = "$LUMEN_REF" ] || echo "  ⚠️ odyss-lumen 当前分支 $cur ≠ manifest 要求 ${LUMEN_REF}（开发迭代可继续；发布前请对齐）"
 
 mkdir -p "$LUMEN_DIR/artifacts/bin"
 

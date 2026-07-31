@@ -15,13 +15,13 @@ set +a
 SERVICES_REPO="${SERVICES_REPO:-$STACK_DIR/../../odyss-services}"
 SUPERADMIN_REPO="${SUPERADMIN_REPO:-$STACK_DIR/../../odyss-superadmin}"
 
-echo "== 校验代码仓路径与分支（manifest：services=$SERVICES_REF superadmin=$SUPERADMIN_REF）"
+echo "== 校验代码仓路径与分支（manifest：services=${SERVICES_REF} superadmin=${SUPERADMIN_REF}）"
 [ -d "$SERVICES_REPO/cmd/odyss-services" ] || { echo "找不到 odyss-services 仓：$SERVICES_REPO（stack.env 里 SERVICES_REPO 覆盖）"; exit 1; }
 [ -f "$SUPERADMIN_REPO/package.json" ] || { echo "找不到 odyss-superadmin 仓：$SUPERADMIN_REPO（stack.env 里 SUPERADMIN_REPO 覆盖）"; exit 1; }
 warn_ref() {
   local repo="$1" want="$2" cur
   cur=$(git -C "$repo" branch --show-current 2>/dev/null || echo "?")
-  [ "$cur" = "$want" ] || echo "  ⚠️ $(basename "$repo") 当前分支 $cur ≠ manifest 要求 $want（开发迭代可继续；发布离线包前请对齐）"
+  [ "$cur" = "$want" ] || echo "  ⚠️ $(basename "$repo") 当前分支 $cur ≠ manifest 要求 ${want}（开发迭代可继续；发布离线包前请对齐）"
 }
 warn_ref "$SERVICES_REPO" "$SERVICES_REF"
 warn_ref "$SUPERADMIN_REPO" "$SUPERADMIN_REF"

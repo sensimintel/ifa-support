@@ -34,7 +34,11 @@ echo "== 3/4 同步 superadmin 无状态文件（nginx conf + runtime-config）"
 sed -e "s|__STACK_ID__|$STACK_ID|" -e "s|__STACK_LABEL__|$STACK_LABEL|" \
   "$STACK_DIR/superadmin/superadmin-runtime-config.template.json" > /tmp/superadmin-runtime-config.rendered.json
 rsync -az "$STACK_DIR/superadmin/superadmin.conf" "$REMOTE:$SUPERADMIN_DIR/superadmin.conf"
+# 渲染后的 runtime-config 必须进 webroot（dist/）才能被前端 fetch 到；
+# superadmin/ 层再留一份作为「当前生效配置」的可读孤本。注意 dist 同步用了 --delete，
+# 每次重发 dist 后都要重跑本脚本把它补回去。
 rsync -az /tmp/superadmin-runtime-config.rendered.json "$REMOTE:$SUPERADMIN_DIR/superadmin-runtime-config.json"
+rsync -az /tmp/superadmin-runtime-config.rendered.json "$REMOTE:$SUPERADMIN_DIR/dist/superadmin-runtime-config.json"
 rm -f /tmp/superadmin-runtime-config.rendered.json
 ssh "$REMOTE" "docker restart odyss-ifa-superadmin > /dev/null"
 
