@@ -68,6 +68,15 @@ services:
     container_name: odyss-ifa-lumen-observation
     restart: unless-stopped
     command: ["/app/odyss-lumen-observation", "-config", "/app/observation.yaml"]
+    environment:
+      # 帧图代理直读业务栈 minio（凭证与业务栈 compose 同源，仅指向栈内服务，可入库）：
+      # 自定义端点 + path-style 由 OBS_FRAME_IMAGE_S3_ENDPOINT 触发（lumen#261），
+      # allowlist 放行本地帧桶 odyss-local。
+      OBS_FRAME_IMAGE_S3_ENDPOINT: http://minio:9000
+      OBS_FRAME_IMAGE_S3_BUCKETS: odyss-local
+      OBS_FRAME_IMAGE_AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: odyss
+      AWS_SECRET_ACCESS_KEY: odyssadmin
     depends_on:
       lumen-migrate:
         condition: service_completed_successfully
