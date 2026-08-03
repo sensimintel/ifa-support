@@ -47,8 +47,20 @@ expect_stopped() { # 预期停止（腾显存）：在跑反而是异常
 }
 
 need_systemd() { # $1=unit $2=组件标签
+  local st
   if systemctl is-active --quiet "$1"; then say OK "$2" "systemd active"
-  else say FAIL "$2" "systemd $(systemctl is-active "$1" 2>/dev/null || echo unknown)"; fi
+  else
+    # is-active 对非 active 单元「既打印状态又返回非零」，不能用 || echo 兜底（会输出两行破坏行协议）
+    st=$(systemctl is-active "$1" 2>/dev/null | head -1)
+    say FAIL "$2" "systemd ${st:-unknown}"
+  fi
+}
+
+drift_systemd() { # 管理态漂移：unit 不 active 但端口仍在监听 = 游离进程接管（kill+nohup 手工起的）
+  # $1=unit $2=port $3=组件标签。此时裸 systemctl restart 会因端口被占失败，须按 README 归位。
+  if ! systemctl is-active --quiet "$1" && ss -tln 2>/dev/null | grep -q ":$2 "; then
+    say FAIL "$3" "systemd inactive 但 $2 仍在监听——游离进程接管，按 README 归位（da3-web 用 ~/da3-web/deploy.sh），勿裸 systemctl restart"
+  fi
 }
 
 http_code() { curl -sS -o /dev/null -m "${3:-8}" ${2:+-X "$2"} -w '%{http_code}' "$1" 2>/dev/null || echo 000; }
@@ -105,8 +117,10 @@ fi
 
 # ---------------- B. 演示 ----------------
 need_systemd da3-web "演示/da3-web"
+drift_systemd da3-web 8060 "演示/da3-web漂移"
 need_http "演示/da3-web页面" "http://127.0.0.1:8060/" '^200$'
 need_systemd sam3 "演示/SAM3"
+drift_systemd sam3 8013 "演示/SAM3漂移"
 ss -tln 2>/dev/null | grep -q ':8013 ' && say OK "演示/SAM3端口" "8013 在监听" || say FAIL "演示/SAM3端口" "8013 未监听"
 need_running locateanything-vllm "演示/LA-vLLM"
 need_http "演示/LA-vLLM接口" "http://127.0.0.1:8001/v1/models" '^(200|401|403)$'

@@ -49,6 +49,7 @@ odyss-gitea、cpa-preview 两容器、comfyui / food-image-search / milvus / net
 |---|---|
 | local-stack 任何容器 | `cd ~/odyss-services-ifa && docker compose up -d`（幂等，一次拉齐全栈） |
 | da3-web | `sudo systemctl restart da3-web`；要更新代码用 `~/da3-web/deploy.sh` |
+| da3-web/SAM3 漂移（systemd inactive 但端口仍在监听 = 游离进程接管） | da3-web 用 `~/da3-web/deploy.sh`（自动清游离进程再走 systemd）；SAM3 手工归位：`pkill -f "sam3[_]server.py"` 后 `sudo systemctl restart sam3`。**勿裸 restart**（端口被游离进程占着会 bind 失败）；清理模式必须精确到脚本名/端口——`uvicorn app:app` 这种不带端口的模式会误伤 LA gateway 的同名进程 |
 | SAM3 | `sudo systemctl restart sam3` |
 | LA / 本机观测容器 | `cd ~/odyss-models/deploy/gpu5090 && docker compose -f compose.gpu.yml up -d locateanything-vllm locateanything-gateway-1 locateanything-lb prometheus grafana gpu-exporter node-exporter` ——**必须点名服务，严禁裸 `up -d`**（会拉起 gateway-2 与 siglip-score 抢显存） |
 | 统一 Grafana | `cd ~/da3-web/grafana-gcp && ./up.sh`（含隧道自检） |
@@ -83,3 +84,4 @@ sudo ufw allow from 192.168.0.0/24 to any port <端口> proto tcp comment "<用�
 
 - 部署机上只探测 + 跑上表入口，**严禁改配置孤本、git commit/push、裸 docker 命令做部署级变更**。
 - 期望状态变了（如 gateway-2 恢复常驻）→ 先改本 README 与 check.sh 再执行，不允许现场口头例外。
+- systemd 管理的服务（da3-web、sam3）**严禁 kill + nohup 手工拉起**，更新代码一律 `./deploy.sh`、重启一律 systemctl：2026-08-03 曾有部署回路手工 kill 主进程后 nohup 起 uvicorn，造成「页面 200 但 systemd inactive」的游离态，丢失崩溃自愈与开机自启（deploy.sh 的 nohup 兜底分支已因此移除）。
