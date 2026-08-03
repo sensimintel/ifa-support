@@ -1530,10 +1530,26 @@ async def api_infer(
 #   · 结果进 _recog_cards，前端 /recog 轮询 /api/recog/list 渲染卡片、名称流式打字。
 #   · endpoint 经环境变量配置（默认空=不接入，右栏显示「识别服务未接入」）：
 #       RECOG_ENDPOINT / RECOG_API_KEY / RECOG_MODEL / RECOG_MIN_INTERVAL
+#   · 双识别目标可切（页面按钮，免重启、下一轮生效）：
+#       qwen 目标=上面三个变量（历史名不动，兼容既有 .env）；
+#       gemini 目标=RECOG_ENDPOINT_GEMINI / RECOG_API_KEY_GEMINI / RECOG_MODEL_GEMINI，
+#       未配置 endpoint 的目标在页面上置灰不可切；RECOG_TARGET 指定启动默认目标。
 # ══════════════════════════════════════════════════════════════════════
 RECOG_ENDPOINT = os.environ.get("RECOG_ENDPOINT", "").strip()
 RECOG_API_KEY = os.environ.get("RECOG_API_KEY", "").strip()
 RECOG_MODEL = os.environ.get("RECOG_MODEL", "Qwen3.6-35B-A3B-FP8").strip()
+# 识别目标注册表：页面切换按钮在两套 endpoint/key/model 间切，label 供前端展示
+RECOG_TARGETS = {
+    "qwen": {"label": "Qwen", "endpoint": RECOG_ENDPOINT,
+             "api_key": RECOG_API_KEY, "model": RECOG_MODEL},
+    "gemini": {"label": "Gemini Pro",
+               "endpoint": os.environ.get("RECOG_ENDPOINT_GEMINI", "").strip(),
+               "api_key": os.environ.get("RECOG_API_KEY_GEMINI", "").strip(),
+               "model": os.environ.get("RECOG_MODEL_GEMINI", "gemini-3.1-pro-preview").strip()},
+}
+_recog_target = os.environ.get("RECOG_TARGET", "qwen").strip()
+if _recog_target not in RECOG_TARGETS or not RECOG_TARGETS[_recog_target]["endpoint"]:
+    _recog_target = "qwen"   # 非法或未配置的默认目标一律回退 qwen（与历史行为一致）
 RECOG_MIN_INTERVAL = float(os.environ.get("RECOG_MIN_INTERVAL", "4.0"))  # 两次识别最小间隔(秒)，节流防刷屏
 RECOG_TIMEOUT = 30.0
 RECOG_MAX_CARDS = 200
@@ -1754,12 +1770,14 @@ def _parse_recog(content):
     return out
 
 
-def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0):
-    """调 Qwen3-VL 识别 + 去重。一次多图请求：图1原图 + 图2带框图 + 各候选参考图(带横幅标记)。
+def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, target=None):
+    """调多模态 VLM 识别 + 去重。一次多图请求：图1原图 + 图2带框图 + 各候选参考图(带横幅标记)。
     candidates: [{"id","name","desc","ref_img"}...]（顺序即参考图编号）。
     n_food/n_drink：当前画面检测器命中数，作为软接地信息进 prompt。
+    target：识别目标预设（RECOG_TARGETS 里的一项，缺省=当前选中目标）。
     返回 [{name,type,description,...,match,matched_name,match_confidence}]；任何失败返回 []。"""
-    if not RECOG_ENDPOINT:
+    cfg = target or RECOG_TARGETS[_recog_target]
+    if not cfg["endpoint"]:
         return []
     u1, u2 = _img_data_uri(orig_rgb), _img_data_uri(boxed_rgb)
     if not u1 or not u2:
@@ -1770,14 +1788,14 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0):
         if c.get("ref_img"):
             content.append({"type": "image_url", "image_url": {"url": c["ref_img"]}})
     content.append({"type": "text", "text": _build_recog_prompt(candidates, n_food, n_drink)})
-    payload = {"model": RECOG_MODEL,
+    payload = {"model": cfg["model"],
                "messages": [{"role": "user", "content": content}],
                "max_tokens": 768, "temperature": 0.2}
     headers = {"Content-Type": "application/json"}
-    if RECOG_API_KEY:
-        headers["Authorization"] = f"Bearer {RECOG_API_KEY}"
+    if cfg["api_key"]:
+        headers["Authorization"] = f"Bearer {cfg['api_key']}"
     try:
-        req = urllib.request.Request(RECOG_ENDPOINT, data=json.dumps(payload).encode(), headers=headers)
+        req = urllib.request.Request(cfg["endpoint"], data=json.dumps(payload).encode(), headers=headers)
         with urllib.request.urlopen(req, timeout=RECOG_TIMEOUT) as r:
             out = json.loads(r.read().decode())["choices"][0]["message"]["content"]
     except Exception as e:
@@ -1811,12 +1829,13 @@ def _recog_worker():
         wait_ms = (time.time() - enq_ts) * 1000.0     # 在队列里等 worker 的时长
         # 新卡代表图(ref_img)：带框图加 HISTORY REF 横幅标记，防止后续轮次被当成当前画面
         boxed_uri = _img_data_uri(_make_ref_img(boxed))
+        tgt = RECOG_TARGETS[_recog_target]   # 快照本轮识别目标：切换只影响后续轮次
         _tq = time.time()
-        items = _recognize_dedup(orig, boxed, candidates, n_food, n_drink)
-        qwen_ms = (time.time() - _tq) * 1000.0
+        items = _recognize_dedup(orig, boxed, candidates, n_food, n_drink, tgt)
+        llm_ms = (time.time() - _tq) * 1000.0
         # 全链路审计日志：每轮（含空返回）都落盘——耗时分段 + 原始判定，可定位慢在哪/错在哪
-        print("[da3-web] 识别一轮：排队%.0fms · Qwen %.0fms · 返回 %d 项（去重候选 %d 个：%s）" % (
-            wait_ms, qwen_ms, len(items), len(candidates),
+        print("[da3-web] 识别一轮：排队%.0fms · %s %.0fms · 返回 %d 项（去重候选 %d 个：%s）" % (
+            wait_ms, tgt["label"], llm_ms, len(items), len(candidates),
             "、".join(c["name"] for c in candidates) or "无"), flush=True)
         now = time.time()
         with _recog_lock:
@@ -1869,6 +1888,9 @@ def _recog_worker():
                     target["last_ts"] = now
                     target["t"] = t
                     target["frame"] = frame
+                    # 最近一次识别到该食物的 VLM 延时（合并也刷新：卡片右侧展示）
+                    target["latency_ms"] = int(llm_ms)
+                    target["latency_model"] = tgt["label"]
                     target["rev"] = target.get("rev", 0) + 1
                     # 有更新的卡移到列表末尾（下发时反转=置顶），顺序=最近更新在前
                     cards.remove(target)
@@ -1881,6 +1903,7 @@ def _recog_worker():
                         "nutrition_tags": it["nutrition_tags"], "food_signal": it["food_signal"],
                         "shots": [shot_url] if shot_url else [], "ref_img": boxed_uri,
                         "merge_history": [],
+                        "latency_ms": int(llm_ms), "latency_model": tgt["label"],
                         "frame": frame, "t": t, "last_ts": now, "rev": 0})
             if len(cards) > RECOG_MAX_CARDS:
                 del cards[:len(cards) - RECOG_MAX_CARDS]
@@ -1892,7 +1915,7 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
     processor 里调用，不阻塞产线。去重候选与新卡都落在 device 自己的卡片桶里。
     不再加 pending 占位卡（去重后归属不定），识别中用前端顶部 live 指示。"""
     global _recog_last_ts, _recog_worker_started
-    if not detections or not RECOG_ENDPOINT:
+    if not detections or not RECOG_TARGETS[_recog_target]["endpoint"]:
         return
     now = time.time()
     with _recog_lock:
@@ -2043,7 +2066,33 @@ def recog_list(device: Optional[str] = None):
         cards = [{k: v for k, v in c.items() if k != "ref_img"}
                  for c in _recog_cards.get(dev, []) if c.get("status") != "empty"]
     cards.reverse()   # 最新在前，前端 prepend 到顶部
-    return JSONResponse({"enabled": bool(RECOG_ENDPOINT), "device": dev, "cards": cards})
+    tgt = RECOG_TARGETS[_recog_target]
+    return JSONResponse({"enabled": bool(tgt["endpoint"]), "device": dev, "cards": cards,
+                         "target": _recog_target, "model": tgt["model"],
+                         "targets": {k: bool(v["endpoint"]) for k, v in RECOG_TARGETS.items()}})
+
+
+@app.get("/api/recog/target")
+def recog_target_get():
+    """当前识别目标 + 各目标是否可用（endpoint 已配置）。"""
+    tgt = RECOG_TARGETS[_recog_target]
+    return JSONResponse({"target": _recog_target, "model": tgt["model"],
+                         "targets": {k: bool(v["endpoint"]) for k, v in RECOG_TARGETS.items()}})
+
+
+@app.post("/api/recog/target")
+def recog_target_set(body: dict = Body(default=None)):
+    """切换识别目标（qwen|gemini）：免重启，下一轮识别即用新目标；未配置 endpoint 的目标拒绝。"""
+    global _recog_target
+    want = str((body or {}).get("target", "")).strip()
+    if want not in RECOG_TARGETS:
+        return JSONResponse({"error": "target 只支持 " + "|".join(RECOG_TARGETS)}, status_code=400)
+    if not RECOG_TARGETS[want]["endpoint"]:
+        return JSONResponse({"error": f"目标 {want} 未配置 endpoint（.env 缺 RECOG_ENDPOINT"
+                             + ("_GEMINI" if want == "gemini" else "") + "）"}, status_code=400)
+    _recog_target = want
+    print(f"[da3-web] 识别目标切换 → {want}（{RECOG_TARGETS[want]['model']}）", flush=True)
+    return JSONResponse({"ok": True, "target": want, "model": RECOG_TARGETS[want]["model"]})
 
 
 @app.post("/api/recog/clear")
@@ -2336,14 +2385,23 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .live.off{color:var(--faint);background:rgba(120,130,145,.12)}
  .clr{margin-left:10px;font-size:12px;font-weight:600;color:var(--muted);background:var(--panel2);border:1px solid var(--line);padding:5px 13px;border-radius:8px;cursor:pointer}
  .clr:hover{color:var(--food);border-color:var(--food)}
+ /* 识别目标切换（Qwen / Gemini Pro）：分段按钮，未配置 endpoint 的目标置灰 */
+ .seg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;background:var(--panel2)}
+ .seg button{font-size:12px;font-weight:600;padding:5px 13px;border:0;background:transparent;color:var(--muted);cursor:pointer}
+ .seg button.sel{background:var(--accent);color:#fff}
+ .seg button:disabled{opacity:.4;cursor:not-allowed}
  .live i{width:7px;height:7px;border-radius:50%;background:currentColor;animation:pulse 1.4s infinite}
  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
  .head .sub{font-size:12px;color:var(--muted);margin-top:3px}
  .head .sub code{font-family:var(--mono);font-size:11px;color:var(--accent);background:var(--accent-soft);padding:1px 6px;border-radius:5px}
  .feed{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
  .empty{color:var(--faint);font-size:13px;text-align:center;margin:36px 10px}
- .rcard{position:relative;display:grid;grid-template-columns:118px 1fr;gap:15px;padding:12px;border:1px solid var(--line);
+ .rcard{position:relative;display:grid;grid-template-columns:118px 1fr auto;gap:15px;padding:12px;border:1px solid var(--line);
    border-radius:13px;background:var(--panel2);animation:rise .34s cubic-bezier(.2,.7,.3,1)}
+ /* 卡片右侧：最近一次识别该食物的 VLM 延时 + 所用模型 */
+ .rlat{display:flex;flex-direction:column;align-items:flex-end;justify-content:center;gap:3px;min-width:72px}
+ .rlat .lv{font-size:15px;font-weight:650;font-family:var(--mono);font-variant-numeric:tabular-nums}
+ .rlat .lm{font-size:10.5px;color:var(--faint)}
  @keyframes rise{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:none}}
  .thumb{position:relative;width:104px;aspect-ratio:3/4;border-radius:9px;overflow:hidden;border:1px solid var(--line);
    background-color:#10141a;
@@ -2401,7 +2459,9 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </style></head><body>
 <div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <div class="head">
-  <div class="l1"><h2>实时识别 · Live Recognition</h2><span class="live" id="live"><i></i>识别中</span><button class="clr" id="clr">清空</button></div>
+  <div class="l1"><h2>实时识别 · Live Recognition</h2>
+    <span class="seg" id="seg"><button data-t="qwen">Qwen</button><button data-t="gemini">Gemini Pro</button></span>
+    <span class="live" id="live"><i></i>识别中</span><button class="clr" id="clr">清空</button></div>
   <div class="sub">food/drink 命中某帧 → <code id="model">Qwen3-VL</code> 识别四字段 · 同一物 30 秒内去重合并（缩略图叠加，点击看图集）· 有更新的卡自动置顶 · 当前设备 <code id="devlab">–</code></div>
 </div>
 <div class="feed" id="feed"><div class="empty" id="empty">等待 food/drink 命中…</div></div>
@@ -2453,7 +2513,9 @@ function cardEl(c){
     +'  <div class="fld f-tags hide"><div class="flab">营养标签 / Nutrition Tags</div><div class="tags"></div></div>'
     +'  <div class="fld f-sig hide"><div class="flab">食物信号 / Food Signal</div><div class="sig"></div></div>'
     +'  <div class="meta"><span>帧 '+(c.frame||'')+'</span><span>'+(c.t||'')+'</span></div>'
-    +'</div>';
+    +'</div>'
+    +'<div class="rlat"><div class="flab">识别延时 / Latency</div><div class="lv"></div><div class="lm"></div></div>';
+  latFill(el, c);
   typeInto(el.querySelector('.nm'), c.name||'');
   if(c.description){ el.querySelector('.f-desc').classList.remove('hide'); el.querySelector('.desc').textContent=c.description; }
   const tags=c.nutrition_tags||[];
@@ -2461,6 +2523,12 @@ function cardEl(c){
     el.querySelector('.tags').innerHTML=tags.map(t=>'<span class="chip">'+t+'</span>').join(''); }
   if(c.food_signal){ el.querySelector('.f-sig').classList.remove('hide'); el.querySelector('.sig').textContent=c.food_signal; }
   return el;
+}
+// —— 卡片右侧延时：最近一次识别该食物的 VLM 耗时 + 所用模型（新建与去重合并都会刷新）——
+function latFill(el,c){
+  const v=el.querySelector('.rlat .lv'), m=el.querySelector('.rlat .lm');
+  if(c.latency_ms!=null){ v.textContent=(c.latency_ms/1000).toFixed(1)+'s'; m.textContent=c.latency_model||''; }
+  else { v.textContent='–'; m.textContent=''; }
 }
 function flashUpdate(el){
   el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
@@ -2503,6 +2571,17 @@ document.addEventListener('keydown',e=>{ if(!$('lb').classList.contains('on'))re
   if(e.key==='ArrowRight'){lbIdx=(lbIdx+1)%lbShots.length;renderLB();}
   if(e.key==='ArrowLeft'){lbIdx=(lbIdx-1+lbShots.length)%lbShots.length;renderLB();} });
 
+// 识别目标切换：POST 后端换 endpoint/model，免重启、下一轮识别生效；按钮状态由 tick 对账
+$('seg').addEventListener('click', async e=>{
+  const b=e.target.closest('button');
+  if(!b||b.disabled||b.classList.contains('sel'))return;
+  try{
+    const r=await fetch('/api/recog/target',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({target:b.dataset.t})});
+    if(r.ok) tick(); else console.log('识别目标切换失败：', await r.text());
+  }catch(e){/* 网络失败忽略，按钮状态由下个 tick 恢复 */}
+});
+
 // 清空：后端清卡 + 前端清 feed/state + 关 lightbox
 $('clr').onclick=async()=>{
   try{ await fetch('/api/recog/clear',{method:'POST'}); }catch(e){}
@@ -2526,6 +2605,13 @@ async function tick(){
   if(!d.enabled){ live.className='live off'; live.innerHTML='<i></i>未接入';
     $('empty').textContent='识别服务未接入（RECOG_ENDPOINT 未配置）'; }
   else { live.className='live'; live.innerHTML='<i></i>识别中'; }
+  // 识别目标：模型名 + 分段按钮状态（选中高亮；未配置 endpoint 的目标置灰）
+  if(d.model) $('model').textContent=d.model;
+  const tg=d.targets||{};
+  [...$('seg').children].forEach(b=>{ const t=b.dataset.t;
+    b.classList.toggle('sel', t===d.target);
+    b.disabled=!tg[t];
+    b.title=tg[t]?'':'未配置该目标的 endpoint（服务器 .env）'; });
   // 设备切换（在 /panel 下拉触发）：关掉图集弹层，卡片由下方 seen 对账逻辑自动整体换桶
   const dev=d.device||null;
   if(curDev!==null && dev!==curDev) $('lb').classList.remove('on');
@@ -2547,6 +2633,7 @@ async function tick(){
       if(feed.firstChild!==st.el) feed.insertBefore(st.el, feed.firstChild);
       const ms=st.el.querySelectorAll('.meta span');
       if(ms[0]) ms[0].textContent='帧 '+(c.frame||''); if(ms[1]) ms[1].textContent=c.t||'';
+      latFill(st.el, c);
       renderStack(st.el, c.name||'', st.shots); flashUpdate(st.el); changed=true; } });
   if(changed) bumpScroll();
  }catch(e){}
