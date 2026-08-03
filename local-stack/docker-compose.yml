@@ -136,6 +136,21 @@ services:
     networks:
       - odyss-local-net
 
+  # 识别模型一键切换 actuator：superadmin 顶栏按钮经 /ops-api 调它，切换 = 用
+  # config/runtime-config.{qwen,gemini}.yaml 变体覆盖生效配置 + 重启 services 容器。
+  # 变体含 LLM 密钥，属服务器侧运行时数据（同 stack.env 口径），不入仓；缺变体时拒绝切换。
+  llm-switch:
+    build: ./llm-switch
+    container_name: odyss-local-llm-switch
+    restart: unless-stopped
+    environment:
+      TARGET_CONTAINER: odyss-local-services
+    volumes:
+      - ./config:/config
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - odyss-local-net
+
   superadmin:
     image: ${IMG_NGINX:-nginx:alpine}
     container_name: odyss-local-superadmin

@@ -12,6 +12,7 @@
     "firmware-versions",
     "app-config",
     "push-debugger",
-    "user-permissions"
+    "user-permissions",
+    "llm-switch"
   ]
 }
