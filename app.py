@@ -1585,8 +1585,11 @@ RECOG_DESC_MAX = 20         # 一句话描述最大字数
 
 def _build_recog_prompt(candidates, n_food=0, n_drink=0):
     """按候选动态生成「识别 + 去重」prompt。
-    关键防线：历史参考图（图3起）带 HISTORY REF 横幅 + prompt 明令，防止参考图内容
-    泄漏进任务一被当成当前画面的物品（实测过：画面空无一物时模型照着参考图报 Snickers）。"""
+    关键防线一：历史参考图（图3起）带 HISTORY REF 横幅 + prompt 明令，防止参考图内容
+    泄漏进任务一被当成当前画面的物品（实测过：画面空无一物时模型照着参考图报 Snickers）。
+    关键防线二（治 over-merge）：合并不是自由心证，而是逐项对照（品牌/颜色/形状/容器）
+    的 checklist，字段顺序上证据(match_evidence)先于结论(match)生成，high 有硬性定义；
+    「同名≠同物」明确写死——两根不同的香蕉、两杯咖啡必须分开记录。"""
     p = (
         "图1=当前画面原图；图2=当前画面带检测框版本（红框=疑似食物，蓝框=疑似液体/容器）。"
         "从图3起（若有）全部是带“HISTORY REF”横幅的历史参考图，只用于任务二对照，**不是当前画面**。\n"
@@ -1609,32 +1612,50 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0):
         "框要紧贴物品本体。\n"
     )
     if candidates:
-        lines = "\n".join("  [%d] %s —— %s" % (i + 1, c.get("name", ""), c.get("desc") or "无描述")
+        lines = "\n".join("  [%d] %s（%s）—— %s" % (i + 1, c.get("name", ""),
+                                                    c.get("type") or "食物", c.get("desc") or "无描述")
                           for i, c in enumerate(candidates))
         p += (
-            "任务二·去重：以下是最近30秒已记录的物品清单（编号·名称·描述），其参考图依次是图3、图4…"
+            "任务二·去重：以下是最近30秒已记录的物品清单（编号·名称·类型·描述），其参考图依次是图3、图4…"
             "（图3=[1]、图4=[2]，以此类推）：\n" + lines + "\n"
-            "对识别出的每个物品，判断它是否就是清单里某一项的**同一个具体物品**在持续出现：\n"
-            "  · 只有当它与该候选是同一个具体产品/同一份食物（同品牌同包装，或明显是同一份）时，才 match=该编号；\n"
-            "  · 同类目但不同产品必须判新：如巧克力棒 vs 谷物棒、可乐 vs 橙汁、品牌/口味/包装不同的同类零食，一律 match=null；\n"
-            "  · 用参考图核对：参考图与当前物品明显不是同一个东西时，必须 match=null；\n"
-            "  · 拿不准是否同一个时，判新（match=null）。\n"
-            "每个物品额外输出三个字段：\n"
-            "  match_reason：一句简短中文，给出 match 或判新的依据；\n"
+            "判断识别出的每个物品是否就是清单里某一项的**同一个具体物品**在持续出现。"
+            "默认它是新物品（match=null）；只有走完下面的对照流程并全部通过，才允许 match。\n"
+            "对每个物品，先在 match_evidence 字段里对最像的那个候选做逐项对照"
+            "（对照该候选的参考图与当前画面里的这个物品），每一项只能填“一致/不一致/看不清”：\n"
+            "  · 品牌与包装文字（无包装食物填“无包装”）；\n"
+            "  · 颜色与外观；\n"
+            "  · 形状与份量（明显被吃掉/喝掉一部分属于允许的变化）；\n"
+            "  · 容器/餐具/摆放位置。\n"
+            "然后按对照结果下结论：\n"
+            "  · 任何一项为“不一致” → match=null，禁止合并；\n"
+            "  · 包装食品：品牌与包装文字必须“一致”才可 match；\n"
+            "  · 无包装食物/饮品：颜色外观、形状份量、容器摆放三项中至少两项“一致”且无一项“不一致”，"
+            "才可 match；只是名称相同（如都叫 Banana、都叫 Coffee）绝不构成 match 的理由——"
+            "不同的两根香蕉、两杯咖啡必须分开记录；\n"
+            "  · 同类目但不同产品必须判新：巧克力棒 vs 谷物棒、可乐 vs 橙汁、品牌/口味/包装不同的同类零食，一律 match=null；\n"
+            "  · 参考图看不清、被遮挡、或在参考图里无法定位该候选物品时 → match=null。\n"
+            "match_confidence 的判定标准（先给证据再定档，不允许跳过对照直接定档）：\n"
+            "  · high：对照项中至少两项明确“一致”、零项“不一致”，且参考图清晰可辨；\n"
+            "  · low：其余一切情况（有“看不清”项、只有一项“一致”、或仅凭名称相似）。\n"
+            "错误合并（把不同食物记成同一个）比重复建卡严重得多；宁可多一张卡，不可错并一次。\n"
+            "每个物品额外输出这些字段（严格按此顺序，证据先于结论）：\n"
+            "  match_evidence：上述逐项对照结果（如“品牌一致；颜色一致；形状一致；容器一致”，"
+            "或“颜色不一致（红vs绿）”）；无相似候选时写“无相似候选”；\n"
+            "  match_reason：一句简短中文，给出 match 或判新的结论依据；\n"
+            "  match：候选编号，或 null；\n"
             "  matched_name：match≠null 时，一字不差照抄清单里该编号的名称；match=null 时为 null；\n"
-            "  match_confidence：match≠null 时填“high”（确定是同一个）或“low”（不太确定）；"
-            "只有 high 会被合并，low 会按新物品处理。\n"
+            "  match_confidence：match≠null 时按上面的标准填“high”或“low”。\n"
         )
     else:
         p += ("任务二·去重：当前没有已记录的物品，识别到的都是新的，match 一律为 null，"
-              "match_reason 写“无已记录物品”，matched_name 为 null。\n")
+              "match_evidence 写“无相似候选”，match_reason 写“无已记录物品”，matched_name 为 null。\n")
     p += (
         "只输出 JSON，不要任何解释："
         "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
         "\"nutrition_tags\":[\"Carbs\",\"Fiber\",\"Potassium\"],\"food_signal\":\"Quick energy\","
         "\"box\":[412,530,668,845],"
-        "\"match\":null,\"match_reason\":\"画面新出现的物品\",\"matched_name\":null,"
-        "\"match_confidence\":null}]}。"
+        "\"match_evidence\":\"无相似候选\",\"match_reason\":\"画面新出现的物品\","
+        "\"match\":null,\"matched_name\":null,\"match_confidence\":null}]}。"
         "画面里没有食物也没有液体时，items 为空数组。"
     )
     return p
@@ -1698,6 +1719,38 @@ def _make_ref_img(rgb):
     return out
 
 
+REF_CROP_MARGIN = 0.18   # 参考图裁剪的 box 外扩比例：保留少量容器/摆放上下文
+REF_CROP_MIN = 224       # 参考图裁剪最小边长(px)：太小的 crop 会糊，以中心为基准向外扩到该尺寸
+
+
+def _make_ref_crop(rgb, box):
+    """新卡参考图：按物品 box 外扩裁剪出「只含本物品」的特写，再打 HISTORY REF 横幅。
+    动机（over-merge 第一根因）：整帧参考图在多物品同框时彼此几乎相同——同一轮建的
+    多张卡甚至共享同一张图，「用参考图核对」被结构性架空；候选特写才真正可判别。
+    box 为 0-1 归一化 (x1,y1,x2,y2)；box 缺失、疑似退化（面积<2%帧面积）或裁剪
+    结果过小时返回 None，调用方回退整帧带框图（与旧行为一致）。"""
+    if not box:
+        return None
+    H, W = rgb.shape[:2]
+    x1, y1, x2, y2 = box[0] * W, box[1] * H, box[2] * W, box[3] * H
+    bw, bh = x2 - x1, y2 - y1
+    if bw * bh < 0.02 * W * H:      # 面积过小：疑似漂移/退化框，裁下来也认不出，不如整帧
+        return None
+    mx, my = bw * REF_CROP_MARGIN, bh * REF_CROP_MARGIN
+    x1, y1, x2, y2 = x1 - mx, y1 - my, x2 + mx, y2 + my
+    if x2 - x1 < REF_CROP_MIN:
+        cx = (x1 + x2) / 2
+        x1, x2 = cx - REF_CROP_MIN / 2, cx + REF_CROP_MIN / 2
+    if y2 - y1 < REF_CROP_MIN:
+        cy = (y1 + y2) / 2
+        y1, y2 = cy - REF_CROP_MIN / 2, cy + REF_CROP_MIN / 2
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(W, int(x2)), min(H, int(y2))
+    if x2 - x1 < 32 or y2 - y1 < 32:
+        return None
+    return _make_ref_img(rgb[y1:y2, x1:x2])
+
+
 def _draw_boxes(rgb, detections):
     """在原图上画 food(红)/drink(蓝) 检测框，返回带框图(RGB)。"""
     out = rgb.copy()
@@ -1749,6 +1802,7 @@ def _parse_recog(content):
             match = int(it.get("match"))     # 命中的候选编号；范围校验在 worker（要对齐候选数）
         except (TypeError, ValueError):
             match = None
+        evidence = str(it.get("match_evidence", "")).strip().replace("\n", " ")[:80]
         reason = str(it.get("match_reason", "")).strip().replace("\n", " ")[:60]
         mname = str(it.get("matched_name") or "").strip()[:40]
         conf = str(it.get("match_confidence") or "").strip().lower()
@@ -1765,14 +1819,14 @@ def _parse_recog(content):
                 box = None
         out.append({"name": name, "type": "液体" if is_liquid else "食物",
                     "description": desc, "nutrition_tags": tags, "food_signal": sig,
-                    "match": match, "match_reason": reason,
+                    "match": match, "match_evidence": evidence, "match_reason": reason,
                     "matched_name": mname, "match_confidence": conf, "box": box})
     return out
 
 
 def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, target=None):
     """调多模态 VLM 识别 + 去重。一次多图请求：图1原图 + 图2带框图 + 各候选参考图(带横幅标记)。
-    candidates: [{"id","name","desc","ref_img"}...]（顺序即参考图编号）。
+    candidates: [{"id","name","type","desc","ref_img"}...]（顺序即参考图编号）。
     n_food/n_drink：当前画面检测器命中数，作为软接地信息进 prompt。
     target：识别目标预设（RECOG_TARGETS 里的一项，缺省=当前选中目标）。
     返回 [{name,type,description,...,match,matched_name,match_confidence}]；任何失败返回 []。"""
@@ -1788,9 +1842,12 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
         if c.get("ref_img"):
             content.append({"type": "image_url", "image_url": {"url": c["ref_img"]}})
     content.append({"type": "text", "text": _build_recog_prompt(candidates, n_food, n_drink)})
+    # temperature=0：判同结果下游有硬合并动作，消除轮间抖动、日志巡检可复现；
+    # max_tokens 1024：新增 match_evidence 对照文本后，多物品帧 768 可能截断 JSON——
+    # 截断会被 _parse_recog 的容错整体吞掉 items，表现为静默丢识别。
     payload = {"model": cfg["model"],
                "messages": [{"role": "user", "content": content}],
-               "max_tokens": 768, "temperature": 0.2}
+               "max_tokens": 1024, "temperature": 0}
     headers = {"Content-Type": "application/json"}
     if cfg["api_key"]:
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
@@ -1806,7 +1863,8 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
 
 def _name_tokens(s):
     """名称 → 词面 token 集（拉丁按词、中文按字符 2-gram，单字退化为单字）。
-    仅用于合并零重叠 WARN 观测，不做合并闸门（语义判同权在模型）。"""
+    用于「合并名称零重叠」闸门：模型合并时被要求照抄候选名，实际输出名也强烈
+    倾向沿用候选名，零重叠+high 是罕见且高危的错并组合，确定性拦截、误杀极少。"""
     s = (s or "").strip().lower()
     toks = set(re.findall(r"[a-z0-9]+", s))
     cjk = re.findall(r"[一-鿿]", s)
@@ -1816,8 +1874,10 @@ def _name_tokens(s):
 
 def _recog_worker():
     """后台单线程：取最新识别任务、丢弃积压，识别 + 去重：
-      duplicate 命中 → 合并到那张卡（只追加缩略图 glb、刷新 last_ts、rev+1，内容不改）；
-      否则 → 新建卡（ref_img=本帧带框图，供后续做去重视觉比对）。"""
+      duplicate 命中且通过全部闸门 → 合并到那张卡（只追加缩略图、刷新 last_ts、rev+1，内容不改）；
+      否则 → 新建卡（ref_img=按物品 box 裁剪的特写，无 box 回退整帧带框图）。
+    合并闸门共五道（宁拒勿并，错并比重复建卡严重）：回显校验 → 类型一致 →
+    证据自洽 → high 置信 → 名称零重叠拦截。"""
     global _recog_id
     while True:
         with _recog_cv:
@@ -1827,7 +1887,9 @@ def _recog_worker():
                 _recog_pending.pop()             # 最新优先
             _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
         wait_ms = (time.time() - enq_ts) * 1000.0     # 在队列里等 worker 的时长
-        # 新卡代表图(ref_img)：带框图加 HISTORY REF 横幅标记，防止后续轮次被当成当前画面
+        # 新卡代表图兜底：整帧带框图加 HISTORY REF 横幅（物品无 box/裁剪失败时用）。
+        # 注意：这张图同轮所有新卡共享，正是曾经 over-merge 的第一根因——正常路径
+        # 走建卡处按各自 box 裁剪的特写，这里仅作退路。
         boxed_uri = _img_data_uri(_make_ref_img(boxed))
         tgt = RECOG_TARGETS[_recog_target]   # 快照本轮识别目标：切换只影响后续轮次
         _tq = time.time()
@@ -1842,7 +1904,7 @@ def _recog_worker():
             cards = _recog_cards.setdefault(dev, [])   # 该设备自己的卡片流
             for it in items:
                 target = None
-                m = it.get("match")   # 命中候选编号；还要过「回显校验+置信度」两道闸才允许合并
+                m = it.get("match")   # 命中候选编号；还要过五道闸才允许合并（宁拒勿并）
                 if isinstance(m, int) and 1 <= m <= len(candidates):
                     cand = candidates[m - 1]
                     if (it.get("matched_name") or "").strip().casefold() \
@@ -1851,20 +1913,33 @@ def _recog_worker():
                         # 指称对齐（抓编号幻觉/错位），零语义判断、零语义误伤
                         print("[da3-web] 识别拒合并（回显不一致）：『%s』match=%s 回显『%s』≠候选『%s』→ 按新卡处理" % (
                             it["name"], m, it.get("matched_name") or "空", cand["name"]), flush=True)
+                    elif (cand.get("type") or "食物") != it["type"]:
+                        # 闸门二·类型一致：食物↔液体跨类合并是强错并信号，确定性拦截；
+                        # 误杀代价只是多一张卡（演示场景可接受的错误方向）
+                        print("[da3-web] 识别拒合并（类型不一致）：『%s』(%s) match=%s 候选『%s』(%s) → 按新卡处理" % (
+                            it["name"], it["type"], m, cand["name"],
+                            cand.get("type") or "食物"), flush=True)
+                    elif "不一致" in (it.get("match_evidence") or ""):
+                        # 闸门三·证据自洽：逐项对照里已有「不一致」却仍给 match——
+                        # 模型自相矛盾（prompt 明令任一项不一致禁并），确定性拦截
+                        print("[da3-web] 识别拒合并（证据矛盾）：『%s』match=%s 证据『%s』含不一致 → 按新卡处理" % (
+                            it["name"], m, it.get("match_evidence")), flush=True)
                     elif it.get("match_confidence") != "high":
-                        # 闸门二·置信度：模型自报不确定 → 宁拒勿并（判断权在看过图的模型）
+                        # 闸门四·置信度：模型自报不确定 → 宁拒勿并（high 在 prompt 里有硬性定义）
                         print("[da3-web] 识别拒合并（低置信）：『%s』match=%s confidence=%s → 按新卡处理" % (
                             it["name"], m, it.get("match_confidence") or "缺省"), flush=True)
+                    elif not (_name_tokens(it["name"]) & _name_tokens(cand["name"])):
+                        # 闸门五·名称零重叠：合并时模型被要求照抄候选名，本轮识别名与候选名
+                        # 连一个词面 token 都不重叠还要合并，几乎必是错并——从 WARN 升级为拦截
+                        print("[da3-web] 识别拒合并（名称零重叠）：『%s』→候选『%s』 → 按新卡处理" % (
+                            it["name"], cand["name"]), flush=True)
                     else:
                         target = next((c for c in cards if c["id"] == cand["id"]), None)
                 if target is not None:
-                    print("[da3-web] 识别去重：『%s』match=%s(high) → 合并到卡%s『%s』｜理由：%s" % (
+                    print("[da3-web] 识别去重：『%s』match=%s(high) → 合并到卡%s『%s』｜证据：%s｜理由：%s" % (
                         it["name"], m, target["id"], target["name"],
+                        it.get("match_evidence") or "（模型未给）",
                         it.get("match_reason") or "（模型未给）"), flush=True)
-                    if not (_name_tokens(it["name"]) & _name_tokens(target["name"])):
-                        # 仅观测不拦截：零重叠合并连续出现是错并的高危信号，供日志巡检
-                        print("[da3-web] ⚠️ 合并名称零重叠：『%s』→卡『%s』，请人工核对是否错并" % (
-                            it["name"], target["name"]), flush=True)
                 else:
                     print("[da3-web] 识别新卡：『%s』(%s) match=%s｜理由：%s" % (
                         it["name"], it["type"], m,
@@ -1878,6 +1953,7 @@ def _recog_worker():
                 if target is not None:           # 去重命中：合并（显示名不改，本轮名称进合并史）
                     target.setdefault("merge_history", []).append({
                         "t": t, "name": it["name"],
+                        "evidence": it.get("match_evidence", ""),
                         "reason": it.get("match_reason", ""),
                         "confidence": it.get("match_confidence", "")})
                     del target["merge_history"][:-20]    # 只留最近 20 条
@@ -1897,11 +1973,15 @@ def _recog_worker():
                     cards.append(target)
                 else:                            # 新食物：新建卡
                     _recog_id += 1
+                    # 参考图优先用按本物品 box 裁剪的特写（横幅在 crop 上），
+                    # 让后续轮次的去重对照真正可判别；裁剪失败回退整帧带框图
+                    crop = _make_ref_crop(orig, it.get("box"))
+                    ref_uri = (_img_data_uri(crop) if crop is not None else None) or boxed_uri
                     cards.append({
                         "id": _recog_id, "status": "done",
                         "name": it["name"], "type": it["type"], "description": it["description"],
                         "nutrition_tags": it["nutrition_tags"], "food_signal": it["food_signal"],
-                        "shots": [shot_url] if shot_url else [], "ref_img": boxed_uri,
+                        "shots": [shot_url] if shot_url else [], "ref_img": ref_uri,
                         "merge_history": [],
                         "latency_ms": int(llm_ms), "latency_model": tgt["label"],
                         "frame": frame, "t": t, "last_ts": now, "rev": 0})
@@ -1930,8 +2010,10 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
                   if c.get("status") == "done" and c.get("ref_img")
                   and now - c.get("last_ts", 0) <= RECOG_ACTIVE_WINDOW]
         active.sort(key=lambda c: c.get("last_ts", 0), reverse=True)
-        candidates = [{"id": c["id"], "name": c.get("name", ""), "desc": c.get("description", ""),
-                       "ref_img": c["ref_img"]} for c in active[:RECOG_MAX_CANDIDATES]]
+        # type 进快照：候选清单文字带类型，且供 worker 的「类型不一致禁并」闸门用
+        candidates = [{"id": c["id"], "name": c.get("name", ""), "type": c.get("type", "食物"),
+                       "desc": c.get("description", ""), "ref_img": c["ref_img"]}
+                      for c in active[:RECOG_MAX_CANDIDATES]]
     t = time.strftime("%H:%M:%S")
     boxed = _draw_boxes(orig_rgb, detections)
     n_food = sum(1 for d in detections if d[0] == "food")
