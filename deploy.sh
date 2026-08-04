@@ -29,15 +29,42 @@ else
   sleep 2
 fi
 
+# 深体验区后端 8070（dx-backend.service）：已安装 systemd 单元则一并重启
+if systemctl list-unit-files 2>/dev/null | grep -q '^dx-backend\.service'; then
+  echo "==> 通过 systemd 重启 dx-backend.service (8070)"
+  sudo systemctl restart dx-backend.service
+  sleep 1
+else
+  echo "==> 未装 dx-backend.service，跳过 8070（首次安装见 dx-backend.service 头部注释）"
+fi
+
 echo "==> 健康检查 http://127.0.0.1:8060/（导入 torch/gradio + 构建 Gradio app 需若干秒，轮询至多 60s）"
+ok8060=0
 for i in $(seq 1 20); do
   code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8060/ 2>/dev/null || true)
   if [ "$code" = "200" ]; then
-    echo "    HTTP 200（约 $((i * 3))s 就绪）"
-    echo "==> 部署完成"
-    exit 0
+    echo "    8060 HTTP 200（约 $((i * 3))s 就绪）"
+    ok8060=1
+    break
   fi
   sleep 3
 done
-echo "!! 60s 内健康检查未通过，请查看 serve.log 或 systemd 日志" >&2
-exit 1
+if [ "$ok8060" != "1" ]; then
+  echo "!! 8060 在 60s 内健康检查未通过，请查看 serve.log 或 systemd 日志" >&2
+  exit 1
+fi
+
+if systemctl list-unit-files 2>/dev/null | grep -q '^dx-backend\.service'; then
+  echo "==> 健康检查 http://127.0.0.1:8070/api/health"
+  for i in $(seq 1 5); do
+    if curl -fsS --max-time 3 http://127.0.0.1:8070/api/health > /dev/null 2>&1; then
+      echo "    8070 就绪"
+      echo "==> 部署完成"
+      exit 0
+    fi
+    sleep 2
+  done
+  echo "!! 8070 健康检查未通过：journalctl -u dx-backend -n 50" >&2
+  exit 1
+fi
+echo "==> 部署完成"
