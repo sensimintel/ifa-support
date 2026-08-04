@@ -36,6 +36,7 @@ import numpy as np
 import torch
 import trimesh
 from fastapi import Body, FastAPI, File, Form, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from PIL import Image, ImageOps
 
@@ -58,6 +59,9 @@ GLB_DIR.mkdir(parents=True, exist_ok=True)
 GLB_KEEP = 24  # 最多保留最近多少次产物
 
 app = FastAPI(title="DA3 Depth Web")
+# 局域网演示服务：放开跨域，供 superadmin(18091) 等同网页面直调秤接口
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
 _model = None
 _model_lock = threading.Lock()   # 保护模型单例的加载
 _gpu_lock = threading.Lock()     # 串行化所有 GPU 推理（右栏 + 官方 Gradio 共用同一模型）
@@ -107,8 +111,57 @@ def _read_scale_int32(host, port, unit, addr, word_order, timeout):
     return struct.unpack(">i", struct.pack(">I", raw_u))[0]
 
 
+# ── 深体验区 · 四通道食物秤 ──────────────────────────────────────────
+# 同一台四通道称重模块（与秤A同设备）的 4 组寄存器：通道 1..4 → addr 0/2/4/6，
+# 解码方式与秤A完全一致（FC3、32 位有符号、HH-LL、分度 0.1）。
+# 「清空（去皮）」为软件去皮：记录当下 raw 为皮重，净重 = (raw - 皮重) × 分度。
+FOOD_SCALE_HOST = "192.168.0.80"
+FOOD_SCALE_PORT = 502
+FOOD_SCALE_UNIT = 1
+FOOD_SCALE_DIVISION = 0.1
+FOOD_SCALE_CHANNELS = (1, 2, 3, 4)
+_food_latest = {ch: {"ok": False, "raw": None} for ch in FOOD_SCALE_CHANNELS}
+_food_tare = {ch: 0 for ch in FOOD_SCALE_CHANNELS}
+
+
+def _read_food_scale_raws():
+    """一次 FC3 读 addr 0 起 8 个保持寄存器，解码四个通道的有符号 32 位 raw（HH-LL）。"""
+    req = struct.pack(">HHHBBHH", 1, 0, 6, FOOD_SCALE_UNIT, 0x03, 0, 8)
+    with socket.create_connection((FOOD_SCALE_HOST, FOOD_SCALE_PORT),
+                                  timeout=SCALE_TIMEOUT) as sock:
+        sock.settimeout(SCALE_TIMEOUT)
+        sock.sendall(req)
+        head = _recv_exact(sock, 9)
+        if head[7] & 0x80:
+            raise IOError(f"Modbus 异常响应，功能码 0x{head[7]:02X}")
+        data = _recv_exact(sock, head[8])
+    regs = struct.unpack(">" + "H" * (head[8] // 2), data)
+    raws = {}
+    for i, ch in enumerate(FOOD_SCALE_CHANNELS):
+        high, low = regs[2 * i], regs[2 * i + 1]
+        raw_u = ((high << 16) | low) & 0xFFFFFFFF
+        raws[ch] = struct.unpack(">i", struct.pack(">I", raw_u))[0]
+    return raws
+
+
+def _poll_food_scales():
+    """读四通道食物秤并写入缓存；失败时整组标离线、保留上次 raw。"""
+    try:
+        raws = _read_food_scale_raws()
+        with _scale_lock:
+            for ch, raw in raws.items():
+                _food_latest[ch] = {"ok": True, "raw": raw}
+    except Exception:
+        with _scale_lock:
+            for ch in FOOD_SCALE_CHANNELS:
+                _food_latest[ch] = {"ok": False, "raw": _food_latest[ch].get("raw")}
+
+
 def _scale_poller():
-    """后台线程：周期性读两个秤，写入缓存。"""
+    """后台线程：周期性读两个秤 + 四通道食物秤，写入缓存。
+
+    四通道模块与秤A是同一台设备，读取集中在本线程串行进行，避免并发连接冲突。
+    """
     while True:
         for s in SCALES:
             try:
@@ -122,6 +175,7 @@ def _scale_poller():
                     prev = _scale_latest[s["id"]]
                     _scale_latest[s["id"]] = {
                         "ok": False, "weight": prev.get("weight"), "raw": prev.get("raw")}
+        _poll_food_scales()
         time.sleep(SCALE_POLL_INTERVAL)
 
 
@@ -2365,6 +2419,41 @@ def serve_glb(token: str, name: str):
     if not p.exists():
         return JSONResponse({"error": "产物已过期或不存在"}, status_code=404)
     return FileResponse(str(p), media_type="model/gltf-binary", filename="scene.glb")
+
+
+# ── 深体验区 · 四通道食物秤：JSON 接口 ─────────────────────────────────
+@app.get("/api/food-scales")
+def api_food_scales():
+    """返回四通道食物秤的最新缓存读数（net=去皮后净重，gross=毛重，单位克）。"""
+    with _scale_lock:
+        scales = []
+        for ch in FOOD_SCALE_CHANNELS:
+            st = _food_latest[ch]
+            raw = st["raw"]
+            tare = _food_tare[ch]
+            scales.append({
+                "channel": ch,
+                "ok": st["ok"],
+                "net": round((raw - tare) * FOOD_SCALE_DIVISION, 1) if raw is not None else None,
+                "gross": round(raw * FOOD_SCALE_DIVISION, 1) if raw is not None else None,
+                "tare_g": round(tare * FOOD_SCALE_DIVISION, 1),
+            })
+    return JSONResponse({"scales": scales, "ts": time.time()})
+
+
+@app.post("/api/food-scales/{channel}/tare")
+def api_food_scale_tare(channel: int):
+    """清空（软件去皮）：把该通道当前 raw 记为皮重，此后净重按扣除皮重后返回。"""
+    if channel not in FOOD_SCALE_CHANNELS:
+        return JSONResponse({"ok": False, "error": f"通道 {channel} 不存在（合法 1~4）"},
+                            status_code=404)
+    with _scale_lock:
+        st = _food_latest[channel]
+        if not st["ok"] or st["raw"] is None:
+            return JSONResponse({"ok": False, "error": "秤当前离线，无法去皮"}, status_code=409)
+        _food_tare[channel] = st["raw"]
+        tare_g = round(st["raw"] * FOOD_SCALE_DIVISION, 1)
+    return JSONResponse({"ok": True, "channel": channel, "tare_g": tare_g})
 
 
 # ── 电子秤：JSON 接口 + 实时看板页 ─────────────────────────────────────
