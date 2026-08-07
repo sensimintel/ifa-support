@@ -1,6 +1,6 @@
 # ifa-support
 
-> 本仓同时是 Odyss 本地化组件的**编排管理仓**：全套管理规范见 [`MANAGEMENT.md`](MANAGEMENT.md)，全栈本地化 SOP（一套拉起）见 [`local-stack/`](local-stack/README.md)。以下为 DA3 演示服务说明。
+> 本仓同时是 Odyss 本地化组件的**编排管理仓**：全套管理规范见 [`MANAGEMENT.md`](MANAGEMENT.md)，全栈本地化 SOP（一套拉起）见 [`local-stack/`](local-stack/README.md)，演示现场网络方案（展会拓扑与公司内模拟）见 [`NETWORK.md`](NETWORK.md)。以下为 DA3 演示服务说明。
 
 5090 服务器上跑在 `0.0.0.0:8060` 的运维/演示 Web 服务（原目录 `~/da3-web`），单文件 FastAPI 应用，纯服务端渲染、零前端构建。一个端口同时挂官方 Gradio 与自研面板：
 
@@ -11,7 +11,8 @@
   - **点云 + 相机（GLB）**：DA3 官方 `scene.glb` 导出（点云 + 相机线框），网页内 `<model-viewer>` 可鼠标 3D 转视角；
   - **网格 mesh（GLB）**：由深度反投影自建带顶点色的三角网格，同样可 3D 转视角。
   - 可调参数：`process_res`、`conf_thresh_percentile`、`num_max_points`、`show_cameras`。`/api/infer` 出 JSON，GLB 经 `/glb/{token}/scene.glb` 提供（只保留最近若干次、自动清理）。
-- **`/weight` 电子秤实时重量**：后台线程手写 Modbus TCP 轮询两台电子秤（秤A SJ101CX @ 192.168.0.80、秤B Y31X04 @ 192.168.0.90），`/api/weights` 出 JSON，看板页每 0.5s 刷新并画迷你趋势线。
+
+> **电子秤不在本服务**：四通道食物秤（净重 / 毛重、软件去皮）与桌边分组由独立的 dx-backend 提供（`0.0.0.0:8070`，见 `dx_backend.py`），8060 已无 `/weight` 与 `/api/weights`。秤的地址与网络前提见 [`NETWORK.md`](NETWORK.md)。
 
 > **模型单例 + GPU 共存**：`/gradio` 与 `/panel` **共用同一份 DA3 模型权重**（官方 UI 的 `ModelInference.initialize_model` 被改为复用本服务的共享单例），并用一把 GPU 锁串行化推理——因为 5090 显存与产线服务共享，进程内加载两份权重（约 2×6.5GB）会撑爆显存。模型懒加载：启动不占显存，首次推理才加载一份（约 6.5GB，推理峰值约 8.6GB@process_res=504）。process_res 调太高或产线显存吃紧时可能 OOM，此时调低 process_res 重试。
 
@@ -19,9 +20,12 @@
 
 | 文件 | 说明 |
 |---|---|
-| `app.py` | 全部服务端逻辑（FastAPI 应用 `app:app`，含深度推理 + 电子秤模块 + 内嵌 HTML 页面） |
+| `app.py` | 8060 的全部服务端逻辑（FastAPI 应用 `app:app`，深度推理 + 内嵌 HTML 页面） |
 | `run.sh` | 用 `da3` conda 环境在 `0.0.0.0:8060` 起服务的启动脚本 |
-| `deploy.sh` | 5090 上一键部署：`git pull` + 重启服务（systemd 优先，否则 kill+nohup） |
+| `dx_backend.py` | **深体验区后端（8070）**：四通道食物秤读数与软件去皮、桌边分组绑定，独立于 8060 |
+| `run-dx.sh` | 起 8070 的启动脚本（复用 `da3` conda 环境） |
+| `dx-backend.service` | 8070 的 systemd 单元 |
+| `deploy.sh` | 5090 上一键部署：`git pull` + 重启服务（8060 与 8070 一并重启，systemd 优先） |
 | `da3-web.service` | 可选 systemd 单元（正规化开机自启/重启） |
 | `requirements.txt` | pip 依赖（不含 `depth_anything_3`，见下） |
 | `model/` | **三个模型服务（DA3 / LocateAnything / SAM3）的一键拉起脚本与部署信息**，含 SAM3 推理服务源码（流式长记忆版）与 systemd 单元，见 `model/README.md` |
@@ -56,6 +60,6 @@
 1. **DA3 源码**：`app.py` 通过 `sys.path` 引用 `/home/odyss/Depth-Anything-3/src` 的 `depth_anything_3` 包（不在 PyPI），既用其推理 API，也用其自带的官方 Gradio 应用 `depth_anything_3.app.gradio_app`。
 2. **模型权重**：`/home/odyss/Depth-Anything-3/models/DA3NESTED-GIANT-LARGE-1.1`。
 3. **conda 环境**：`da3`（含 torch/CUDA 等）。
-4. **电子秤硬件**：需与两台秤在同一局域网可达（192.168.0.80 / 192.168.0.90，Modbus TCP 502）。
+4. **电子秤硬件**（dx-backend / 8070 用，非 8060）：一台四通道称重变送模块 `SJ101T2_CH4_ETH`，需与 5090 在同一局域网可达（静态 `192.168.0.80`，Modbus TCP 502，通道 1..4 → 寄存器 addr 0/2/4/6）。网络前提见 [`NETWORK.md`](NETWORK.md)。
 
 如需迁移到其他机器，上述路径（`app.py` 中的 `DA3_ROOT` / `MODEL_DIR`、`run.sh` 中的 `HF_HOME` 与 conda python 路径）需相应调整。

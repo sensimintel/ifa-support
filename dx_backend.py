@@ -15,6 +15,7 @@
 """
 
 import json
+import os
 import socket
 import struct
 import threading
@@ -88,16 +89,27 @@ def _group_of(edge):
 
 # ══════════════════════════════════════════════════════════════════════
 # 四通道食物秤：Modbus TCP 轮询（契约与硬件铭牌一致，实测确认于 2026-08-04）
-#   192.168.0.80:502  unit=1  FC3  通道 N → addr (N-1)*2
+#   <SCALE_HOST>:502  unit=1  FC3  通道 N → addr (N-1)*2
 #   32 位有符号 · 字序 HH-LL · 分度 0.1（raw/10 = 克）
+#
+# 连接必须复用：实测该模块在新建 TCP 连接后的**第一个**请求要 6 秒左右才应答，
+# 之后同一条连接上稳定在 20ms。旧实现每次读都新建连接且只给 1.2s 超时，
+# 必然卡在 6 秒门槛前放弃，表现为「秤一直离线」（2026-08-05 抓包定位）。
+#
+# 地址随现场网络而变，用环境变量覆盖、不改代码：
+#   SCALE_HOST=192.168.0.80 ./run-dx.sh
+# 网络形态与各地址的由来见 NETWORK.md。
 # ══════════════════════════════════════════════════════════════════════
-SCALE_HOST = "192.168.0.80"
-SCALE_PORT = 502
+SCALE_HOST = os.environ.get("SCALE_HOST", "192.168.100.80")
+SCALE_PORT = int(os.environ.get("SCALE_PORT", "502"))
 SCALE_UNIT = 1
 SCALE_DIVISION = 0.1
 SCALE_CHANNELS = (1, 2, 3, 4)
-SCALE_POLL_INTERVAL = 0.4   # 后台轮询间隔（秒）
-SCALE_TIMEOUT = 1.2         # 单次 Modbus 读超时（秒）
+SCALE_POLL_INTERVAL = 0.4     # 后台轮询间隔（秒）
+SCALE_CONNECT_TIMEOUT = 5.0   # 建立 TCP 连接的超时（秒）
+SCALE_FIRST_TIMEOUT = 15.0    # 新连接上首个请求的超时——设备实测约需 6s
+SCALE_READ_TIMEOUT = 3.0      # 连接热起来之后的常规读超时
+SCALE_MAX_BACKOFF = 5.0       # 连不上时的最大重试间隔（秒）
 
 _scale_latest = {ch: {"ok": False, "raw": None} for ch in SCALE_CHANNELS}
 _scale_lock = threading.Lock()
@@ -114,17 +126,54 @@ def _recv_exact(sock, n):
     return buf
 
 
+class _ScaleLink:
+    """保持一条到秤模块的常连 Modbus TCP 连接。
+
+    只在后台轮询线程内使用，故不额外加锁。任一次读失败都会关闭连接，
+    下一轮自动重连；重连后的首个请求会再次享受 SCALE_FIRST_TIMEOUT。
+    """
+
+    def __init__(self):
+        self._sock = None
+        self._warm = False        # 这条连接是否已成功收到过响应
+
+    def close(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        self._sock = None
+        self._warm = False
+
+    def read_holding(self, addr, count):
+        """FC3 读保持寄存器，返回寄存器元组；失败时关闭连接并向上抛。"""
+        if self._sock is None:
+            self._sock = socket.create_connection(
+                (SCALE_HOST, SCALE_PORT), timeout=SCALE_CONNECT_TIMEOUT)
+            self._warm = False
+        sock = self._sock
+        sock.settimeout(SCALE_READ_TIMEOUT if self._warm else SCALE_FIRST_TIMEOUT)
+        try:
+            # 该模块固定回 transaction_id=1，这里也固定发 1，避免事务号比对错位
+            sock.sendall(struct.pack(">HHHBBHH", 1, 0, 6, SCALE_UNIT, 0x03, addr, count))
+            head = _recv_exact(sock, 9)      # MBAP(7)+功能码(1)+字节数(1)
+            if head[7] & 0x80:
+                raise IOError(f"Modbus 异常响应，异常码 0x{head[8]:02X}")
+            data = _recv_exact(sock, head[8])
+        except Exception:
+            self.close()
+            raise
+        self._warm = True
+        return struct.unpack(">" + "H" * (head[8] // 2), data)
+
+
+_scale_link = _ScaleLink()
+
+
 def _read_scale_raws():
     """一次 FC3 读 addr 0 起 8 个保持寄存器，解码四个通道的有符号 32 位 raw（HH-LL）。"""
-    req = struct.pack(">HHHBBHH", 1, 0, 6, SCALE_UNIT, 0x03, 0, 8)
-    with socket.create_connection((SCALE_HOST, SCALE_PORT), timeout=SCALE_TIMEOUT) as sock:
-        sock.settimeout(SCALE_TIMEOUT)
-        sock.sendall(req)
-        head = _recv_exact(sock, 9)          # MBAP(7)+功能码(1)+字节数(1)
-        if head[7] & 0x80:
-            raise IOError(f"Modbus 异常响应，功能码 0x{head[7]:02X}")
-        data = _recv_exact(sock, head[8])
-    regs = struct.unpack(">" + "H" * (head[8] // 2), data)
+    regs = _scale_link.read_holding(0, 8)
     raws = {}
     for i, ch in enumerate(SCALE_CHANNELS):
         high, low = regs[2 * i], regs[2 * i + 1]
@@ -135,17 +184,21 @@ def _read_scale_raws():
 
 def _scale_poller():
     """后台线程：周期性读四通道并缓存；失败整组标离线、保留上次 raw。"""
+    backoff = SCALE_POLL_INTERVAL
     while True:
         try:
             raws = _read_scale_raws()
             with _scale_lock:
                 for ch, raw in raws.items():
                     _scale_latest[ch] = {"ok": True, "raw": raw}
+            backoff = SCALE_POLL_INTERVAL
         except Exception:
             with _scale_lock:
                 for ch in SCALE_CHANNELS:
                     _scale_latest[ch] = {"ok": False, "raw": _scale_latest[ch].get("raw")}
-        time.sleep(SCALE_POLL_INTERVAL)
+            # 秤不可达时逐步退避，避免每轮都卡在建连/首包的长超时上空转
+            backoff = min(backoff * 2, SCALE_MAX_BACKOFF)
+        time.sleep(backoff)
 
 
 threading.Thread(target=_scale_poller, daemon=True).start()
