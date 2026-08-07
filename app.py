@@ -854,9 +854,26 @@ _sam3cloud = {"kind": None, "url": None, "bytes": None, "seq": 0,
 # 不画 AABB 框，改为点云本体高亮。样式/强度/点大小/背景压暗/颜色由 /api/sam3hl/config
 # 实时可调（只影响本图），始终走服务端渲染图（点大小只有该路径能控）。──
 _HL_STYLE_CN = {"tint": "染色", "solid": "纯色", "glow": "提亮", "outline": "描边"}
+# 数值字段统一钳制表：{字段: (下限, 上限, 类型)}，高亮组 + 点云整体样式组共用一个配置
+_HL_NUM_FIELDS = {
+    "strength": (0, 100, int), "point_scale": (1.0, 5.0, float), "dim": (0, 90, int),
+    # ── 点云整体样式（同样只作用于第四图）──
+    "splat": (1, 4, int),            # 所有点的 splat 基数（高亮点在其上再乘 point_scale）
+    "view_tilt": (0.0, 45.0, float), # 虚拟相机俯视角（°）
+    "view_zoom": (0.5, 2.5, float),  # 视野缩放（>1 拉远留白）
+    "eye_lift": (0.0, 1.0, float),   # 相机抬升（米，离开光心才有视差/遮挡黑缝的立体感）
+    "eye_back": (0.0, 1.0, float),   # 相机后撤（米）
+    "out_size": (320, 1200, int),    # 输出图高度（px）
+    "sat": (0.0, 2.5, float),        # 点云底色饱和度系数（高亮色不受影响）
+    "val": (0.2, 2.0, float),        # 点云底色明度系数
+    "conf": (0, 90, int),            # 置信度裁剪分位（独立于产物参数，仅第四图）
+}
 _sam3hl_lock = threading.Lock()
 _sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
-               "dim": 40, "color_mode": "auto", "color": "#ff9f0a"}
+               "dim": 40, "color_mode": "auto", "color": "#ff9f0a",
+               "splat": 2, "view_tilt": 18.0, "view_zoom": 1.0,
+               "eye_lift": 0.0, "eye_back": 0.0, "out_size": 760,
+               "sat": 1.0, "val": 1.0, "conf": 40}
 _sam3hl = {"bytes": None, "seq": 0, "meta": None, "error": None}
 
 
@@ -933,7 +950,18 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
             with _sam3hl_lock:
                 hcfg = dict(_sam3hl_cfg)
             _th = time.time()
-            himg = _render_pointcloud_image(pred, None, conf_thresh_percentile=conf,
+            # 点云整体样式全部来自面板配置（含独立的 conf 分位）；饱和/明度=1 时不做调色
+            _cg = (hcfg["sat"], hcfg["val"]) \
+                if abs(hcfg["sat"] - 1.0) > 1e-3 or abs(hcfg["val"] - 1.0) > 1e-3 else None
+            himg = _render_pointcloud_image(pred, None,
+                                            conf_thresh_percentile=float(hcfg["conf"]),
+                                            view_tilt=float(hcfg["view_tilt"]),
+                                            view_zoom=float(hcfg["view_zoom"]),
+                                            splat=int(hcfg["splat"]),
+                                            out_size=int(hcfg["out_size"]),
+                                            eye_lift=float(hcfg["eye_lift"]),
+                                            eye_back=float(hcfg["eye_back"]),
+                                            color_grade=_cg,
                                             mask_overlays=overlays, hl_cfg=hcfg)
             if himg is None:
                 raise RuntimeError("点云为空，无法渲染")
@@ -1231,6 +1259,33 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="hint">样式：<b>染色</b>=原色与高亮色按强度混合；<b>纯色</b>=直接填色；<b>提亮</b>=保留物体纹理只加亮加饱和（颜色选择不生效）；<b>描边</b>=只描 mask 轮廓一圈。点大小只放大高亮点；背景压暗把非目标点整体调暗、聚光灯式突出目标。调整在下一轮 SAM3 结果生效（约 1~3 秒）。</div>
 </div>
 
+<div class="card" id="pccard">
+ <div style="font-size:13px;color:#3a3a3c;margin-bottom:10px"><b>点云整体样式</b>（同样只作用于「SAM3 高亮点云」这张图）</div>
+ <div class="row">
+  <div class="fld"><label>基础点大小 <span class="rngval" id="pcspv">2</span>px</label>
+   <input type="range" id="pcsp" min="1" max="4" step="1" value="2"></div>
+  <div class="fld"><label>俯视角 <span class="rngval" id="pctv">18</span>°</label>
+   <input type="range" id="pct" min="0" max="45" step="1" value="18"></div>
+  <div class="fld"><label>视野缩放 ×<span class="rngval" id="pczv">1.0</span></label>
+   <input type="range" id="pcz" min="0.6" max="2.0" step="0.1" value="1.0"></div>
+  <div class="fld"><label>相机抬升 <span class="rngval" id="pclv">0.00</span>m</label>
+   <input type="range" id="pcl" min="0" max="0.5" step="0.05" value="0"></div>
+  <div class="fld"><label>相机后撤 <span class="rngval" id="pcbv">0.00</span>m</label>
+   <input type="range" id="pcb" min="0" max="0.5" step="0.05" value="0"></div>
+ </div>
+ <div class="row" style="margin-top:10px">
+  <div class="fld"><label>输出分辨率 <span class="rngval" id="pcov">760</span>px</label>
+   <input type="range" id="pco" min="480" max="1080" step="40" value="760"></div>
+  <div class="fld"><label>饱和度 ×<span class="rngval" id="pcsv2">1.0</span></label>
+   <input type="range" id="pcs2" min="0" max="2" step="0.1" value="1.0"></div>
+  <div class="fld"><label>明度 ×<span class="rngval" id="pcvv">1.0</span></label>
+   <input type="range" id="pcv" min="0.2" max="1.6" step="0.1" value="1.0"></div>
+  <div class="fld"><label>置信度裁剪分位 <span class="rngval" id="pccv">40</span>%</label>
+   <input type="range" id="pcc" min="0" max="90" step="5" value="40"></div>
+ </div>
+ <div class="hint">控制第四图点云本身的渲染：<b>基础点大小</b>=所有点的 splat 基数（上方高亮"点大小×"在其上再放大）；<b>俯视角/缩放/抬升/后撤</b>=虚拟相机位姿——抬升/后撤离开光心才有真实视差与遮挡黑缝，立体感更强，0=贴着拍摄光轴（重投影≈原图）；<b>饱和度/明度</b>只调点云底色，高亮色不受影响；<b>置信度分位</b>越高裁得越狠、点越少越干净（独立于上方"产物参数"的同名项，仅作用第四图）。</div>
+</div>
+
 <label id="ctltglwrap" style="margin:18px 2px 8px;font-size:13px;cursor:pointer;user-select:none;display:block"><input type="checkbox" id="ctltoggle"> 产物参数调节（默认收起 · 改产物类型/分辨率用）</label>
 
 <div class="card" id="ctlcard" style="display:none">
@@ -1373,9 +1428,18 @@ function pushHlConfig(){
     fetch('/api/sam3hl/config',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({style:hlStyle,strength:+$('hls').value,point_scale:+$('hlp').value,
         dim:+$('hld').value,color_mode:document.querySelector('input[name=hlcm]:checked').value,
-        color:$('hlc').value})}).catch(()=>{});
+        color:$('hlc').value,
+        splat:+$('pcsp').value,view_tilt:+$('pct').value,view_zoom:+$('pcz').value,
+        eye_lift:+$('pcl').value,eye_back:+$('pcb').value,out_size:+$('pco').value,
+        sat:+$('pcs2').value,val:+$('pcv').value,conf:+$('pcc').value})}).catch(()=>{});
   },250);
 }
+// 点云整体样式滑条：[滑条id, 数值标签id, 显示格式]，统一接线（改动即更新标签+下发配置）
+[['pcsp','pcspv',v=>v],['pct','pctv',v=>v],['pcz','pczv',v=>(+v).toFixed(1)],
+ ['pcl','pclv',v=>(+v).toFixed(2)],['pcb','pcbv',v=>(+v).toFixed(2)],['pco','pcov',v=>v],
+ ['pcs2','pcsv2',v=>(+v).toFixed(1)],['pcv','pcvv',v=>(+v).toFixed(1)],['pcc','pccv',v=>v]]
+ .forEach(([id,lab,fmt])=>{$(id).addEventListener('input',()=>{
+   $(lab).textContent=fmt($(id).value);pushHlConfig();});});
 document.querySelectorAll('#hlseg button').forEach(b=>{
   b.addEventListener('click',()=>{hlStyle=b.dataset.s;
     document.querySelectorAll('#hlseg button').forEach(x=>x.classList.toggle('on',x===b));
@@ -2476,18 +2540,13 @@ def sam3hl_config(body: dict = Body(default=None)):
     with _sam3hl_lock:
         if str(body.get("style", "")) in _HL_STYLE_CN:
             _sam3hl_cfg["style"] = str(body["style"])
-        try:
-            _sam3hl_cfg["strength"] = min(100, max(0, int(float(body["strength"]))))
-        except Exception:
-            pass
-        try:
-            _sam3hl_cfg["point_scale"] = min(5.0, max(1.0, float(body["point_scale"])))
-        except Exception:
-            pass
-        try:
-            _sam3hl_cfg["dim"] = min(90, max(0, int(float(body["dim"]))))
-        except Exception:
-            pass
+        for k, (lo, hi, typ) in _HL_NUM_FIELDS.items():
+            if k not in body:
+                continue
+            try:
+                _sam3hl_cfg[k] = typ(min(hi, max(lo, float(body[k]))))
+            except Exception:
+                pass
         if str(body.get("color_mode", "")) in ("auto", "custom"):
             _sam3hl_cfg["color_mode"] = str(body["color_mode"])
         c = str(body.get("color", "")).strip()
