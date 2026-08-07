@@ -464,12 +464,12 @@
             "type": "prometheus",
             "uid": "g4-01-prometheus"
           },
-          "expr": "avg_over_time(vllm:kv_cache_usage_perc[$__interval]) * 17.31 * 1024 * 1024 * 1024",
+          "expr": "avg_over_time(vllm:kv_cache_usage_perc[$__interval]) * 51.11 * 1024 * 1024 * 1024",
           "interval": "1m",
           "legendFormat": "{{model_name}} · kv_cache 绝对量 (均)"
         }
       ],
-      "description": "绝对量 = usage_perc × 17.31GiB(总池大小,取自 vLLM 启动日志 \"Available KV cache memory\";改模型/max-model-len/gpu-memory-utilization 后需同步更新此常数)\n\n注意: 这是瞬时 gauge, 没有 counter 替代物。上游是「每 30s 一批、每批只忙 1~3s」的 burst 流量, 瞬时采样会混叠成尖刺, 因此 vllm job 加密到 5s 抓取, 面板取滑动窗口平均(窗口 = max(1m, 查询 step), 随视图范围自适应)还原占空比 —— 曲线低不代表 burst 峰值低, 判断是否真的空闲请看「vLLM 队列」与「吞吐」两个 counter 面板。"
+      "description": "绝对量 = usage_perc × 51.11GiB(总池大小,取自 vLLM 启动日志 \"Available KV cache memory\", 2026-08-03 GPU_UTIL=0.90 整卡口径;改模型/max-model-len/gpu-memory-utilization 后需同步更新此常数)\n\n注意: 这是瞬时 gauge, 没有 counter 替代物。上游是「每 30s 一批、每批只忙 1~3s」的 burst 流量, 瞬时采样会混叠成尖刺, 因此 vllm job 加密到 5s 抓取, 面板取滑动窗口平均(窗口 = max(1m, 查询 step), 随视图范围自适应)还原占空比 —— 曲线低不代表 burst 峰值低, 判断是否真的空闲请看「vLLM 队列」与「吞吐」两个 counter 面板。"
     },
     {
       "id": 8,

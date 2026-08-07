@@ -45,11 +45,11 @@
 - **nginx 反代必须动态解析**：容器上游一律「resolver 127.0.0.11 + 变量 proxy_pass + compose 服务名」，静态 proxy_pass 会在上游容器重建后 502（已在 `superadmin/superadmin.conf` 固化）。
 - **跨机隧道做成栈内容器**：宿主防火墙（如 5090 INPUT policy DROP）不影响容器互访；不要 bind 宿主端口。
 
-## 5. 现场对齐状态（2026-07-27）
+## 5. 现场对齐状态（2026-08-03）
 
 | 部署点 | 状态 | 待办 |
 |---|---|---|
-| GCP gpu-g4-01（VLM） | 与 odyss-models 正源一致 | SERVED_ALIASES 别名随 odyss-models PR 落地 |
+| GCP gpu-g4-01（VLM） | 与 odyss-models 正源一致；`GPU_UTIL=0.90` 整卡承接 VLM（2026-08-03 容量压测定标：meal 并发容量依赖大 KV 池，51.11GiB/558k tokens；legacy sam3(8001) 已停用腾显存，恢复方式见该单元 README） | — |
 | 5090 `~/odyss-services-ifa` | **手工演化的孤本**（容器名 odyss-ifa-*、pg/minio **无命名卷**、配置手改） | 下次维护窗口用本仓 SOP 重新拉起：`./stack backup` 思路导出数据 → 按 bundle 重部署 → restore；在此之前只允许对齐 nginx conf、superadmin `dist` 等无状态文件（`superadmin/dist` 是 bind mount，换文件即生效，不需重建容器） |
 | 5090 `~/odyss-ifa-lumen`（lumen overlay） | 由本仓 `local-stack/lumen/` 管理（独立 compose 项目挂 `odyss-ifa-network`，collector 以别名 `lumen-collector.odyss.internal:80` 接住 services 默认导出；lumen 数据在命名卷 `odyss-ifa-lumen-pg-data`） | 更新一律 `deploy-5090.sh` 重放；业务栈重拉为标准 local-stack 后把 `LUMEN_ATTACH_NETWORK` 换成 `odyss-local-network` 重挂 |
 

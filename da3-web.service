@@ -3,7 +3,7 @@
 #       sudo systemctl enable --now da3-web.service
 # 查日志：journalctl -u da3-web -f
 [Unit]
-Description=DA3 Web (Depth Anything 3 深度图 + 电子秤) 8060 服务
+Description=DA3 Web (Depth Anything 3 深度图 + 实时识别) 8060 服务
 After=network-online.target
 Wants=network-online.target
 

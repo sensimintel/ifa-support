@@ -1,0 +1,19 @@
+# 深体验区后端 8070 服务的 systemd 单元。
+# 安装：sudo cp dx-backend.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#       sudo systemctl enable --now dx-backend.service
+# 查日志：journalctl -u dx-backend -f
+[Unit]
+Description=深体验区后端（四通道食物秤 + 分组绑定配置）8070 服务
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=odyss
+WorkingDirectory=/home/odyss/da3-web
+ExecStart=/home/odyss/da3-web/run-dx.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

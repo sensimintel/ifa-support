@@ -21,6 +21,9 @@ app_new.py
 measure.py
 test_food.jpg
 
+# 深体验区后端持久化数据（分组绑定 + 皮重，运行时生成）
+dx_data.json
+
 # 本地运维配置（RECOG_ENDPOINT/RECOG_API_KEY 等，run.sh 启动时读取）
 .env
 

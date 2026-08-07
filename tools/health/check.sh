@@ -144,11 +144,18 @@ need_running locateanything-grafana "观测/LA-Grafana"
 need_running locateanything-node-exporter "观测/node-exporter"
 need_running locateanything-gpu-exporter "观测/gpu-exporter"
 # 语义探活：exporter 进程活着 ≠ 有 GPU 指标。容器内 NVML 会被宿主 systemctl daemon-reload
-# 吊销（现象：nvidia-smi "Failed to initialize NVML"，看板 GPU 面板 No data），必须查指标本体。
-if curl -sS -m 8 http://127.0.0.1:9835/metrics 2>/dev/null | grep -q nvidia_smi_memory_used_bytes; then
-  say OK "观测/GPU指标" "9835 有 nvidia_smi 指标"
+# 吊销（现象：nvidia-smi "Failed to initialize NVML"，看板 GPU 面板 No data，而 Prometheus
+# target 仍显示 up——"假 up"，2026-07-31~08-07 因此静默断采一周），必须查指标本体与失败计数。
+gpum=$(curl -sS -m 8 http://127.0.0.1:9835/metrics 2>/dev/null)
+gpufs=$(printf '%s' "$gpum" | awk '/^nvidia_smi_failed_scrapes_total/{print int($2)}')
+if printf '%s' "$gpum" | grep -q nvidia_smi_memory_used_bytes; then
+  if [ "${gpufs:-0}" -gt 0 ]; then
+    say WARN "观测/GPU指标" "9835 有指标但容器本次生命周期内已累计 ${gpufs} 次抓取失败——NVML 间歇失效前兆，留意复发"
+  else
+    say OK "观测/GPU指标" "9835 有 nvidia_smi 指标（failed_scrapes=0）"
+  fi
 else
-  say FAIL "观测/GPU指标" "9835 无 GPU 指标——大概率容器内 NVML 被 daemon-reload 吊销，docker restart locateanything-gpu-exporter"
+  say FAIL "观测/GPU指标" "9835 无 GPU 指标（failed_scrapes=${gpufs:-?}）——NVML 被吊销；docker restart 可能无效（2026-08-07 实测），用 cd ~/odyss-models/deploy/gpu5090 && docker compose -f compose.gpu.yml up -d --force-recreate gpu-exporter"
 fi
 
 # ---------------- 预期停止（反向异常检测：在跑才是问题） ----------------
