@@ -135,7 +135,9 @@ def _worker_loop() -> None:
                 dev = _effective_device_locked()
                 st = _devices.get(dev) if dev else None
                 if _processor is not None and st is not None and st["image"] is not None:
-                    key = (dev, st["seq"], _config_gen)
+                    # 键须含 received_at：设备桶过期重建后 seq 从 1 重新计数，若只看
+                    # (dev, seq, 配置版本) 会与旧桶首帧撞键 → 新帧被误判"已处理"而永久漏处理
+                    key = (dev, st["seq"], st["received_at"], _config_gen)
                     if key != last_key:
                         break
                 _cv.wait()
