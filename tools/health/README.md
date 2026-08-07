@@ -77,7 +77,7 @@ sudo ufw allow from 192.168.0.0/24 to any port <端口> proto tcp comment "<用�
 
 ## 已知坑：daemon-reload 吊销容器 NVML
 
-宿主执行 `systemctl daemon-reload`（装 systemd 单元、up.sh 都会触发）后，NVIDIA 容器内新起的进程会报 `Failed to initialize NVML: Unknown Error`：gpu-exporter 每次抓取新起 nvidia-smi → GPU 指标消失（但 exporter 进程与 Prometheus target 都显示正常）；vllm/gateway 等服务容器启动时已持有 GPU 句柄，**推理不受影响、无需重启**。修复：`docker restart locateanything-gpu-exporter`。2026-07-03 起反复出现，根治要动 nvidia-container-toolkit 配置（odyss-models 仓的部署层欠账）。
+宿主执行 `systemctl daemon-reload`（装 systemd 单元、up.sh 都会触发）后，NVIDIA 容器内新起的进程会报 `Failed to initialize NVML: Unknown Error`：gpu-exporter 每次抓取新起 nvidia-smi → GPU 指标消失（但 exporter 进程与 Prometheus target 都显示正常——**"假 up"**，2026-07-31~08-07 因此静默断采一周才被发现）；vllm/gateway 等服务容器启动时已持有 GPU 句柄，**推理不受影响、无需重启**。修复：`cd ~/odyss-models/deploy/gpu5090 && docker compose -f compose.gpu.yml up -d --force-recreate gpu-exporter`——**不要只 `docker restart`**：2026-08-07 实测该次故障中 restart 无效（07-31 重启过一次仍持续报错），只有 force-recreate 重走 nvidia runtime 设备注入才恢复。修复后跑本 check.sh 复验「观测/GPU指标」为 OK。2026-07-03 起反复出现，根治要动 nvidia-container-toolkit 配置（odyss-models 仓的部署层欠账）。
 
 ## 纪律（继承 MANAGEMENT.md §1/§6）
 
