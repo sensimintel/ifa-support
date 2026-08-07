@@ -614,10 +614,56 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
     return hit_labels
 
 
+def _hex_rgb(s, fallback=(255, 159, 10)):
+    """'#rrggbb' → (r,g,b)；解析失败回退默认橙色。"""
+    try:
+        s = str(s).lstrip("#")
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except Exception:
+        return fallback
+
+
+def _apply_hl_styles(rgb, overlays, cfg):
+    """第四图高亮：按配置把 SAM3 mask 命中的像素做染色/纯色/提亮/描边，背景可整体压暗。
+    只改像素颜色、不画任何框/文字。返回 (处理后的 rgb, 高亮布尔 mask(H,W))。"""
+    rgb = rgb.copy()
+    style = str(cfg.get("style", "tint"))
+    strength = min(100.0, max(0.0, float(cfg.get("strength", 65)))) / 100.0
+    dim = min(90.0, max(0.0, float(cfg.get("dim", 40)))) / 100.0
+    custom = (_hex_rgb(cfg.get("color", "#ff9f0a"))
+              if str(cfg.get("color_mode", "auto")) == "custom" else None)
+    hmask = np.zeros(rgb.shape[:2], bool)
+    for (_l, _c, mk) in overlays:
+        hmask |= mk
+    if dim > 0 and hmask.any():
+        # 背景压暗：非目标点整体调暗，聚光灯式突出目标（无目标时不压，避免整图变黑）
+        bg = ~hmask
+        rgb[bg] = (rgb[bg].astype(np.float32) * (1.0 - dim)).astype(np.uint8)
+    for (_l, col0, mk) in overlays:
+        col = np.array(custom if custom is not None else col0, np.float32)
+        if style == "solid":
+            rgb[mk] = col.astype(np.uint8)
+        elif style == "glow":
+            # 提亮：保留物体自身纹理，只抬饱和度/明度（自发光感）；颜色选择不生效
+            hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+            hsv[..., 1][mk] *= (1.0 + 0.6 * strength)
+            hsv[..., 2][mk] *= (1.0 + 0.9 * strength)
+            rgb = cv2.cvtColor(np.clip(hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2RGB)
+        elif style == "outline":
+            # 描边：只染 mask 边缘一圈（腐蚀求内边界），内部保持原色
+            u8 = mk.astype(np.uint8)
+            edge = (u8 - cv2.erode(u8, np.ones((5, 5), np.uint8))).astype(bool)
+            rgb[edge] = col.astype(np.uint8)
+        else:  # tint 半透明染色：原色与高亮色按强度混合
+            rgb[mk] = (rgb[mk].astype(np.float32) * (1.0 - strength)
+                       + col * strength).astype(np.uint8)
+    return rgb, hmask
+
+
 def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
                              view_tilt=18.0, view_zoom=1.0, splat=2, out_size=760,
                              mask_overlays=None, eye_lift=0.0, eye_back=0.0,
-                             color_grade=None):
+                             color_grade=None, hl_cfg=None):
     """方案A·服务端渲染：5090 就地把点云用 torch(GPU) 投影 + 画家算法 z-buffer + splat 渲成 2D 图，
     跳过 GLB 序列化与前端 model-viewer 全量加载。叠 food/drink 框。返回 RGB uint8；点云为空返回 None。
 
@@ -651,7 +697,12 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
         _hsv[..., 1] *= _gs
         _hsv[..., 2] *= _gv
         rgb = cv2.cvtColor(np.clip(_hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2RGB)
-    if mask_overlays:
+    hl_flat = None
+    if mask_overlays and hl_cfg is not None:
+        # 第四图高亮模式：样式化染色/提亮/描边 + 背景压暗，后续不画框；记录高亮点位掩码供二次 splat
+        rgb, _hm = _apply_hl_styles(rgb, mask_overlays, hl_cfg)
+        hl_flat = _hm.reshape(-1)
+    elif mask_overlays:
         # SAM3 mask 命中的像素在投影前染成该词颜色（半透明混合），把分割结果"染"进点云本体
         rgb = rgb.copy()
         for (_label, col, mk) in mask_overlays:
@@ -664,6 +715,8 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
     m = valid.reshape(-1)
     Xc = Xc_all[m]
     cols = rgb.reshape(-1, 3)[m]
+    if hl_flat is not None:
+        hl_flat = hl_flat[m]
     if Xc.shape[0] < 50:
         return None
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -702,6 +755,18 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
                 vv = (v + dy).clamp(0, Hout - 1)
                 uu = (u + dx).clamp(0, Wout - 1)
                 img[vv, uu] = Cin
+        if hl_flat is not None:
+            # 高亮点二次 splat：按面板"点大小"倍数居中放大、后画覆盖 → 目标点比背景点更大更醒目
+            Hf = torch.from_numpy(np.ascontiguousarray(hl_flat)).to(dev)[inb][order]
+            k = max(1, int(round(splat * float(hl_cfg.get("point_scale", 2.0)))))
+            if k > splat and bool(Hf.any()):
+                uh, vh, Ch = u[Hf], v[Hf], Cin[Hf]
+                off = (k - splat) // 2
+                for dy in range(k):
+                    for dx in range(k):
+                        vv = (vh + dy - off).clamp(0, Hout - 1)
+                        uu = (uh + dx - off).clamp(0, Wout - 1)
+                        img[vv, uu] = Ch
         out = img.cpu().numpy()
     # 叠 food/drink 框：框内近侧主簇的 3D AABB → 8 角投影 → 画线
     if detections:
@@ -735,8 +800,8 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
                 w = int(np.clip(f * 2.0 * tube_r / zm, 2, 14))
                 cv2.line(out, (int(cu[a]), int(cv[a])), (int(cu[b]), int(cv[b])), color, w, cv2.LINE_AA)
     # 叠 SAM3 mask 映射框：mask 命中的有效点直接就是目标本体（无需近侧前景启发式），
-    # 2%/98% 分位算 3D AABB → 8 角投影 → 画线 + 词名
-    if mask_overlays:
+    # 2%/98% 分位算 3D AABB → 8 角投影 → 画线 + 词名。高亮模式（第四图）不画框。
+    if mask_overlays and hl_cfg is None:
         for (label, col, mk) in mask_overlays:
             sel = (mk & valid).reshape(-1)
             sub = Xc_all[sel]
@@ -784,6 +849,15 @@ def _sam3_recent_drinks():
 _sam3cloud_lock = threading.Lock()
 _sam3cloud = {"kind": None, "url": None, "bytes": None, "seq": 0,
               "meta": None, "error": None, "running": False}
+
+# ── 第四图：SAM3 高亮点云（无框）。与第三图共用同一轮 SAM3 mask 结果，仅呈现方式不同：
+# 不画 AABB 框，改为点云本体高亮。样式/强度/点大小/背景压暗/颜色由 /api/sam3hl/config
+# 实时可调（只影响本图），始终走服务端渲染图（点大小只有该路径能控）。──
+_HL_STYLE_CN = {"tint": "染色", "solid": "纯色", "glow": "提亮", "outline": "描边"}
+_sam3hl_lock = threading.Lock()
+_sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
+               "dim": 40, "color_mode": "auto", "color": "#ff9f0a"}
+_sam3hl = {"bytes": None, "seq": 0, "meta": None, "error": None}
 
 
 def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
@@ -852,6 +926,29 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
         with _sam3_dets_lock:
             _sam3_dets["dets"] = drink_dets
             _sam3_dets["ts"] = time.time()
+
+        # 第四图：同一轮 overlays 再渲一张"纯高亮、无框"的服务端图。零额外 SAM3 调用，
+        # 样式读 /api/sam3hl/config 的实时配置；独立 try 隔离，失败不影响第三图。
+        try:
+            with _sam3hl_lock:
+                hcfg = dict(_sam3hl_cfg)
+            _th = time.time()
+            himg = _render_pointcloud_image(pred, None, conf_thresh_percentile=conf,
+                                            mask_overlays=overlays, hl_cfg=hcfg)
+            if himg is None:
+                raise RuntimeError("点云为空，无法渲染")
+            hok, hbuf = cv2.imencode(".jpg", cv2.cvtColor(himg, cv2.COLOR_RGB2BGR))
+            if not hok:
+                raise RuntimeError("高亮点云图编码失败")
+            with _sam3hl_lock:
+                _sam3hl.update({
+                    "bytes": hbuf.tobytes(), "seq": _sam3hl["seq"] + 1, "error": None,
+                    "meta": {"label": f"高亮·{_HL_STYLE_CN.get(hcfg['style'], hcfg['style'])}"
+                                      f"（{'、'.join(id_tags) if id_tags else '无目标'}）",
+                             "render_ms": round((time.time() - _th) * 1000.0, 1)}})
+        except Exception as e:
+            with _sam3hl_lock:
+                _sam3hl["error"] = f"{type(e).__name__}: {e}"
 
         _tr = time.time()
         _impl_cn = {"incremental": "增量", "replay": "重放"}
@@ -956,6 +1053,8 @@ def _reset_stream_state():
     with _sam3cloud_lock:
         _sam3cloud.update({"kind": None, "url": None, "bytes": None,
                            "meta": None, "error": None})
+    with _sam3hl_lock:
+        _sam3hl.update({"bytes": None, "meta": None, "error": None})
 
 
 def _track_stream_device(device_id):
@@ -1048,6 +1147,9 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .wait{color:#7a828c;font-size:14px}
  figcaption{font-size:13px;color:#6b6b70;margin-top:8px;text-align:center}
  figcaption .m{color:#8e8e93}
+ .seg{display:flex;gap:6px;flex-wrap:wrap}
+ .seg button{font-size:13px;padding:6px 14px;border-radius:980px;border:1px solid #d0d0d5;background:#fff;cursor:pointer;color:#3a3a3c}
+ .seg button.on{background:#0071e3;border-color:#0071e3;color:#fff}
  @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style></head><body>
 <div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
@@ -1090,10 +1192,43 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   </div>
   <figcaption>SAM3→点云映射（同②点云 · 相机跟随②）<span class="m" id="s3meta"></span></figcaption>
  </figure>
- <figure style="grid-column:1/-1">
+ <figure>
+  <div class="box">
+   <img id="hlimg" style="display:none">
+   <span class="wait" id="hlwait">等待 SAM3 高亮点云…</span>
+  </div>
+  <figcaption>SAM3 高亮点云（同③识别结果 · 无框）<span class="m" id="hlmeta"></span></figcaption>
+ </figure>
+ <figure>
   <div class="box"><img id="raw" style="display:none"><span class="wait" id="rawwait">等待设备帧…</span></div>
   <figcaption>接收到的设备帧 <span class="m" id="rawmeta"></span></figcaption>
  </figure>
+</div>
+
+<div class="card" id="hlcard" style="margin-top:16px">
+ <div style="font-size:13px;color:#3a3a3c;margin-bottom:10px"><b>高亮样式调节</b>（只作用于「SAM3 高亮点云」这张图）</div>
+ <div class="row">
+  <div class="fld" style="flex:1 1 260px"><label>高亮样式</label>
+   <div class="seg" id="hlseg">
+    <button data-s="tint" class="on">染色</button>
+    <button data-s="solid">纯色</button>
+    <button data-s="glow">提亮</button>
+    <button data-s="outline">描边</button>
+   </div></div>
+  <div class="fld"><label>高亮强度 <span class="rngval" id="hlsv">65</span>%</label>
+   <input type="range" id="hls" min="10" max="100" step="5" value="65"></div>
+  <div class="fld"><label>点大小 ×<span class="rngval" id="hlpv">2.0</span></label>
+   <input type="range" id="hlp" min="1" max="5" step="0.5" value="2"></div>
+  <div class="fld"><label>背景压暗 <span class="rngval" id="hldv">40</span>%</label>
+   <input type="range" id="hld" min="0" max="90" step="5" value="40"></div>
+  <div class="fld" style="flex:1 1 220px"><label>点颜色</label>
+   <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+    <label style="display:inline;margin:0;cursor:pointer"><input type="radio" name="hlcm" value="auto" checked> 按词自动</label>
+    <label style="display:inline;margin:0;cursor:pointer"><input type="radio" name="hlcm" value="custom"> 自选</label>
+    <input type="color" id="hlc" value="#ff9f0a" style="width:44px;height:28px;border:none;background:none;padding:0;cursor:pointer">
+   </div></div>
+ </div>
+ <div class="hint">样式：<b>染色</b>=原色与高亮色按强度混合；<b>纯色</b>=直接填色；<b>提亮</b>=保留物体纹理只加亮加饱和（颜色选择不生效）；<b>描边</b>=只描 mask 轮廓一圈。点大小只放大高亮点；背景压暗把非目标点整体调暗、聚光灯式突出目标。调整在下一轮 SAM3 结果生效（约 1~3 秒）。</div>
 </div>
 
 <label id="ctltglwrap" style="margin:18px 2px 8px;font-size:13px;cursor:pointer;user-select:none;display:block"><input type="checkbox" id="ctltoggle"> 产物参数调节（默认收起 · 改产物类型/分辨率用）</label>
@@ -1230,7 +1365,30 @@ function pushConfig(){
 });
 syncOpts();pushConfig();  // 首次把面板初值下发后端
 
-let lastSeq=-1,lastProdKey='',lastSwap=0,lastS3=-1,lastSwap3=0;
+// ── 第四图高亮配置：任何改动只影响「SAM3 高亮点云」，debounce 后 POST /api/sam3hl/config ──
+let hlStyle='tint',hlTimer=null;
+function pushHlConfig(){
+  clearTimeout(hlTimer);
+  hlTimer=setTimeout(()=>{
+    fetch('/api/sam3hl/config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({style:hlStyle,strength:+$('hls').value,point_scale:+$('hlp').value,
+        dim:+$('hld').value,color_mode:document.querySelector('input[name=hlcm]:checked').value,
+        color:$('hlc').value})}).catch(()=>{});
+  },250);
+}
+document.querySelectorAll('#hlseg button').forEach(b=>{
+  b.addEventListener('click',()=>{hlStyle=b.dataset.s;
+    document.querySelectorAll('#hlseg button').forEach(x=>x.classList.toggle('on',x===b));
+    pushHlConfig();});
+});
+$('hls').addEventListener('input',()=>{$('hlsv').textContent=$('hls').value;pushHlConfig();});
+$('hlp').addEventListener('input',()=>{$('hlpv').textContent=(+$('hlp').value).toFixed(1);pushHlConfig();});
+$('hld').addEventListener('input',()=>{$('hldv').textContent=$('hld').value;pushHlConfig();});
+$('hlc').addEventListener('input',()=>{document.querySelector('input[name=hlcm][value=custom]').checked=true;pushHlConfig();});
+document.querySelectorAll('input[name=hlcm]').forEach(r=>r.addEventListener('change',pushHlConfig));
+pushHlConfig();  // 首次把高亮初值下发后端（服务重启后回落面板当前值）
+
+let lastSeq=-1,lastProdKey='',lastSwap=0,lastS3=-1,lastSwap3=0,lastHl=-1;
 const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显示，避免高帧率下一直卡在"加载中"(黑屏)
 
 // ── 多设备：下拉选设备（服务端只处理选中设备一路；非选中设备的帧只进各自缓存） ──
@@ -1254,11 +1412,12 @@ function renderDevices(s){
   $('devinfo').textContent=(devs.length>1?('共 '+devs.length+' 台在传 · '):'')
     +(sel&&sel.fps?('选中 '+sel.fps.toFixed(1)+' fps'):'');
 }
-function resetPanesForSwitch(){   // 切设备：清空三框显示与序号缓存，等新设备的帧/产物
-  lastSeq=-1;lastProdKey='';lastS3=-1;lastSwap=0;lastSwap3=0;
+function resetPanesForSwitch(){   // 切设备：清空四框显示与序号缓存，等新设备的帧/产物
+  lastSeq=-1;lastProdKey='';lastS3=-1;lastSwap=0;lastSwap3=0;lastHl=-1;
   $('raw').style.display='none';$('rawwait').style.display='';
   $('prodimg').style.display='none';$('mv').style.display='none';$('prodwait').style.display='';
   $('s3img').style.display='none';$('mv2').style.display='none';$('s3wait').style.display='';
+  $('hlimg').style.display='none';$('hlwait').style.display='';
 }
 async function tick(){
  try{
@@ -1330,6 +1489,16 @@ async function tick(){
     if(s3.running) sm+=' <span class="dim">（处理中…）</span>';
     $('s3meta').innerHTML=sm;
   }catch(e){/* 第三框轮询失败忽略 */}
+
+  // 第四框：SAM3 高亮点云（与③同一轮 mask 结果，无框、样式可调；meta 非空才拉图防 404）
+  try{
+    const hl=await(await fetch('/api/sam3hl/status',{cache:'no-store'})).json();
+    if(hl.seq && hl.meta && hl.seq!==lastHl){lastHl=hl.seq;
+      $('hlimg').src='/api/sam3hl/latest?t='+hl.seq;
+      $('hlimg').style.display='block';$('hlwait').style.display='none';}
+    $('hlmeta').innerHTML=hl.error?('<span class="err">'+hl.error+'</span>')
+      :(hl.meta?((hl.meta.label||'')+(hl.meta.render_ms?(' · 渲染'+hl.meta.render_ms+'ms'):'')):'');
+  }catch(e){/* 第四框轮询失败忽略 */}
 
   // 顶部状态行
   if(!s.processor){$('status').innerHTML='<span class="err">未接入 DA3 模型（纯中继）。</span>';}
@@ -2279,6 +2448,52 @@ def sam3cloud_latest():
         return JSONResponse({"error": "暂无 SAM3 点云映射图"}, status_code=404)
     return Response(content=data, media_type="image/jpeg",
                     headers={"Cache-Control": "no-store", "X-Sam3cloud-Seq": str(seq)})
+
+
+@app.get("/api/sam3hl/status")
+def sam3hl_status():
+    """第四图（SAM3 高亮点云·无框）状态：seq 变化且 meta 非空=有新图可拉；cfg=当前高亮配置。"""
+    with _sam3hl_lock:
+        return JSONResponse({"seq": _sam3hl["seq"], "meta": _sam3hl["meta"],
+                             "error": _sam3hl["error"], "cfg": dict(_sam3hl_cfg)})
+
+
+@app.get("/api/sam3hl/latest")
+def sam3hl_latest():
+    """第四图最新 JPEG 字节。"""
+    with _sam3hl_lock:
+        data, seq = _sam3hl["bytes"], _sam3hl["seq"]
+    if not data:
+        return JSONResponse({"error": "暂无高亮点云图"}, status_code=404)
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store", "X-Sam3hl-Seq": str(seq)})
+
+
+@app.post("/api/sam3hl/config")
+def sam3hl_config(body: dict = Body(default=None)):
+    """更新第四图高亮配置（只影响第四图，下一轮 SAM3 任务即生效）。逐字段校验，非法值忽略。"""
+    body = body or {}
+    with _sam3hl_lock:
+        if str(body.get("style", "")) in _HL_STYLE_CN:
+            _sam3hl_cfg["style"] = str(body["style"])
+        try:
+            _sam3hl_cfg["strength"] = min(100, max(0, int(float(body["strength"]))))
+        except Exception:
+            pass
+        try:
+            _sam3hl_cfg["point_scale"] = min(5.0, max(1.0, float(body["point_scale"])))
+        except Exception:
+            pass
+        try:
+            _sam3hl_cfg["dim"] = min(90, max(0, int(float(body["dim"]))))
+        except Exception:
+            pass
+        if str(body.get("color_mode", "")) in ("auto", "custom"):
+            _sam3hl_cfg["color_mode"] = str(body["color_mode"])
+        c = str(body.get("color", "")).strip()
+        if re.fullmatch(r"#[0-9a-fA-F]{6}", c):
+            _sam3hl_cfg["color"] = c
+        return JSONResponse({"ok": True, "cfg": dict(_sam3hl_cfg)})
 
 
 @app.get("/shotimg/{name}")
