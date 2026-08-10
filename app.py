@@ -875,10 +875,13 @@ _HL_NUM_FIELDS = {
     "conf": (0, 90, int),            # 置信度裁剪分位（独立于产物参数，仅第四图）
 }
 _sam3hl_lock = threading.Lock()
+# 默认参数取「有立体感」的一组（同识别缩略图调优常量的思路）：
+# 抬升/后撤离开光心产生真实视差与遮挡黑缝、splat=1 保留点间缝隙——否则贴光轴+大 splat
+# 会退化成重投影原图（仓内已知坑，/experience 默认背景就是这张图，必须一眼看出是点云）
 _sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
                "dim": 40, "color_mode": "auto", "color": "#ff9f0a",
-               "splat": 2, "view_tilt": 18.0, "view_zoom": 1.0,
-               "eye_lift": 0.0, "eye_back": 0.0, "out_size": 760,
+               "splat": 1, "view_tilt": 20.0, "view_zoom": 0.9,
+               "eye_lift": 0.4, "eye_back": 0.3, "out_size": 760,
                "sat": 1.0, "val": 1.0, "conf": 40}
 _sam3hl = {"bytes": None, "seq": 0, "meta": None, "error": None}
 
@@ -1269,16 +1272,16 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <div class="card" id="pccard">
  <div style="font-size:13px;color:#3a3a3c;margin-bottom:10px"><b>点云整体样式</b>（同样只作用于「SAM3 高亮点云」这张图）</div>
  <div class="row">
-  <div class="fld"><label>基础点大小 <span class="rngval" id="pcspv">2</span>px</label>
-   <input type="range" id="pcsp" min="1" max="4" step="1" value="2"></div>
-  <div class="fld"><label>俯视角 <span class="rngval" id="pctv">18</span>°</label>
-   <input type="range" id="pct" min="0" max="45" step="1" value="18"></div>
-  <div class="fld"><label>视野缩放 ×<span class="rngval" id="pczv">1.0</span></label>
-   <input type="range" id="pcz" min="0.6" max="2.0" step="0.1" value="1.0"></div>
-  <div class="fld"><label>相机抬升 <span class="rngval" id="pclv">0.00</span>m</label>
-   <input type="range" id="pcl" min="0" max="0.5" step="0.05" value="0"></div>
-  <div class="fld"><label>相机后撤 <span class="rngval" id="pcbv">0.00</span>m</label>
-   <input type="range" id="pcb" min="0" max="0.5" step="0.05" value="0"></div>
+  <div class="fld"><label>基础点大小 <span class="rngval" id="pcspv">1</span>px</label>
+   <input type="range" id="pcsp" min="1" max="4" step="1" value="1"></div>
+  <div class="fld"><label>俯视角 <span class="rngval" id="pctv">20</span>°</label>
+   <input type="range" id="pct" min="0" max="45" step="1" value="20"></div>
+  <div class="fld"><label>视野缩放 ×<span class="rngval" id="pczv">0.9</span></label>
+   <input type="range" id="pcz" min="0.6" max="2.0" step="0.1" value="0.9"></div>
+  <div class="fld"><label>相机抬升 <span class="rngval" id="pclv">0.40</span>m</label>
+   <input type="range" id="pcl" min="0" max="0.5" step="0.05" value="0.4"></div>
+  <div class="fld"><label>相机后撤 <span class="rngval" id="pcbv">0.30</span>m</label>
+   <input type="range" id="pcb" min="0" max="0.5" step="0.05" value="0.3"></div>
  </div>
  <div class="row" style="margin-top:10px">
   <div class="fld"><label>输出分辨率 <span class="rngval" id="pcov">760</span>px</label>
@@ -1654,7 +1657,8 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  .sig p{font-size:.2rem;line-height:1.4;margin:.13rem 0 0;color:rgba(255,253,247,.92)}
  /* ── 流水视图：实时画面小窗 + 当日识别记录列表 ── */
  #tl{position:absolute;inset:0;display:none}
- #tl.on{display:block}
+ #tl.on{display:block;background:rgba(0,0,0,.62)}   /* 流水态强压暗背景，突出列表 */
+ body.tlon #panel{visibility:hidden}                 /* 流水态彻底藏起状态文案（不留渐隐残影） */
  #tlinset{position:absolute;left:17.5%;top:29.8%;width:40.2%;height:39.8%;background:#050505;
           border-radius:.08rem;overflow:hidden;display:flex;align-items:center;justify-content:center}
  #tlinset img{width:100%;height:100%;object-fit:cover;display:none}
@@ -1776,16 +1780,16 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <input type="color" id="hlcolor" value="#ff9f0a">
   </div></div>
  <div class="sec">点云整体样式</div>
- <div class="fld"><label>基础点大小 <b id="v_splat">2</b>px</label>
-  <input type="range" id="r_splat" min="1" max="4" step="1" value="2"></div>
- <div class="fld"><label>俯视角 <b id="v_view_tilt">18</b>°</label>
-  <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="18"></div>
- <div class="fld"><label>视野缩放 ×<b id="v_view_zoom">1.0</b></label>
-  <input type="range" id="r_view_zoom" min="0.6" max="2.0" step="0.1" value="1.0"></div>
- <div class="fld"><label>相机抬升 <b id="v_eye_lift">0.00</b>m</label>
-  <input type="range" id="r_eye_lift" min="0" max="0.5" step="0.05" value="0"></div>
- <div class="fld"><label>相机后撤 <b id="v_eye_back">0.00</b>m</label>
-  <input type="range" id="r_eye_back" min="0" max="0.5" step="0.05" value="0"></div>
+ <div class="fld"><label>基础点大小 <b id="v_splat">1</b>px</label>
+  <input type="range" id="r_splat" min="1" max="4" step="1" value="1"></div>
+ <div class="fld"><label>俯视角 <b id="v_view_tilt">20</b>°</label>
+  <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="20"></div>
+ <div class="fld"><label>视野缩放 ×<b id="v_view_zoom">0.9</b></label>
+  <input type="range" id="r_view_zoom" min="0.6" max="2.0" step="0.1" value="0.9"></div>
+ <div class="fld"><label>相机抬升 <b id="v_eye_lift">0.40</b>m</label>
+  <input type="range" id="r_eye_lift" min="0" max="0.5" step="0.05" value="0.4"></div>
+ <div class="fld"><label>相机后撤 <b id="v_eye_back">0.30</b>m</label>
+  <input type="range" id="r_eye_back" min="0" max="0.5" step="0.05" value="0.3"></div>
  <div class="fld"><label>输出分辨率 <b id="v_out_size">760</b>px</label>
   <input type="range" id="r_out_size" min="480" max="1080" step="40" value="760"></div>
  <div class="fld"><label>饱和度 ×<b id="v_sat">1.0</b></label>
@@ -1825,6 +1829,7 @@ if(!['hl','la','s3','raw'].includes(bgSource))bgSource='hl';
 const MIN_SWAP_MS=1500;               // GLB 换模型最小间隔（同 /panel：防高帧率下一直黑屏加载）
 let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
 
+let lastBgUrl='';                     // 当前背景图 url（流水小窗镜像用）
 function showImg(url,key){            // 双缓冲交叉淡入：新图解码完成后才切换，不闪黑
   if(!url)return false;
   if(key===lastBgKey)return true;
@@ -1834,7 +1839,7 @@ function showImg(url,key){            // 双缓冲交叉淡入：新图解码完
     bgFlip=!bgFlip;
     const showEl=bgFlip?$('bgA'):$('bgB'),hideEl=bgFlip?$('bgB'):$('bgA');
     showEl.src=url;showEl.classList.add('on');hideEl.classList.remove('on');
-    $('bgmv').style.display='none';lastMvUrl='';
+    $('bgmv').style.display='none';lastMvUrl='';lastBgUrl=url;
   };
   im.src=url;
   return true;
@@ -1864,7 +1869,7 @@ function pushDefaultConfig(){
   lastCfgPush=Date.now();
   fetch('/api/frame/config',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({export_format:'glb',process_res:504,conf_thresh_percentile:40,
-                         num_max_points:800000,show_cameras:'1'})}).catch(()=>{});
+                         num_max_points:800000,show_cameras:'0'})}).catch(()=>{});   // 展示页不要相机线框
 }
 
 // ── 多设备：下拉选设备（服务端只处理选中设备一路；同 /panel 的下拉逻辑） ──
@@ -1884,7 +1889,7 @@ $('selDev').onchange=()=>{
     body:JSON.stringify({device_id:$('selDev').value})}).catch(()=>{});
 };
 
-let rawSeq=-1;
+let lastInset='';
 async function bgTick(){
  if(DEMO)return;
  try{
@@ -1892,13 +1897,9 @@ async function bgTick(){
   if(s.processor&&s.config_gen===0)pushDefaultConfig();
   renderDevices(s);
   if(s.device&&s.device!==curDev){   // 切设备：清背景与卡片缓存，等新设备的帧/产物
-    if(curDev!==null){lastBgKey='';lastMvUrl='';rawSeq=-1;curCard=null;lastCardKey='';}
+    if(curDev!==null){lastBgKey='';lastMvUrl='';lastBgUrl='';lastInset='';curCard=null;lastCardKey='';}
     curDev=s.device;
   }
-  // 流水小窗：实时设备帧（仅流水视图打开时刷新，省带宽）
-  if($('tl').classList.contains('on')&&s.has_frame&&s.seq!==rawSeq){rawSeq=s.seq;
-    $('tlraw').src='/api/frame/latest?t='+s.seq;
-    $('tlraw').style.display='block';$('tlwait').style.display='none';}
   let shown=false;
   if(bgSource==='raw'){ if(s.has_frame)shown=showImg('/api/frame/latest?t='+s.seq,'raw:'+s.seq); }
   else if(bgSource==='la'){
@@ -1914,6 +1915,14 @@ async function bgTick(){
   }
   // 所选来源暂无产物（模型服务未就绪等）→ 兜底显示设备原图，避免黑屏
   if(!shown&&s.has_frame)showImg('/api/frame/latest?t='+s.seq,'rawfb:'+s.seq);
+  // 流水小窗：镜像当前背景画面（点云等）；背景是 GLB/尚无图时才回退设备原帧
+  if($('tl').classList.contains('on')){
+    const mvOn=$('bgmv').style.display!=='none';
+    const insetUrl=(!mvOn&&lastBgUrl)?lastBgUrl:(s.has_frame?'/api/frame/latest?t='+s.seq:null);
+    if(insetUrl&&insetUrl!==lastInset){lastInset=insetUrl;
+      $('tlraw').src=insetUrl;
+      $('tlraw').style.display='block';$('tlwait').style.display='none';}
+  }
  }catch(e){/* 单次轮询失败忽略 */}
 }
 
@@ -1974,6 +1983,7 @@ $('selStyle').onchange=()=>{
 $('btnTl').onclick=()=>{
   const on=!$('tl').classList.contains('on');
   $('tl').classList.toggle('on',on);
+  document.body.classList.toggle('tlon',on);   // 流水态：状态文案彻底隐藏 + 背景压暗
   $('btnTl').textContent=on?'实时':'流水';
   setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
 };
