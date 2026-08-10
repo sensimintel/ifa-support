@@ -62,6 +62,12 @@ PAIRING_TRACKED_FIELDS = ("necklace_device_id", "phone_client_id")
 NECKLACE_SOURCE_URL = os.environ.get(
     "NECKLACE_SOURCE_URL", "http://127.0.0.1:8060/api/frame/status")
 NECKLACE_SOURCE_TIMEOUT = 2.0
+# 判定「项链在线」的最大数据龄（秒）：超过这么久没有新帧就不算在线。
+#
+# 故意不改帧中继自己的 DEVICE_TTL(60s)——那是它的桶清理策略，8060 的 /experience
+# 多设备下拉、/panel 的选中设备回落都依赖它，调小会让那些页面在短暂停传时就丢设备。
+# 这里只在本接口按更严的阈值过滤，影响面收在深体验区内。
+NECKLACE_ONLINE_MAX_AGE = float(os.environ.get("NECKLACE_ONLINE_MAX_AGE", "15"))
 
 _state_lock = threading.Lock()
 
@@ -412,9 +418,12 @@ def api_group_resolve(device_id: str = "", client_id: str = ""):
 def api_necklaces_online():
     """在线项链列表：代理 8060 帧中继的设备表，并标注每个项链当前绑在哪条桌边。
 
+    「在线」的唯一依据是 **NECKLACE_ONLINE_MAX_AGE 秒内有新帧到达**（默认 15s）——
+    它不代表设备通电、BLE 已连接或 App 里显示绑定成功，只代表这个 device_id 最近
+    确实有图片传进来。帧中继自己的桶保留 60s，这里按更严的阈值过滤。
+
     项链身份取 camera_info.device_id（蓝牙名，如 odyss-0F0B），跨手机稳定。
     帧中继不可达时返回空列表 + error 说明，让控制面回落到手工输入而不是报错。
-    注意：只有「正在发帧」的项链才会出现，60s 没有新帧即被帧中继判为下线。
     """
     devices, error = [], ""
     try:
@@ -430,9 +439,14 @@ def api_necklaces_online():
         device_id = str((dev or {}).get("device_id") or "").strip()
         if not device_id:
             continue
-        items.append({"device_id": device_id, "age": dev.get("age"),
+        age = (dev or {}).get("age")
+        # age 未知一律当不在线：宁可少列一个，也不要把停传的项链说成在线
+        if age is None or age > NECKLACE_ONLINE_MAX_AGE:
+            continue
+        items.append({"device_id": device_id, "age": age,
                       "fps": dev.get("fps"), "bound_edge": bound.get(device_id)})
-    return JSONResponse({"necklaces": items, "error": error, "ts": time.time()})
+    return JSONResponse({"necklaces": items, "error": error,
+                         "max_age_s": NECKLACE_ONLINE_MAX_AGE, "ts": time.time()})
 
 
 @app.get("/api/pairing-log")
