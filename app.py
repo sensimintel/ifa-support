@@ -1798,6 +1798,8 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <img class="bg" id="bgA" alt=""><img class="bg" id="bgB" alt="">
  <model-viewer id="bgmv" touch-action="none" interaction-prompt="none"
    camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
+   min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
+   min-field-of-view="10deg" max-field-of-view="60deg"
    shadow-intensity="0.3" exposure="1.35"></model-viewer>
  <div id="shade"></div>
 
