@@ -1678,6 +1678,33 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    color:rgba(255,253,247,.72);font:12px system-ui,sans-serif;padding:6px 14px;border-radius:99px;
    cursor:pointer;backdrop-filter:blur(6px)}
  #tools button:hover{background:rgba(255,253,247,.16)}
+ #tools select{background:rgba(255,253,247,.08);border:1px solid rgba(255,253,247,.22);
+   color:rgba(255,253,247,.72);font:12px system-ui,sans-serif;padding:6px 10px;border-radius:99px;
+   cursor:pointer;backdrop-filter:blur(6px);outline:none}
+ #tools select option{background:#1c1c1e;color:#eee}
+ /* ── 高亮点云样式调节抽屉（临时工程工具；物理像素、不随设计稿缩放；同 /panel 两张调节卡） ── */
+ #hlcfg{position:fixed;top:0;right:-340px;bottom:0;width:320px;z-index:20;overflow-y:auto;
+   background:rgba(12,12,14,.94);border-left:1px solid rgba(255,253,247,.14);
+   backdrop-filter:blur(10px);transition:right .3s ease;
+   font:12px system-ui,sans-serif;color:rgba(255,253,247,.85);padding:14px 16px 20px}
+ #hlcfg.on{right:0}
+ #hlcfg .hd{display:flex;align-items:center;justify-content:space-between;font-size:13px;
+   font-weight:600;margin-bottom:4px;color:rgba(255,253,247,.95)}
+ #hlcfg .hd button{background:none;border:0;color:rgba(255,253,247,.6);font-size:15px;cursor:pointer;padding:2px 6px}
+ #hlcfg .sec{font-weight:600;margin:14px 0 4px;color:rgba(255,253,247,.95);
+   border-top:1px solid rgba(255,253,247,.12);padding-top:12px}
+ #hlcfg .seg{display:flex;gap:6px;flex-wrap:wrap;margin:6px 0 2px}
+ #hlcfg .seg button{font-size:12px;padding:4px 12px;border-radius:99px;cursor:pointer;
+   border:1px solid rgba(255,253,247,.25);background:transparent;color:rgba(255,253,247,.75)}
+ #hlcfg .seg button.on{background:var(--white);border-color:var(--white);color:#161311}
+ #hlcfg .fld{margin:9px 0 2px}
+ #hlcfg .fld label{display:block;margin-bottom:2px;color:rgba(255,253,247,.72)}
+ #hlcfg .fld b{color:#6ab7ff;font-weight:600;font-variant-numeric:tabular-nums}
+ #hlcfg input[type=range]{width:100%;margin:2px 0 0}
+ #hlcfg .radios{display:flex;gap:14px;align-items:center;margin:6px 0 2px;flex-wrap:wrap}
+ #hlcfg .radios label{cursor:pointer}
+ #hlcfg input[type=color]{width:38px;height:24px;border:none;background:none;padding:0;cursor:pointer}
+ #hlcfg .hint{margin-top:12px;font-size:11px;line-height:1.5;color:rgba(255,253,247,.45)}
 </style></head><body>
 <div id="stage">
  <img class="bg" id="bgA" alt=""><img class="bg" id="bgB" alt="">
@@ -1716,8 +1743,58 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 </div>
 
 <div id="tools">
- <button id="btnStyle"></button>
+ <select id="selStyle">
+  <option value="hl">高亮点云</option>
+  <option value="la">LA点云</option>
+  <option value="s3">SAM3点云</option>
+  <option value="raw">原图</option>
+ </select>
+ <button id="btnHlCfg">调节</button>
  <button id="btnTl">流水</button>
+</div>
+
+<div id="hlcfg">
+ <div class="hd">高亮点云样式调节 <button id="hlcfgClose" title="关闭">✕</button></div>
+ <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">高亮样式（只作用于高亮点云）</div>
+ <div class="seg" id="hlseg">
+  <button data-s="tint" class="on">染色</button>
+  <button data-s="solid">纯色</button>
+  <button data-s="glow">提亮</button>
+  <button data-s="outline">描边</button>
+ </div>
+ <div class="fld"><label>高亮强度 <b id="v_strength">65</b>%</label>
+  <input type="range" id="r_strength" min="10" max="100" step="5" value="65"></div>
+ <div class="fld"><label>点大小 ×<b id="v_point_scale">2.0</b></label>
+  <input type="range" id="r_point_scale" min="1" max="5" step="0.5" value="2"></div>
+ <div class="fld"><label>背景压暗 <b id="v_dim">40</b>%</label>
+  <input type="range" id="r_dim" min="0" max="90" step="5" value="40"></div>
+ <div class="fld"><label>点颜色</label>
+  <div class="radios">
+   <label><input type="radio" name="hlcm" value="auto" checked> 按词自动</label>
+   <label><input type="radio" name="hlcm" value="custom"> 自选</label>
+   <input type="color" id="hlcolor" value="#ff9f0a">
+  </div></div>
+ <div class="sec">点云整体样式</div>
+ <div class="fld"><label>基础点大小 <b id="v_splat">2</b>px</label>
+  <input type="range" id="r_splat" min="1" max="4" step="1" value="2"></div>
+ <div class="fld"><label>俯视角 <b id="v_view_tilt">18</b>°</label>
+  <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="18"></div>
+ <div class="fld"><label>视野缩放 ×<b id="v_view_zoom">1.0</b></label>
+  <input type="range" id="r_view_zoom" min="0.6" max="2.0" step="0.1" value="1.0"></div>
+ <div class="fld"><label>相机抬升 <b id="v_eye_lift">0.00</b>m</label>
+  <input type="range" id="r_eye_lift" min="0" max="0.5" step="0.05" value="0"></div>
+ <div class="fld"><label>相机后撤 <b id="v_eye_back">0.00</b>m</label>
+  <input type="range" id="r_eye_back" min="0" max="0.5" step="0.05" value="0"></div>
+ <div class="fld"><label>输出分辨率 <b id="v_out_size">760</b>px</label>
+  <input type="range" id="r_out_size" min="480" max="1080" step="40" value="760"></div>
+ <div class="fld"><label>饱和度 ×<b id="v_sat">1.0</b></label>
+  <input type="range" id="r_sat" min="0" max="2" step="0.1" value="1.0"></div>
+ <div class="fld"><label>明度 ×<b id="v_val">1.0</b></label>
+  <input type="range" id="r_val" min="0.2" max="1.6" step="0.1" value="1.0"></div>
+ <div class="fld"><label>置信度裁剪分位 <b id="v_conf">40</b>%</label>
+  <input type="range" id="r_conf" min="0" max="90" step="5" value="40"></div>
+ <div class="hint">与 /panel 的「高亮样式调节」「点云整体样式」同一套配置（/api/sam3hl/config），
+  两边改动互相可见；调整在下一轮 SAM3 结果生效（约 1~3 秒）。</div>
 </div>
 
 <script>
@@ -1741,10 +1818,9 @@ const SIGNAL_LINES={
 // 营养标签展示名（其余枚举直接原词大写展示）
 const TAG_DISPLAY={'Carbs':'Carbohydrates'};
 
-// ══ 背景层：四种来源循环切换（临时按钮），默认 SAM3 高亮点云 ══
-const SOURCES=[['hl','高亮点云'],['la','LA点云'],['s3','SAM3点云'],['raw','原图']];
+// ══ 背景层：四种来源下拉框选择（临时工具），默认 SAM3 高亮点云 ══
 let bgSource=localStorage.getItem('exp_bg')||'hl';
-if(!SOURCES.some(s=>s[0]===bgSource))bgSource='hl';
+if(!['hl','la','s3','raw'].includes(bgSource))bgSource='hl';
 const MIN_SWAP_MS=1500;               // GLB 换模型最小间隔（同 /panel：防高帧率下一直黑屏加载）
 let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
 
@@ -1860,14 +1936,17 @@ async function recogTick(){
  }catch(e){/* 单次轮询失败忽略 */}
 }
 
-// ══ 右下临时按钮：样式循环切换 + 流水视图开关 ══
-function syncStyleBtn(){$('btnStyle').textContent='样式：'+SOURCES.find(s=>s[0]===bgSource)[1];}
-$('btnStyle').onclick=()=>{
-  const i=SOURCES.findIndex(s=>s[0]===bgSource);
-  bgSource=SOURCES[(i+1)%SOURCES.length][0];
+// ══ 右下临时工具：来源下拉框 + 高亮调节抽屉开关 + 流水视图开关 ══
+function syncStyleUI(){
+  $('selStyle').value=bgSource;
+  $('btnHlCfg').style.display=bgSource==='hl'?'':'none';   // 仅高亮点云来源可调样式
+  if(bgSource!=='hl')$('hlcfg').classList.remove('on');
+}
+$('selStyle').onchange=()=>{
+  bgSource=$('selStyle').value;
   localStorage.setItem('exp_bg',bgSource);
   lastBgKey='';lastMvUrl='';   // 立刻允许下一轮加载新来源
-  syncStyleBtn();bgTick();
+  syncStyleUI();bgTick();
 };
 $('btnTl').onclick=()=>{
   const on=!$('tl').classList.contains('on');
@@ -1875,7 +1954,52 @@ $('btnTl').onclick=()=>{
   $('btnTl').textContent=on?'实时':'流水';
   setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
 };
-syncStyleBtn();
+syncStyleUI();
+
+// ══ 高亮点云样式调节抽屉：读写 /api/sam3hl/config（与 /panel 两张调节卡同一套配置） ══
+// 打开时从服务端读当前配置回填（不主动推初值，避免覆盖 /panel 已调好的参数），改动才下发
+const HL_KEYS=['strength','point_scale','dim','splat','view_tilt','view_zoom',
+               'eye_lift','eye_back','out_size','sat','val','conf'];
+const HL_FMT={point_scale:v=>(+v).toFixed(1),view_zoom:v=>(+v).toFixed(1),
+              eye_lift:v=>(+v).toFixed(2),eye_back:v=>(+v).toFixed(2),
+              sat:v=>(+v).toFixed(1),val:v=>(+v).toFixed(1)};
+let hlStyle='tint',hlPushTimer=null;
+function hlLabel(k){$('v_'+k).textContent=(HL_FMT[k]||(v=>v))($('r_'+k).value);}
+function pushHlCfg(){
+  clearTimeout(hlPushTimer);
+  hlPushTimer=setTimeout(()=>{
+    const body={style:hlStyle,color:$('hlcolor').value,
+      color_mode:document.querySelector('input[name=hlcm]:checked').value};
+    HL_KEYS.forEach(k=>body[k]=+$('r_'+k).value);
+    fetch('/api/sam3hl/config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)}).catch(()=>{});
+  },250);
+}
+async function loadHlCfg(){
+  try{
+    const st=await(await fetch('/api/sam3hl/status',{cache:'no-store'})).json();
+    const c=st.cfg||{};
+    if(c.style){hlStyle=c.style;
+      document.querySelectorAll('#hlseg button').forEach(b=>b.classList.toggle('on',b.dataset.s===hlStyle));}
+    HL_KEYS.forEach(k=>{if(c[k]!==undefined){$('r_'+k).value=c[k];hlLabel(k);}});
+    if(c.color_mode)document.querySelector('input[name=hlcm][value='+c.color_mode+']').checked=true;
+    if(/^#[0-9a-fA-F]{6}$/.test(c.color||''))$('hlcolor').value=c.color;
+  }catch(e){/* 读取失败保持面板默认值 */}
+}
+HL_KEYS.forEach(k=>$('r_'+k).addEventListener('input',()=>{hlLabel(k);pushHlCfg();}));
+document.querySelectorAll('#hlseg button').forEach(b=>b.addEventListener('click',()=>{
+  hlStyle=b.dataset.s;
+  document.querySelectorAll('#hlseg button').forEach(x=>x.classList.toggle('on',x===b));
+  pushHlCfg();}));
+document.querySelectorAll('input[name=hlcm]').forEach(r=>r.addEventListener('change',pushHlCfg));
+$('hlcolor').addEventListener('input',()=>{
+  document.querySelector('input[name=hlcm][value=custom]').checked=true;pushHlCfg();});
+$('btnHlCfg').onclick=()=>{
+  const on=!$('hlcfg').classList.contains('on');
+  $('hlcfg').classList.toggle('on',on);
+  if(on)loadHlCfg();   // 每次打开都回填服务端当前值
+};
+$('hlcfgClose').onclick=()=>$('hlcfg').classList.remove('on');
 
 if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布局
   curCard={name:'Banana',description_en:'A quick source of everyday energy.',
