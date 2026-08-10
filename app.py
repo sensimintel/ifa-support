@@ -669,7 +669,7 @@ def _apply_hl_styles(rgb, overlays, cfg):
 def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
                              view_tilt=10.0, view_zoom=1.25, splat=2, out_size=760,
                              mask_overlays=None, eye_lift=0.0, eye_back=0.0,
-                             color_grade=None, hl_cfg=None):
+                             color_grade=None, hl_cfg=None, aspect=None):
     """方案A·服务端渲染：5090 就地把点云用 torch(GPU) 投影 + 画家算法 z-buffer + splat 渲成 2D 图，
     跳过 GLB 序列化与前端 model-viewer 全量加载。叠 food/drink 框。返回 RGB uint8；点云为空返回 None。
 
@@ -731,10 +731,12 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
         P = torch.from_numpy(np.ascontiguousarray(Xc)).to(dev).float()
         C = torch.from_numpy(np.ascontiguousarray(cols)).to(dev)
         # 调优视角（同②③前端）：对准光轴上的点云中心、按场景深度定距、绕中心俯视 tilt。
-        # cz 用鲁棒分位算（同 GLB bbox 中心思路，抗离群点）；一切偏移×cz → 尺度抖动天然抵消。
+        # cz 必须用整体 min/max 包围盒中心（同 model-viewer getBoundingBoxCenter 语义）——
+        # 远端天花板/远景会把包围盒撑大、相机随之拉远，③ 的"拉远小景"观感正来自这里；
+        # 用分位数抗离群会把远点滤掉、相机贴近变满屏（已踩过）。一切偏移×cz → 尺度抖动天然抵消。
         tilt = math.radians(view_tilt)
         zs = Xc[:, 2]
-        cz = max(0.2, (float(np.percentile(zs, 2.0)) + float(np.percentile(zs, 98.0))) / 2.0)
+        cz = max(0.2, (float(zs.min()) + float(zs.max())) / 2.0)
         fwd = torch.tensor([0.0, math.sin(tilt), math.cos(tilt)], device=dev)   # y 向下为正 → 视线向下俯视
         target = torch.tensor([0.0, 0.0, cz], device=dev)
         eye = target - fwd * (cz * float(view_zoom)) \
@@ -751,7 +753,9 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
             return u, v, Pv[:, 2]
 
         Hout = int(out_size)
-        Wout = max(1, int(round(out_size * W0 / H0)))
+        # aspect：输出画幅宽高比。缺省=照片比例；全屏展示传 16/9（同 model-viewer 全屏画布，
+        # 垂直 FOV 不变、横向多出黑边——前端 cover 铺满时才不会因裁切放大而丢失取景）
+        Wout = max(1, int(round(out_size * (float(aspect) if aspect else W0 / H0))))
         real_fov = 2 * math.atan(H0 / (2 * K[1, 1]))             # 真实相机垂直 fov
         fov = min(math.radians(130.0), real_fov)                 # FOV=真实内参（同前端）；远近由 view_zoom 距离控制
         f = (Hout / 2.0) / math.tan(fov / 2.0)
@@ -887,7 +891,7 @@ _sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
                "dim": 40, "color_mode": "auto", "color": "#ff9f0a",
                "splat": 1, "view_tilt": 10.0, "view_zoom": 1.25,
                "eye_lift": 0.0, "eye_back": 0.0, "out_size": 760,
-               "sat": 1.0, "val": 1.0, "conf": 40}
+               "sat": 0.0, "val": 1.2, "conf": 40}   # 饱和0+明度1.2≈model-viewer 灰白点云观感
 _sam3hl = {"bytes": None, "seq": 0, "meta": None, "error": None}
 
 
@@ -976,7 +980,8 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
                                             eye_lift=float(hcfg["eye_lift"]),
                                             eye_back=float(hcfg["eye_back"]),
                                             color_grade=_cg,
-                                            mask_overlays=overlays, hl_cfg=hcfg)
+                                            mask_overlays=overlays, hl_cfg=hcfg,
+                                            aspect=16 / 9)   # /experience 全屏 16:9 画布
             if himg is None:
                 raise RuntimeError("点云为空，无法渲染")
             hok, hbuf = cv2.imencode(".jpg", cv2.cvtColor(himg, cv2.COLOR_RGB2BGR))
@@ -1291,10 +1296,10 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="row" style="margin-top:10px">
   <div class="fld"><label>输出分辨率 <span class="rngval" id="pcov">760</span>px</label>
    <input type="range" id="pco" min="480" max="1080" step="40" value="760"></div>
-  <div class="fld"><label>饱和度 ×<span class="rngval" id="pcsv2">1.0</span></label>
-   <input type="range" id="pcs2" min="0" max="2" step="0.1" value="1.0"></div>
-  <div class="fld"><label>明度 ×<span class="rngval" id="pcvv">1.0</span></label>
-   <input type="range" id="pcv" min="0.2" max="1.6" step="0.1" value="1.0"></div>
+  <div class="fld"><label>饱和度 ×<span class="rngval" id="pcsv2">0.0</span></label>
+   <input type="range" id="pcs2" min="0" max="2" step="0.1" value="0"></div>
+  <div class="fld"><label>明度 ×<span class="rngval" id="pcvv">1.2</span></label>
+   <input type="range" id="pcv" min="0.2" max="1.6" step="0.1" value="1.2"></div>
   <div class="fld"><label>置信度裁剪分位 <span class="rngval" id="pccv">40</span>%</label>
    <input type="range" id="pcc" min="0" max="90" step="5" value="40"></div>
  </div>
@@ -1797,10 +1802,10 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <input type="range" id="r_eye_back" min="0" max="0.5" step="0.05" value="0"></div>
  <div class="fld"><label>输出分辨率 <b id="v_out_size">760</b>px</label>
   <input type="range" id="r_out_size" min="480" max="1080" step="40" value="760"></div>
- <div class="fld"><label>饱和度 ×<b id="v_sat">1.0</b></label>
-  <input type="range" id="r_sat" min="0" max="2" step="0.1" value="1.0"></div>
- <div class="fld"><label>明度 ×<b id="v_val">1.0</b></label>
-  <input type="range" id="r_val" min="0.2" max="1.6" step="0.1" value="1.0"></div>
+ <div class="fld"><label>饱和度 ×<b id="v_sat">0.0</b></label>
+  <input type="range" id="r_sat" min="0" max="2" step="0.1" value="0"></div>
+ <div class="fld"><label>明度 ×<b id="v_val">1.2</b></label>
+  <input type="range" id="r_val" min="0.2" max="1.6" step="0.1" value="1.2"></div>
  <div class="fld"><label>置信度裁剪分位 <b id="v_conf">40</b>%</label>
   <input type="range" id="r_conf" min="0" max="90" step="5" value="40"></div>
  <div class="hint">与 /panel 的「高亮样式调节」「点云整体样式」同一套配置（/api/sam3hl/config），
