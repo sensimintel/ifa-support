@@ -8,6 +8,7 @@ Depth Anything 3 Web 服务：一个页面、一个 8060 端口，左右两栏�
     · 网格 mesh   —— 由深度反投影自建三角网格 GLB，可 3D 转视角
   可调参数：process_res、conf_thresh_percentile、num_max_points、show_cameras。
 - 顶层 / 是左右分栏首页，用两个同源 iframe 分别嵌入 /gradio 与 /panel。
+- /experience 是 IFA 浅体验区展示页：品牌化全屏实时识别 UI（实时点云背景 + 待机/识别态 + 流水视图）。
 - 关键约束：5090 GPU 与产线服务共享，官方 Gradio 与右栏共用同一个模型单例（进程内只加载一份
   权重），并用 GPU 锁串行化推理，避免加载两份权重撑爆显存。
 - 绑定 0.0.0.0，局域网内可直接用 http://<5090局域网IP>:8060 访问。
@@ -36,6 +37,7 @@ import trimesh
 from fastapi import Body, FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
 # 把 DA3 源码目录加入 import 路径（本服务独立于 DA3 仓，只引用其 src）
@@ -60,6 +62,10 @@ app = FastAPI(title="DA3 Depth Web")
 # 局域网演示服务：放开跨域，供 superadmin(18091) 等同网页面直调秤接口
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
+# 静态资源（/experience 用的品牌字体等）：仓内 static/ 目录随代码一起部署
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+if STATIC_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 _model = None
 _model_lock = threading.Lock()   # 保护模型单例的加载
 _gpu_lock = threading.Lock()     # 串行化所有 GPU 推理（右栏 + 官方 Gradio 共用同一模型）
@@ -1124,7 +1130,8 @@ SPLIT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  @media(max-width:900px){.wrap{flex-direction:column;height:auto}.pane{height:90vh;border-right:0;border-bottom:1px solid #2c2c2e}}
 </style></head><body>
  <div class="top"><b>Depth Anything 3</b>
-  <span class="tag">左：设备实时帧 + DA3 产物（深度图 · 点云 · 网格，可调参转视角）　·　右：实时识别卡片流　·　同一 8060 端口</span></div>
+  <span class="tag">左：设备实时帧 + DA3 产物（深度图 · 点云 · 网格，可调参转视角）　·　右：实时识别卡片流　·　同一 8060 端口</span>
+  <a href="/experience" target="_blank" style="margin-left:auto;font-size:13px;color:#0a84ff;text-decoration:none">✨ 浅体验区展示页 ↗</a></div>
  <div class="wrap">
   <div class="pane">
    <div class="bar"><span class="dot" style="background:#0a84ff"></span>设备实时帧 · DA3 产物
@@ -1598,10 +1605,314 @@ setInterval(tunTick,5000);tunTick();
 </body></html>"""
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 浅体验区展示页（/experience）：IFA 展台品牌化全屏 UI（Figma「IFA 专项 · 浅体验区」）
+# - 全屏背景 = 实时点云/设备帧（默认 SAM3 高亮点云，右下临时按钮循环切换四种来源）
+# - 右侧状态区：待机「Place your food here」 ↔ 识别成功（名称/英文描述/营养标签/食物信号）
+# - 流水视图：临时按钮进入，当日识别记录（名称+时间）+ 实时画面小窗
+# - 设计稿 2240×1260，用 rem 等比缩放（1rem=设计稿 100px）；品牌字体走 /static/fonts
+# ══════════════════════════════════════════════════════════════════════
+EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ODYSS · Experience</title>
+<script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
+<style>
+ @font-face{font-family:'ABC Arizona Serif';src:url('/static/fonts/ABCArizonaSerif-Regular-Trial.otf') format('opentype');font-weight:400;font-display:swap}
+ @font-face{font-family:'ABC Arizona Serif';src:url('/static/fonts/ABCArizonaSerif-Light-Trial.otf') format('opentype');font-weight:300;font-display:swap}
+ @font-face{font-family:'Seabirds';src:url('/static/fonts/SeabirdsTrial-Book-V1.ttf') format('truetype');font-weight:400;font-display:swap}
+ @font-face{font-family:'Seabirds';src:url('/static/fonts/SeabirdsTrial-SemiBold-V1.ttf') format('truetype');font-weight:600;font-display:swap}
+ :root{--white:#FFFDF7}
+ /* 设计稿 2240×1260 等比缩放：1rem = 设计稿 100px，按宽高较小者定标（保持构图比例） */
+ html{font-size:min(calc(100vw/22.4),calc(100vh/12.6))}
+ *{box-sizing:border-box}
+ body{margin:0;height:100vh;overflow:hidden;background:#000;color:var(--white);
+      font-family:'Seabirds','Century Gothic','Futura',system-ui,sans-serif}
+ /* ── 背景层：双 img 交叉淡入（换帧不闪黑） + model-viewer（GLB 产物用） ── */
+ #stage{position:fixed;inset:0;background:#000}
+ .bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .45s ease}
+ .bg.on{opacity:1}
+ #bgmv{position:absolute;inset:0;width:100%;height:100%;display:none;--poster-color:transparent}
+ /* 压暗渐变：右侧文字区 + 底部整体，保证文案可读（对应设计稿的压暗矩形层） */
+ #shade{position:absolute;inset:0;pointer-events:none;
+   background:linear-gradient(90deg,rgba(0,0,0,.32),rgba(0,0,0,0) 40%,rgba(0,0,0,.08) 62%,rgba(0,0,0,.46)),
+              linear-gradient(0deg,rgba(0,0,0,.38),rgba(0,0,0,0) 32%)}
+ /* ── 左侧 ODYSS logo（垂直居中） ── */
+ #logo{position:absolute;left:1.3rem;top:50%;transform:translateY(-50%);width:2rem;height:auto;opacity:.95}
+ /* ── 右侧状态区（两态叠放，淡入淡出切换） ── */
+ #panel{position:absolute;left:75.4%;top:50%;transform:translateY(-50%);width:5.15rem;display:grid}
+ #panel .state{grid-area:1/1;opacity:0;transition:opacity .5s ease;pointer-events:none}
+ #panel .state.on{opacity:1}
+ h1{font-family:'ABC Arizona Serif',Georgia,serif;font-weight:400;font-size:.5rem;line-height:1;
+    letter-spacing:-.01rem;margin:0}
+ #card h1{font-size:.56rem}
+ .sub{font-size:.2rem;line-height:1.4;letter-spacing:-.002rem;margin:.16rem 0 0;color:rgba(255,253,247,.92)}
+ .chips{display:flex;gap:.18rem;flex-wrap:wrap;margin-top:.3rem}
+ .chip{background:var(--white);color:#161311;border-radius:9rem;padding:.135rem .3rem;
+       font-size:.155rem;letter-spacing:.012rem;text-transform:uppercase;white-space:nowrap}
+ .rule{border:0;border-top:1px solid rgba(255,253,247,.4);margin:.42rem 0 0}
+ .sig h2{font-weight:400;font-size:.33rem;letter-spacing:-.004rem;margin:.38rem 0 0}
+ .sig p{font-size:.2rem;line-height:1.4;margin:.13rem 0 0;color:rgba(255,253,247,.92)}
+ /* ── 流水视图：实时画面小窗 + 当日识别记录列表 ── */
+ #tl{position:absolute;inset:0;display:none}
+ #tl.on{display:block}
+ #tlinset{position:absolute;left:17.5%;top:29.8%;width:40.2%;height:39.8%;background:#050505;
+          border-radius:.08rem;overflow:hidden;display:flex;align-items:center;justify-content:center}
+ #tlinset img{width:100%;height:100%;object-fit:cover;display:none}
+ #tlwait{font-size:.16rem;color:rgba(255,253,247,.5)}
+ #tllist{position:absolute;left:65%;right:3.3%;top:0;bottom:0;display:flex;flex-direction:column;justify-content:center}
+ .trow{display:flex;justify-content:space-between;align-items:baseline;gap:.3rem;
+       padding:.205rem 0;border-bottom:1px solid rgba(255,253,247,.34);
+       font-family:'ABC Arizona Serif',Georgia,serif;font-size:.4rem;letter-spacing:-.006rem}
+ .trow .tname{display:flex;align-items:center;gap:.16rem;min-width:0;overflow:hidden;
+       text-overflow:ellipsis;white-space:nowrap}
+ .trow .ttime{font-variant-numeric:tabular-nums;flex:none}
+ .trow.dim{opacity:.42}
+ .spin{flex:none;width:.26rem;height:.26rem;border-radius:50%;
+       border:.025rem solid rgba(255,253,247,.35);border-top-color:var(--white);
+       animation:spin 1s linear infinite}
+ @keyframes spin{to{transform:rotate(360deg)}}
+ #tlempty{font-family:'ABC Arizona Serif',Georgia,serif;font-size:.3rem;color:rgba(255,253,247,.55)}
+ /* ── 右下临时工具按钮（后期调样式用，刻意低调；尺寸用物理像素不随设计稿缩放） ── */
+ #tools{position:fixed;right:20px;bottom:18px;display:flex;gap:8px;z-index:9}
+ #tools button{background:rgba(255,253,247,.08);border:1px solid rgba(255,253,247,.22);
+   color:rgba(255,253,247,.72);font:12px system-ui,sans-serif;padding:6px 14px;border-radius:99px;
+   cursor:pointer;backdrop-filter:blur(6px)}
+ #tools button:hover{background:rgba(255,253,247,.16)}
+</style></head><body>
+<div id="stage">
+ <img class="bg" id="bgA" alt=""><img class="bg" id="bgB" alt="">
+ <model-viewer id="bgmv" touch-action="none" interaction-prompt="none"
+   camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
+   shadow-intensity="0.3" exposure="1.35"></model-viewer>
+ <div id="shade"></div>
+
+ <svg id="logo" viewBox="0 0 132 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path fill-rule="evenodd" clip-rule="evenodd" fill="#FFFDF7" d="M7.89492 0C10.0744 0.000214409 11.9432 0.773049 13.48 2.30987C15.0165 3.84677 15.788 5.71539 15.788 7.89492C15.7878 10.0741 15.0163 11.9415 13.48 13.4782C11.9432 15.015 10.0744 15.7878 7.89492 15.788C5.71553 15.7879 3.8485 15.0146 2.31168 13.4782C0.774843 11.9413 0.000194423 10.0744 0 7.89492C0 5.71506 0.77465 3.8469 2.31168 2.30987C3.84849 0.773434 5.71557 7.90328e-05 7.89492 0ZM7.89492 1.90342C6.8145 1.90347 5.81496 2.1734 4.89191 2.71269L4.8901 2.7145C3.96745 3.24172 3.23472 3.96349 2.69454 4.88647L2.69636 4.88828C2.16858 5.81194 1.90523 6.81279 1.90523 7.89492C1.90537 8.97584 2.16777 9.97514 2.69454 10.8979L2.90684 11.2354C3.42094 12.0013 4.08036 12.6207 4.88828 13.0935C5.81146 13.6207 6.81346 13.8846 7.89492 13.8846C8.97675 13.8845 9.97812 13.6212 10.9016 13.0935C11.8246 12.5533 12.5481 11.8224 13.0753 10.8997L13.0771 10.8979C13.6165 9.97494 13.8863 8.97526 13.8864 7.89492C13.8864 6.81426 13.6166 5.81332 13.0771 4.8901L13.0753 4.88828C12.548 3.96546 11.8242 3.24198 10.9016 2.7145L10.8979 2.71269C9.97497 2.1734 8.97522 1.90357 7.89492 1.90342Z"/>
+  <path fill-rule="evenodd" clip-rule="evenodd" fill="#FFFDF7" d="M36.9179 0C39.0974 0.000214409 40.9662 0.773049 42.503 2.30987C44.0395 3.84675 44.8111 5.71543 44.8111 7.89492C44.8109 10.074 44.0393 11.9415 42.503 13.4782C40.9662 15.015 39.0974 15.7878 36.9179 15.788H29.0248V13.8846H36.9179C37.9998 13.8845 39.0012 13.6212 39.9246 13.0935C40.8476 12.5533 41.5711 11.8224 42.0984 10.8997L42.1002 10.8979C42.6395 9.97494 42.9093 8.97526 42.9095 7.89492C42.9095 6.81426 42.6396 5.81332 42.1002 4.8901L42.0984 4.88828C41.5711 3.9655 40.8472 3.24198 39.9246 2.7145L39.921 2.71269C38.998 2.17335 37.9983 1.90357 36.9179 1.90342H29.0248V0H36.9179Z"/>
+  <path fill-rule="evenodd" clip-rule="evenodd" fill="#FFFDF7" d="M59.9513 0.961689C59.9513 2.0419 60.2129 3.04059 60.7388 3.96288C61.2787 4.87457 62.0096 5.60104 62.9343 6.14211L63.2845 6.32719C64.1095 6.73117 64.9942 6.93323 65.941 6.93323C67.0228 6.93308 68.0242 6.66978 68.9476 6.14211C69.8715 5.60136 70.5963 4.87488 71.1232 3.9647C71.6625 3.04163 71.9307 2.04213 71.9307 0.961689V0H73.8341V0.961689C73.8341 2.14567 73.5874 3.26245 73.0938 4.30764L72.867 4.75038C72.236 5.90693 71.3668 6.84907 70.2631 7.57194C69.2396 8.24208 68.117 8.64408 66.9027 8.78403V15.788H64.9793V8.78403C63.7649 8.6442 62.6424 8.242 61.6188 7.57194C60.5154 6.84937 59.6404 5.90772 58.9969 4.75219L58.7737 4.30582C58.29 3.26075 58.0479 2.14505 58.0479 0.961689V0H59.9513V0.961689Z"/>
+  <path fill-rule="evenodd" clip-rule="evenodd" fill="#FFFDF7" d="M102.857 1.90342H91.4983C90.8003 1.90342 90.2109 2.148 89.7147 2.64374C89.2183 3.14004 88.9726 3.7291 88.9725 4.4274C88.9725 5.12591 89.2182 5.71463 89.7147 6.21106C90.2101 6.69422 90.7985 6.93323 91.4983 6.93323H98.4297C99.6488 6.93345 100.696 7.36986 101.551 8.23605L101.856 8.56629C102.521 9.35633 102.857 10.2923 102.857 11.3606C102.857 12.5813 102.419 13.6345 101.552 14.5015C100.697 15.3569 99.6489 15.7878 98.4297 15.788H87.0709V13.8846H98.4297C99.1277 13.8844 99.7172 13.6403 100.213 13.1443C100.709 12.648 100.954 12.0588 100.954 11.3606C100.954 10.6628 100.71 10.0814 100.217 9.59874L100.213 9.59511C99.7173 9.09917 99.1277 8.855 98.4297 8.85479H91.4983C90.2792 8.85479 89.2267 8.42374 88.3592 7.57012L88.3556 7.56649C87.5016 6.69893 87.0709 5.64682 87.0709 4.4274C87.071 3.20808 87.5019 2.16194 88.3574 1.30644C89.2245 0.439601 90.2775 0 91.4983 0H102.857V1.90342Z"/>
+  <path fill-rule="evenodd" clip-rule="evenodd" fill="#FFFDF7" d="M131.88 1.90342H120.521C119.823 1.90342 119.234 2.14806 118.738 2.64374C118.241 3.14004 117.996 3.7291 117.996 4.4274C117.996 5.12591 118.241 5.71463 118.738 6.21106C119.233 6.69417 119.822 6.93323 120.521 6.93323H127.453C128.672 6.93345 129.719 7.3698 130.574 8.23605L130.879 8.56629C131.544 9.35631 131.88 10.2923 131.88 11.3606C131.88 12.5812 131.442 13.6345 130.576 14.5015C129.72 15.3569 128.672 15.7878 127.453 15.788H116.094V13.8846H127.453C128.151 13.8844 128.74 13.6403 129.236 13.1443C129.732 12.648 129.977 12.0588 129.977 11.3606C129.977 10.6629 129.733 10.0813 129.24 9.59874L129.236 9.59511C128.74 9.09911 128.151 8.855 127.453 8.85479H120.521C119.302 8.85479 118.25 8.42368 117.382 7.57012L117.379 7.56649C116.525 6.69893 116.094 5.64682 116.094 4.4274C116.094 3.20808 116.525 2.16194 117.38 1.30644C118.248 0.439657 119.301 0 120.521 0H131.88V1.90342Z"/>
+ </svg>
+
+ <div id="panel">
+  <div class="state" id="idle">
+   <h1>Place your food here</h1>
+   <p class="sub">Hold your food in front of the camera. ODYSS will recognize it automatically in seconds.</p>
+  </div>
+  <div class="state" id="card">
+   <h1 id="cname"></h1>
+   <p class="sub" id="cdesc"></p>
+   <div class="chips" id="cchips"></div>
+   <hr class="rule">
+   <div class="sig" id="csig"><h2 id="signame"></h2><p id="sigline"></p></div>
+   <hr class="rule">
+  </div>
+ </div>
+
+ <div id="tl">
+  <div id="tlinset"><img id="tlraw" alt=""><span id="tlwait">Waiting for camera…</span></div>
+  <div id="tllist"></div>
+ </div>
+</div>
+
+<div id="tools">
+ <button id="btnStyle"></button>
+ <button id="btnTl">流水</button>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无后端时目检布局用
+
+// ── 食物信号 → 英文一句话（设计稿「Quick energy / Fast-access fuel …」段），键=后端 FOOD_SIGNALS 枚举 ──
+const SIGNAL_LINES={
+ 'Quick energy':'Fast-access fuel for the next part of your day.',
+ 'Sustained energy':'Slow-burning fuel that keeps you going for hours.',
+ 'High protein':'Building blocks for muscle and recovery.',
+ 'High fiber':'Keeps digestion steady and you fuller for longer.',
+ 'Hydration':'Tops up your fluids and keeps you refreshed.',
+ 'Healthy fats':'Good fats that support heart and brain.',
+ 'Low calorie':'Light on calories, easy on your day.',
+ 'Sugar spike':'A fast sugar hit — energy now, dip later.',
+ 'Caffeine boost':'A lift for focus and alertness.',
+ 'Vitamin boost':'A dose of vitamins to round out your day.',
+ 'Balanced nutrition':'A well-rounded mix of what your body needs.',
+ 'Indulgent treat':'Pure enjoyment — worth savoring slowly.'};
+// 营养标签展示名（其余枚举直接原词大写展示）
+const TAG_DISPLAY={'Carbs':'Carbohydrates'};
+
+// ══ 背景层：四种来源循环切换（临时按钮），默认 SAM3 高亮点云 ══
+const SOURCES=[['hl','高亮点云'],['la','LA点云'],['s3','SAM3点云'],['raw','原图']];
+let bgSource=localStorage.getItem('exp_bg')||'hl';
+if(!SOURCES.some(s=>s[0]===bgSource))bgSource='hl';
+const MIN_SWAP_MS=1500;               // GLB 换模型最小间隔（同 /panel：防高帧率下一直黑屏加载）
+let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
+
+function showImg(url,key){            // 双缓冲交叉淡入：新图解码完成后才切换，不闪黑
+  if(!url)return false;
+  if(key===lastBgKey)return true;
+  lastBgKey=key;
+  const im=new Image();
+  im.onload=()=>{ if(key!==lastBgKey)return;      // 已被更新的帧超越则丢弃
+    bgFlip=!bgFlip;
+    const showEl=bgFlip?$('bgA'):$('bgB'),hideEl=bgFlip?$('bgB'):$('bgA');
+    showEl.src=url;showEl.classList.add('on');hideEl.classList.remove('on');
+    $('bgmv').style.display='none';lastMvUrl='';
+  };
+  im.src=url;
+  return true;
+}
+function showModel(url,fov){          // GLB 产物（LA 点云等）：全屏 model-viewer 展示
+  const mv=$('bgmv');
+  if(fov)mvFov=fov;
+  if(url===lastMvUrl){mv.style.display='block';return true;}
+  if(!(mv.loaded||!mv.getAttribute('src'))||Date.now()-lastMvSwap<MIN_SWAP_MS)return true;
+  lastMvSwap=Date.now();lastMvUrl=url;lastBgKey='';
+  mv.src=url;mv.style.display='block';
+  $('bgA').classList.remove('on');$('bgB').classList.remove('on');
+  return true;
+}
+// GLB 加载完自动摆「调优视角」（同 /panel：略俯视、拉远，FOV 用真实相机内参）
+$('bgmv').addEventListener('load',()=>{const mv=$('bgmv');
+  try{const c=mv.getBoundingBoxCenter();const cz=(c.z<-0.001)?c.z:-1.5;
+    mv.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
+    mv.cameraOrbit='0deg 80deg '+(Math.abs(cz)*1.25).toFixed(4)+'m';
+    mv.fieldOfView=mvFov+'deg';
+    mv.jumpCameraToGoal&&mv.jumpCameraToGoal();}catch(e){}});
+
+// 服务重启后配置清零会回落 depth 模式（识别不触发）：本页独立运行时补推默认配置（glb=识别链路）
+let lastCfgPush=0;
+function pushDefaultConfig(){
+  if(Date.now()-lastCfgPush<5000)return;
+  lastCfgPush=Date.now();
+  fetch('/api/frame/config',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({export_format:'glb',process_res:504,conf_thresh_percentile:40,
+                         num_max_points:800000,show_cameras:'1'})}).catch(()=>{});
+}
+
+let rawSeq=-1;
+async function bgTick(){
+ if(DEMO)return;
+ try{
+  const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
+  if(s.processor&&s.config_gen===0)pushDefaultConfig();
+  // 流水小窗：实时设备帧（仅流水视图打开时刷新，省带宽）
+  if($('tl').classList.contains('on')&&s.has_frame&&s.seq!==rawSeq){rawSeq=s.seq;
+    $('tlraw').src='/api/frame/latest?t='+s.seq;
+    $('tlraw').style.display='block';$('tlwait').style.display='none';}
+  let shown=false;
+  if(bgSource==='raw'){ if(s.has_frame)shown=showImg('/api/frame/latest?t='+s.seq,'raw:'+s.seq); }
+  else if(bgSource==='la'){
+    if(s.product_kind==='image')shown=showImg('/api/frame/latest-product?t='+s.product_seq,'la:'+s.product_seq);
+    else if(s.product_kind==='model'&&s.product_url)shown=showModel(s.product_url,s.product_meta&&s.product_meta.fov_deg);
+  }else if(bgSource==='s3'){
+    const s3=await(await fetch('/api/sam3cloud/status',{cache:'no-store'})).json();
+    if(s3.kind==='image'&&s3.seq)shown=showImg('/api/sam3cloud/latest?t='+s3.seq,'s3:'+s3.seq);
+    else if(s3.kind==='model'&&s3.url)shown=showModel(s3.url,null);
+  }else{
+    const hl=await(await fetch('/api/sam3hl/status',{cache:'no-store'})).json();
+    if(hl.seq&&hl.meta)shown=showImg('/api/sam3hl/latest?t='+hl.seq,'hl:'+hl.seq);
+  }
+  // 所选来源暂无产物（模型服务未就绪等）→ 兜底显示设备原图，避免黑屏
+  if(!shown&&s.has_frame)showImg('/api/frame/latest?t='+s.seq,'rawfb:'+s.seq);
+ }catch(e){/* 单次轮询失败忽略 */}
+}
+
+// ══ 状态机：待机 ↔ 识别成功（识别失败态暂不做）══
+// 最新卡片有更新（id/rev 变化）即进入成功态并驻留 FRESH_MS；无更新则回落待机
+const FRESH_MS=20000;
+let lastCardKey='',cardShownAt=0,curCard=null;
+function setState(st){
+  $('idle').classList.toggle('on',st==='idle'&&!$('tl').classList.contains('on'));
+  $('card').classList.toggle('on',st==='card'&&!$('tl').classList.contains('on'));
+}
+function renderCard(c){
+  $('cname').textContent=c.name||'';
+  $('cdesc').textContent=c.description_en||c.description||'';
+  $('cchips').innerHTML=(c.nutrition_tags||[]).map(t=>
+    '<span class="chip">'+(TAG_DISPLAY[t]||t)+'</span>').join('');
+  const sig=c.food_signal||'';
+  $('csig').style.display=sig?'block':'none';
+  $('signame').textContent=sig;
+  $('sigline').textContent=SIGNAL_LINES[sig]||'';
+}
+function renderTimeline(cards){
+  const list=$('tllist');
+  const rows=(cards||[]).slice(0,10).reverse();   // 最新 10 条，按时间升序排布（同设计稿）
+  if(!rows.length){list.innerHTML='<span id="tlempty">No records yet today.</span>';return;}
+  list.innerHTML=rows.map(c=>{
+    const busy=c.status&&c.status!=='done';
+    return '<div class="trow'+(busy?' dim':'')+'"><span class="tname">'
+      +(busy?'<span class="spin"></span>':'')
+      +(c.name||'')+(busy?'…':'')+'</span><span class="ttime">'
+      +String(c.t||'').slice(0,5)+'</span></div>';}).join('');
+}
+async function recogTick(){
+ if(DEMO)return;
+ try{
+  const r=await(await fetch('/api/recog/list',{cache:'no-store'})).json();
+  const cards=r.cards||[];
+  renderTimeline(cards);
+  const c=cards[0];
+  if(c){const key=c.id+':'+(c.rev||0);
+    if(key!==lastCardKey){lastCardKey=key;cardShownAt=Date.now();curCard=c;renderCard(c);}}
+  setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
+ }catch(e){/* 单次轮询失败忽略 */}
+}
+
+// ══ 右下临时按钮：样式循环切换 + 流水视图开关 ══
+function syncStyleBtn(){$('btnStyle').textContent='样式：'+SOURCES.find(s=>s[0]===bgSource)[1];}
+$('btnStyle').onclick=()=>{
+  const i=SOURCES.findIndex(s=>s[0]===bgSource);
+  bgSource=SOURCES[(i+1)%SOURCES.length][0];
+  localStorage.setItem('exp_bg',bgSource);
+  lastBgKey='';lastMvUrl='';   // 立刻允许下一轮加载新来源
+  syncStyleBtn();bgTick();
+};
+$('btnTl').onclick=()=>{
+  const on=!$('tl').classList.contains('on');
+  $('tl').classList.toggle('on',on);
+  $('btnTl').textContent=on?'实时':'流水';
+  setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
+};
+syncStyleBtn();
+
+if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布局
+  curCard={name:'Banana',description_en:'A quick source of everyday energy.',
+           nutrition_tags:['Carbs','Fiber'],food_signal:'Quick energy'};
+  renderCard(curCard);cardShownAt=Date.now();lastCardKey='demo';
+  setInterval(()=>{cardShownAt=Date.now();},5000);   // 常驻成功态
+  renderTimeline([
+    {name:'Green tea latte',t:'20:45:00',status:'done'},
+    {name:'Pasta carbonara',t:'19:20:00',status:'done'},
+    {name:'Mango smoothie',t:'18:10:00',status:'done'},
+    {name:'Chicken soup',t:'17:30:00',status:'done'},
+    {name:'Blueberry yogurt',t:'14:50:00',status:'done'},
+    {name:'Avocado toast',t:'12:35:00',status:'done'},
+    {name:'Salmon sushi',t:'12:00:00',status:'done'},
+    {name:'Apple',t:'10:15:00',status:'done'},
+    {name:'Grilled steak',t:'08:20:00',status:'pending'},
+    {name:'Grilled steak',t:'07:45:00',status:'pending'}]);
+  setState('card');
+}else{
+  setState('idle');
+  setInterval(bgTick,500);bgTick();
+  setInterval(recogTick,1500);recogTick();
+}
+</script>
+</body></html>"""
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     """左右分栏对比首页。"""
     return SPLIT_PAGE
+
+
+@app.get("/experience", response_class=HTMLResponse)
+def experience():
+    """IFA 浅体验区展示页：品牌化全屏实时识别 UI。"""
+    return EXPERIENCE_PAGE
 
 
 @app.get("/panel", response_class=HTMLResponse)
@@ -1774,6 +2085,7 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0):
         "杯子/瓶子上的装饰文案（如 Good morning）不是名称；\n"
         "  type：只能是“食物”或“液体”；\n"
         "  description：一句话中文描述（不超过" + str(RECOG_DESC_MAX) + "字，如“快速补能的小食”）；\n"
+        "  description_en：一句话英文描述（不超过 60 字符，如 \"A quick source of everyday energy.\"）；\n"
         "  nutrition_tags：营养标签数组，最多" + str(RECOG_MAX_TAGS) + "个，只能从这些里选："
         + "、".join(NUTRITION_TAGS) + "；\n"
         "  food_signal：食物信号，只能从这些里选一个：" + "、".join(FOOD_SIGNALS) + "；\n"
@@ -1821,6 +2133,7 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0):
     p += (
         "只输出 JSON，不要任何解释："
         "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
+        "\"description_en\":\"A quick source of everyday energy.\","
         "\"nutrition_tags\":[\"Carbs\",\"Fiber\",\"Potassium\"],\"food_signal\":\"Quick energy\","
         "\"box\":[412,530,668,845],"
         "\"match_evidence\":\"无相似候选\",\"match_reason\":\"画面新出现的物品\","
@@ -1957,6 +2270,7 @@ def _parse_recog(content):
         typ = str(it.get("type", "")).strip().lower()
         is_liquid = ("液" in typ or "饮" in typ or "drink" in typ or "liquid" in typ)
         desc = str(it.get("description", "")).strip().replace("\n", " ")[:RECOG_DESC_MAX]
+        desc_en = str(it.get("description_en", "")).strip().replace("\n", " ")[:60]
         raw_tags = it.get("nutrition_tags") or []
         if isinstance(raw_tags, str):
             raw_tags = [raw_tags]
@@ -1987,7 +2301,8 @@ def _parse_recog(content):
             except (TypeError, ValueError):
                 box = None
         out.append({"name": name, "type": "液体" if is_liquid else "食物",
-                    "description": desc, "nutrition_tags": tags, "food_signal": sig,
+                    "description": desc, "description_en": desc_en,
+                    "nutrition_tags": tags, "food_signal": sig,
                     "match": match, "match_evidence": evidence, "match_reason": reason,
                     "matched_name": mname, "match_confidence": conf, "box": box})
     return out
@@ -2149,6 +2464,7 @@ def _recog_worker():
                     cards.append({
                         "id": _recog_id, "status": "done",
                         "name": it["name"], "type": it["type"], "description": it["description"],
+                        "description_en": it.get("description_en", ""),
                         "nutrition_tags": it["nutrition_tags"], "food_signal": it["food_signal"],
                         "shots": [shot_url] if shot_url else [], "ref_img": ref_uri,
                         "merge_history": [],
