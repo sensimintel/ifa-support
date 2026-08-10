@@ -28,12 +28,13 @@ import struct
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 app = FastAPI(title="深体验区后端")
 # 局域网演示服务：放开跨域，供 superadmin(18091) 等同网页面直调
@@ -61,6 +62,9 @@ PAIRING_TRACKED_FIELDS = ("necklace_device_id", "phone_client_id")
 # 让 8070 代理比再开一条对外通路省事。
 NECKLACE_SOURCE_URL = os.environ.get(
     "NECKLACE_SOURCE_URL", "http://127.0.0.1:8060/api/frame/status")
+# 取某个项链最新一帧原图（image/jpeg）。同样经本服务转发，理由见 api_necklace_frame。
+NECKLACE_FRAME_URL = os.environ.get(
+    "NECKLACE_FRAME_URL", "http://127.0.0.1:8060/api/frame/latest")
 NECKLACE_SOURCE_TIMEOUT = 2.0
 # 判定「项链在线」的最大数据龄（秒）：超过这么久没有新帧就不算在线。
 #
@@ -451,11 +455,39 @@ def api_necklaces_online():
         if device_id == UNKNOWN_NECKLACE:
             unknown_active = True   # 不进候选，但要报出去让人去修那个项链
             continue
-        items.append({"device_id": device_id, "age": age,
+        items.append({"device_id": device_id, "age": age, "seq": dev.get("seq"),
                       "fps": dev.get("fps"), "bound_edge": bound.get(device_id)})
     return JSONResponse({"necklaces": items, "error": error,
                          "max_age_s": NECKLACE_ONLINE_MAX_AGE,
                          "unknown_active": unknown_active, "ts": time.time()})
+
+
+@app.get("/api/necklaces/frame")
+def api_necklace_frame(device: str = ""):
+    """代理某个项链的最新帧原图（image/jpeg），供控制面的 <img> 直接展示。
+
+    为什么经本服务转发、而不让控制面直连 8060：superadmin 的 nginx 只反代了
+    /dx-api/ → 宿主 8070，8060 对容器网络的 ufw 放行早已移除，加回去要动部署机
+    防火墙与 nginx 配置。而这里的帧很小（几十 KB、1~2 fps），转发开销可忽略。
+
+    404 原样透出（该项链暂无帧），让前端显示占位而不是当成错误。
+    """
+    device = (device or "").strip()
+    if not device:
+        return JSONResponse({"ok": False, "error": "需要 device 参数"}, status_code=400)
+    url = "%s?device=%s" % (NECKLACE_FRAME_URL, urllib.parse.quote(device))
+    try:
+        with urllib.request.urlopen(url, timeout=NECKLACE_SOURCE_TIMEOUT) as resp:
+            data = resp.read()
+            content_type = resp.headers.get("Content-Type") or "image/jpeg"
+            seq = resp.headers.get("X-Frame-Seq") or "0"
+    except urllib.error.HTTPError as exc:
+        return JSONResponse({"ok": False, "error": "该项链暂无帧"}, status_code=exc.code)
+    except (urllib.error.URLError, OSError) as exc:
+        return JSONResponse({"ok": False, "error": "帧中继不可达：%s" % exc}, status_code=502)
+    # no-store：帧是一直在变的，缓存住就成了静态图
+    return Response(content=data, media_type=content_type,
+                    headers={"Cache-Control": "no-store", "X-Frame-Seq": seq})
 
 
 @app.get("/api/pairing-log")
