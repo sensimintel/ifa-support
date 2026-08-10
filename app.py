@@ -498,9 +498,17 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
     rgb = _rgb_uint8(pred, None)
     if rgb is None or rgb.shape[:2] != (H, W):
         rgb = np.full((H, W, 3), 180, np.uint8)
-    if mask_overlays and hl_cfg is not None:
-        # 高亮模式：样式化染色/纯色/提亮/描边 + 背景压暗直接作用于顶点色（后续不画框）
-        rgb, _ = _apply_hl_styles(rgb, mask_overlays, hl_cfg)
+    if hl_cfg is not None:
+        # 高亮模式：先按配置调底色（饱和/明度，中性 1.0 时跳过），再把样式化染色/纯色/
+        # 提亮/描边 + 背景压暗直接写进顶点色（后续不画框）
+        _gs = float(hl_cfg.get("sat", 1.0)); _gv = float(hl_cfg.get("val", 1.0))
+        if abs(_gs - 1.0) > 1e-3 or abs(_gv - 1.0) > 1e-3:
+            _hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+            _hsv[..., 1] *= _gs
+            _hsv[..., 2] *= _gv
+            rgb = cv2.cvtColor(np.clip(_hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2RGB)
+        if mask_overlays:
+            rgb, _ = _apply_hl_styles(rgb, mask_overlays, hl_cfg)
     elif mask_overlays:
         # SAM3 mask 命中的点染成该词颜色（半透明混合），把分割结果"染"进点云本体
         rgb = rgb.copy()
@@ -902,7 +910,8 @@ _sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
                "dim": 40, "color_mode": "auto", "color": "#ff9f0a",
                "splat": 1, "view_tilt": 10.0, "view_zoom": 1.25,
                "eye_lift": 0.0, "eye_back": 0.0, "out_size": 760,
-               "sat": 0.0, "val": 1.2, "conf": 40}   # 饱和0+明度1.2≈model-viewer 灰白点云观感
+               "sat": 1.0, "val": 1.0, "conf": 40}   # 饱和/明度中性：GLB 直渲本身即 model-viewer
+                                                     # 观感（点云图模式可手动调 0/1.2 复刻灰白）
 _sam3hl = {"kind": None, "url": None, "bytes": None, "seq": 0, "meta": None, "error": None}
 
 
@@ -1011,13 +1020,14 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
                         "meta": {"label": _hlbl,
                                  "render_ms": round((time.time() - _th) * 1000.0, 1)}})
             else:
-                # 与③同参（conf/nmp）同链路构建高亮 GLB；不画框、不画相机线框
+                # 与③同链路（同 pred/nmp/降采样/裁剪）构建高亮 GLB；不画框、不画相机线框。
+                # conf 用高亮配置里独立的分位（默认 40=③默认，此时几何与③全等；调了则按需裁点）
                 htoken = uuid.uuid4().hex
                 houtdir = GLB_DIR / htoken
                 houtdir.mkdir(parents=True, exist_ok=True)
                 hglb = houtdir / "scene.glb"
                 build_pointcloud_boxes_glb(pred, [], str(hglb),
-                                           conf_thresh_percentile=conf,
+                                           conf_thresh_percentile=float(hcfg["conf"]),
                                            num_max_points=nmp, show_cameras=False,
                                            mask_overlays=overlays, hl_cfg=hcfg)
                 _prune_glb()
@@ -1335,14 +1345,14 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="row" style="margin-top:10px">
   <div class="fld"><label>输出分辨率 <span class="rngval" id="pcov">760</span>px</label>
    <input type="range" id="pco" min="480" max="1080" step="40" value="760"></div>
-  <div class="fld"><label>饱和度 ×<span class="rngval" id="pcsv2">0.0</span></label>
-   <input type="range" id="pcs2" min="0" max="2" step="0.1" value="0"></div>
-  <div class="fld"><label>明度 ×<span class="rngval" id="pcvv">1.2</span></label>
-   <input type="range" id="pcv" min="0.2" max="1.6" step="0.1" value="1.2"></div>
+  <div class="fld"><label>饱和度 ×<span class="rngval" id="pcsv2">1.0</span></label>
+   <input type="range" id="pcs2" min="0" max="2" step="0.1" value="1"></div>
+  <div class="fld"><label>明度 ×<span class="rngval" id="pcvv">1.0</span></label>
+   <input type="range" id="pcv" min="0.2" max="1.6" step="0.1" value="1"></div>
   <div class="fld"><label>置信度裁剪分位 <span class="rngval" id="pccv">40</span>%</label>
    <input type="range" id="pcc" min="0" max="90" step="5" value="40"></div>
  </div>
- <div class="hint"><b>仅产物类型=点云图（服务端渲染）时生效</b>；产物类型=点云 GLB 时第四图走 model-viewer 直渲，视角/点大小/分辨率由前端相机决定，本组滑条不起作用。控制第四图点云本身的渲染。虚拟相机=复刻②③的「调优视角」：对准点云中心、<b>相机距离</b>=场景深度×系数（1.25≈②③ 前端）、<b>俯视角</b>绕点云中心俯视、FOV=真实相机内参——全部按场景深度归一化，帧间深度尺度抖动不会带着视角跳，取景与②③一致；<b>附加抬升/后撤</b>是在此基础上的场景相对偏移（×场景深度），默认 0；<b>基础点大小</b>=所有点的 splat 基数（上方高亮"点大小×"在其上再放大）；<b>饱和度/明度</b>只调点云底色，高亮色不受影响；<b>置信度分位</b>越高裁得越狠、点越少越干净（独立于上方"产物参数"的同名项，仅作用第四图）。</div>
+ <div class="hint"><b>产物类型=点云图（服务端渲染）时全部生效</b>；产物类型=点云 GLB 时：<b>饱和度/明度/置信度分位</b>仍生效（写进 GLB 顶点色/裁点，默认中性 1.0/1.0 与③一致），<b>俯视角/相机距离/抬升/后撤</b>由 /experience 高亮背景的前端相机使用（本页第四格相机跟随②、不受影响），<b>基础点大小/输出分辨率</b>不生效。控制第四图点云本身的渲染。虚拟相机=复刻②③的「调优视角」：对准点云中心、<b>相机距离</b>=场景深度×系数（1.25≈②③ 前端）、<b>俯视角</b>绕点云中心俯视、FOV=真实相机内参——全部按场景深度归一化，帧间深度尺度抖动不会带着视角跳，取景与②③一致；<b>附加抬升/后撤</b>是在此基础上的场景相对偏移（×场景深度），默认 0；<b>基础点大小</b>=所有点的 splat 基数（上方高亮"点大小×"在其上再放大）；<b>饱和度/明度</b>只调点云底色，高亮色不受影响；<b>置信度分位</b>越高裁得越狠、点越少越干净（独立于上方"产物参数"的同名项，仅作用第四图）。</div>
 </div>
 
 <label id="ctltglwrap" style="margin:18px 2px 8px;font-size:13px;cursor:pointer;user-select:none;display:block"><input type="checkbox" id="ctltoggle"> 产物参数调节（默认收起 · 改产物类型/分辨率用）</label>
@@ -1851,9 +1861,26 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <label><input type="radio" name="hlcm" value="custom"> 自选</label>
    <input type="color" id="hlcolor" value="#ff9f0a">
   </div></div>
- <div class="hint">与 /panel 的「高亮样式调节」同一套配置（/api/sam3hl/config），两边改动互相可见；
-  调整在下一轮 SAM3 结果生效（约 1~3 秒）。高亮点云与「SAM3点云」同一条 GLB 渲染管线
-  （model-viewer 直渲），取景/点大小由前端相机决定，故不在此调节。</div>
+ <div class="sec">点云整体样式</div>
+ <div class="fld"><label>俯视角 <b id="v_view_tilt">10</b>°</label>
+  <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="10"></div>
+ <div class="fld"><label>相机距离 ×<b id="v_view_zoom">1.25</b></label>
+  <input type="range" id="r_view_zoom" min="0.6" max="2.0" step="0.05" value="1.25"></div>
+ <div class="fld"><label>附加抬升 ×<b id="v_eye_lift">0.00</b></label>
+  <input type="range" id="r_eye_lift" min="0" max="0.5" step="0.05" value="0"></div>
+ <div class="fld"><label>附加后撤 ×<b id="v_eye_back">0.00</b></label>
+  <input type="range" id="r_eye_back" min="0" max="0.5" step="0.05" value="0"></div>
+ <div class="fld"><label>饱和度 ×<b id="v_sat">1.0</b></label>
+  <input type="range" id="r_sat" min="0" max="2" step="0.1" value="1"></div>
+ <div class="fld"><label>明度 ×<b id="v_val">1.0</b></label>
+  <input type="range" id="r_val" min="0.2" max="1.6" step="0.1" value="1"></div>
+ <div class="fld"><label>置信度裁剪分位 <b id="v_conf">40</b>%</label>
+  <input type="range" id="r_conf" min="0" max="90" step="5" value="40"></div>
+ <div class="hint">与 /panel 的两张调节卡同一套配置（/api/sam3hl/config），两边改动互相可见。
+  <b>俯视角/相机距离/抬升/后撤</b>是前端相机参数，拖动立即生效；高亮样式与
+  <b>饱和度/明度/置信度分位</b>写进 GLB，下一轮 SAM3 结果生效（约 1~3 秒）。
+  饱和/明度默认中性 1.0、置信度默认 40，与「SAM3点云」完全一致；点大小在
+  GLB/model-viewer 里不可调，故无此项。</div>
 </div>
 
 <script>
@@ -1908,13 +1935,21 @@ function showModel(url,fov){          // GLB 产物（LA 点云等）：全屏 m
   $('bgA').classList.remove('on');$('bgB').classList.remove('on');
   return true;
 }
-// GLB 加载完自动摆「调优视角」（同 /panel：略俯视、拉远，FOV 用真实相机内参）
-$('bgmv').addEventListener('load',()=>{const mv=$('bgmv');
+// GLB 加载完自动摆「调优视角」（同 /panel：略俯视、拉远，FOV 用真实相机内参）。
+// 高亮点云来源时视角参数可调（抽屉「点云整体样式」，与服务端渲染同语义：绕点云中心
+// 俯视 tilt、距离=|cz|×zoom、附加抬升/后撤 ×|cz|）；默认 10°/1.25/0/0 与②③取景逐位一致。
+const DEF_VIEW={view_tilt:10,view_zoom:1.25,eye_lift:0,eye_back:0};
+function applyExpView(){const mv=$('bgmv');
   try{const c=mv.getBoundingBoxCenter();const cz=(c.z<-0.001)?c.z:-1.5;
+    const v=bgSource==='hl'?hlView:DEF_VIEW;
+    const t=v.view_tilt*Math.PI/180;
+    const dy=v.view_zoom*Math.sin(t)+v.eye_lift, dz=v.view_zoom*Math.cos(t)+v.eye_back;
     mv.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
-    mv.cameraOrbit='0deg 80deg '+(Math.abs(cz)*1.25).toFixed(4)+'m';
+    mv.cameraOrbit='0deg '+(90-Math.atan2(dy,dz)*180/Math.PI).toFixed(2)+'deg '
+      +(Math.abs(cz)*Math.hypot(dy,dz)).toFixed(4)+'m';
     mv.fieldOfView=mvFov+'deg';
-    mv.jumpCameraToGoal&&mv.jumpCameraToGoal();}catch(e){}});
+    mv.jumpCameraToGoal&&mv.jumpCameraToGoal();}catch(e){}}
+$('bgmv').addEventListener('load',applyExpView);
 
 // 服务重启后配置清零会回落 depth 模式（识别不触发）：本页独立运行时补推默认配置（glb=识别链路）
 let lastCfgPush=0;
@@ -1970,20 +2005,26 @@ async function bgTick(){
   }
   // 所选来源暂无产物（模型服务未就绪等）→ 兜底显示设备原图，避免黑屏
   if(!shown&&s.has_frame)showImg('/api/frame/latest?t='+s.seq,'rawfb:'+s.seq);
-  // 流水小窗：镜像当前背景画面（点云等）；背景是 GLB/尚无图时才回退设备原帧
+  // 流水小窗：镜像当前背景画面——图片背景直接复用 url；GLB 背景截取 model-viewer
+  // 画布（toDataURL）做镜像（不受流水态压暗影响）；两者都没有时才回退设备原帧
   if($('tl').classList.contains('on')){
-    const mvOn=$('bgmv').style.display!=='none';
-    const insetUrl=(!mvOn&&lastBgUrl)?lastBgUrl:(s.has_frame?'/api/frame/latest?t='+s.seq:null);
-    if(insetUrl&&insetUrl!==lastInset){lastInset=insetUrl;
-      $('tlraw').src=insetUrl;
-      $('tlraw').style.display='block';$('tlwait').style.display='none';}
+    const mv=$('bgmv'),mvOn=mv.style.display!=='none';
+    if(mvOn&&mv.loaded&&mv.src){
+      try{$('tlraw').src=mv.toDataURL('image/jpeg',0.8);lastInset='';
+        $('tlraw').style.display='block';$('tlwait').style.display='none';}catch(e){}
+    }else{
+      const insetUrl=(!mvOn&&lastBgUrl)?lastBgUrl:(s.has_frame?'/api/frame/latest?t='+s.seq:null);
+      if(insetUrl&&insetUrl!==lastInset){lastInset=insetUrl;
+        $('tlraw').src=insetUrl;
+        $('tlraw').style.display='block';$('tlwait').style.display='none';}
+    }
   }
  }catch(e){/* 单次轮询失败忽略 */}
 }
 
 // ══ 状态机：待机 ↔ 识别成功（识别失败态暂不做）══
 // 最新卡片有更新（id/rev 变化）即进入成功态并驻留 FRESH_MS；无更新则回落待机
-const FRESH_MS=20000;
+const FRESH_MS=10000;
 let lastCardKey='',cardShownAt=0,curCard=null;
 function setState(st){
   $('idle').classList.toggle('on',st==='idle'&&!$('tl').classList.contains('on'));
@@ -2033,6 +2074,7 @@ $('selStyle').onchange=()=>{
   bgSource=$('selStyle').value;
   localStorage.setItem('exp_bg',bgSource);
   lastBgKey='';lastMvUrl='';   // 立刻允许下一轮加载新来源
+  applyExpView();              // hl↔其它来源视角参数不同：切换即按新来源重摆相机
   syncStyleUI();bgTick();
 };
 $('btnTl').onclick=()=>{
@@ -2046,9 +2088,13 @@ syncStyleUI();
 
 // ══ 高亮点云样式调节抽屉：读写 /api/sam3hl/config（与 /panel 的「高亮样式调节」同一套配置） ══
 // 打开时从服务端读当前配置回填（不主动推初值，避免覆盖 /panel 已调好的参数），改动才下发
-// GLB 直渲模式下仅高亮样式类字段有效（点大小/视角/分辨率等由 model-viewer 前端相机决定）
-const HL_KEYS=['strength','dim'];
-const HL_FMT={};
+// strength/dim/sat/val/conf 走服务端写进 GLB；view_* 四项是前端相机参数（拖动立即生效），
+// 同样存进服务端配置做持久化/与 /panel 互通。点大小/输出分辨率在 GLB 直渲下不存在，不设。
+const HL_KEYS=['strength','dim','view_tilt','view_zoom','eye_lift','eye_back','sat','val','conf'];
+const HL_FMT={view_zoom:v=>(+v).toFixed(2),eye_lift:v=>(+v).toFixed(2),
+              eye_back:v=>(+v).toFixed(2),sat:v=>(+v).toFixed(1),val:v=>(+v).toFixed(1)};
+const VIEW_KEYS=['view_tilt','view_zoom','eye_lift','eye_back'];
+let hlView={view_tilt:10,view_zoom:1.25,eye_lift:0,eye_back:0};
 let hlStyle='tint',hlPushTimer=null;
 function hlLabel(k){$('v_'+k).textContent=(HL_FMT[k]||(v=>v))($('r_'+k).value);}
 function pushHlCfg(){
@@ -2068,11 +2114,15 @@ async function loadHlCfg(){
     if(c.style){hlStyle=c.style;
       document.querySelectorAll('#hlseg button').forEach(b=>b.classList.toggle('on',b.dataset.s===hlStyle));}
     HL_KEYS.forEach(k=>{if(c[k]!==undefined){$('r_'+k).value=c[k];hlLabel(k);}});
+    VIEW_KEYS.forEach(k=>{if(c[k]!==undefined)hlView[k]=+c[k];});
+    applyExpView();   // 服务端可能有 /panel 调过的视角参数，回填后立即应用
     if(c.color_mode)document.querySelector('input[name=hlcm][value='+c.color_mode+']').checked=true;
     if(/^#[0-9a-fA-F]{6}$/.test(c.color||''))$('hlcolor').value=c.color;
   }catch(e){/* 读取失败保持面板默认值 */}
 }
-HL_KEYS.forEach(k=>$('r_'+k).addEventListener('input',()=>{hlLabel(k);pushHlCfg();}));
+HL_KEYS.forEach(k=>$('r_'+k).addEventListener('input',()=>{hlLabel(k);
+  if(VIEW_KEYS.includes(k)){hlView[k]=+$('r_'+k).value;applyExpView();}   // 相机参数立即生效
+  pushHlCfg();}));
 document.querySelectorAll('#hlseg button').forEach(b=>b.addEventListener('click',()=>{
   hlStyle=b.dataset.s;
   document.querySelectorAll('#hlseg button').forEach(x=>x.classList.toggle('on',x===b));
