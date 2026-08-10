@@ -2006,17 +2006,23 @@ async function bgTick(){
   // 所选来源暂无产物（模型服务未就绪等）→ 兜底显示设备原图，避免黑屏
   if(!shown&&s.has_frame)showImg('/api/frame/latest?t='+s.seq,'rawfb:'+s.seq);
   // 流水小窗：镜像当前背景画面——图片背景直接复用 url；GLB 背景截取 model-viewer
-  // 画布（toDataURL）做镜像（不受流水态压暗影响）；两者都没有时才回退设备原帧
+  // 画布（toDataURL）做镜像（不受流水态压暗影响）。GLB 换模加载中（loaded=false）
+  // 保持上一帧镜像不动，避免与设备原帧来回闪；只有从未截到过镜像时才临时垫原帧。
   if($('tl').classList.contains('on')){
-    const mv=$('bgmv'),mvOn=mv.style.display!=='none';
-    if(mvOn&&mv.loaded&&mv.src){
-      try{$('tlraw').src=mv.toDataURL('image/jpeg',0.8);lastInset='';
-        $('tlraw').style.display='block';$('tlwait').style.display='none';}catch(e){}
+    const mv=$('bgmv'),mvOn=mv.style.display!=='none',tlr=$('tlraw');
+    if(mvOn){
+      if(mv.loaded&&mv.src){
+        try{tlr.src=mv.toDataURL('image/jpeg',0.8);lastInset='';
+          tlr.style.display='block';$('tlwait').style.display='none';}catch(e){}
+      }else if(!tlr.src&&s.has_frame){   // 尚无任何镜像可显：先垫设备原帧防空窗
+        tlr.src='/api/frame/latest?t='+s.seq;lastInset='';
+        tlr.style.display='block';$('tlwait').style.display='none';
+      }
     }else{
-      const insetUrl=(!mvOn&&lastBgUrl)?lastBgUrl:(s.has_frame?'/api/frame/latest?t='+s.seq:null);
+      const insetUrl=lastBgUrl||(s.has_frame?'/api/frame/latest?t='+s.seq:null);
       if(insetUrl&&insetUrl!==lastInset){lastInset=insetUrl;
-        $('tlraw').src=insetUrl;
-        $('tlraw').style.display='block';$('tlwait').style.display='none';}
+        tlr.src=insetUrl;
+        tlr.style.display='block';$('tlwait').style.display='none';}
     }
   }
  }catch(e){/* 单次轮询失败忽略 */}
