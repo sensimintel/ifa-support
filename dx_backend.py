@@ -4,11 +4,17 @@
 1. 四通道食物秤（一台 SJ101T2_CH4_ETH 模块，通道 1..4 → 寄存器 addr 0/2/4/6）：
    后台线程轮询缓存实时读数；「清空」= 软件去皮（记当前 raw 为皮重）。
 2. 桌边分组绑定配置：每条桌边一组「手机 / 项链 / 秤通道」，可查可改、落盘持久化。
-   这份绑定信息是深体验区的编排事实源——services 之后可按设备号反查所在组，
-   进而知道该设备的推理要读哪个秤通道（见 GET /api/groups/resolve）。
+   这份绑定信息是深体验区的编排事实源——services 按项链 device_id 反查所在组，
+   即可得知要读哪个秤通道、以及把通知推给哪台手机（见 GET /api/groups/resolve）。
+   三层身份（详见 NETWORK.md）：
+     · 秤   = 通道号 1..4，固定不变
+     · 项链 = 蓝牙名（odyss-XXXX），随帧上报在 camera_info.device_id，跨手机稳定
+     · 手机 = client_id（App 每个请求的 X-Client-Id），推送定向用它；
+              不能用 FCM token 或 target_id——token 会轮换、target_id 由它派生
+3. 在线项链列表（代理 8060 帧中继）与绑定变更流水，供控制面下拉选择与追踪配对历史。
 
-持久化：单文件 dx_data.json（分组配置 + 各通道皮重），原子写（tmp+rename），
-重启不丢；文件 gitignore，不进代码仓。
+持久化：dx_data.json（分组配置 + 各通道皮重）原子写（tmp+rename）；
+dx_pairing_log.jsonl 追加写绑定变更流水。两者均 gitignore，不进代码仓。
 
 零重依赖：fastapi + uvicorn（复用 da3 conda 环境），Modbus TCP 为手写 socket。
 启动：./run-dx.sh 或 systemd dx-backend.service（见 deploy.sh）。
@@ -20,6 +26,8 @@ import socket
 import struct
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from fastapi import Body, FastAPI
@@ -35,25 +43,77 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 # 持久化状态：分组配置 + 皮重
 # ══════════════════════════════════════════════════════════════════════
 DATA_FILE = Path(__file__).resolve().parent / "dx_data.json"
+# 绑定变更流水（append-only）：追踪项链/手机什么时候换到了哪条桌边
+PAIRING_LOG_FILE = Path(__file__).resolve().parent / "dx_pairing_log.jsonl"
 EDGES = (1, 2, 3, 4)
 
 # 分组允许编辑的字段（除 edge 外全部可改）
-GROUP_EDITABLE_FIELDS = ("label", "phone_device_id", "necklace_device_id", "scale_channel")
+GROUP_EDITABLE_FIELDS = (
+    "label", "phone_no", "phone_identity", "phone_client_id", "phone_user_id",
+    "necklace_device_id", "scale_channel",
+)
+# 会写入配对流水的字段（只关心「谁换到了哪条桌边」这类物理配对）
+PAIRING_TRACKED_FIELDS = ("necklace_device_id", "phone_client_id")
+
+# 在线项链来源：8060 帧中继按 camera_info.device_id 分桶维护的设备表（60s 无新帧即下线）。
+# 走宿主 localhost——控制面只经 nginx /dx-api/ 访问 8070，8060 那条 ufw 放行早已移除，
+# 让 8070 代理比再开一条对外通路省事。
+NECKLACE_SOURCE_URL = os.environ.get(
+    "NECKLACE_SOURCE_URL", "http://127.0.0.1:8060/api/frame/status")
+NECKLACE_SOURCE_TIMEOUT = 2.0
 
 _state_lock = threading.Lock()
 
 
-def _default_state():
-    """默认状态：桌边 N 绑秤通道 N，设备号留空待配置。"""
+def _default_group(edge):
+    """一条桌边的默认绑定。三层身份的取值来源见 NETWORK.md：
+    秤=通道号（固定）；项链=蓝牙名（如 odyss-0F0B）；手机=client_id（X-Client-Id）。
+    """
     return {
-        "groups": [
-            {"edge": e, "label": f"桌边 {e}",
-             "phone_device_id": "", "necklace_device_id": "", "scale_channel": e}
-            for e in EDGES
-        ],
+        "edge": edge,
+        "label": f"桌边 {edge}",
+        "scale_channel": edge,
+        # 手机编号：纯人类标签，方便现场喊「1 号机」；定向一律用 phone_client_id
+        "phone_no": edge,
+        # 账号（手机号/邮箱）：控制面据此查该手机的推送目标；4 台演示手机各登一个账号
+        "phone_identity": "",
+        # 手机唯一身份：App 每个请求的 X-Client-Id。推送定向用它，不用 FCM token
+        # （token 会轮换，target_id 由 token_hash 派生也会跟着变）
+        "phone_client_id": "",
+        "phone_user_id": "",
+        # 项链蓝牙名，随帧上报在 camera_info.device_id
+        "necklace_device_id": "",
+    }
+
+
+def _default_state():
+    """默认状态：桌边 N 绑秤通道 N，设备身份留空待配置。"""
+    return {
+        "groups": [_default_group(e) for e in EDGES],
         # 皮重按通道存 raw 值（与读数同分度），服务重启不丢
         "tare_raw": {str(ch): 0 for ch in EDGES},
     }
+
+
+def _migrate_groups(state):
+    """把旧结构升级到新结构，返回是否发生改动。
+
+    旧版把手机记成 phone_device_id 自由文本（实际存的是 "iPhone-5 (192.168.0.243)"
+    这类带 IP 的描述，IP 会变、也无法用于推送定向），这里直接丢弃并打日志留痕，
+    改由 phone_client_id 承担手机身份。
+    """
+    changed = False
+    for group in state.get("groups", []):
+        legacy = group.pop("phone_device_id", None)
+        if legacy:
+            print(f"[迁移] 桌边 {group.get('edge')} 的旧 phone_device_id={legacy!r} 已丢弃，"
+                  f"请在控制面重新绑定手机（改用 client_id 定向）", flush=True)
+            changed = True
+        for key, value in _default_group(group.get("edge") or 0).items():
+            if key not in group:
+                group[key] = value
+                changed = True
+    return changed
 
 
 def _load_state():
@@ -65,12 +125,25 @@ def _load_state():
             default = _default_state()
             for key, value in default.items():
                 state.setdefault(key, value)
+            if _migrate_groups(state):
+                _save_state(state)
             return state
         except Exception:
             pass
     state = _default_state()
     _save_state(state)
     return state
+
+
+def _append_pairing_log(edge, field, old, new):
+    """把一次绑定变更追加到配对流水。写失败只打日志，绝不影响绑定本身。"""
+    try:
+        record = {"ts": time.time(), "edge": edge, "field": field,
+                  "old": old, "new": new}
+        with PAIRING_LOG_FILE.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        print(f"[配对流水] 写入失败（绑定已生效，仅流水缺失）：{exc}", flush=True)
 
 
 def _save_state(state):
@@ -239,35 +312,119 @@ def api_groups():
 
 @app.put("/api/groups/{edge}")
 def api_group_update(edge: int, patch: dict = Body(...)):
-    """更新一条桌边的绑定（支持部分字段），立即落盘。"""
+    """更新一条桌边的绑定（支持部分字段），立即落盘并记配对流水。"""
     if edge not in EDGES:
         return JSONResponse({"ok": False, "error": f"桌边 {edge} 不存在（合法 1~4）"},
                             status_code=404)
     unknown = [k for k in patch if k not in GROUP_EDITABLE_FIELDS]
     if unknown:
         return JSONResponse({"ok": False, "error": f"不支持的字段：{unknown}"}, status_code=400)
-    if "scale_channel" in patch:
-        if not isinstance(patch["scale_channel"], int) or patch["scale_channel"] not in SCALE_CHANNELS:
-            return JSONResponse({"ok": False, "error": "scale_channel 必须是 1~4 的整数"},
+    for key, allowed in (("scale_channel", SCALE_CHANNELS), ("phone_no", EDGES)):
+        if key in patch and (not isinstance(patch[key], int) or patch[key] not in allowed):
+            return JSONResponse({"ok": False, "error": f"{key} 必须是 1~4 的整数"},
                                 status_code=400)
-    for key in ("label", "phone_device_id", "necklace_device_id"):
+    for key in ("label", "phone_identity", "phone_client_id", "phone_user_id",
+                "necklace_device_id"):
         if key in patch and not isinstance(patch[key], str):
             return JSONResponse({"ok": False, "error": f"{key} 必须是字符串"}, status_code=400)
+
     with _state_lock:
+        # 同一项链 / 同一手机不能同时绑在两条桌边，否则 resolve 会出现歧义
+        for key, name_cn in (("necklace_device_id", "项链"), ("phone_client_id", "手机")):
+            value = str(patch.get(key, "") or "").strip()
+            if not value:
+                continue
+            conflict = next((g for g in _state["groups"]
+                             if g["edge"] != edge and g.get(key) == value), None)
+            if conflict:
+                return JSONResponse(
+                    {"ok": False,
+                     "error": f"{name_cn} {value} 已绑在桌边 {conflict['edge']}，请先在那边解绑"},
+                    status_code=409)
         group = _group_of(edge)
+        # 先算出物理配对的变化，落盘后再写流水（不在持锁期间做文件 IO）
+        changes = [(k, group.get(k, ""), patch[k]) for k in PAIRING_TRACKED_FIELDS
+                   if k in patch and patch[k] != group.get(k, "")]
         group.update({k: v for k, v in patch.items() if k in GROUP_EDITABLE_FIELDS})
         _save_state(_state)
-        return JSONResponse({"ok": True, "group": dict(group)})
+        updated = dict(group)
+
+    for field, old, new in changes:
+        _append_pairing_log(edge, field, old, new)
+    return JSONResponse({"ok": True, "group": updated})
 
 
 @app.get("/api/groups/resolve")
-def api_group_resolve(device_id: str):
-    """按设备号（手机或项链）反查所在分组——services 由此得知该设备对应读哪个秤通道。"""
+def api_group_resolve(device_id: str = "", client_id: str = ""):
+    """按项链设备号或手机 client_id 反查所在分组。
+
+    services 的典型用法：拿到项链 device_id（camera_info.device_id）→ 得到该桌边的
+    秤通道，以及要把通知推给哪台手机（phone_client_id + phone_user_id）。
+    """
+    device_id = (device_id or "").strip()
+    client_id = (client_id or "").strip()
+    if not device_id and not client_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id（项链）或 client_id（手机）"},
+                            status_code=400)
     with _state_lock:
         for group in _state["groups"]:
-            if device_id and device_id in (group["phone_device_id"], group["necklace_device_id"]):
+            if device_id and device_id == group.get("necklace_device_id"):
                 return JSONResponse({"ok": True, "group": dict(group)})
-    return JSONResponse({"ok": False, "error": f"没有分组绑定设备 {device_id}"}, status_code=404)
+            if client_id and client_id == group.get("phone_client_id"):
+                return JSONResponse({"ok": True, "group": dict(group)})
+    missing = device_id or client_id
+    return JSONResponse({"ok": False, "error": f"没有分组绑定 {missing}"}, status_code=404)
+
+
+@app.get("/api/necklaces/online")
+def api_necklaces_online():
+    """在线项链列表：代理 8060 帧中继的设备表，并标注每个项链当前绑在哪条桌边。
+
+    项链身份取 camera_info.device_id（蓝牙名，如 odyss-0F0B），跨手机稳定。
+    帧中继不可达时返回空列表 + error 说明，让控制面回落到手工输入而不是报错。
+    注意：只有「正在发帧」的项链才会出现，60s 没有新帧即被帧中继判为下线。
+    """
+    devices, error = [], ""
+    try:
+        with urllib.request.urlopen(NECKLACE_SOURCE_URL, timeout=NECKLACE_SOURCE_TIMEOUT) as resp:
+            devices = (json.loads(resp.read().decode("utf-8")) or {}).get("devices") or []
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        error = f"帧中继（{NECKLACE_SOURCE_URL}）不可达：{exc}"
+    with _state_lock:
+        bound = {g["necklace_device_id"]: g["edge"] for g in _state["groups"]
+                 if g.get("necklace_device_id")}
+    items = []
+    for dev in devices:
+        device_id = str((dev or {}).get("device_id") or "").strip()
+        if not device_id:
+            continue
+        items.append({"device_id": device_id, "age": dev.get("age"),
+                      "fps": dev.get("fps"), "bound_edge": bound.get(device_id)})
+    return JSONResponse({"necklaces": items, "error": error, "ts": time.time()})
+
+
+@app.get("/api/pairing-log")
+def api_pairing_log(limit: int = 50):
+    """最近的绑定变更流水（倒序）：追踪一天里项链/手机什么时候换到了哪条桌边。"""
+    limit = max(1, min(limit, 500))
+    if not PAIRING_LOG_FILE.exists():
+        return JSONResponse({"records": []})
+    try:
+        lines = PAIRING_LOG_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return JSONResponse({"records": [], "error": f"流水读取失败：{exc}"})
+    records = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            continue
+        if len(records) >= limit:
+            break
+    return JSONResponse({"records": records})
 
 
 @app.get("/api/food-scales")
