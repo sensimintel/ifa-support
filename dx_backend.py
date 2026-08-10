@@ -68,6 +68,11 @@ NECKLACE_SOURCE_TIMEOUT = 2.0
 # 多设备下拉、/panel 的选中设备回落都依赖它，调小会让那些页面在短暂停传时就丢设备。
 # 这里只在本接口按更严的阈值过滤，影响面收在深体验区内。
 NECKLACE_ONLINE_MAX_AGE = float(os.environ.get("NECKLACE_ONLINE_MAX_AGE", "15"))
+# 帧中继对「camera_info 缺失或其中没有 device_id」的兜底桶名。
+# 它不是真实身份：多个未识别设备的帧会混进同一个桶，绑定它毫无意义，故不进候选。
+# 但它出现本身是个运维信号——说明有项链的蓝牙名没被 App 侧的 BleDeviceIdentityCache
+# 缓存到（回落顺序：缓存 → 已连接设备 → 配置值 → "unknown"），该项链需要重连一次。
+UNKNOWN_NECKLACE = "unknown"
 
 _state_lock = threading.Lock()
 
@@ -434,7 +439,7 @@ def api_necklaces_online():
     with _state_lock:
         bound = {g["necklace_device_id"]: g["edge"] for g in _state["groups"]
                  if g.get("necklace_device_id")}
-    items = []
+    items, unknown_active = [], False
     for dev in devices:
         device_id = str((dev or {}).get("device_id") or "").strip()
         if not device_id:
@@ -443,10 +448,14 @@ def api_necklaces_online():
         # age 未知一律当不在线：宁可少列一个，也不要把停传的项链说成在线
         if age is None or age > NECKLACE_ONLINE_MAX_AGE:
             continue
+        if device_id == UNKNOWN_NECKLACE:
+            unknown_active = True   # 不进候选，但要报出去让人去修那个项链
+            continue
         items.append({"device_id": device_id, "age": age,
                       "fps": dev.get("fps"), "bound_edge": bound.get(device_id)})
     return JSONResponse({"necklaces": items, "error": error,
-                         "max_age_s": NECKLACE_ONLINE_MAX_AGE, "ts": time.time()})
+                         "max_age_s": NECKLACE_ONLINE_MAX_AGE,
+                         "unknown_active": unknown_active, "ts": time.time()})
 
 
 @app.get("/api/pairing-log")
