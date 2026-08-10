@@ -470,7 +470,8 @@ def _box_wireframe_meshes(lo, hi, color_rgb, radius):
 
 
 def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentile=40.0,
-                               num_max_points=800000, show_cameras=True, mask_overlays=None):
+                               num_max_points=800000, show_cameras=True, mask_overlays=None,
+                               hl_cfg=None):
     """自建单视图点云并叠加 food/drink 3D 检测框，导出 GLB。
 
     坐标系用「相机坐标系」（相机=原点/拍摄位置、光轴固定，仅 flip Y/Z 到 glTF 约定），
@@ -479,7 +480,11 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
 
     mask_overlays：SAM3 mask 映射，[(label, color_rgb, mask_bool(H,W)), ...]——mask 命中的点
     染成该词颜色，并按 mask 命中点算 3D AABB 画线框。同一函数/同一 pred 下点云几何与
-    detections 链路完全一致，保证第二/三图点云长一个样。"""
+    detections 链路完全一致，保证第二/三图点云长一个样。
+
+    hl_cfg 非空=第四图「高亮点云」模式：mask 染色不走 0.5 混合，而是把 _apply_hl_styles
+    的样式（染色/纯色/提亮/描边 + 背景压暗）直接写进顶点色，且不画 mask 的 AABB 线框
+    （无框）——点云几何/降采样/裁剪与②③完全同链路，仅顶点颜色不同。"""
     from depth_anything_3.utils.export import glb as _glb  # 复用官方对齐/相机/降采样
 
     depth = np.asarray(pred.depth).astype(np.float32)       # (N,H,W)
@@ -493,7 +498,10 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
     rgb = _rgb_uint8(pred, None)
     if rgb is None or rgb.shape[:2] != (H, W):
         rgb = np.full((H, W, 3), 180, np.uint8)
-    if mask_overlays:
+    if mask_overlays and hl_cfg is not None:
+        # 高亮模式：样式化染色/纯色/提亮/描边 + 背景压暗直接作用于顶点色（后续不画框）
+        rgb, _ = _apply_hl_styles(rgb, mask_overlays, hl_cfg)
+    elif mask_overlays:
         # SAM3 mask 命中的点染成该词颜色（半透明混合），把分割结果"染"进点云本体
         rgb = rgb.copy()
         for (_label, _col, _mk) in mask_overlays:
@@ -593,8 +601,9 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
             scene.add_geometry(m)
         hit_labels.append(label)
 
-    # 逐 SAM3 mask：mask 命中的有效点就是目标本体（无需前景启发式），2%/98% 分位 AABB 画线框
-    for (label, col, mk) in (mask_overlays or []):
+    # 逐 SAM3 mask：mask 命中的有效点就是目标本体（无需前景启发式），2%/98% 分位 AABB 画线框；
+    # 高亮模式（hl_cfg 非空）不画任何框
+    for (label, col, mk) in ([] if hl_cfg is not None else (mask_overlays or [])):
         sel = mk & valid
         sub_pts = Xa_grid[sel]
         if sub_pts.shape[0] < 20:
@@ -866,8 +875,10 @@ _sam3cloud = {"kind": None, "url": None, "bytes": None, "seq": 0,
               "meta": None, "error": None, "running": False}
 
 # ── 第四图：SAM3 高亮点云（无框）。与第三图共用同一轮 SAM3 mask 结果，仅呈现方式不同：
-# 不画 AABB 框，改为点云本体高亮。样式/强度/点大小/背景压暗/颜色由 /api/sam3hl/config
-# 实时可调（只影响本图），始终走服务端渲染图（点大小只有该路径能控）。──
+# 不画 AABB 框，改为点云本体高亮。样式/强度/背景压暗/颜色由 /api/sam3hl/config 实时可调
+# （只影响本图）。产物形态跟随③：fmt=glb → 与②③同一条 GLB 构建链路直渲（model-viewer
+# 同管线，高亮写进顶点色；点大小在 glTF/model-viewer 里不可控，该字段仅图模式生效）；
+# fmt=cloudimg → 服务端渲染 JPEG（点大小/视角等「点云整体样式」仅此路径生效）。──
 _HL_STYLE_CN = {"tint": "染色", "solid": "纯色", "glow": "提亮", "outline": "描边"}
 # 数值字段统一钳制表：{字段: (下限, 上限, 类型)}，高亮组 + 点云整体样式组共用一个配置
 _HL_NUM_FIELDS = {
@@ -892,7 +903,7 @@ _sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
                "splat": 1, "view_tilt": 10.0, "view_zoom": 1.25,
                "eye_lift": 0.0, "eye_back": 0.0, "out_size": 760,
                "sat": 0.0, "val": 1.2, "conf": 40}   # 饱和0+明度1.2≈model-viewer 灰白点云观感
-_sam3hl = {"bytes": None, "seq": 0, "meta": None, "error": None}
+_sam3hl = {"kind": None, "url": None, "bytes": None, "seq": 0, "meta": None, "error": None}
 
 
 def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
@@ -962,37 +973,60 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
             _sam3_dets["dets"] = drink_dets
             _sam3_dets["ts"] = time.time()
 
-        # 第四图：同一轮 overlays 再渲一张"纯高亮、无框"的服务端图。零额外 SAM3 调用，
-        # 样式读 /api/sam3hl/config 的实时配置；独立 try 隔离，失败不影响第三图。
+        # 第四图：同一轮 overlays 产出"纯高亮、无框"版。零额外 SAM3 调用，样式读
+        # /api/sam3hl/config 的实时配置；独立 try 隔离，失败不影响第三图。
+        # fmt=glb（默认/展示页）→ 与②③同一条 GLB 构建链路（同 pred/conf/降采样/裁剪，
+        # 高亮写进顶点色），前端 model-viewer 直渲，除高亮/无框外与③画面一致；
+        # fmt=cloudimg → 维持服务端渲染 JPEG（与③同为图模式，点大小/视角可调）。
         try:
             with _sam3hl_lock:
                 hcfg = dict(_sam3hl_cfg)
             _th = time.time()
-            # 点云整体样式全部来自面板配置（含独立的 conf 分位）；饱和/明度=1 时不做调色
-            _cg = (hcfg["sat"], hcfg["val"]) \
-                if abs(hcfg["sat"] - 1.0) > 1e-3 or abs(hcfg["val"] - 1.0) > 1e-3 else None
-            himg = _render_pointcloud_image(pred, None,
-                                            conf_thresh_percentile=float(hcfg["conf"]),
-                                            view_tilt=float(hcfg["view_tilt"]),
-                                            view_zoom=float(hcfg["view_zoom"]),
-                                            splat=int(hcfg["splat"]),
-                                            out_size=int(hcfg["out_size"]),
-                                            eye_lift=float(hcfg["eye_lift"]),
-                                            eye_back=float(hcfg["eye_back"]),
-                                            color_grade=_cg,
-                                            mask_overlays=overlays, hl_cfg=hcfg,
-                                            aspect=16 / 9)   # /experience 全屏 16:9 画布
-            if himg is None:
-                raise RuntimeError("点云为空，无法渲染")
-            hok, hbuf = cv2.imencode(".jpg", cv2.cvtColor(himg, cv2.COLOR_RGB2BGR))
-            if not hok:
-                raise RuntimeError("高亮点云图编码失败")
-            with _sam3hl_lock:
-                _sam3hl.update({
-                    "bytes": hbuf.tobytes(), "seq": _sam3hl["seq"] + 1, "error": None,
-                    "meta": {"label": f"高亮·{_HL_STYLE_CN.get(hcfg['style'], hcfg['style'])}"
-                                      f"（{'、'.join(id_tags) if id_tags else '无目标'}）",
-                             "render_ms": round((time.time() - _th) * 1000.0, 1)}})
+            _hlbl = (f"高亮·{_HL_STYLE_CN.get(hcfg['style'], hcfg['style'])}"
+                     f"（{'、'.join(id_tags) if id_tags else '无目标'}）")
+            if fmt == "cloudimg":
+                # 点云整体样式全部来自面板配置（含独立的 conf 分位）；饱和/明度=1 时不做调色
+                _cg = (hcfg["sat"], hcfg["val"]) \
+                    if abs(hcfg["sat"] - 1.0) > 1e-3 or abs(hcfg["val"] - 1.0) > 1e-3 else None
+                himg = _render_pointcloud_image(pred, None,
+                                                conf_thresh_percentile=float(hcfg["conf"]),
+                                                view_tilt=float(hcfg["view_tilt"]),
+                                                view_zoom=float(hcfg["view_zoom"]),
+                                                splat=int(hcfg["splat"]),
+                                                out_size=int(hcfg["out_size"]),
+                                                eye_lift=float(hcfg["eye_lift"]),
+                                                eye_back=float(hcfg["eye_back"]),
+                                                color_grade=_cg,
+                                                mask_overlays=overlays, hl_cfg=hcfg,
+                                                aspect=16 / 9)   # /experience 全屏 16:9 画布
+                if himg is None:
+                    raise RuntimeError("点云为空，无法渲染")
+                hok, hbuf = cv2.imencode(".jpg", cv2.cvtColor(himg, cv2.COLOR_RGB2BGR))
+                if not hok:
+                    raise RuntimeError("高亮点云图编码失败")
+                with _sam3hl_lock:
+                    _sam3hl.update({
+                        "kind": "image", "url": None,
+                        "bytes": hbuf.tobytes(), "seq": _sam3hl["seq"] + 1, "error": None,
+                        "meta": {"label": _hlbl,
+                                 "render_ms": round((time.time() - _th) * 1000.0, 1)}})
+            else:
+                # 与③同参（conf/nmp）同链路构建高亮 GLB；不画框、不画相机线框
+                htoken = uuid.uuid4().hex
+                houtdir = GLB_DIR / htoken
+                houtdir.mkdir(parents=True, exist_ok=True)
+                hglb = houtdir / "scene.glb"
+                build_pointcloud_boxes_glb(pred, [], str(hglb),
+                                           conf_thresh_percentile=conf,
+                                           num_max_points=nmp, show_cameras=False,
+                                           mask_overlays=overlays, hl_cfg=hcfg)
+                _prune_glb()
+                with _sam3hl_lock:
+                    _sam3hl.update({
+                        "kind": "model", "url": f"/glb/{htoken}/scene.glb",
+                        "bytes": None, "seq": _sam3hl["seq"] + 1, "error": None,
+                        "meta": {"label": _hlbl,
+                                 "render_ms": round((time.time() - _th) * 1000.0, 1)}})
         except Exception as e:
             with _sam3hl_lock:
                 _sam3hl["error"] = f"{type(e).__name__}: {e}"
@@ -1101,7 +1135,7 @@ def _reset_stream_state():
         _sam3cloud.update({"kind": None, "url": None, "bytes": None,
                            "meta": None, "error": None})
     with _sam3hl_lock:
-        _sam3hl.update({"bytes": None, "meta": None, "error": None})
+        _sam3hl.update({"kind": None, "url": None, "bytes": None, "meta": None, "error": None})
 
 
 def _track_stream_device(device_id):
@@ -1243,9 +1277,14 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <figure>
   <div class="box">
    <img id="hlimg" style="display:none">
+   <model-viewer id="mv3" style="display:none" touch-action="none"
+     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
+     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
+     min-field-of-view="10deg" max-field-of-view="60deg"
+     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
    <span class="wait" id="hlwait">等待 SAM3 高亮点云…</span>
   </div>
-  <figcaption>SAM3 高亮点云（同③识别结果 · 无框）<span class="m" id="hlmeta"></span></figcaption>
+  <figcaption>SAM3 高亮点云（同③点云 · 无框 · 相机跟随②）<span class="m" id="hlmeta"></span></figcaption>
  </figure>
  <figure>
   <div class="box"><img id="raw" style="display:none"><span class="wait" id="rawwait">等待设备帧…</span></div>
@@ -1276,7 +1315,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
     <input type="color" id="hlc" value="#ff9f0a" style="width:44px;height:28px;border:none;background:none;padding:0;cursor:pointer">
    </div></div>
  </div>
- <div class="hint">样式：<b>染色</b>=原色与高亮色按强度混合；<b>纯色</b>=直接填色；<b>提亮</b>=保留物体纹理只加亮加饱和（颜色选择不生效）；<b>描边</b>=只描 mask 轮廓一圈。点大小只放大高亮点；背景压暗把非目标点整体调暗、聚光灯式突出目标。调整在下一轮 SAM3 结果生效（约 1~3 秒）。</div>
+ <div class="hint">样式：<b>染色</b>=原色与高亮色按强度混合；<b>纯色</b>=直接填色；<b>提亮</b>=保留物体纹理只加亮加饱和（颜色选择不生效）；<b>描边</b>=只描 mask 轮廓一圈。背景压暗把非目标点整体调暗、聚光灯式突出目标。调整在下一轮 SAM3 结果生效（约 1~3 秒）。产物类型=<b>点云 GLB</b> 时第四图与②③同管线 model-viewer 直渲（相机跟随②），<b>点大小</b>不可调（glTF 点渲染尺寸固定），仅产物类型=点云图时生效。</div>
 </div>
 
 <div class="card" id="pccard">
@@ -1303,7 +1342,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="fld"><label>置信度裁剪分位 <span class="rngval" id="pccv">40</span>%</label>
    <input type="range" id="pcc" min="0" max="90" step="5" value="40"></div>
  </div>
- <div class="hint">控制第四图点云本身的渲染。虚拟相机=复刻②③的「调优视角」：对准点云中心、<b>相机距离</b>=场景深度×系数（1.25≈②③ 前端）、<b>俯视角</b>绕点云中心俯视、FOV=真实相机内参——全部按场景深度归一化，帧间深度尺度抖动不会带着视角跳，取景与②③一致；<b>附加抬升/后撤</b>是在此基础上的场景相对偏移（×场景深度），默认 0；<b>基础点大小</b>=所有点的 splat 基数（上方高亮"点大小×"在其上再放大）；<b>饱和度/明度</b>只调点云底色，高亮色不受影响；<b>置信度分位</b>越高裁得越狠、点越少越干净（独立于上方"产物参数"的同名项，仅作用第四图）。</div>
+ <div class="hint"><b>仅产物类型=点云图（服务端渲染）时生效</b>；产物类型=点云 GLB 时第四图走 model-viewer 直渲，视角/点大小/分辨率由前端相机决定，本组滑条不起作用。控制第四图点云本身的渲染。虚拟相机=复刻②③的「调优视角」：对准点云中心、<b>相机距离</b>=场景深度×系数（1.25≈②③ 前端）、<b>俯视角</b>绕点云中心俯视、FOV=真实相机内参——全部按场景深度归一化，帧间深度尺度抖动不会带着视角跳，取景与②③一致；<b>附加抬升/后撤</b>是在此基础上的场景相对偏移（×场景深度），默认 0；<b>基础点大小</b>=所有点的 splat 基数（上方高亮"点大小×"在其上再放大）；<b>饱和度/明度</b>只调点云底色，高亮色不受影响；<b>置信度分位</b>越高裁得越狠、点越少越干净（独立于上方"产物参数"的同名项，仅作用第四图）。</div>
 </div>
 
 <label id="ctltglwrap" style="margin:18px 2px 8px;font-size:13px;cursor:pointer;user-select:none;display:block"><input type="checkbox" id="ctltoggle"> 产物参数调节（默认收起 · 改产物类型/分辨率用）</label>
@@ -1417,6 +1456,20 @@ function syncS3Cam(){
 mv.addEventListener('camera-change',syncS3Cam);
 mv2.addEventListener('load',syncS3Cam);
 
+// ── 第四框（高亮 GLB 模式）相机同样跟随第二框：与③保证三团点云永远同一视角 ──
+const mv3=$('mv3');
+function syncHlCam(){
+  if(mv3.style.display==='none'||!mv3.loaded)return;
+  try{
+    mv3.cameraOrbit=mv.getCameraOrbit().toString();
+    mv3.cameraTarget=mv.getCameraTarget().toString();
+    mv3.fieldOfView=mv.getFieldOfView()+'deg';
+    mv3.jumpCameraToGoal&&mv3.jumpCameraToGoal();
+  }catch(e){}
+}
+mv.addEventListener('camera-change',syncHlCam);
+mv3.addEventListener('load',syncHlCam);
+
 function currentConfig(){return {
   export_format:$('fmt').value,
   process_res:+$('pr').value,
@@ -1472,7 +1525,7 @@ $('hlc').addEventListener('input',()=>{document.querySelector('input[name=hlcm][
 document.querySelectorAll('input[name=hlcm]').forEach(r=>r.addEventListener('change',pushHlConfig));
 pushHlConfig();  // 首次把高亮初值下发后端（服务重启后回落面板当前值）
 
-let lastSeq=-1,lastProdKey='',lastSwap=0,lastS3=-1,lastSwap3=0,lastHl=-1;
+let lastSeq=-1,lastProdKey='',lastSwap=0,lastS3=-1,lastSwap3=0,lastHl=-1,lastSwapH=0;
 const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显示，避免高帧率下一直卡在"加载中"(黑屏)
 
 // ── 多设备：下拉选设备（服务端只处理选中设备一路；非选中设备的帧只进各自缓存） ──
@@ -1497,11 +1550,11 @@ function renderDevices(s){
     +(sel&&sel.fps?('选中 '+sel.fps.toFixed(1)+' fps'):'');
 }
 function resetPanesForSwitch(){   // 切设备：清空四框显示与序号缓存，等新设备的帧/产物
-  lastSeq=-1;lastProdKey='';lastS3=-1;lastSwap=0;lastSwap3=0;lastHl=-1;
+  lastSeq=-1;lastProdKey='';lastS3=-1;lastSwap=0;lastSwap3=0;lastHl=-1;lastSwapH=0;
   $('raw').style.display='none';$('rawwait').style.display='';
   $('prodimg').style.display='none';$('mv').style.display='none';$('prodwait').style.display='';
   $('s3img').style.display='none';$('mv2').style.display='none';$('s3wait').style.display='';
-  $('hlimg').style.display='none';$('hlwait').style.display='';
+  $('hlimg').style.display='none';$('mv3').style.display='none';$('hlwait').style.display='';
 }
 async function tick(){
  try{
@@ -1574,12 +1627,23 @@ async function tick(){
     $('s3meta').innerHTML=sm;
   }catch(e){/* 第三框轮询失败忽略 */}
 
-  // 第四框：SAM3 高亮点云（与③同一轮 mask 结果，无框、样式可调；meta 非空才拉图防 404）
+  // 第四框：SAM3 高亮点云（与③同一轮 mask 结果，无框、样式可调）
+  // kind=model → 高亮 GLB 与②③同管线 model-viewer 直渲（换模节流同②③、相机跟随②）；
+  // kind=image →（产物类型=点云图时）服务端渲染 JPEG，meta 非空才拉图防 404
   try{
     const hl=await(await fetch('/api/sam3hl/status',{cache:'no-store'})).json();
-    if(hl.seq && hl.meta && hl.seq!==lastHl){lastHl=hl.seq;
-      $('hlimg').src='/api/sam3hl/latest?t='+hl.seq;
-      $('hlimg').style.display='block';$('hlwait').style.display='none';}
+    if(hl.seq && hl.seq!==lastHl){
+      if(hl.kind==='model' && hl.url){
+        if((mv3.loaded || !mv3.getAttribute('src')) && Date.now()-lastSwapH>=MIN_SWAP_MS){
+          lastSwapH=Date.now(); lastHl=hl.seq;
+          mv3.src=hl.url;
+          mv3.style.display='block';$('hlimg').style.display='none';$('hlwait').style.display='none';
+        }
+      }else if(hl.kind==='image' && hl.meta){lastHl=hl.seq;
+        $('hlimg').src='/api/sam3hl/latest?t='+hl.seq;
+        $('hlimg').style.display='block';mv3.style.display='none';$('hlwait').style.display='none';
+      }
+    }
     $('hlmeta').innerHTML=hl.error?('<span class="err">'+hl.error+'</span>')
       :(hl.meta?((hl.meta.label||'')+(hl.meta.render_ms?(' · 渲染'+hl.meta.render_ms+'ms'):'')):'');
   }catch(e){/* 第四框轮询失败忽略 */}
@@ -1779,8 +1843,6 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  </div>
  <div class="fld"><label>高亮强度 <b id="v_strength">65</b>%</label>
   <input type="range" id="r_strength" min="10" max="100" step="5" value="65"></div>
- <div class="fld"><label>点大小 ×<b id="v_point_scale">2.0</b></label>
-  <input type="range" id="r_point_scale" min="1" max="5" step="0.5" value="2"></div>
  <div class="fld"><label>背景压暗 <b id="v_dim">40</b>%</label>
   <input type="range" id="r_dim" min="0" max="90" step="5" value="40"></div>
  <div class="fld"><label>点颜色</label>
@@ -1789,27 +1851,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <label><input type="radio" name="hlcm" value="custom"> 自选</label>
    <input type="color" id="hlcolor" value="#ff9f0a">
   </div></div>
- <div class="sec">点云整体样式</div>
- <div class="fld"><label>基础点大小 <b id="v_splat">1</b>px</label>
-  <input type="range" id="r_splat" min="1" max="4" step="1" value="1"></div>
- <div class="fld"><label>俯视角 <b id="v_view_tilt">10</b>°</label>
-  <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="10"></div>
- <div class="fld"><label>相机距离 ×<b id="v_view_zoom">1.25</b></label>
-  <input type="range" id="r_view_zoom" min="0.6" max="2.0" step="0.05" value="1.25"></div>
- <div class="fld"><label>附加抬升 ×<b id="v_eye_lift">0.00</b></label>
-  <input type="range" id="r_eye_lift" min="0" max="0.5" step="0.05" value="0"></div>
- <div class="fld"><label>附加后撤 ×<b id="v_eye_back">0.00</b></label>
-  <input type="range" id="r_eye_back" min="0" max="0.5" step="0.05" value="0"></div>
- <div class="fld"><label>输出分辨率 <b id="v_out_size">760</b>px</label>
-  <input type="range" id="r_out_size" min="480" max="1080" step="40" value="760"></div>
- <div class="fld"><label>饱和度 ×<b id="v_sat">0.0</b></label>
-  <input type="range" id="r_sat" min="0" max="2" step="0.1" value="0"></div>
- <div class="fld"><label>明度 ×<b id="v_val">1.2</b></label>
-  <input type="range" id="r_val" min="0.2" max="1.6" step="0.1" value="1.2"></div>
- <div class="fld"><label>置信度裁剪分位 <b id="v_conf">40</b>%</label>
-  <input type="range" id="r_conf" min="0" max="90" step="5" value="40"></div>
- <div class="hint">与 /panel 的「高亮样式调节」「点云整体样式」同一套配置（/api/sam3hl/config），
-  两边改动互相可见；调整在下一轮 SAM3 结果生效（约 1~3 秒）。</div>
+ <div class="hint">与 /panel 的「高亮样式调节」同一套配置（/api/sam3hl/config），两边改动互相可见；
+  调整在下一轮 SAM3 结果生效（约 1~3 秒）。高亮点云与「SAM3点云」同一条 GLB 渲染管线
+  （model-viewer 直渲），取景/点大小由前端相机决定，故不在此调节。</div>
 </div>
 
 <script>
@@ -1921,7 +1965,8 @@ async function bgTick(){
     else if(s3.kind==='model'&&s3.url)shown=showModel(s3.url,null);
   }else{
     const hl=await(await fetch('/api/sam3hl/status',{cache:'no-store'})).json();
-    if(hl.seq&&hl.meta)shown=showImg('/api/sam3hl/latest?t='+hl.seq,'hl:'+hl.seq);
+    if(hl.kind==='model'&&hl.url)shown=showModel(hl.url,null);   // 高亮 GLB：与③同管线直渲
+    else if(hl.kind==='image'&&hl.seq&&hl.meta)shown=showImg('/api/sam3hl/latest?t='+hl.seq,'hl:'+hl.seq);
   }
   // 所选来源暂无产物（模型服务未就绪等）→ 兜底显示设备原图，避免黑屏
   if(!shown&&s.has_frame)showImg('/api/frame/latest?t='+s.seq,'rawfb:'+s.seq);
@@ -1999,13 +2044,11 @@ $('btnTl').onclick=()=>{
 };
 syncStyleUI();
 
-// ══ 高亮点云样式调节抽屉：读写 /api/sam3hl/config（与 /panel 两张调节卡同一套配置） ══
+// ══ 高亮点云样式调节抽屉：读写 /api/sam3hl/config（与 /panel 的「高亮样式调节」同一套配置） ══
 // 打开时从服务端读当前配置回填（不主动推初值，避免覆盖 /panel 已调好的参数），改动才下发
-const HL_KEYS=['strength','point_scale','dim','splat','view_tilt','view_zoom',
-               'eye_lift','eye_back','out_size','sat','val','conf'];
-const HL_FMT={point_scale:v=>(+v).toFixed(1),view_zoom:v=>(+v).toFixed(2),
-              eye_lift:v=>(+v).toFixed(2),eye_back:v=>(+v).toFixed(2),
-              sat:v=>(+v).toFixed(1),val:v=>(+v).toFixed(1)};
+// GLB 直渲模式下仅高亮样式类字段有效（点大小/视角/分辨率等由 model-viewer 前端相机决定）
+const HL_KEYS=['strength','dim'];
+const HL_FMT={};
 let hlStyle='tint',hlPushTimer=null;
 function hlLabel(k){$('v_'+k).textContent=(HL_FMT[k]||(v=>v))($('r_'+k).value);}
 function pushHlCfg(){
@@ -2999,9 +3042,11 @@ def sam3cloud_latest():
 
 @app.get("/api/sam3hl/status")
 def sam3hl_status():
-    """第四图（SAM3 高亮点云·无框）状态：seq 变化且 meta 非空=有新图可拉；cfg=当前高亮配置。"""
+    """第四图（SAM3 高亮点云·无框）状态：kind=model → url 为高亮 GLB（与②③同管线直渲）；
+    kind=image → seq 变化且 meta 非空时拉 /api/sam3hl/latest；cfg=当前高亮配置。"""
     with _sam3hl_lock:
-        return JSONResponse({"seq": _sam3hl["seq"], "meta": _sam3hl["meta"],
+        return JSONResponse({"kind": _sam3hl["kind"], "url": _sam3hl["url"],
+                             "seq": _sam3hl["seq"], "meta": _sam3hl["meta"],
                              "error": _sam3hl["error"], "cfg": dict(_sam3hl_cfg)})
 
 
