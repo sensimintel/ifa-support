@@ -22,6 +22,7 @@ dx_pairing_log.jsonl 追加写绑定变更流水。两者均 gitignore，不进�
 
 import json
 import os
+import select
 import socket
 import struct
 import threading
@@ -178,14 +179,36 @@ SCALE_PORT = int(os.environ.get("SCALE_PORT", "502"))
 SCALE_UNIT = 1
 SCALE_DIVISION = 0.1
 SCALE_CHANNELS = (1, 2, 3, 4)
-SCALE_POLL_INTERVAL = 0.4     # 后台轮询间隔（秒）
+# 后台轮询间隔（秒）。Modbus 一次读只要 ~20ms，而模块说明书要求的最小请求间隔是 50ms，
+# 取 0.2s 仍有 10 倍余量；端到端延迟里这一层贡献平均 100ms。
+SCALE_POLL_INTERVAL = 0.2
 SCALE_CONNECT_TIMEOUT = 5.0   # 建立 TCP 连接的超时（秒）
 SCALE_FIRST_TIMEOUT = 15.0    # 新连接上首个请求的超时——设备实测约需 6s
 SCALE_READ_TIMEOUT = 3.0      # 连接热起来之后的常规读超时
 SCALE_MAX_BACKOFF = 5.0       # 连不上时的最大重试间隔（秒）
 
-_scale_latest = {ch: {"ok": False, "raw": None} for ch in SCALE_CHANNELS}
+# read_at = 这批 raw 实际被读到的时刻，用于让调用方判断数据新鲜度
+# （接口的 ts 是响应生成时刻，两者不是一回事）
+_scale_latest = {ch: {"ok": False, "raw": None, "read_at": None} for ch in SCALE_CHANNELS}
 _scale_lock = threading.Lock()
+
+
+def _drain(sock):
+    """清掉 socket 里残留的响应，再发新请求。
+
+    该模块固定回 transaction_id=1，客户端无从识别响应错位；若上一轮的响应还躺在
+    接收缓冲里，本轮就会读到那一帧陈旧数据、白白多担一轮延迟（实测连续读时出现过
+    0.1ms 的「秒回」，正是读到了积压帧）。
+    """
+    try:
+        while True:
+            ready, _, _ = select.select([sock], [], [], 0)
+            if not ready:
+                break
+            if not sock.recv(4096):
+                break
+    except OSError:
+        pass
 
 
 def _recv_exact(sock, n):
@@ -228,6 +251,7 @@ class _ScaleLink:
         sock = self._sock
         sock.settimeout(SCALE_READ_TIMEOUT if self._warm else SCALE_FIRST_TIMEOUT)
         try:
+            _drain(sock)   # 丢掉上一轮可能积压的响应，确保这次读到的是新鲜帧
             # 该模块固定回 transaction_id=1，这里也固定发 1，避免事务号比对错位
             sock.sendall(struct.pack(">HHHBBHH", 1, 0, 6, SCALE_UNIT, 0x03, addr, count))
             head = _recv_exact(sock, 9)      # MBAP(7)+功能码(1)+字节数(1)
@@ -261,14 +285,17 @@ def _scale_poller():
     while True:
         try:
             raws = _read_scale_raws()
+            read_at = time.time()
             with _scale_lock:
                 for ch, raw in raws.items():
-                    _scale_latest[ch] = {"ok": True, "raw": raw}
+                    _scale_latest[ch] = {"ok": True, "raw": raw, "read_at": read_at}
             backoff = SCALE_POLL_INTERVAL
         except Exception:
             with _scale_lock:
                 for ch in SCALE_CHANNELS:
-                    _scale_latest[ch] = {"ok": False, "raw": _scale_latest[ch].get("raw")}
+                    # 掉线时保留上次 raw 与其 read_at——读数是旧的，新鲜度必须能看出来
+                    _scale_latest[ch] = {"ok": False, "raw": _scale_latest[ch].get("raw"),
+                                         "read_at": _scale_latest[ch].get("read_at")}
             # 秤不可达时逐步退避，避免每轮都卡在建连/首包的长超时上空转
             backoff = min(backoff * 2, SCALE_MAX_BACKOFF)
         time.sleep(backoff)
@@ -284,12 +311,17 @@ def _channel_reading(ch):
     with _state_lock:
         tare = _state["tare_raw"].get(str(ch), 0)
     raw = st["raw"]
+    read_at = st.get("read_at")
     return {
         "channel": ch,
         "ok": st["ok"],
         "net": round((raw - tare) * SCALE_DIVISION, 1) if raw is not None else None,
         "gross": round(raw * SCALE_DIVISION, 1) if raw is not None else None,
         "tare_g": round(tare * SCALE_DIVISION, 1),
+        # 这批读数被采到的时刻，以及到现在过了多久。调用方据此判断新鲜度——
+        # 响应里的 ts 只是响应生成时刻，掉线时读数会停在旧值上而 ts 照常前进。
+        "read_at": read_at,
+        "age_s": round(time.time() - read_at, 3) if read_at else None,
     }
 
 
