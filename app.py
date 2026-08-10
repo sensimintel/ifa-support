@@ -1743,6 +1743,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 </div>
 
 <div id="tools">
+ <select id="selDev" style="display:none" title="选择设备"></select>
  <select id="selStyle">
   <option value="hl">高亮点云</option>
   <option value="la">LA点云</option>
@@ -1866,12 +1867,34 @@ function pushDefaultConfig(){
                          num_max_points:800000,show_cameras:'1'})}).catch(()=>{});
 }
 
+// ── 多设备：下拉选设备（服务端只处理选中设备一路；同 /panel 的下拉逻辑） ──
+let lastDevKey='',curDev=null;
+function renderDevices(s){
+  const devs=s.devices||[],sel=$('selDev');
+  sel.style.display=devs.length?'':'none';
+  if(document.activeElement!==sel){   // 下拉展开操作中不重建选项，避免选择被打断
+    const key=devs.map(d=>d.device_id).join('|')+'#'+(s.selected||'');
+    if(key!==lastDevKey){lastDevKey=key;
+      sel.innerHTML=devs.map(d=>'<option value="'+d.device_id+'"'
+        +(d.device_id===s.selected?' selected':'')+'>'+d.device_id+'</option>').join('');}
+  }
+}
+$('selDev').onchange=()=>{
+  fetch('/api/frame/select',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({device_id:$('selDev').value})}).catch(()=>{});
+};
+
 let rawSeq=-1;
 async function bgTick(){
  if(DEMO)return;
  try{
   const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
   if(s.processor&&s.config_gen===0)pushDefaultConfig();
+  renderDevices(s);
+  if(s.device&&s.device!==curDev){   // 切设备：清背景与卡片缓存，等新设备的帧/产物
+    if(curDev!==null){lastBgKey='';lastMvUrl='';rawSeq=-1;curCard=null;lastCardKey='';}
+    curDev=s.device;
+  }
   // 流水小窗：实时设备帧（仅流水视图打开时刷新，省带宽）
   if($('tl').classList.contains('on')&&s.has_frame&&s.seq!==rawSeq){rawSeq=s.seq;
     $('tlraw').src='/api/frame/latest?t='+s.seq;
