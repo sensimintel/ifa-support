@@ -52,6 +52,7 @@ EDGES = (1, 2, 3, 4)
 # 分组允许编辑的字段（除 edge 外全部可改）
 GROUP_EDITABLE_FIELDS = (
     "label", "phone_no", "phone_identity", "phone_client_id", "phone_user_id",
+    "phone_udid", "phone_serial", "phone_build",
     "necklace_device_id", "scale_channel",
 )
 # 会写入配对流水的字段（只关心「谁换到了哪条桌边」这类物理配对）
@@ -97,6 +98,13 @@ def _default_group(edge):
         # （token 会轮换，target_id 由 token_hash 派生也会跟着变）
         "phone_client_id": "",
         "phone_user_id": "",
+        # 手机硬件 UDID（如 00008150-001D15E43478401C）：Mac 上 xcodebuild / run-ios
+        # 装机的 build 目标身份，跟机身走、重装 App 不变——与 client_id 互补
+        "phone_udid": "",
+        # 手机序列号：机身「设置→通用→关于本机」可查，现场人肉对照哪台是几号机用
+        "phone_serial": "",
+        # 当前装机 build 描述（自由文本，如 "fe 75f0eb62 + hub f92b405 @ 2026-08-10"）
+        "phone_build": "",
         # 项链蓝牙名，随帧上报在 camera_info.device_id
         "necklace_device_id": "",
     }
@@ -371,7 +379,7 @@ def api_group_update(edge: int, patch: dict = Body(...)):
             return JSONResponse({"ok": False, "error": f"{key} 必须是 1~4 的整数"},
                                 status_code=400)
     for key in ("label", "phone_identity", "phone_client_id", "phone_user_id",
-                "necklace_device_id"):
+                "phone_udid", "phone_serial", "phone_build", "necklace_device_id"):
         if key in patch and not isinstance(patch[key], str):
             return JSONResponse({"ok": False, "error": f"{key} 必须是字符串"}, status_code=400)
 
