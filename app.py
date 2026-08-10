@@ -667,19 +667,20 @@ def _apply_hl_styles(rgb, overlays, cfg):
 
 
 def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
-                             view_tilt=18.0, view_zoom=1.0, splat=2, out_size=760,
+                             view_tilt=10.0, view_zoom=1.25, splat=2, out_size=760,
                              mask_overlays=None, eye_lift=0.0, eye_back=0.0,
                              color_grade=None, hl_cfg=None):
     """方案A·服务端渲染：5090 就地把点云用 torch(GPU) 投影 + 画家算法 z-buffer + splat 渲成 2D 图，
     跳过 GLB 序列化与前端 model-viewer 全量加载。叠 food/drink 框。返回 RGB uint8；点云为空返回 None。
 
-    视角固定不飘：相机钉在光心(原点)、真实相机 fov×view_zoom 投影(主体大小=真实成像→天然稳定)、
-    视线绕 x 轴俯视固定角 view_tilt(立体感)。完全不依赖每帧点云的中心/深度统计，故不会忽大忽小。
+    视角=复刻②③前端 model-viewer 的「调优视角」：相机对准光轴上的点云中心(0,0,cz)、
+    距离=cz×view_zoom（1.25≈前端 VIEW_K）、绕点云中心俯视 view_tilt 度、FOV=真实相机内参。
+    所有量都按场景深度 cz 等比缩放（场景相对）——单目逐帧深度的尺度抖动被归一化，
+    帧间视角不跳；同时保证本渲染与②③ GLB 的取景一致（除染色/高亮外画面一致）。
 
     mask_overlays：SAM3 mask 映射，[(label, color_rgb, mask_bool(H0,W0)), ...]——mask 命中的点
     在投影前染成该词颜色，并按 mask 命中点算 3D AABB 画框+词名（与 detections 的 2D 框链路互不影响）。
-    eye_lift/eye_back：相机相对光心固定抬升/后撤（米，常量、不依赖点云统计→不飘）。抬离光心
-    才有真实视差与遮挡黑缝，点云的"点状/立体"感才出来；默认 0=钉在光心（重投影≈原图）。"""
+    eye_lift/eye_back：在调优视角基础上的附加抬升/后撤，单位=场景深度比例（×cz），默认 0。"""
     import math
     depth = np.asarray(pred.depth)[0].astype(np.float32)
     H0, W0 = depth.shape
@@ -729,11 +730,15 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
     with torch.no_grad():
         P = torch.from_numpy(np.ascontiguousarray(Xc)).to(dev).float()
         C = torch.from_numpy(np.ascontiguousarray(cols)).to(dev)
-        # 固定虚拟相机（不依赖点云统计 → 不飘）：相机在光心(原点)，视线在正视 +z 上绕 x 轴俯视固定角 tilt。
+        # 调优视角（同②③前端）：对准光轴上的点云中心、按场景深度定距、绕中心俯视 tilt。
+        # cz 用鲁棒分位算（同 GLB bbox 中心思路，抗离群点）；一切偏移×cz → 尺度抖动天然抵消。
         tilt = math.radians(view_tilt)
-        # eye 固定偏移：y 向下为正 → 抬升取 -eye_lift；z 前方为正 → 后撤取 -eye_back
-        eye = torch.tensor([0.0, -float(eye_lift), -float(eye_back)], device=dev)
+        zs = Xc[:, 2]
+        cz = max(0.2, (float(np.percentile(zs, 2.0)) + float(np.percentile(zs, 98.0))) / 2.0)
         fwd = torch.tensor([0.0, math.sin(tilt), math.cos(tilt)], device=dev)   # y 向下为正 → 视线向下俯视
+        target = torch.tensor([0.0, 0.0, cz], device=dev)
+        eye = target - fwd * (cz * float(view_zoom)) \
+            + torch.tensor([0.0, -float(eye_lift) * cz, -float(eye_back) * cz], device=dev)
         right = torch.tensor([1.0, 0.0, 0.0], device=dev)
         up = torch.cross(right, fwd)                             # 相机"上"(世界 -y 方向)
         Rm = torch.stack([right, up, fwd], 0)                    # 行基：世界 → 相机(x右 y上 z前)
@@ -748,7 +753,7 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
         Hout = int(out_size)
         Wout = max(1, int(round(out_size * W0 / H0)))
         real_fov = 2 * math.atan(H0 / (2 * K[1, 1]))             # 真实相机垂直 fov
-        fov = min(math.radians(130.0), real_fov * view_zoom)     # ×zoom 拉远留白；主体大小仍随真实成像稳定
+        fov = min(math.radians(130.0), real_fov)                 # FOV=真实内参（同前端）；远近由 view_zoom 距离控制
         f = (Hout / 2.0) / math.tan(fov / 2.0)
         u, v, zc = project(P)
         inb = (zc > 1e-3) & (u >= 0) & (u < Wout) & (v >= 0) & (v < Hout)
@@ -865,23 +870,23 @@ _HL_NUM_FIELDS = {
     "strength": (0, 100, int), "point_scale": (1.0, 5.0, float), "dim": (0, 90, int),
     # ── 点云整体样式（同样只作用于第四图）──
     "splat": (1, 4, int),            # 所有点的 splat 基数（高亮点在其上再乘 point_scale）
-    "view_tilt": (0.0, 45.0, float), # 虚拟相机俯视角（°）
-    "view_zoom": (0.5, 2.5, float),  # 视野缩放（>1 拉远留白）
-    "eye_lift": (0.0, 1.0, float),   # 相机抬升（米，离开光心才有视差/遮挡黑缝的立体感）
-    "eye_back": (0.0, 1.0, float),   # 相机后撤（米）
+    "view_tilt": (0.0, 45.0, float), # 绕点云中心的俯视角（°，同②③调优视角）
+    "view_zoom": (0.5, 2.5, float),  # 相机距离系数（×场景深度；1.25≈前端 VIEW_K）
+    "eye_lift": (0.0, 1.0, float),   # 附加抬升（×场景深度，场景相对不跳帧）
+    "eye_back": (0.0, 1.0, float),   # 附加后撤（×场景深度）
     "out_size": (320, 1200, int),    # 输出图高度（px）
     "sat": (0.0, 2.5, float),        # 点云底色饱和度系数（高亮色不受影响）
     "val": (0.2, 2.0, float),        # 点云底色明度系数
     "conf": (0, 90, int),            # 置信度裁剪分位（独立于产物参数，仅第四图）
 }
 _sam3hl_lock = threading.Lock()
-# 默认参数取「有立体感」的一组（同识别缩略图调优常量的思路）：
-# 抬升/后撤离开光心产生真实视差与遮挡黑缝、splat=1 保留点间缝隙——否则贴光轴+大 splat
-# 会退化成重投影原图（仓内已知坑，/experience 默认背景就是这张图，必须一眼看出是点云）
+# 默认=②③前端 model-viewer 调优视角的等价参数（俯视10°、距离1.25×场景深度、真实FOV）：
+# 除高亮/染色外与②③ GLB 取景一致；场景相对定距把单目逐帧深度的尺度抖动归一化，视角不跳。
+# splat=1 保留点间缝隙的点状质感（拉远后点自然离散）。
 _sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
                "dim": 40, "color_mode": "auto", "color": "#ff9f0a",
-               "splat": 1, "view_tilt": 20.0, "view_zoom": 0.9,
-               "eye_lift": 0.4, "eye_back": 0.3, "out_size": 760,
+               "splat": 1, "view_tilt": 10.0, "view_zoom": 1.25,
+               "eye_lift": 0.0, "eye_back": 0.0, "out_size": 760,
                "sat": 1.0, "val": 1.0, "conf": 40}
 _sam3hl = {"bytes": None, "seq": 0, "meta": None, "error": None}
 
@@ -1274,14 +1279,14 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="row">
   <div class="fld"><label>基础点大小 <span class="rngval" id="pcspv">1</span>px</label>
    <input type="range" id="pcsp" min="1" max="4" step="1" value="1"></div>
-  <div class="fld"><label>俯视角 <span class="rngval" id="pctv">20</span>°</label>
-   <input type="range" id="pct" min="0" max="45" step="1" value="20"></div>
-  <div class="fld"><label>视野缩放 ×<span class="rngval" id="pczv">0.9</span></label>
-   <input type="range" id="pcz" min="0.6" max="2.0" step="0.1" value="0.9"></div>
-  <div class="fld"><label>相机抬升 <span class="rngval" id="pclv">0.40</span>m</label>
-   <input type="range" id="pcl" min="0" max="0.5" step="0.05" value="0.4"></div>
-  <div class="fld"><label>相机后撤 <span class="rngval" id="pcbv">0.30</span>m</label>
-   <input type="range" id="pcb" min="0" max="0.5" step="0.05" value="0.3"></div>
+  <div class="fld"><label>俯视角 <span class="rngval" id="pctv">10</span>°</label>
+   <input type="range" id="pct" min="0" max="45" step="1" value="10"></div>
+  <div class="fld"><label>相机距离 ×<span class="rngval" id="pczv">1.25</span></label>
+   <input type="range" id="pcz" min="0.6" max="2.0" step="0.05" value="1.25"></div>
+  <div class="fld"><label>附加抬升 ×<span class="rngval" id="pclv">0.00</span></label>
+   <input type="range" id="pcl" min="0" max="0.5" step="0.05" value="0"></div>
+  <div class="fld"><label>附加后撤 ×<span class="rngval" id="pcbv">0.00</span></label>
+   <input type="range" id="pcb" min="0" max="0.5" step="0.05" value="0"></div>
  </div>
  <div class="row" style="margin-top:10px">
   <div class="fld"><label>输出分辨率 <span class="rngval" id="pcov">760</span>px</label>
@@ -1293,7 +1298,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="fld"><label>置信度裁剪分位 <span class="rngval" id="pccv">40</span>%</label>
    <input type="range" id="pcc" min="0" max="90" step="5" value="40"></div>
  </div>
- <div class="hint">控制第四图点云本身的渲染：<b>基础点大小</b>=所有点的 splat 基数（上方高亮"点大小×"在其上再放大）；<b>俯视角/缩放/抬升/后撤</b>=虚拟相机位姿——抬升/后撤离开光心才有真实视差与遮挡黑缝，立体感更强，0=贴着拍摄光轴（重投影≈原图）；<b>饱和度/明度</b>只调点云底色，高亮色不受影响；<b>置信度分位</b>越高裁得越狠、点越少越干净（独立于上方"产物参数"的同名项，仅作用第四图）。</div>
+ <div class="hint">控制第四图点云本身的渲染。虚拟相机=复刻②③的「调优视角」：对准点云中心、<b>相机距离</b>=场景深度×系数（1.25≈②③ 前端）、<b>俯视角</b>绕点云中心俯视、FOV=真实相机内参——全部按场景深度归一化，帧间深度尺度抖动不会带着视角跳，取景与②③一致；<b>附加抬升/后撤</b>是在此基础上的场景相对偏移（×场景深度），默认 0；<b>基础点大小</b>=所有点的 splat 基数（上方高亮"点大小×"在其上再放大）；<b>饱和度/明度</b>只调点云底色，高亮色不受影响；<b>置信度分位</b>越高裁得越狠、点越少越干净（独立于上方"产物参数"的同名项，仅作用第四图）。</div>
 </div>
 
 <label id="ctltglwrap" style="margin:18px 2px 8px;font-size:13px;cursor:pointer;user-select:none;display:block"><input type="checkbox" id="ctltoggle"> 产物参数调节（默认收起 · 改产物类型/分辨率用）</label>
@@ -1445,7 +1450,7 @@ function pushHlConfig(){
   },250);
 }
 // 点云整体样式滑条：[滑条id, 数值标签id, 显示格式]，统一接线（改动即更新标签+下发配置）
-[['pcsp','pcspv',v=>v],['pct','pctv',v=>v],['pcz','pczv',v=>(+v).toFixed(1)],
+[['pcsp','pcspv',v=>v],['pct','pctv',v=>v],['pcz','pczv',v=>(+v).toFixed(2)],
  ['pcl','pclv',v=>(+v).toFixed(2)],['pcb','pcbv',v=>(+v).toFixed(2)],['pco','pcov',v=>v],
  ['pcs2','pcsv2',v=>(+v).toFixed(1)],['pcv','pcvv',v=>(+v).toFixed(1)],['pcc','pccv',v=>v]]
  .forEach(([id,lab,fmt])=>{$(id).addEventListener('input',()=>{
@@ -1782,14 +1787,14 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div class="sec">点云整体样式</div>
  <div class="fld"><label>基础点大小 <b id="v_splat">1</b>px</label>
   <input type="range" id="r_splat" min="1" max="4" step="1" value="1"></div>
- <div class="fld"><label>俯视角 <b id="v_view_tilt">20</b>°</label>
-  <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="20"></div>
- <div class="fld"><label>视野缩放 ×<b id="v_view_zoom">0.9</b></label>
-  <input type="range" id="r_view_zoom" min="0.6" max="2.0" step="0.1" value="0.9"></div>
- <div class="fld"><label>相机抬升 <b id="v_eye_lift">0.40</b>m</label>
-  <input type="range" id="r_eye_lift" min="0" max="0.5" step="0.05" value="0.4"></div>
- <div class="fld"><label>相机后撤 <b id="v_eye_back">0.30</b>m</label>
-  <input type="range" id="r_eye_back" min="0" max="0.5" step="0.05" value="0.3"></div>
+ <div class="fld"><label>俯视角 <b id="v_view_tilt">10</b>°</label>
+  <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="10"></div>
+ <div class="fld"><label>相机距离 ×<b id="v_view_zoom">1.25</b></label>
+  <input type="range" id="r_view_zoom" min="0.6" max="2.0" step="0.05" value="1.25"></div>
+ <div class="fld"><label>附加抬升 ×<b id="v_eye_lift">0.00</b></label>
+  <input type="range" id="r_eye_lift" min="0" max="0.5" step="0.05" value="0"></div>
+ <div class="fld"><label>附加后撤 ×<b id="v_eye_back">0.00</b></label>
+  <input type="range" id="r_eye_back" min="0" max="0.5" step="0.05" value="0"></div>
  <div class="fld"><label>输出分辨率 <b id="v_out_size">760</b>px</label>
   <input type="range" id="r_out_size" min="480" max="1080" step="40" value="760"></div>
  <div class="fld"><label>饱和度 ×<b id="v_sat">1.0</b></label>
@@ -1993,7 +1998,7 @@ syncStyleUI();
 // 打开时从服务端读当前配置回填（不主动推初值，避免覆盖 /panel 已调好的参数），改动才下发
 const HL_KEYS=['strength','point_scale','dim','splat','view_tilt','view_zoom',
                'eye_lift','eye_back','out_size','sat','val','conf'];
-const HL_FMT={point_scale:v=>(+v).toFixed(1),view_zoom:v=>(+v).toFixed(1),
+const HL_FMT={point_scale:v=>(+v).toFixed(1),view_zoom:v=>(+v).toFixed(2),
               eye_lift:v=>(+v).toFixed(2),eye_back:v=>(+v).toFixed(2),
               sat:v=>(+v).toFixed(1),val:v=>(+v).toFixed(1)};
 let hlStyle='tint',hlPushTimer=null;
@@ -2315,12 +2320,12 @@ def _save_cloud_shot(pred, dets, conf):
     叠 Qwen 给的 box（食物红/液体蓝 3D 框），存盘返回 /shotimg url；渲染失败返回 None。
     dets: [(label, nx1, ny1, nx2, ny2)]，坐标 0-1 归一化（同 LA 框约定）；空则渲无框点云。"""
     try:
-        # 点云观感参数沿用 bc2bc8b 验收过的那组：相机抬离光心（视差遮挡缝）+ 俯视 20°
-        # + splat=1 点状离散渲染；钉光心/大 splat 会退化成"重投影原图"（仓内已知坑）
-        # out_size 拉到 1140：点距>点径(1px)才处处离散成"碎点"，760 时中近距离会糊成片
+        # 相机模型已改为「调优视角」（对准点云中心、按场景深度定距，场景相对不跳帧）：
+        # 缩略图取稍近距离(1.0×) + 俯视 20°；splat=1 + out_size=1140 保持点状离散
+        # （点距>点径才处处离散成"碎点"，760 时中近距离会糊成片）
         img = _render_pointcloud_image(pred, dets or None, conf_thresh_percentile=conf,
-                                       view_tilt=20.0, view_zoom=0.85, splat=1,
-                                       out_size=1140, eye_lift=0.4, eye_back=0.3,
+                                       view_tilt=20.0, view_zoom=1.0, splat=1,
+                                       out_size=1140, eye_lift=0.0, eye_back=0.0,
                                        color_grade=(0.0, 0.75))   # 饱和0=纯黑白点云
     except Exception as e:
         print(f"[da3-web] 识别缩略图渲染失败：{type(e).__name__}: {e}", flush=True)
