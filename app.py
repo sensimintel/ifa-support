@@ -2017,9 +2017,11 @@ function applyPtStyle(){
       m.userData.ptPatched=true;
       m.onBeforeCompile=sh=>{
         sh.uniforms.uPtRound=ptRoundU;
-        sh.fragmentShader='uniform float uPtRound;\n'+sh.fragmentShader.replace(
+        // 注意：本页嵌在 Python 普通字符串里，JS 转义序列必须写成 \\n（否则被 Python
+        // 先转成真实换行，截断 JS 字符串字面量 → 整页脚本 SyntaxError）
+        sh.fragmentShader='uniform float uPtRound;\\n'+sh.fragmentShader.replace(
           '#include <clipping_planes_fragment>',
-          '#include <clipping_planes_fragment>\n\tif(uPtRound>0.5&&length(gl_PointCoord-vec2(0.5))>0.5)discard;');
+          '#include <clipping_planes_fragment>\\nif(uPtRound>0.5&&length(gl_PointCoord-vec2(0.5))>0.5)discard;');
       };
       m.needsUpdate=true;
     }
