@@ -471,7 +471,7 @@ def _box_wireframe_meshes(lo, hi, color_rgb, radius):
 
 def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentile=40.0,
                                num_max_points=800000, show_cameras=True, mask_overlays=None,
-                               hl_cfg=None):
+                               hl_cfg=None, outlier_mad=12.0, bake_conf_alpha=False):
     """自建单视图点云并叠加 food/drink 3D 检测框，导出 GLB。
 
     坐标系用「相机坐标系」（相机=原点/拍摄位置、光轴固定，仅 flip Y/Z 到 glTF 约定），
@@ -499,14 +499,19 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
     if rgb is None or rgb.shape[:2] != (H, W):
         rgb = np.full((H, W, 3), 180, np.uint8)
     if hl_cfg is not None:
-        # 高亮模式：先按配置调底色（饱和/明度，中性 1.0 时跳过），再把样式化染色/纯色/
+        # 高亮模式：先按配置调底色（色相/饱和/明度，中性时跳过），再把样式化染色/纯色/
         # 提亮/描边 + 背景压暗直接写进顶点色（后续不画框）
         _gs = float(hl_cfg.get("sat", 1.0)); _gv = float(hl_cfg.get("val", 1.0))
-        if abs(_gs - 1.0) > 1e-3 or abs(_gv - 1.0) > 1e-3:
+        _gh = float(hl_cfg.get("hue", 0.0))
+        if abs(_gs - 1.0) > 1e-3 or abs(_gv - 1.0) > 1e-3 or abs(_gh) > 0.5:
             _hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
+            _hsv[..., 0] = np.mod(_hsv[..., 0] + _gh / 2.0, 180.0)  # OpenCV H 范围 [0,180)
             _hsv[..., 1] *= _gs
             _hsv[..., 2] *= _gv
-            rgb = cv2.cvtColor(np.clip(_hsv, 0, 255).astype(np.uint8), cv2.COLOR_HSV2RGB)
+            _h = np.mod(_hsv[..., 0], 180.0)
+            _sv = np.clip(_hsv[..., 1:], 0, 255)
+            _hsv = np.concatenate([_h[..., None], _sv], -1)
+            rgb = cv2.cvtColor(_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
         if mask_overlays:
             rgb, _ = _apply_hl_styles(rgb, mask_overlays, hl_cfg)
     elif mask_overlays:
@@ -553,19 +558,29 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
     A_cam = np.eye(4); A_cam[1, 1] = -1.0; A_cam[2, 2] = -1.0
     scene.metadata["hf_alignment"] = A_cam
 
-    # 点云（降采样后加入场景）
+    # 点云（降采样后加入场景）。颜色统一带 alpha 通道：默认 255；bake_conf_alpha 时
+    # 把逐点置信度（5/95 分位稳健归一）烘进 alpha [40,255]，供前端做「置信度→点大小/
+    # 透明度」联动（_filter_and_downsample 纯花式索引，RGBA 原样透传）
     pc_pts = Xa[vmask].astype(np.float32)
-    pc_cols = rgb.reshape(-1, 3)[vmask].astype(np.uint8)
+    _rgb_flat = rgb.reshape(-1, 3)[vmask].astype(np.uint8)
+    if bake_conf_alpha and conf is not None:
+        _cf = conf[i].reshape(-1)[vmask].astype(np.float32)
+        _lo = float(np.percentile(_cf, 5.0)); _hi = float(np.percentile(_cf, 95.0))
+        _t = np.clip((_cf - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
+        _alpha = (40.0 + _t * 215.0).astype(np.uint8)
+    else:
+        _alpha = np.full(_rgb_flat.shape[0], 255, np.uint8)
+    pc_cols = np.concatenate([_rgb_flat, _alpha[:, None]], axis=1)
     pc_pts, pc_cols = _glb._filter_and_downsample(pc_pts, pc_cols, int(num_max_points))
     # 裁离群点：个别深度估计异常的远点会把点云包围盒撑爆，导致 model-viewer 取景距离算成
     # 负/极小值、画面全黑（尤其自适应/近距视角）。
-    # 只挡「深度爆炸」的极端离群点，用深度(Z)方向的 MAD 稳健界；不再按到中心的欧氏距离切 98.5 分位——
-    # 那会把连续的远景层当离群整片误删（这正是远景点云消失+取景抖动的第二把刀）。
+    # 只挡「深度爆炸」的极端离群点，用深度(Z)方向的 MAD 稳健界（倍数可调）；不按到中心的
+    # 欧氏距离切 98.5 分位——那会把连续的远景层当离群整片误删（远景消失+取景抖动的第二把刀）。
     if pc_pts.shape[0] > 200:
         zc = -pc_pts[:, 2]                                   # 相机看 -Z，深度值 = -z（正）
         med = float(np.median(zc))
         mad = float(np.median(np.abs(zc - med))) + 1e-6
-        keep = zc <= med + 12.0 * mad                        # 远端只砍极端离群，保留连续远景
+        keep = zc <= med + float(outlier_mad) * mad          # 远端只砍极端离群，保留连续远景
         pc_pts, pc_cols = pc_pts[keep], pc_cols[keep]
     if pc_pts.shape[0] > 0:
         scene.add_geometry(trimesh.points.PointCloud(vertices=pc_pts, colors=pc_cols))
@@ -902,17 +917,48 @@ _HL_NUM_FIELDS = {
     "sat": (0.0, 2.5, float),        # 点云底色饱和度系数（高亮色不受影响）
     "val": (0.2, 2.0, float),        # 点云底色明度系数
     "conf": (0, 90, int),            # 置信度裁剪分位（独立于产物参数，仅第四图）
+    # ── 烘焙类扩展（写进 GLB，下一轮生效）──
+    "hue": (-180.0, 180.0, float),   # 底色色相偏移（烘焙进顶点色，只动底色不动高亮色）
+    "outlier_mad": (2.0, 20.0, float),  # 离群点裁剪强度：深度 MAD 倍数（越小裁得越狠；12=原写死值）
     # ── 点渲染（前端实时生效：/experience 穿透 model-viewer 内部 three.js 场景改
-    # PointsMaterial，不进 GLB、不需重建；服务端仅存值做持久化/多端互通）──
+    # PointsMaterial/着色器，不进 GLB、不需重建；服务端仅存值做持久化/多端互通）──
     "pt_size": (0.5, 12.0, float),   # 点大小（px；近大远小开启时映射为世界尺寸）
-    "pt_round": (0, 1, int),         # 1=圆点（片元 discard 裁圆） 0=方点（three 默认）
+    "pt_shape": (0, 2, int),         # 0=方点（three 默认） 1=圆点（裁圆） 2=柔边点（高斯衰减）
     "pt_atten": (0, 1, int),         # 1=近大远小（sizeAttenuation） 0=固定像素大小
-    # 整体色彩（片元 uniform 实时调色，作用于最终画面含高亮色；区别于上面写进 GLB
-    # 顶点色、只调底色不动高亮色的 sat/val）
+    "pt_opacity": (0.05, 1.0, float),  # 整体不透明度
+    "pt_blend": (0, 1, int),         # 1=发光叠加（additive blending） 0=正常
+    "pt_density": (5, 100, int),     # 点密度 %（drawRange 抽稀显示）
+    # 整体色彩（片元 uniform 实时调色，作用于最终画面含高亮色；区别于写进 GLB
+    # 顶点色、只调底色不动高亮色的 sat/val/hue）
     "pt_hue": (-180.0, 180.0, float),  # 色相偏移（°，绕灰轴旋转）
     "pt_sat": (0.0, 2.5, float),       # 饱和度系数（0=灰度）
     "pt_val": (0.2, 2.5, float),       # 明度系数
+    "pt_contrast": (0.5, 2.0, float),  # 对比度
+    "pt_exposure": (0.3, 3.0, float),  # 曝光（model-viewer 原生属性）
+    "pt_invert": (0, 1, int),          # 1=反色
+    "pt_colormode": (0, 3, int),       # 着色模式：0原色 1双色调 2按深度 3按高度
+    "pt_ramp_near": (0.2, 5.0, float), # 色带/深度雾 近端（m）
+    "pt_ramp_far": (0.3, 6.0, float),  # 色带/深度雾 远端（m）
+    "pt_fog": (0.0, 1.0, float),       # 深度雾强度（远点向背景色淡出）
+    # 空间裁剪（实时，shader discard）
+    "pt_clip_near": (0.0, 6.0, float), # 深度裁剪近端（m）
+    "pt_clip_far": (0.3, 8.0, float),  # 深度裁剪远端（m；8=不裁）
+    "pt_clip_ylo": (0.0, 1.0, float),  # 高度裁剪下限（点云高度归一化 0~1）
+    "pt_clip_yhi": (0.0, 1.0, float),  # 高度裁剪上限
+    # 相机与动效（实时）
+    "pt_rotate": (0, 1, int),          # 1=自动旋转（model-viewer auto-rotate）
+    "pt_rotate_speed": (2.0, 60.0, float),  # 旋转速度（°/s）
+    "pt_fov_off": (-20.0, 20.0, float),     # FOV 偏移（°，叠加在真实相机 FOV 上）
+    "pt_pulse": (0, 2, int),           # 呼吸脉冲：0关 1明度脉冲 2点大小脉冲
+    "pt_pulse_speed": (0.2, 3.0, float),    # 脉冲/闪烁频率（Hz）
+    "pt_sparkle": (0.0, 1.0, float),   # 星光闪烁强度（逐点错相位）
+    # 置信度联动（读顶点色 alpha 通道里烘焙的置信度；任一 >0 时服务端才开始烘焙，
+    # 首次开启需等下一轮 GLB，之后实时调节；仅③④，LA 点云无此数据）
+    "pt_conf_size": (0.0, 1.0, float),   # 置信度→点大小（低置信点变小）
+    "pt_conf_alpha": (0.0, 1.0, float),  # 置信度→透明度（低置信点变透明）
 }
+# 十六进制颜色类配置字段（与 color 同样按 #rrggbb 校验）：双色调深/浅色、背景色
+_HL_HEX_FIELDS = ("color", "pt_duo_a", "pt_duo_b", "pt_bg")
 _sam3hl_lock = threading.Lock()
 # 默认=②③前端 model-viewer 调优视角的等价参数（俯视10°、距离1.25×场景深度、真实FOV）：
 # 除高亮/染色外与②③ GLB 取景一致；场景相对定距把单目逐帧深度的尺度抖动归一化，视角不跳。
@@ -923,8 +969,19 @@ _sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
                "eye_lift": 0.0, "eye_back": 0.0, "out_size": 760,
                "sat": 1.0, "val": 1.0, "conf": 40,   # 饱和/明度中性：GLB 直渲本身即 model-viewer
                                                      # 观感（点云图模式可手动调 0/1.2 复刻灰白）
-               "pt_size": 1.0, "pt_round": 0, "pt_atten": 0,  # 点渲染默认=three 原生观感（1px 方点）
-               "pt_hue": 0.0, "pt_sat": 1.0, "pt_val": 1.0}   # 整体色彩默认中性（不调色）
+               "hue": 0.0, "outlier_mad": 12.0,
+               # 点渲染默认全中性 = three 原生观感（1px 方点、不调色、无动效）
+               "pt_size": 1.0, "pt_shape": 0, "pt_atten": 0,
+               "pt_opacity": 1.0, "pt_blend": 0, "pt_density": 100,
+               "pt_hue": 0.0, "pt_sat": 1.0, "pt_val": 1.0,
+               "pt_contrast": 1.0, "pt_exposure": 1.35, "pt_invert": 0,
+               "pt_colormode": 0, "pt_duo_a": "#141450", "pt_duo_b": "#ffd27f",
+               "pt_ramp_near": 0.5, "pt_ramp_far": 2.2, "pt_fog": 0.0,
+               "pt_clip_near": 0.0, "pt_clip_far": 8.0,
+               "pt_clip_ylo": 0.0, "pt_clip_yhi": 1.0,
+               "pt_rotate": 0, "pt_rotate_speed": 10.0, "pt_fov_off": 0.0,
+               "pt_pulse": 0, "pt_pulse_speed": 1.0, "pt_sparkle": 0.0,
+               "pt_bg": "#000000", "pt_conf_size": 0.0, "pt_conf_alpha": 0.0}
 _sam3hl = {"kind": None, "url": None, "bytes": None, "seq": 0, "meta": None, "error": None}
 
 
@@ -1042,7 +1099,10 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
                 build_pointcloud_boxes_glb(pred, [], str(hglb),
                                            conf_thresh_percentile=float(hcfg["conf"]),
                                            num_max_points=nmp, show_cameras=False,
-                                           mask_overlays=overlays, hl_cfg=hcfg)
+                                           mask_overlays=overlays, hl_cfg=hcfg,
+                                           outlier_mad=float(hcfg["outlier_mad"]),
+                                           bake_conf_alpha=(hcfg["pt_conf_size"] > 1e-3
+                                                            or hcfg["pt_conf_alpha"] > 1e-3))
                 _prune_glb()
                 with _sam3hl_lock:
                     _sam3hl.update({
@@ -1077,9 +1137,15 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
             outdir = GLB_DIR / token
             outdir.mkdir(parents=True, exist_ok=True)
             glb = outdir / "scene.glb"
+            # 离群裁剪/置信度烘焙与第四图同参（读同一配置），保证③④几何全等
+            with _sam3hl_lock:
+                _scfg = dict(_sam3hl_cfg)
             build_pointcloud_boxes_glb(pred, [], str(glb), conf_thresh_percentile=conf,
                                        num_max_points=nmp, show_cameras=show_cam,
-                                       mask_overlays=overlays)
+                                       mask_overlays=overlays,
+                                       outlier_mad=float(_scfg["outlier_mad"]),
+                                       bake_conf_alpha=(_scfg["pt_conf_size"] > 1e-3
+                                                        or _scfg["pt_conf_alpha"] > 1e-3))
             render_ms = (time.time() - _tr) * 1000.0
             _prune_glb()
             with _sam3cloud_lock:
@@ -1911,31 +1977,111 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <input type="range" id="r_val" min="0.2" max="1.6" step="0.1" value="1"></div>
  <div class="fld"><label>置信度裁剪分位 <b id="v_conf">40</b>%</label>
   <input type="range" id="r_conf" min="0" max="90" step="5" value="40"></div>
- <div class="sec">点渲染（实时）</div>
+ <div class="fld"><label>底色色相（烘焙） <b id="v_hue">0</b>°</label>
+  <input type="range" id="r_hue" min="-180" max="180" step="5" value="0"></div>
+ <div class="fld"><label>离群裁剪 MAD×<b id="v_outlier_mad">12.0</b></label>
+  <input type="range" id="r_outlier_mad" min="2" max="20" step="0.5" value="12"></div>
+ <div class="sec">点渲染 · 形态（实时）</div>
  <div class="fld"><label>点大小 <b id="v_pt_size">1.0</b></label>
   <input type="range" id="r_pt_size" min="0.5" max="12" step="0.5" value="1"></div>
  <div class="fld"><label>点形状</label>
   <div class="radios">
    <label><input type="radio" name="ptshape" value="0" checked> 方点</label>
    <label><input type="radio" name="ptshape" value="1"> 圆点</label>
+   <label><input type="radio" name="ptshape" value="2"> 柔边</label>
   </div></div>
  <div class="fld"><label>近大远小</label>
   <div class="radios">
    <label><input type="radio" name="ptatten" value="0" checked> 关（固定像素）</label>
    <label><input type="radio" name="ptatten" value="1"> 开（透视缩放）</label>
   </div></div>
+ <div class="fld"><label>不透明度 ×<b id="v_pt_opacity">1.00</b></label>
+  <input type="range" id="r_pt_opacity" min="0.05" max="1" step="0.05" value="1"></div>
+ <div class="fld"><label>发光叠加</label>
+  <div class="radios">
+   <label><input type="radio" name="ptblend" value="0" checked> 关</label>
+   <label><input type="radio" name="ptblend" value="1"> 开（重叠越亮）</label>
+  </div></div>
+ <div class="fld"><label>点密度 <b id="v_pt_density">100</b>%</label>
+  <input type="range" id="r_pt_density" min="5" max="100" step="5" value="100"></div>
+ <div class="sec">点渲染 · 色彩（实时）</div>
  <div class="fld"><label>色相偏移 <b id="v_pt_hue">0</b>°</label>
   <input type="range" id="r_pt_hue" min="-180" max="180" step="5" value="0"></div>
- <div class="fld"><label>饱和度（实时） ×<b id="v_pt_sat">1.0</b></label>
+ <div class="fld"><label>饱和度 ×<b id="v_pt_sat">1.0</b></label>
   <input type="range" id="r_pt_sat" min="0" max="2.5" step="0.1" value="1"></div>
- <div class="fld"><label>明度（实时） ×<b id="v_pt_val">1.0</b></label>
+ <div class="fld"><label>明度 ×<b id="v_pt_val">1.0</b></label>
   <input type="range" id="r_pt_val" min="0.2" max="2.5" step="0.1" value="1"></div>
+ <div class="fld"><label>对比度 ×<b id="v_pt_contrast">1.00</b></label>
+  <input type="range" id="r_pt_contrast" min="0.5" max="2" step="0.05" value="1"></div>
+ <div class="fld"><label>曝光 ×<b id="v_pt_exposure">1.35</b></label>
+  <input type="range" id="r_pt_exposure" min="0.3" max="3" step="0.05" value="1.35"></div>
+ <div class="fld"><label>反色</label>
+  <div class="radios">
+   <label><input type="radio" name="ptinvert" value="0" checked> 关</label>
+   <label><input type="radio" name="ptinvert" value="1"> 开</label>
+  </div></div>
+ <div class="fld"><label>着色模式</label>
+  <div class="radios">
+   <label><input type="radio" name="ptcm" value="0" checked> 原色</label>
+   <label><input type="radio" name="ptcm" value="1"> 双色调</label>
+   <label><input type="radio" name="ptcm" value="2"> 按深度</label>
+   <label><input type="radio" name="ptcm" value="3"> 按高度</label>
+  </div></div>
+ <div class="fld"><label>双色调 深→浅</label>
+  <div class="radios">
+   <input type="color" id="c_pt_duo_a" value="#141450">
+   <input type="color" id="c_pt_duo_b" value="#ffd27f">
+  </div></div>
+ <div class="fld"><label>色带/雾 近端 <b id="v_pt_ramp_near">0.5</b>m</label>
+  <input type="range" id="r_pt_ramp_near" min="0.2" max="5" step="0.1" value="0.5"></div>
+ <div class="fld"><label>色带/雾 远端 <b id="v_pt_ramp_far">2.2</b>m</label>
+  <input type="range" id="r_pt_ramp_far" min="0.3" max="6" step="0.1" value="2.2"></div>
+ <div class="fld"><label>深度雾 <b id="v_pt_fog">0.00</b></label>
+  <input type="range" id="r_pt_fog" min="0" max="1" step="0.05" value="0"></div>
+ <div class="fld"><label>背景色</label>
+  <div class="radios"><input type="color" id="c_pt_bg" value="#000000"></div></div>
+ <div class="sec">点渲染 · 空间裁剪（实时）</div>
+ <div class="fld"><label>深度裁剪 近 <b id="v_pt_clip_near">0.0</b>m</label>
+  <input type="range" id="r_pt_clip_near" min="0" max="6" step="0.1" value="0"></div>
+ <div class="fld"><label>深度裁剪 远 <b id="v_pt_clip_far">8.0</b>m</label>
+  <input type="range" id="r_pt_clip_far" min="0.3" max="8" step="0.1" value="8"></div>
+ <div class="fld"><label>高度裁剪 下 <b id="v_pt_clip_ylo">0.00</b></label>
+  <input type="range" id="r_pt_clip_ylo" min="0" max="1" step="0.02" value="0"></div>
+ <div class="fld"><label>高度裁剪 上 <b id="v_pt_clip_yhi">1.00</b></label>
+  <input type="range" id="r_pt_clip_yhi" min="0" max="1" step="0.02" value="1"></div>
+ <div class="sec">点渲染 · 相机与动效（实时）</div>
+ <div class="fld"><label>自动旋转</label>
+  <div class="radios">
+   <label><input type="radio" name="ptrot" value="0" checked> 关</label>
+   <label><input type="radio" name="ptrot" value="1"> 开</label>
+  </div></div>
+ <div class="fld"><label>旋转速度 <b id="v_pt_rotate_speed">10</b>°/s</label>
+  <input type="range" id="r_pt_rotate_speed" min="2" max="60" step="1" value="10"></div>
+ <div class="fld"><label>FOV 偏移 <b id="v_pt_fov_off">0</b>°</label>
+  <input type="range" id="r_pt_fov_off" min="-20" max="20" step="1" value="0"></div>
+ <div class="fld"><label>呼吸脉冲</label>
+  <div class="radios">
+   <label><input type="radio" name="ptpulse" value="0" checked> 关</label>
+   <label><input type="radio" name="ptpulse" value="1"> 明度</label>
+   <label><input type="radio" name="ptpulse" value="2"> 点大小</label>
+  </div></div>
+ <div class="fld"><label>脉冲/闪烁频率 <b id="v_pt_pulse_speed">1.0</b>Hz</label>
+  <input type="range" id="r_pt_pulse_speed" min="0.2" max="3" step="0.1" value="1"></div>
+ <div class="fld"><label>星光闪烁 <b id="v_pt_sparkle">0.00</b></label>
+  <input type="range" id="r_pt_sparkle" min="0" max="1" step="0.05" value="0"></div>
+ <div class="sec">点渲染 · 置信度联动</div>
+ <div class="fld"><label>置信度→点大小 <b id="v_pt_conf_size">0.00</b></label>
+  <input type="range" id="r_pt_conf_size" min="0" max="1" step="0.05" value="0"></div>
+ <div class="fld"><label>置信度→透明度 <b id="v_pt_conf_alpha">0.00</b></label>
+  <input type="range" id="r_pt_conf_alpha" min="0" max="1" step="0.05" value="0"></div>
  <div class="hint">与 /panel 的两张调节卡同一套配置（/api/sam3hl/config），两边改动互相可见。
-  <b>俯视角/相机距离/抬升/后撤</b>是前端相机参数，拖动立即生效；高亮样式与
-  <b>饱和度/明度/置信度分位</b>写进 GLB，下一轮 SAM3 结果生效（约 1~3 秒）、
-  只调底色不动高亮色。<b>点渲染</b>各项直改浏览器内 three.js 点材质，拖动立即
-  生效、对所有 GLB 背景（高亮/SAM3/LA 点云）通用；其中色相/饱和/明度（实时）
-  作用于最终画面<b>含高亮色</b>。默认值均为中性（1px 方点、不调色）。</div>
+  <b>俯视角/相机距离/抬升/后撤</b>是前端相机参数，拖动立即生效；高亮样式、
+  <b>饱和度/明度/底色色相/置信度分位/离群裁剪</b>写进 GLB，下一轮 SAM3 结果生效
+  （约 1~3 秒）、只调底色不动高亮色。<b>点渲染</b>各区直改浏览器内 three.js
+  点材质/着色器，拖动立即生效、对所有 GLB 背景（高亮/SAM3/LA 点云）通用，色彩类
+  作用于最终画面<b>含高亮色</b>。置信度联动首次开启需等下一轮 GLB（把置信度烘进
+  顶点 alpha，仅高亮/SAM3 点云有此数据），之后实时。自动旋转在每次换模时回正。
+  默认值均为中性观感。</div>
 </div>
 
 <script>
@@ -2002,50 +2148,137 @@ function applyExpView(){const mv=$('bgmv');
     mv.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
     mv.cameraOrbit='0deg '+(90-Math.atan2(dy,dz)*180/Math.PI).toFixed(2)+'deg '
       +(Math.abs(cz)*Math.hypot(dy,dz)).toFixed(4)+'m';
-    mv.fieldOfView=mvFov+'deg';
+    mv.fieldOfView=Math.min(60,Math.max(10,mvFov+(+ptStyle.pt_fov_off)))+'deg';
     mv.jumpCameraToGoal&&mv.jumpCameraToGoal();}catch(e){}}
 
 // ── 点渲染（实时）：穿透 model-viewer 私有 Symbol("scene") 拿内部 three.js 场景，直改
-// PointsMaterial（size/sizeAttenuation/圆点裁剪）。glTF 的 POINTS 图元不携带点大小，
-// 大小/形状是渲染器参数——model-viewer 公开 API 不暴露，只能穿透（版本已钉死 3.5.0，
-// 符号描述 minify 后仍稳定）。每次换 GLB 材质是新实例，须在 load 事件重新应用。──
-let mvSceneSym=null,ptStyle={pt_size:1,pt_round:0,pt_atten:0,pt_hue:0,pt_sat:1,pt_val:1};
-// 材质间共享引用的 uniform：翻值即生效不重编译（圆点开关 + 整体色彩 色相/饱和/明度）
-const ptRoundU={value:0},ptHueU={value:0},ptSatU={value:1},ptValU={value:1};
+// PointsMaterial + 注入着色器（形态/色彩/裁剪/动效全套调节）。glTF 的 POINTS 图元不携带
+// 点大小等渲染参数——model-viewer 公开 API 不暴露，只能穿透（版本钉死 3.5.0，符号描述
+// minify 后仍稳定）。每次换 GLB 材质是新实例，须在 load 事件重新应用。──
+let mvSceneSym=null,ptStyle={pt_size:1,pt_shape:0,pt_atten:0,pt_opacity:1,pt_blend:0,
+  pt_density:100,pt_hue:0,pt_sat:1,pt_val:1,pt_contrast:1,pt_exposure:1.35,pt_invert:0,
+  pt_colormode:0,pt_duo_a:'#141450',pt_duo_b:'#ffd27f',pt_ramp_near:0.5,pt_ramp_far:2.2,
+  pt_fog:0,pt_clip_near:0,pt_clip_far:8,pt_clip_ylo:0,pt_clip_yhi:1,
+  pt_rotate:0,pt_rotate_speed:10,pt_fov_off:0,pt_pulse:0,pt_pulse_speed:1,pt_sparkle:0,
+  pt_bg:'#000000',pt_conf_size:0,pt_conf_alpha:0};
+// 材质间共享引用的 uniform 表：改 value 即生效、零重编译（vec3 用数组）
+const PTU={shape:{value:0},hue:{value:0},sat:{value:1},val:{value:1},contrast:{value:1},
+  invert:{value:0},cmode:{value:0},duoa:{value:[0.08,0.08,0.31]},duob:{value:[1,0.82,0.5]},
+  rampn:{value:0.5},rampf:{value:2.2},fog:{value:0},bg:{value:[0,0,0]},
+  clipn:{value:0},clipf:{value:8},clipylo:{value:0},clipyhi:{value:1},
+  ymin:{value:0},ymax:{value:1},pulse:{value:0},pspeed:{value:1},sparkle:{value:0},
+  time:{value:0},confsize:{value:0},confalpha:{value:0}};
+function ptHex(h){return [parseInt(h.slice(1,3),16)/255,parseInt(h.slice(3,5),16)/255,
+  parseInt(h.slice(5,7),16)/255];}
 function mvScene(mv){
   if(!mvSceneSym)mvSceneSym=Object.getOwnPropertySymbols(mv).find(s=>s.description==='scene');
   return mvSceneSym?mv[mvSceneSym]:null;
 }
+// 注入片元：色相/饱和/明度/对比/反色 → 着色模式(双色调/深度/高度色带) → 脉冲/闪烁 →
+// 深度雾 → 置信度透明 → 点形状(圆/柔边)。全部由 uniform 驱动，一次编译多路复用。
+// （本页嵌在 Python 普通字符串里，JS 转义序列必须写成 \\n，否则整页脚本 SyntaxError）
+const PT_FRAG='if(vPtD<uPt_clipn||vPtD>uPt_clipf)discard;\\n'
+ +'float ptyn=clamp((vPtY-uPt_ymin)/max(uPt_ymax-uPt_ymin,1e-5),0.0,1.0);\\n'
+ +'if(ptyn<uPt_clipylo||ptyn>uPt_clipyhi)discard;\\n'
+ +'float ptcf=1.0;\\n#ifdef USE_COLOR_ALPHA\\nptcf=clamp(vColor.a,0.0,1.0);\\n#endif\\n'
+ +'vec3 pc=diffuseColor.rgb;\\n'
+ +'pc=mix(pc,vec3(1.0)-pc,uPt_invert);\\n'
+ +'float pl=dot(pc,vec3(0.2126,0.7152,0.0722));\\n'
+ +'pc=mix(vec3(pl),pc,uPt_sat)*uPt_val;\\n'
+ +'float pha=radians(uPt_hue);vec3 pk=vec3(0.57735);\\n'
+ +'pc=pc*cos(pha)+cross(pk,pc)*sin(pha)+pk*dot(pk,pc)*(1.0-cos(pha));\\n'
+ +'pc=(pc-0.5)*uPt_contrast+0.5;\\n'
+ +'float plum=dot(clamp(pc,0.0,1.0),vec3(0.2126,0.7152,0.0722));\\n'
+ +'if(uPt_cmode>0.5&&uPt_cmode<1.5){pc=mix(uPt_duoa,uPt_duob,plum);}\\n'
+ +'else if(uPt_cmode>1.5){\\n'
+ +' float ptt=uPt_cmode<2.5?clamp((vPtD-uPt_rampn)/max(uPt_rampf-uPt_rampn,1e-4),0.0,1.0):ptyn;\\n'
+ +' float pth=(1.0-ptt)*0.6667;\\n'
+ +' vec3 ptr=clamp(abs(fract(pth+vec3(1.0,0.6667,0.3333))*6.0-3.0)-1.0,0.0,1.0);\\n'
+ +' pc=ptr*mix(0.35,1.0,plum);}\\n'
+ +'if(uPt_pulse>0.5&&uPt_pulse<1.5)pc*=1.0+0.25*sin(6.2832*uPt_pspeed*uPt_time);\\n'
+ +'pc*=mix(1.0,0.35+0.65*(0.5+0.5*sin(6.2832*(uPt_pspeed*uPt_time+vPtR))),uPt_sparkle);\\n'
+ +'float pfog=clamp((vPtD-uPt_rampn)/max(uPt_rampf-uPt_rampn,1e-4),0.0,1.0);\\n'
+ +'pc=mix(pc,uPt_bg,pfog*uPt_fog);\\n'
+ +'diffuseColor.rgb=max(pc,vec3(0.0));\\n'
+ +'diffuseColor.a=opacity*mix(1.0,ptcf,uPt_confalpha);\\n'
+ +'if(uPt_shape>0.5&&uPt_shape<1.5){if(length(gl_PointCoord-vec2(0.5))>0.5)discard;}\\n'
+ +'else if(uPt_shape>1.5){float pdd=length(gl_PointCoord-vec2(0.5));if(pdd>0.5)discard;diffuseColor.a*=smoothstep(0.5,0.12,pdd);}\\n';
+const PT_FRAG_DECL='uniform float uPt_shape;uniform float uPt_hue;uniform float uPt_sat;'
+ +'uniform float uPt_val;uniform float uPt_contrast;uniform float uPt_invert;'
+ +'uniform float uPt_cmode;uniform vec3 uPt_duoa;uniform vec3 uPt_duob;'
+ +'uniform float uPt_rampn;uniform float uPt_rampf;uniform float uPt_fog;uniform vec3 uPt_bg;'
+ +'uniform float uPt_clipn;uniform float uPt_clipf;uniform float uPt_clipylo;uniform float uPt_clipyhi;'
+ +'uniform float uPt_ymin;uniform float uPt_ymax;uniform float uPt_pulse;uniform float uPt_pspeed;'
+ +'uniform float uPt_sparkle;uniform float uPt_time;uniform float uPt_confalpha;'
+ +'varying float vPtD;varying float vPtY;varying float vPtR;\\n';
+// 注入顶点：视深/世界高度/逐点随机相位三个 varying + 置信度→点大小
+const PT_VERT='vPtD=-mvPosition.z;vPtY=(modelMatrix*vec4(transformed,1.0)).y;'
+ +'vPtR=fract(sin(dot(position.xyz,vec3(12.9898,78.233,37.719)))*43758.5453);\\n'
+ +'#ifdef USE_COLOR_ALPHA\\ngl_PointSize*=mix(1.0,clamp(vColor.a,0.05,1.0),uPt_confsize);\\n#endif\\n';
+const PT_VERT_DECL='uniform float uPt_confsize;varying float vPtD;varying float vPtY;varying float vPtR;\\n';
+let ptMats=[],ptTimer=null;
 function applyPtStyle(){
-  const sc=mvScene($('bgmv'));if(!sc||!sc.traverse)return;
-  ptRoundU.value=ptStyle.pt_round?1:0;
-  ptHueU.value=+ptStyle.pt_hue;ptSatU.value=+ptStyle.pt_sat;ptValU.value=+ptStyle.pt_val;
+  const mv=$('bgmv'),sc=mvScene(mv);if(!sc||!sc.traverse)return;
+  const S=ptStyle;
+  // uniform 同步
+  PTU.shape.value=+S.pt_shape;PTU.hue.value=+S.pt_hue;PTU.sat.value=+S.pt_sat;
+  PTU.val.value=+S.pt_val;PTU.contrast.value=+S.pt_contrast;PTU.invert.value=+S.pt_invert;
+  PTU.cmode.value=+S.pt_colormode;PTU.duoa.value=ptHex(S.pt_duo_a);PTU.duob.value=ptHex(S.pt_duo_b);
+  PTU.rampn.value=+S.pt_ramp_near;PTU.rampf.value=+S.pt_ramp_far;PTU.fog.value=+S.pt_fog;
+  PTU.bg.value=ptHex(S.pt_bg);PTU.clipn.value=+S.pt_clip_near;PTU.clipf.value=+S.pt_clip_far;
+  PTU.clipylo.value=+S.pt_clip_ylo;PTU.clipyhi.value=+S.pt_clip_yhi;
+  PTU.pulse.value=+S.pt_pulse;PTU.pspeed.value=+S.pt_pulse_speed;PTU.sparkle.value=+S.pt_sparkle;
+  PTU.confsize.value=+S.pt_conf_size;PTU.confalpha.value=+S.pt_conf_alpha;
+  // 元素级：曝光 / 自动旋转 / 背景色（fog 混向同色）
+  mv.exposure=+S.pt_exposure;
+  if(+S.pt_rotate){mv.setAttribute('auto-rotate','');mv.setAttribute('auto-rotate-delay','0');
+    mv.setAttribute('rotation-per-second',S.pt_rotate_speed+'deg');}
+  else mv.removeAttribute('auto-rotate');
+  $('stage').style.background=S.pt_bg;
+  ptMats=[];
   sc.traverse(o=>{
     if(!o.isPoints||!o.material)return;
-    const m=o.material;
+    const m=o.material,g=o.geometry;
+    ptMats.push(m);
+    if(g&&g.attributes&&g.attributes.position){   // 点密度：drawRange 抽稀
+      const n=g.attributes.position.count;
+      g.setDrawRange(0,Math.max(1,Math.round(n*(+S.pt_density)/100)));
+      if(!g.boundingBox)g.computeBoundingBox();   // 高度归一化范围（世界系）
+      if(g.boundingBox){o.updateWorldMatrix&&o.updateWorldMatrix(true,false);
+        const bb=g.boundingBox.clone().applyMatrix4(o.matrixWorld);
+        PTU.ymin.value=bb.min.y;PTU.ymax.value=bb.max.y;}
+    }
     // 近大远小开启时 size 是世界单位：场景深度约 1.2~1.5m，用 3mm/档 把滑条映射到米
-    m.size=ptStyle.pt_atten?ptStyle.pt_size*0.003:ptStyle.pt_size;
-    const att=!!ptStyle.pt_atten;
+    m.size=+S.pt_atten?S.pt_size*0.003:+S.pt_size;
+    m.opacity=+S.pt_opacity;
+    const trans=(+S.pt_opacity<0.999)||(+S.pt_shape===2)||(+S.pt_blend===1)||(+S.pt_conf_alpha>0.001);
+    m.transparent=trans;m.depthWrite=!trans;      // 半透明点不写深度，避免自遮挡黑斑
+    m.blending=(+S.pt_blend===1)?2:1;             // three 数值常量：2=Additive 1=Normal
+    const att=!!+S.pt_atten;
     if(m.sizeAttenuation!==att){m.sizeAttenuation=att;m.needsUpdate=true;}  // define 变更须重编译
-    if(!m.userData.ptPatched){   // 圆点：片元按 gl_PointCoord 裁圆，uniform 控制开关
+    if(!m.userData.ptPatched){
       m.userData.ptPatched=true;
       m.onBeforeCompile=sh=>{
-        sh.uniforms.uPtRound=ptRoundU;sh.uniforms.uPtHue=ptHueU;
-        sh.uniforms.uPtSat=ptSatU;sh.uniforms.uPtVal=ptValU;
-        // 注意：本页嵌在 Python 普通字符串里，JS 转义序列必须写成 \\n（否则被 Python
-        // 先转成真实换行，截断 JS 字符串字面量 → 整页脚本 SyntaxError）
-        sh.fragmentShader='uniform float uPtRound;uniform float uPtHue;uniform float uPtSat;uniform float uPtVal;\\n'
-          +sh.fragmentShader.replace(
-            '#include <clipping_planes_fragment>',
-            '#include <clipping_planes_fragment>\\nif(uPtRound>0.5&&length(gl_PointCoord-vec2(0.5))>0.5)discard;')
-          // 整体色彩：顶点色装配(color_fragment)后做 饱和(灰度插值)→明度→色相(绕灰轴旋转)
-          .replace(
-            '#include <color_fragment>',
-            '#include <color_fragment>\\n{vec3 c=diffuseColor.rgb;float l=dot(c,vec3(0.2126,0.7152,0.0722));c=mix(vec3(l),c,uPtSat)*uPtVal;float a=radians(uPtHue);vec3 k=vec3(0.57735);c=c*cos(a)+cross(k,c)*sin(a)+k*dot(k,c)*(1.0-cos(a));diffuseColor.rgb=max(c,vec3(0.0));}');
+        Object.keys(PTU).forEach(k=>sh.uniforms['uPt_'+k]=PTU[k]);
+        sh.vertexShader=PT_VERT_DECL+sh.vertexShader.replace(
+          '#include <logdepthbuf_vertex>',PT_VERT+'#include <logdepthbuf_vertex>');
+        sh.fragmentShader=PT_FRAG_DECL+sh.fragmentShader.replace(
+          '#include <color_fragment>','#include <color_fragment>\\n'+PT_FRAG);
       };
       m.needsUpdate=true;
     }
   });
+  // 动效计时器：脉冲/闪烁开启时 20fps 驱动 time uniform 并请求重绘
+  const tick=(+S.pt_pulse>0)||(+S.pt_sparkle>0.001);
+  if(tick&&!ptTimer)ptTimer=setInterval(()=>{
+    PTU.time.value=performance.now()/1000;
+    if(+ptStyle.pt_pulse===2){   // 点大小脉冲：直接调材质 size（uniform 每帧自动刷新）
+      const b=+ptStyle.pt_atten?ptStyle.pt_size*0.003:+ptStyle.pt_size;
+      const f=1.0+0.25*Math.sin(6.2832*ptStyle.pt_pulse_speed*PTU.time.value);
+      ptMats.forEach(m=>{m.size=b*f;});
+    }
+    const s2=mvScene($('bgmv'));s2&&s2.queueRender&&s2.queueRender();},50);
+  if(!tick&&ptTimer){clearInterval(ptTimer);ptTimer=null;}
   sc.queueRender&&sc.queueRender();
 }
 $('bgmv').addEventListener('load',()=>{applyExpView();applyPtStyle();});
@@ -2196,10 +2429,20 @@ syncStyleUI();
 // strength/dim/sat/val/conf 走服务端写进 GLB；view_* 四项是前端相机参数（拖动立即生效），
 // pt_* 三项是前端点材质参数（拖动立即生效），均存进服务端配置做持久化/与 /panel 互通。
 const HL_KEYS=['strength','dim','view_tilt','view_zoom','eye_lift','eye_back','sat','val','conf',
-               'pt_size','pt_hue','pt_sat','pt_val'];
-const HL_FMT={view_zoom:v=>(+v).toFixed(2),eye_lift:v=>(+v).toFixed(2),
-              eye_back:v=>(+v).toFixed(2),sat:v=>(+v).toFixed(1),val:v=>(+v).toFixed(1),
-              pt_size:v=>(+v).toFixed(1),pt_sat:v=>(+v).toFixed(1),pt_val:v=>(+v).toFixed(1)};
+  'hue','outlier_mad','pt_size','pt_opacity','pt_density','pt_hue','pt_sat','pt_val',
+  'pt_contrast','pt_exposure','pt_ramp_near','pt_ramp_far','pt_fog',
+  'pt_clip_near','pt_clip_far','pt_clip_ylo','pt_clip_yhi',
+  'pt_rotate_speed','pt_fov_off','pt_pulse_speed','pt_sparkle','pt_conf_size','pt_conf_alpha'];
+const _f1=v=>(+v).toFixed(1),_f2=v=>(+v).toFixed(2);
+const HL_FMT={view_zoom:_f2,eye_lift:_f2,eye_back:_f2,sat:_f1,val:_f1,outlier_mad:_f1,
+  pt_size:_f1,pt_opacity:_f2,pt_sat:_f1,pt_val:_f1,pt_contrast:_f2,pt_exposure:_f2,
+  pt_ramp_near:_f1,pt_ramp_far:_f1,pt_fog:_f2,pt_clip_near:_f1,pt_clip_far:_f1,
+  pt_clip_ylo:_f2,pt_clip_yhi:_f2,pt_pulse_speed:_f1,pt_sparkle:_f2,
+  pt_conf_size:_f2,pt_conf_alpha:_f2};
+// radio 组（name → 配置字段）与颜色控件（元素 id → 配置字段）
+const PT_RADIOS={ptshape:'pt_shape',ptatten:'pt_atten',ptblend:'pt_blend',
+  ptinvert:'pt_invert',ptcm:'pt_colormode',ptrot:'pt_rotate',ptpulse:'pt_pulse'};
+const PT_COLORS={c_pt_duo_a:'pt_duo_a',c_pt_duo_b:'pt_duo_b',c_pt_bg:'pt_bg'};
 const VIEW_KEYS=['view_tilt','view_zoom','eye_lift','eye_back'];
 let hlView={view_tilt:10,view_zoom:1.25,eye_lift:0,eye_back:0};
 let hlStyle='tint',hlPushTimer=null;
@@ -2210,8 +2453,9 @@ function pushHlCfg(){
     const body={style:hlStyle,color:$('hlcolor').value,
       color_mode:document.querySelector('input[name=hlcm]:checked').value};
     HL_KEYS.forEach(k=>body[k]=+$('r_'+k).value);
-    body.pt_round=+document.querySelector('input[name=ptshape]:checked').value;
-    body.pt_atten=+document.querySelector('input[name=ptatten]:checked').value;
+    Object.keys(PT_RADIOS).forEach(nm=>
+      body[PT_RADIOS[nm]]=+document.querySelector('input[name='+nm+']:checked').value);
+    Object.keys(PT_COLORS).forEach(id=>body[PT_COLORS[id]]=$(id).value);
     fetch('/api/sam3hl/config',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(body)}).catch(()=>{});
   },250);
@@ -2226,9 +2470,12 @@ async function loadHlCfg(){
     VIEW_KEYS.forEach(k=>{if(c[k]!==undefined)hlView[k]=+c[k];});
     applyExpView();   // 服务端可能有 /panel 调过的视角参数，回填后立即应用
     HL_KEYS.forEach(k=>{if(k.indexOf('pt_')===0&&c[k]!==undefined)ptStyle[k]=+c[k];});
-    ['pt_round','pt_atten'].forEach((k,i)=>{const nm=i?'ptatten':'ptshape';
-      if(c[k]!==undefined){ptStyle[k]=+c[k]?1:0;
-        document.querySelector('input[name='+nm+'][value="'+ptStyle[k]+'"]').checked=true;}});
+    Object.keys(PT_RADIOS).forEach(nm=>{const k=PT_RADIOS[nm];
+      if(c[k]!==undefined){ptStyle[k]=Math.round(+c[k]);
+        const el=document.querySelector('input[name='+nm+'][value="'+ptStyle[k]+'"]');
+        if(el)el.checked=true;}});
+    Object.keys(PT_COLORS).forEach(id=>{const k=PT_COLORS[id];
+      if(/^#[0-9a-fA-F]{6}$/.test(c[k]||'')){$(id).value=c[k];ptStyle[k]=c[k];}});
     applyPtStyle();   // 点渲染参数回填后立即应用到当前 GLB
     if(c.color_mode)document.querySelector('input[name=hlcm][value='+c.color_mode+']').checked=true;
     if(/^#[0-9a-fA-F]{6}$/.test(c.color||''))$('hlcolor').value=c.color;
@@ -2236,14 +2483,18 @@ async function loadHlCfg(){
 }
 HL_KEYS.forEach(k=>$('r_'+k).addEventListener('input',()=>{hlLabel(k);
   if(VIEW_KEYS.includes(k)){hlView[k]=+$('r_'+k).value;applyExpView();}   // 相机参数立即生效
-  if(k.indexOf('pt_')===0){ptStyle[k]=+$('r_'+k).value;applyPtStyle();}   // 点渲染参数立即生效
+  if(k.indexOf('pt_')===0){ptStyle[k]=+$('r_'+k).value;applyPtStyle();
+    if(k==='pt_fov_off')applyExpView();}                                  // 点渲染参数立即生效
   pushHlCfg();}));
-// 点形状/近大远小：改动立即应用到当前 GLB 并下发持久化
-document.querySelectorAll('input[name=ptshape],input[name=ptatten]').forEach(r=>
+// radio 组与颜色控件：改动立即应用到当前 GLB 并下发持久化
+document.querySelectorAll(
+  Object.keys(PT_RADIOS).map(n=>'input[name='+n+']').join(',')).forEach(r=>
   r.addEventListener('change',()=>{
-    ptStyle.pt_round=+document.querySelector('input[name=ptshape]:checked').value;
-    ptStyle.pt_atten=+document.querySelector('input[name=ptatten]:checked').value;
+    Object.keys(PT_RADIOS).forEach(nm=>{
+      ptStyle[PT_RADIOS[nm]]=+document.querySelector('input[name='+nm+']:checked').value;});
     applyPtStyle();pushHlCfg();}));
+Object.keys(PT_COLORS).forEach(id=>$(id).addEventListener('input',()=>{
+  ptStyle[PT_COLORS[id]]=$(id).value;applyPtStyle();pushHlCfg();}));
 document.querySelectorAll('#hlseg button').forEach(b=>b.addEventListener('click',()=>{
   hlStyle=b.dataset.s;
   document.querySelectorAll('#hlseg button').forEach(x=>x.classList.toggle('on',x===b));
@@ -3249,9 +3500,10 @@ def sam3hl_config(body: dict = Body(default=None)):
                 pass
         if str(body.get("color_mode", "")) in ("auto", "custom"):
             _sam3hl_cfg["color_mode"] = str(body["color_mode"])
-        c = str(body.get("color", "")).strip()
-        if re.fullmatch(r"#[0-9a-fA-F]{6}", c):
-            _sam3hl_cfg["color"] = c
+        for hk in _HL_HEX_FIELDS:
+            c = str(body.get(hk, "")).strip()
+            if re.fullmatch(r"#[0-9a-fA-F]{6}", c):
+                _sam3hl_cfg[hk] = c
         return JSONResponse({"ok": True, "cfg": dict(_sam3hl_cfg)})
 
 
