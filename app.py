@@ -885,7 +885,8 @@ _sam3cloud = {"kind": None, "url": None, "bytes": None, "seq": 0,
 # ── 第四图：SAM3 高亮点云（无框）。与第三图共用同一轮 SAM3 mask 结果，仅呈现方式不同：
 # 不画 AABB 框，改为点云本体高亮。样式/强度/背景压暗/颜色由 /api/sam3hl/config 实时可调
 # （只影响本图）。产物形态跟随③：fmt=glb → 与②③同一条 GLB 构建链路直渲（model-viewer
-# 同管线，高亮写进顶点色；点大小在 glTF/model-viewer 里不可控，该字段仅图模式生效）；
+# 同管线，高亮写进顶点色；point_scale/splat 仅图模式生效，GLB 模式的点渲染由前端
+# pt_size/pt_round/pt_atten 穿透 model-viewer 内部场景实时调节）；
 # fmt=cloudimg → 服务端渲染 JPEG（点大小/视角等「点云整体样式」仅此路径生效）。──
 _HL_STYLE_CN = {"tint": "染色", "solid": "纯色", "glow": "提亮", "outline": "描边"}
 # 数值字段统一钳制表：{字段: (下限, 上限, 类型)}，高亮组 + 点云整体样式组共用一个配置
@@ -901,6 +902,11 @@ _HL_NUM_FIELDS = {
     "sat": (0.0, 2.5, float),        # 点云底色饱和度系数（高亮色不受影响）
     "val": (0.2, 2.0, float),        # 点云底色明度系数
     "conf": (0, 90, int),            # 置信度裁剪分位（独立于产物参数，仅第四图）
+    # ── 点渲染（前端实时生效：/experience 穿透 model-viewer 内部 three.js 场景改
+    # PointsMaterial，不进 GLB、不需重建；服务端仅存值做持久化/多端互通）──
+    "pt_size": (0.5, 12.0, float),   # 点大小（px；近大远小开启时映射为世界尺寸）
+    "pt_round": (0, 1, int),         # 1=圆点（片元 discard 裁圆） 0=方点（three 默认）
+    "pt_atten": (0, 1, int),         # 1=近大远小（sizeAttenuation） 0=固定像素大小
 }
 _sam3hl_lock = threading.Lock()
 # 默认=②③前端 model-viewer 调优视角的等价参数（俯视10°、距离1.25×场景深度、真实FOV）：
@@ -910,8 +916,9 @@ _sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
                "dim": 40, "color_mode": "auto", "color": "#ff9f0a",
                "splat": 1, "view_tilt": 10.0, "view_zoom": 1.25,
                "eye_lift": 0.0, "eye_back": 0.0, "out_size": 760,
-               "sat": 1.0, "val": 1.0, "conf": 40}   # 饱和/明度中性：GLB 直渲本身即 model-viewer
+               "sat": 1.0, "val": 1.0, "conf": 40,   # 饱和/明度中性：GLB 直渲本身即 model-viewer
                                                      # 观感（点云图模式可手动调 0/1.2 复刻灰白）
+               "pt_size": 1.0, "pt_round": 0, "pt_atten": 0}  # 点渲染默认=three 原生观感（1px 方点）
 _sam3hl = {"kind": None, "url": None, "bytes": None, "seq": 0, "meta": None, "error": None}
 
 
@@ -1878,11 +1885,25 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <input type="range" id="r_val" min="0.2" max="1.6" step="0.1" value="1"></div>
  <div class="fld"><label>置信度裁剪分位 <b id="v_conf">40</b>%</label>
   <input type="range" id="r_conf" min="0" max="90" step="5" value="40"></div>
+ <div class="sec">点渲染（实时）</div>
+ <div class="fld"><label>点大小 <b id="v_pt_size">1.0</b></label>
+  <input type="range" id="r_pt_size" min="0.5" max="12" step="0.5" value="1"></div>
+ <div class="fld"><label>点形状</label>
+  <div class="radios">
+   <label><input type="radio" name="ptshape" value="0" checked> 方点</label>
+   <label><input type="radio" name="ptshape" value="1"> 圆点</label>
+  </div></div>
+ <div class="fld"><label>近大远小</label>
+  <div class="radios">
+   <label><input type="radio" name="ptatten" value="0" checked> 关（固定像素）</label>
+   <label><input type="radio" name="ptatten" value="1"> 开（透视缩放）</label>
+  </div></div>
  <div class="hint">与 /panel 的两张调节卡同一套配置（/api/sam3hl/config），两边改动互相可见。
   <b>俯视角/相机距离/抬升/后撤</b>是前端相机参数，拖动立即生效；高亮样式与
   <b>饱和度/明度/置信度分位</b>写进 GLB，下一轮 SAM3 结果生效（约 1~3 秒）。
-  饱和/明度默认中性 1.0、置信度默认 40，与「SAM3点云」完全一致；点大小在
-  GLB/model-viewer 里不可调，故无此项。</div>
+  饱和/明度默认中性 1.0、置信度默认 40，与「SAM3点云」完全一致。
+  <b>点渲染</b>三项直改浏览器内 three.js 点材质，拖动立即生效、对当前所有 GLB
+  背景（高亮/SAM3/LA 点云）通用；默认值即 three 原生观感（1px 方点）。</div>
 </div>
 
 <script>
@@ -1951,7 +1972,41 @@ function applyExpView(){const mv=$('bgmv');
       +(Math.abs(cz)*Math.hypot(dy,dz)).toFixed(4)+'m';
     mv.fieldOfView=mvFov+'deg';
     mv.jumpCameraToGoal&&mv.jumpCameraToGoal();}catch(e){}}
-$('bgmv').addEventListener('load',applyExpView);
+
+// ── 点渲染（实时）：穿透 model-viewer 私有 Symbol("scene") 拿内部 three.js 场景，直改
+// PointsMaterial（size/sizeAttenuation/圆点裁剪）。glTF 的 POINTS 图元不携带点大小，
+// 大小/形状是渲染器参数——model-viewer 公开 API 不暴露，只能穿透（版本已钉死 3.5.0，
+// 符号描述 minify 后仍稳定）。每次换 GLB 材质是新实例，须在 load 事件重新应用。──
+let mvSceneSym=null,ptStyle={pt_size:1,pt_round:0,pt_atten:0};
+const ptRoundU={value:0};            // 圆点开关 uniform：材质间共享引用，翻值即生效不重编译
+function mvScene(mv){
+  if(!mvSceneSym)mvSceneSym=Object.getOwnPropertySymbols(mv).find(s=>s.description==='scene');
+  return mvSceneSym?mv[mvSceneSym]:null;
+}
+function applyPtStyle(){
+  const sc=mvScene($('bgmv'));if(!sc||!sc.traverse)return;
+  ptRoundU.value=ptStyle.pt_round?1:0;
+  sc.traverse(o=>{
+    if(!o.isPoints||!o.material)return;
+    const m=o.material;
+    // 近大远小开启时 size 是世界单位：场景深度约 1.2~1.5m，用 3mm/档 把滑条映射到米
+    m.size=ptStyle.pt_atten?ptStyle.pt_size*0.003:ptStyle.pt_size;
+    const att=!!ptStyle.pt_atten;
+    if(m.sizeAttenuation!==att){m.sizeAttenuation=att;m.needsUpdate=true;}  // define 变更须重编译
+    if(!m.userData.ptPatched){   // 圆点：片元按 gl_PointCoord 裁圆，uniform 控制开关
+      m.userData.ptPatched=true;
+      m.onBeforeCompile=sh=>{
+        sh.uniforms.uPtRound=ptRoundU;
+        sh.fragmentShader='uniform float uPtRound;\n'+sh.fragmentShader.replace(
+          '#include <clipping_planes_fragment>',
+          '#include <clipping_planes_fragment>\n\tif(uPtRound>0.5&&length(gl_PointCoord-vec2(0.5))>0.5)discard;');
+      };
+      m.needsUpdate=true;
+    }
+  });
+  sc.queueRender&&sc.queueRender();
+}
+$('bgmv').addEventListener('load',()=>{applyExpView();applyPtStyle();});
 
 // 服务重启后配置清零会回落 depth 模式（识别不触发）：本页独立运行时补推默认配置（glb=识别链路）
 let lastCfgPush=0;
@@ -2097,10 +2152,11 @@ syncStyleUI();
 // ══ 高亮点云样式调节抽屉：读写 /api/sam3hl/config（与 /panel 的「高亮样式调节」同一套配置） ══
 // 打开时从服务端读当前配置回填（不主动推初值，避免覆盖 /panel 已调好的参数），改动才下发
 // strength/dim/sat/val/conf 走服务端写进 GLB；view_* 四项是前端相机参数（拖动立即生效），
-// 同样存进服务端配置做持久化/与 /panel 互通。点大小/输出分辨率在 GLB 直渲下不存在，不设。
-const HL_KEYS=['strength','dim','view_tilt','view_zoom','eye_lift','eye_back','sat','val','conf'];
+// pt_* 三项是前端点材质参数（拖动立即生效），均存进服务端配置做持久化/与 /panel 互通。
+const HL_KEYS=['strength','dim','view_tilt','view_zoom','eye_lift','eye_back','sat','val','conf','pt_size'];
 const HL_FMT={view_zoom:v=>(+v).toFixed(2),eye_lift:v=>(+v).toFixed(2),
-              eye_back:v=>(+v).toFixed(2),sat:v=>(+v).toFixed(1),val:v=>(+v).toFixed(1)};
+              eye_back:v=>(+v).toFixed(2),sat:v=>(+v).toFixed(1),val:v=>(+v).toFixed(1),
+              pt_size:v=>(+v).toFixed(1)};
 const VIEW_KEYS=['view_tilt','view_zoom','eye_lift','eye_back'];
 let hlView={view_tilt:10,view_zoom:1.25,eye_lift:0,eye_back:0};
 let hlStyle='tint',hlPushTimer=null;
@@ -2111,6 +2167,8 @@ function pushHlCfg(){
     const body={style:hlStyle,color:$('hlcolor').value,
       color_mode:document.querySelector('input[name=hlcm]:checked').value};
     HL_KEYS.forEach(k=>body[k]=+$('r_'+k).value);
+    body.pt_round=+document.querySelector('input[name=ptshape]:checked').value;
+    body.pt_atten=+document.querySelector('input[name=ptatten]:checked').value;
     fetch('/api/sam3hl/config',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(body)}).catch(()=>{});
   },250);
@@ -2124,13 +2182,25 @@ async function loadHlCfg(){
     HL_KEYS.forEach(k=>{if(c[k]!==undefined){$('r_'+k).value=c[k];hlLabel(k);}});
     VIEW_KEYS.forEach(k=>{if(c[k]!==undefined)hlView[k]=+c[k];});
     applyExpView();   // 服务端可能有 /panel 调过的视角参数，回填后立即应用
+    if(c.pt_size!==undefined)ptStyle.pt_size=+c.pt_size;
+    ['pt_round','pt_atten'].forEach((k,i)=>{const nm=i?'ptatten':'ptshape';
+      if(c[k]!==undefined){ptStyle[k]=+c[k]?1:0;
+        document.querySelector('input[name='+nm+'][value="'+ptStyle[k]+'"]').checked=true;}});
+    applyPtStyle();   // 点渲染参数回填后立即应用到当前 GLB
     if(c.color_mode)document.querySelector('input[name=hlcm][value='+c.color_mode+']').checked=true;
     if(/^#[0-9a-fA-F]{6}$/.test(c.color||''))$('hlcolor').value=c.color;
   }catch(e){/* 读取失败保持面板默认值 */}
 }
 HL_KEYS.forEach(k=>$('r_'+k).addEventListener('input',()=>{hlLabel(k);
   if(VIEW_KEYS.includes(k)){hlView[k]=+$('r_'+k).value;applyExpView();}   // 相机参数立即生效
+  if(k==='pt_size'){ptStyle.pt_size=+$('r_'+k).value;applyPtStyle();}     // 点大小立即生效
   pushHlCfg();}));
+// 点形状/近大远小：改动立即应用到当前 GLB 并下发持久化
+document.querySelectorAll('input[name=ptshape],input[name=ptatten]').forEach(r=>
+  r.addEventListener('change',()=>{
+    ptStyle.pt_round=+document.querySelector('input[name=ptshape]:checked').value;
+    ptStyle.pt_atten=+document.querySelector('input[name=ptatten]:checked').value;
+    applyPtStyle();pushHlCfg();}));
 document.querySelectorAll('#hlseg button').forEach(b=>b.addEventListener('click',()=>{
   hlStyle=b.dataset.s;
   document.querySelectorAll('#hlseg button').forEach(x=>x.classList.toggle('on',x===b));
@@ -2143,6 +2213,7 @@ $('btnHlCfg').onclick=()=>{
   $('hlcfg').classList.toggle('on',on);
   if(on)loadHlCfg();   // 每次打开都回填服务端当前值
 };
+loadHlCfg();   // 启动即回填持久化配置：点渲染/视角参数在首个 GLB 加载前就绪，刷新页面不丢样式
 $('hlcfgClose').onclick=()=>$('hlcfg').classList.remove('on');
 
 if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布局
