@@ -73,6 +73,35 @@ def get_selected_device() -> Optional[str]:
         return _effective_device_locked()
 
 
+def _parse_ms(val) -> Optional[int]:
+    """把 13 位毫秒级 epoch 时间戳（str/int/float）解析成 int 毫秒；无效/明显不是毫秒级返回 None。"""
+    try:
+        ms = int(float(val))
+    except (TypeError, ValueError):
+        return None
+    # 粗校验量级：毫秒级 epoch 应在 1e12 ~ 1e14 之间（2001~5138 年），秒级/相对时间戳一律拒收
+    return ms if 10 ** 12 <= ms < 10 ** 14 else None
+
+
+def _timing_locked(st: dict) -> dict:
+    """从设备桶抽取延时链路的三个时刻（均为 epoch 毫秒，缺失为 None）：
+      capture_ts_ms  拍摄时间：multipart `timestamp` 字段（App 从设备媒体文件名解析的 13 位 ms）；
+      upload_ts_ms   发起上传时间：camera_info JSON 里的 `upload_at_ms`（镜像链路专属，老版本 App 没有）；
+      server_ts_ms   服务器收到时间：本服务收到该帧的时刻。
+    注意三者分属设备/手机/服务器三个时钟，前端展示的差值含时钟偏差。"""
+    upload = None
+    if st["camera_info"]:
+        try:
+            upload = _parse_ms((json.loads(st["camera_info"]) or {}).get("upload_at_ms"))
+        except (ValueError, TypeError, AttributeError):
+            pass
+    return {
+        "capture_ts_ms": _parse_ms(st["timestamp"]),
+        "upload_ts_ms": upload,
+        "server_ts_ms": int(st["received_at"] * 1000) if st["received_at"] else None,
+    }
+
+
 def _parse_device_id(camera_info: Optional[str]) -> str:
     """从随帧上报的 camera_info JSON 字符串里取 device_id；解析失败/缺失归 unknown 桶。"""
     if camera_info:
@@ -292,6 +321,7 @@ def frame_status(device: Optional[str] = Query(None)):
                 "config": _config, "config_gen": _config_gen,
                 "received_at": None, "age": None, "interval": None, "fps": None,
                 "content_type": None, "camera_info": None, "timestamp": None,
+                "capture_ts_ms": None, "upload_ts_ms": None, "server_ts_ms": None,
                 "product_kind": None, "product_url": None, "product_meta": None,
                 "product_seq": 0, "product_gen": 0, "product_error": None,
             })
@@ -310,6 +340,7 @@ def frame_status(device: Optional[str] = Query(None)):
             "content_type": st["content_type"],
             "camera_info": st["camera_info"],
             "timestamp": st["timestamp"],
+            **_timing_locked(st),
             # 产物状态
             "processor": _processor is not None,
             "config": _config,

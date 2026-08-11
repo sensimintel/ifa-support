@@ -1306,6 +1306,8 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <figure>
   <div class="box"><img id="raw" style="display:none"><span class="wait" id="rawwait">等待设备帧…</span></div>
   <figcaption>接收到的设备帧 <span class="m" id="rawmeta"></span></figcaption>
+  <figcaption id="rawlat" style="font-variant-numeric:tabular-nums"
+    title="拍摄=设备时钟 · 上传=手机时钟 · 服务器=5090 时钟 · 展示=浏览器时钟；跨时钟差值含偏差，负值≈时钟不同步"></figcaption>
  </figure>
 </div>
 
@@ -1542,6 +1544,21 @@ $('hlc').addEventListener('input',()=>{document.querySelector('input[name=hlcm][
 document.querySelectorAll('input[name=hlcm]').forEach(r=>r.addEventListener('change',pushHlConfig));
 pushHlConfig();  // 首次把高亮初值下发后端（服务重启后回落面板当前值）
 
+// ── 延时链路：拍摄(设备)→发起上传(手机)→服务器收到(5090)→上屏(浏览器)。
+// 上传/服务器延时直接用 status 里的三个 epoch 毫秒时刻相减；端到端延时在帧图 onload
+// 上屏那一刻用浏览器时钟结算。四个时刻分属不同时钟，差值含时钟偏差（负值≈不同步）。
+let pendingE2E=null, e2eMs=null;
+$('raw').addEventListener('load',()=>{
+  e2eMs=(pendingE2E&&pendingE2E.capture)?(Date.now()-pendingE2E.capture):null;});
+function fmtLag(ms){return ms==null?'—':((ms/1000).toFixed(2)+'s');}
+function renderLatency(s){
+  if(!s.has_frame){$('rawlat').textContent='';return;}
+  const up=(s.upload_ts_ms&&s.capture_ts_ms)?(s.upload_ts_ms-s.capture_ts_ms):null;
+  const sv=(s.server_ts_ms&&s.upload_ts_ms)?(s.server_ts_ms-s.upload_ts_ms):null;
+  $('rawlat').innerHTML='上传延时 <b>'+fmtLag(up)+'</b> · 服务器延时 <b>'+fmtLag(sv)
+    +'</b> · 端到端延时 <b>'+fmtLag(e2eMs)+'</b>';
+}
+
 let lastSeq=-1,lastProdKey='',lastSwap=0,lastS3=-1,lastSwap3=0,lastHl=-1,lastSwapH=0;
 const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显示，避免高帧率下一直卡在"加载中"(黑屏)
 
@@ -1568,6 +1585,7 @@ function renderDevices(s){
 }
 function resetPanesForSwitch(){   // 切设备：清空四框显示与序号缓存，等新设备的帧/产物
   lastSeq=-1;lastProdKey='';lastS3=-1;lastSwap=0;lastSwap3=0;lastHl=-1;lastSwapH=0;
+  pendingE2E=null;e2eMs=null;$('rawlat').textContent='';
   $('raw').style.display='none';$('rawwait').style.display='';
   $('prodimg').style.display='none';$('mv').style.display='none';$('prodwait').style.display='';
   $('s3img').style.display='none';$('mv2').style.display='none';$('s3wait').style.display='';
@@ -1583,8 +1601,10 @@ async function tick(){
   if(s.device && s.device!==curDev){ if(curDev!==null) resetPanesForSwitch(); curDev=s.device; }
   // 左框：接收帧
   if(s.has_frame && s.seq!==lastSeq){lastSeq=s.seq;
+    pendingE2E={capture:s.capture_ts_ms};   // 该帧 onload 上屏时结算端到端延时
     $('raw').src='/api/frame/latest?t='+s.seq;$('raw').style.display='block';$('rawwait').style.display='none';}
   $('rawmeta').textContent = s.has_frame ? ('帧 '+s.seq+(s.interval?(' · 间隔 '+s.interval.toFixed(1)+'s'):'')) : '';
+  renderLatency(s);
 
   // 右框：DA3 产物（图片=深度图；模型=GLB）
   const prodKey=(s.product_kind||'')+':'+(s.product_url||'')+':'+s.product_seq;
