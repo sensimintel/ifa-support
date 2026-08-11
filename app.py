@@ -907,6 +907,11 @@ _HL_NUM_FIELDS = {
     "pt_size": (0.5, 12.0, float),   # 点大小（px；近大远小开启时映射为世界尺寸）
     "pt_round": (0, 1, int),         # 1=圆点（片元 discard 裁圆） 0=方点（three 默认）
     "pt_atten": (0, 1, int),         # 1=近大远小（sizeAttenuation） 0=固定像素大小
+    # 整体色彩（片元 uniform 实时调色，作用于最终画面含高亮色；区别于上面写进 GLB
+    # 顶点色、只调底色不动高亮色的 sat/val）
+    "pt_hue": (-180.0, 180.0, float),  # 色相偏移（°，绕灰轴旋转）
+    "pt_sat": (0.0, 2.5, float),       # 饱和度系数（0=灰度）
+    "pt_val": (0.2, 2.5, float),       # 明度系数
 }
 _sam3hl_lock = threading.Lock()
 # 默认=②③前端 model-viewer 调优视角的等价参数（俯视10°、距离1.25×场景深度、真实FOV）：
@@ -918,7 +923,8 @@ _sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
                "eye_lift": 0.0, "eye_back": 0.0, "out_size": 760,
                "sat": 1.0, "val": 1.0, "conf": 40,   # 饱和/明度中性：GLB 直渲本身即 model-viewer
                                                      # 观感（点云图模式可手动调 0/1.2 复刻灰白）
-               "pt_size": 1.0, "pt_round": 0, "pt_atten": 0}  # 点渲染默认=three 原生观感（1px 方点）
+               "pt_size": 1.0, "pt_round": 0, "pt_atten": 0,  # 点渲染默认=three 原生观感（1px 方点）
+               "pt_hue": 0.0, "pt_sat": 1.0, "pt_val": 1.0}   # 整体色彩默认中性（不调色）
 _sam3hl = {"kind": None, "url": None, "bytes": None, "seq": 0, "meta": None, "error": None}
 
 
@@ -1918,12 +1924,18 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <label><input type="radio" name="ptatten" value="0" checked> 关（固定像素）</label>
    <label><input type="radio" name="ptatten" value="1"> 开（透视缩放）</label>
   </div></div>
+ <div class="fld"><label>色相偏移 <b id="v_pt_hue">0</b>°</label>
+  <input type="range" id="r_pt_hue" min="-180" max="180" step="5" value="0"></div>
+ <div class="fld"><label>饱和度（实时） ×<b id="v_pt_sat">1.0</b></label>
+  <input type="range" id="r_pt_sat" min="0" max="2.5" step="0.1" value="1"></div>
+ <div class="fld"><label>明度（实时） ×<b id="v_pt_val">1.0</b></label>
+  <input type="range" id="r_pt_val" min="0.2" max="2.5" step="0.1" value="1"></div>
  <div class="hint">与 /panel 的两张调节卡同一套配置（/api/sam3hl/config），两边改动互相可见。
   <b>俯视角/相机距离/抬升/后撤</b>是前端相机参数，拖动立即生效；高亮样式与
-  <b>饱和度/明度/置信度分位</b>写进 GLB，下一轮 SAM3 结果生效（约 1~3 秒）。
-  饱和/明度默认中性 1.0、置信度默认 40，与「SAM3点云」完全一致。
-  <b>点渲染</b>三项直改浏览器内 three.js 点材质，拖动立即生效、对当前所有 GLB
-  背景（高亮/SAM3/LA 点云）通用；默认值即 three 原生观感（1px 方点）。</div>
+  <b>饱和度/明度/置信度分位</b>写进 GLB，下一轮 SAM3 结果生效（约 1~3 秒）、
+  只调底色不动高亮色。<b>点渲染</b>各项直改浏览器内 three.js 点材质，拖动立即
+  生效、对所有 GLB 背景（高亮/SAM3/LA 点云）通用；其中色相/饱和/明度（实时）
+  作用于最终画面<b>含高亮色</b>。默认值均为中性（1px 方点、不调色）。</div>
 </div>
 
 <script>
@@ -1997,8 +2009,9 @@ function applyExpView(){const mv=$('bgmv');
 // PointsMaterial（size/sizeAttenuation/圆点裁剪）。glTF 的 POINTS 图元不携带点大小，
 // 大小/形状是渲染器参数——model-viewer 公开 API 不暴露，只能穿透（版本已钉死 3.5.0，
 // 符号描述 minify 后仍稳定）。每次换 GLB 材质是新实例，须在 load 事件重新应用。──
-let mvSceneSym=null,ptStyle={pt_size:1,pt_round:0,pt_atten:0};
-const ptRoundU={value:0};            // 圆点开关 uniform：材质间共享引用，翻值即生效不重编译
+let mvSceneSym=null,ptStyle={pt_size:1,pt_round:0,pt_atten:0,pt_hue:0,pt_sat:1,pt_val:1};
+// 材质间共享引用的 uniform：翻值即生效不重编译（圆点开关 + 整体色彩 色相/饱和/明度）
+const ptRoundU={value:0},ptHueU={value:0},ptSatU={value:1},ptValU={value:1};
 function mvScene(mv){
   if(!mvSceneSym)mvSceneSym=Object.getOwnPropertySymbols(mv).find(s=>s.description==='scene');
   return mvSceneSym?mv[mvSceneSym]:null;
@@ -2006,6 +2019,7 @@ function mvScene(mv){
 function applyPtStyle(){
   const sc=mvScene($('bgmv'));if(!sc||!sc.traverse)return;
   ptRoundU.value=ptStyle.pt_round?1:0;
+  ptHueU.value=+ptStyle.pt_hue;ptSatU.value=+ptStyle.pt_sat;ptValU.value=+ptStyle.pt_val;
   sc.traverse(o=>{
     if(!o.isPoints||!o.material)return;
     const m=o.material;
@@ -2016,12 +2030,18 @@ function applyPtStyle(){
     if(!m.userData.ptPatched){   // 圆点：片元按 gl_PointCoord 裁圆，uniform 控制开关
       m.userData.ptPatched=true;
       m.onBeforeCompile=sh=>{
-        sh.uniforms.uPtRound=ptRoundU;
+        sh.uniforms.uPtRound=ptRoundU;sh.uniforms.uPtHue=ptHueU;
+        sh.uniforms.uPtSat=ptSatU;sh.uniforms.uPtVal=ptValU;
         // 注意：本页嵌在 Python 普通字符串里，JS 转义序列必须写成 \\n（否则被 Python
         // 先转成真实换行，截断 JS 字符串字面量 → 整页脚本 SyntaxError）
-        sh.fragmentShader='uniform float uPtRound;\\n'+sh.fragmentShader.replace(
-          '#include <clipping_planes_fragment>',
-          '#include <clipping_planes_fragment>\\nif(uPtRound>0.5&&length(gl_PointCoord-vec2(0.5))>0.5)discard;');
+        sh.fragmentShader='uniform float uPtRound;uniform float uPtHue;uniform float uPtSat;uniform float uPtVal;\\n'
+          +sh.fragmentShader.replace(
+            '#include <clipping_planes_fragment>',
+            '#include <clipping_planes_fragment>\\nif(uPtRound>0.5&&length(gl_PointCoord-vec2(0.5))>0.5)discard;')
+          // 整体色彩：顶点色装配(color_fragment)后做 饱和(灰度插值)→明度→色相(绕灰轴旋转)
+          .replace(
+            '#include <color_fragment>',
+            '#include <color_fragment>\\n{vec3 c=diffuseColor.rgb;float l=dot(c,vec3(0.2126,0.7152,0.0722));c=mix(vec3(l),c,uPtSat)*uPtVal;float a=radians(uPtHue);vec3 k=vec3(0.57735);c=c*cos(a)+cross(k,c)*sin(a)+k*dot(k,c)*(1.0-cos(a));diffuseColor.rgb=max(c,vec3(0.0));}');
       };
       m.needsUpdate=true;
     }
@@ -2175,10 +2195,11 @@ syncStyleUI();
 // 打开时从服务端读当前配置回填（不主动推初值，避免覆盖 /panel 已调好的参数），改动才下发
 // strength/dim/sat/val/conf 走服务端写进 GLB；view_* 四项是前端相机参数（拖动立即生效），
 // pt_* 三项是前端点材质参数（拖动立即生效），均存进服务端配置做持久化/与 /panel 互通。
-const HL_KEYS=['strength','dim','view_tilt','view_zoom','eye_lift','eye_back','sat','val','conf','pt_size'];
+const HL_KEYS=['strength','dim','view_tilt','view_zoom','eye_lift','eye_back','sat','val','conf',
+               'pt_size','pt_hue','pt_sat','pt_val'];
 const HL_FMT={view_zoom:v=>(+v).toFixed(2),eye_lift:v=>(+v).toFixed(2),
               eye_back:v=>(+v).toFixed(2),sat:v=>(+v).toFixed(1),val:v=>(+v).toFixed(1),
-              pt_size:v=>(+v).toFixed(1)};
+              pt_size:v=>(+v).toFixed(1),pt_sat:v=>(+v).toFixed(1),pt_val:v=>(+v).toFixed(1)};
 const VIEW_KEYS=['view_tilt','view_zoom','eye_lift','eye_back'];
 let hlView={view_tilt:10,view_zoom:1.25,eye_lift:0,eye_back:0};
 let hlStyle='tint',hlPushTimer=null;
@@ -2204,7 +2225,7 @@ async function loadHlCfg(){
     HL_KEYS.forEach(k=>{if(c[k]!==undefined){$('r_'+k).value=c[k];hlLabel(k);}});
     VIEW_KEYS.forEach(k=>{if(c[k]!==undefined)hlView[k]=+c[k];});
     applyExpView();   // 服务端可能有 /panel 调过的视角参数，回填后立即应用
-    if(c.pt_size!==undefined)ptStyle.pt_size=+c.pt_size;
+    HL_KEYS.forEach(k=>{if(k.indexOf('pt_')===0&&c[k]!==undefined)ptStyle[k]=+c[k];});
     ['pt_round','pt_atten'].forEach((k,i)=>{const nm=i?'ptatten':'ptshape';
       if(c[k]!==undefined){ptStyle[k]=+c[k]?1:0;
         document.querySelector('input[name='+nm+'][value="'+ptStyle[k]+'"]').checked=true;}});
@@ -2215,7 +2236,7 @@ async function loadHlCfg(){
 }
 HL_KEYS.forEach(k=>$('r_'+k).addEventListener('input',()=>{hlLabel(k);
   if(VIEW_KEYS.includes(k)){hlView[k]=+$('r_'+k).value;applyExpView();}   // 相机参数立即生效
-  if(k==='pt_size'){ptStyle.pt_size=+$('r_'+k).value;applyPtStyle();}     // 点大小立即生效
+  if(k.indexOf('pt_')===0){ptStyle[k]=+$('r_'+k).value;applyPtStyle();}   // 点渲染参数立即生效
   pushHlCfg();}));
 // 点形状/近大远小：改动立即应用到当前 GLB 并下发持久化
 document.querySelectorAll('input[name=ptshape],input[name=ptatten]').forEach(r=>
