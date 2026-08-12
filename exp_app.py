@@ -9,11 +9,11 @@
   lightbox、Qwen/Gemini 切换），卡片字段含 卡路里/宏量/健康分级。
 
 链路（全部在本进程，与 8060 零共享状态）：
-  8060 只读接口拉帧(采样率可调) → 实验检测级(SAM3 /v1/segment 可调阈值、LA 可选对照、
-  embedding 匹配插槽) → 命中触发 VLM 识别(与产线同款 prompt/解析/五道合并闸门，可魔改) → 实验卡片流。
+  8060 只读接口拉帧(采样率可调) → SAM3 检测(/v1/segment 可调查询词/阈值/口径 + embedding 匹配插槽)
+  → 命中触发 VLM 识别(与产线同款 prompt/解析/五道合并闸门，可魔改) → 实验卡片流。不走 LA。
 
 隔离与负载：
-- 不加载任何大模型：SAM3/LA 是 5090 已常驻的 HTTP 服务，SAM3 走无状态 /v1/segment
+- 不加载任何大模型：SAM3 是 5090 已常驻的 HTTP 服务，走无状态 /v1/segment
   （不碰产线流式 session）；VLM 在 GCP，识别逻辑本进程独立一份（正是为了随便魔改）。
 - DA3 不重复跑：点云产物直接展示 8060 产线产物（8060 CORS 全放开，浏览器跨端口直取）。
 - 总开关默认关 = 不拉帧不推理，GPU 零增量。
@@ -27,7 +27,6 @@ import threading
 import time
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -40,11 +39,7 @@ app = FastAPI(title="感知链路实验台")
 # ── 上游地址（与 8060 共用仓根 .env，run-exp.sh 负责加载） ──
 FRAME_SOURCE = os.environ.get("EXP_FRAME_SOURCE", "http://127.0.0.1:8060").rstrip("/")
 SAM3_ENDPOINT = os.environ.get("SAM3_ENDPOINT", "http://127.0.0.1:8013").rstrip("/")
-LOCATE_ENDPOINT = os.environ.get("EXP_LOCATE_ENDPOINT",
-                                 "http://127.0.0.1:8000/v1/chat/completions")
-LOCATE_MODEL = "nvidia/LocateAnything-3B"
 SAM3_TIMEOUT = float(os.environ.get("EXP_SAM3_TIMEOUT", "30"))
-LOCATE_TIMEOUT = float(os.environ.get("EXP_LOCATE_TIMEOUT", "20"))
 UNKNOWN_DEVICE = "unknown"
 
 # ══════════════════════════════════════════════════════════════════════
@@ -64,9 +59,6 @@ _cfg = {
     "sam3_alpha": 1.0,           # presence α（presence 指数软化：1=原始行为，0=完全忽略 presence）
     "sam3_det_thresh": 0.0,      # server 端检测阈值；0=恢复模型默认（0.5，联合分口径）
     "sam3_mask": True,           # 标注帧叠 mask 半透明高亮
-    "la_on": False,              # LocateAnything 对照（默认关——实验主题就是不走 LA）
-    "la_food_queries": "food",
-    "la_drink_queries": "bottle; glass",
     "embed_on": False,           # embedding 匹配插槽（_embed_match 接入前无输出）
     "recog_on": True,            # 命中检测后是否触发 VLM 识别（关=只看检测级）
     "recog_interval": 4.0,       # 两次 VLM 识别最小间隔（秒），与产线同款节流语义
@@ -135,7 +127,7 @@ def _fetch_frame():
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 检测级：SAM3（无状态）与 LocateAnything（对照）
+# 检测级：SAM3（无状态 /v1/segment）
 # ══════════════════════════════════════════════════════════════════════
 def _rle_decode(size, counts):
     """COCO 压缩 RLE → (H,W) uint8 0/1（与 8060 同款自带解码，5090 无 pycocotools）。"""
@@ -182,40 +174,6 @@ def _sam3_segment(rgb, query, alpha=1.0, det_thresh=0.0):
     except Exception as e:
         print(f"[exp] SAM3({query}) 调用失败：{type(e).__name__}: {e}", flush=True)
         return []
-
-
-_LOCATE_RE = re.compile(r"<ref>(.*?)</ref>\s*<box>(.*?)</box>", re.S)
-_LOCATE_INT_RE = re.compile(r"<(-?\d+)>")
-
-
-def _locate_one(rgb, query):
-    """单查询 LocateAnything：返回 [(x1,y1,x2,y2) 0-1 归一化]，失败返回 []。"""
-    uri = _b64_jpg(rgb)
-    if not uri:
-        return []
-    payload = {
-        "model": LOCATE_MODEL,
-        "messages": [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + uri}},
-            {"type": "text",
-             "text": f"Locate all the instances that matches the following description: {query}."},
-        ]}],
-        "max_tokens": 512,
-    }
-    try:
-        r = _http_json(LOCATE_ENDPOINT, payload, timeout=LOCATE_TIMEOUT)
-        content = r["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"[exp] LocateAnything({query}) 调用失败：{type(e).__name__}: {e}", flush=True)
-        return []
-    boxes = []
-    for _ref, box in _LOCATE_RE.findall(content):
-        ints = [int(x) for x in _LOCATE_INT_RE.findall(box)]
-        for i in range(0, len(ints) - 3, 4):
-            x1, y1, x2, y2 = ints[i:i + 4]
-            boxes.append((min(x1, x2) / 999.0, min(y1, y2) / 999.0,
-                          max(x1, x2) / 999.0, max(y1, y2) / 999.0))
-    return boxes
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -652,10 +610,10 @@ def _maybe_recognize(orig_rgb, detections, frame, device, min_interval):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 实验检测主循环：采样帧 → 检测级（SAM3/LA/embed）→ 标注帧 + 逐轮记录 → 触发 VLM 识别
+# 实验检测主循环：采样帧 → SAM3 检测(+embed 插槽) → 标注帧 + 逐轮记录 → 触发 VLM 识别
 # ══════════════════════════════════════════════════════════════════════
-def _draw_round(rgb, sam3_res, la_res, thresh, with_mask):
-    """标注帧：SAM3 过阈值=红(食物)/蓝(液体)框+可选 mask 高亮，低于阈值=灰框；LA=同色系细框。"""
+def _draw_round(rgb, sam3_res, thresh, with_mask):
+    """标注帧：SAM3 过阈值=红(食物)/蓝(液体)框+可选 mask 高亮，低于阈值=灰框。"""
     out = rgb.copy()
     H, W = out.shape[:2]
     lw = max(2, W // 400)
@@ -684,21 +642,14 @@ def _draw_round(rgb, sam3_res, la_res, thresh, with_mask):
                         out[sel] = (out[sel] * 0.55 + np.array(base) * 0.45).astype(np.uint8)
                     except Exception:
                         pass
-    for (label, query, boxes) in la_res:
-        base = _FOOD_COLOR if label == "food" else _DRINK_COLOR
-        for (x1, y1, x2, y2) in boxes:
-            p1, p2 = (int(x1 * W), int(y1 * H)), (int(x2 * W), int(y2 * H))
-            cv2.rectangle(out, p1, p2, base, max(1, lw // 2))
-            cv2.putText(out, "LA:" + query, (p1[0], min(H - 6, p2[1] + 18)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, base, 1, cv2.LINE_AA)
     return out
 
 
 def _run_round(rgb, src_seq, dev, cfg):
     """跑一轮实验链路：检测 → 标注/记录 → 命中触发 VLM 识别。"""
     rec = {"t": time.strftime("%H:%M:%S"), "src_seq": src_seq,
-           "sam3": [], "la": [], "embed": [], "ms": {}}
-    sam3_res, la_res, detections = [], [], []   # detections=[(food|drink,x1,y1,x2,y2)...] 0-1
+           "sam3": [], "embed": [], "ms": {}}
+    sam3_res, detections = [], []   # detections=[(food|drink,x1,y1,x2,y2)...] 0-1
     if cfg["sam3_on"]:
         t0 = time.time()
         groups = [("food", q) for q in _split_queries(cfg["sam3_food_queries"])] + \
@@ -717,18 +668,6 @@ def _run_round(rgb, src_seq, dev, cfg):
                                 "kept": len(kept),
                                 "scores": [round(i.get("score", 0), 3) for i in insts]})
         rec["ms"]["sam3"] = round((time.time() - t0) * 1000)
-    if cfg["la_on"]:
-        t0 = time.time()
-        groups = [("food", q) for q in _split_queries(cfg["la_food_queries"])] + \
-                 [("drink", q) for q in _split_queries(cfg["la_drink_queries"])]
-        with ThreadPoolExecutor(max_workers=max(1, len(groups))) as ex:   # LA 有 LB 可并发
-            results = list(ex.map(lambda g: (g[0], g[1], _locate_one(rgb, g[1])), groups))
-        la_res = results
-        for label, q, boxes in results:
-            for b in boxes:
-                detections.append((label,) + tuple(b))
-        rec["la"] = [{"label": l, "query": q, "boxes": len(bs)} for l, q, bs in results]
-        rec["ms"]["la"] = round((time.time() - t0) * 1000)
     if cfg["embed_on"]:
         t0 = time.time()
         H, W = rgb.shape[:2]
@@ -738,7 +677,7 @@ def _run_round(rgb, src_seq, dev, cfg):
             rec["embed"].append({"from": label, "match": m or "插槽未接入"})
         rec["ms"]["embed"] = round((time.time() - t0) * 1000)
     t0 = time.time()
-    anno = _draw_round(rgb, sam3_res, la_res, cfg["sam3_thresh"], cfg["sam3_mask"])
+    anno = _draw_round(rgb, sam3_res, cfg["sam3_thresh"], cfg["sam3_mask"])
     ok, buf = cv2.imencode(".jpg", cv2.cvtColor(anno, cv2.COLOR_RGB2BGR),
                            [cv2.IMWRITE_JPEG_QUALITY, 85])
     rec["ms"]["draw"] = round((time.time() - t0) * 1000)
@@ -751,8 +690,8 @@ def _run_round(rgb, src_seq, dev, cfg):
         del _rounds[:-ROUNDS_KEEP]
     n_food = sum(1 for d in detections if d[0] == "food")
     n_drink = len(detections) - n_food
-    print("[exp] 检测一轮：帧%d · 食物框%d 液体框%d · sam3 %dms la %dms" % (
-        src_seq, n_food, n_drink, rec["ms"].get("sam3", 0), rec["ms"].get("la", 0)), flush=True)
+    print("[exp] 检测一轮：帧%d · 食物框%d 液体框%d · sam3 %dms" % (
+        src_seq, n_food, n_drink, rec["ms"].get("sam3", 0)), flush=True)
     # 命中 → 触发实验 VLM 识别（异步、节流；与产线同款语义但完全独立一份）
     if cfg["recog_on"] and detections:
         _maybe_recognize(rgb, detections, "e%d" % src_seq, dev,
@@ -800,7 +739,7 @@ def exp_status():
 
 @app.get("/api/exp/health")
 def exp_health():
-    """上游依赖健康：8060 帧源 / SAM3 / LA / VLM 配置（页面顶栏指示灯）。"""
+    """上游依赖健康：8060 帧源 / SAM3 / VLM 配置（页面顶栏指示灯）。"""
     def probe(url):
         try:
             with urllib.request.urlopen(url, timeout=3.0) as r:
@@ -810,7 +749,6 @@ def exp_health():
     return JSONResponse({
         "frame": probe(FRAME_SOURCE + "/api/frame/status"),
         "sam3": probe(SAM3_ENDPOINT + "/health"),
-        "la": probe(LOCATE_ENDPOINT.rsplit("/v1/", 1)[0] + "/v1/models"),
         "vlm": bool(RECOG_TARGETS[_recog_target]["endpoint"]),
     })
 
@@ -963,7 +901,6 @@ EXP_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <span class="tag">8061 · 与产线 8060 / experience 完全隔离 · 帧/点云取自 8060 只读接口 · 检测/VLM 独立可魔改</span>
  <span class="hlth"><span><span class="dot" id="h_frame"></span>帧源</span>
   <span><span class="dot" id="h_sam3"></span>SAM3</span>
-  <span><span class="dot" id="h_la"></span>LA</span>
   <span><span class="dot" id="h_vlm"></span>VLM</span></span>
  <button id="btnCfg">调节</button></div>
 <div class="wrap">
@@ -1005,10 +942,6 @@ EXP_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="fld"><label>score 阈值</label><input type="range" id="c_sam3_thresh" min="0" max="1" step="0.05"><b id="v_thresh">0.50</b></div>
  <div class="fld"><label>mask 高亮</label><span class="sw"><input type="checkbox" id="c_sam3_mask"><i></i></span>
   <span class="hint">score 阈值是返回结果上的客户端二次过滤：低于阈值画灰框，直观看阈值卡掉了什么（设 0 = 全信 server 口径）</span></div>
- <h3>LocateAnything（对照，默认关）</h3>
- <div class="fld"><label>启用</label><span class="sw"><input type="checkbox" id="c_la_on"><i></i></span></div>
- <div class="fld"><label>食物查询词</label><input type="text" id="c_la_food_queries"></div>
- <div class="fld"><label>液体查询词</label><input type="text" id="c_la_drink_queries"></div>
  <h3>VLM 识别（实验独立一份，卡片见右栏）</h3>
  <div class="fld"><label>命中即识别</label><span class="sw"><input type="checkbox" id="c_recog_on"><i></i></span></div>
  <div class="fld"><label>识别节流</label><input type="number" id="c_recog_interval" min="1" step="0.5"> 秒/轮</div>
@@ -1021,8 +954,8 @@ EXP_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <script>
 const $=id=>document.getElementById(id);
 const B8060=location.protocol+'//'+location.hostname+':8060';   // 8060 CORS 全放开，跨端口直取
-const BOOLS=['enabled','sam3_on','sam3_mask','la_on','embed_on','recog_on'];
-const TEXTS=['sam3_food_queries','sam3_drink_queries','la_food_queries','la_drink_queries'];
+const BOOLS=['enabled','sam3_on','sam3_mask','embed_on','recog_on'];
+const TEXTS=['sam3_food_queries','sam3_drink_queries'];
 let inited=false,lastAnno=-1,lastRawSeq=-1,lastMvUrl='',lastProdSeq=-1,pushTimer=null;
 
 function push(){
@@ -1060,7 +993,6 @@ function rdLine(r){
   let s='<span class="t">'+r.t+' 帧'+r.src_seq+'</span>';
   (r.sam3||[]).forEach(x=>{s+=' <span class="'+(x.label==='food'?'f':'d')+'">'+x.query+' '+x.kept+'/'+x.total+'</span>'
     +(x.scores&&x.scores.length?' <span class="cut">['+x.scores.join(',')+']</span>':'');});
-  (r.la||[]).forEach(x=>{s+=' <span class="'+(x.label==='food'?'f':'d')+'">LA:'+x.query+'×'+x.boxes+'</span>';});
   const ms=r.ms||{};s+=' <span class="t">'+Object.entries(ms).map(([k,v])=>k+v+'ms').join(' ')+'</span>';
   return '<div class="rd">'+s+'</div>';
 }
@@ -1113,7 +1045,7 @@ async function tick8060(){   // 原帧 + 点云产物都来自 8060（只读；�
 async function hlth(){
   try{
     const h=await(await fetch('/api/exp/health',{cache:'no-store'})).json();
-    [['h_frame',h.frame],['h_sam3',h.sam3],['h_la',h.la],['h_vlm',h.vlm]].forEach(([id,ok])=>{
+    [['h_frame',h.frame],['h_sam3',h.sam3],['h_vlm',h.vlm]].forEach(([id,ok])=>{
       $(id).className='dot '+(ok?'ok':'bad');});
   }catch(e){}
 }
