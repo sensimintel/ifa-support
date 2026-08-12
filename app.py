@@ -36,7 +36,8 @@ import torch
 import trimesh
 from fastapi import Body, FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, Response,
+                               StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
@@ -2474,17 +2475,14 @@ function renderTimeline(cards){
       +(c.name||'')+(busy?'…':'')+'</span><span class="ttime">'
       +String(c.t||'').slice(0,5)+'</span></div>';}).join('');
 }
-async function recogTick(){
- if(DEMO)return;
- try{
-  const r=await(await fetch('/api/recog/list',{cache:'no-store'})).json();
+// 识别结果由 SSE 推送驱动（不再定时轮询）：后端出卡/合并/清空/切设备时推全量列表
+function applyRecog(r){
   const cards=r.cards||[];
   renderTimeline(cards);
   const c=cards[0];
   if(c){const key=c.id+':'+(c.rev||0);
     if(key!==lastCardKey){lastCardKey=key;cardShownAt=Date.now();curCard=c;renderCard(c);}}
   setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
- }catch(e){/* 单次轮询失败忽略 */}
 }
 
 // ══ 右下临时工具：来源下拉框 + 高亮调节抽屉开关 + 流水视图开关 ══
@@ -2616,7 +2614,10 @@ if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布
 }else{
   setState('idle');
   setInterval(bgTick,500);bgTick();
-  setInterval(recogTick,1500);recogTick();
+  // 识别结果 SSE 推送：连上即收全量快照，之后有变更即刻到达（断线 EventSource 自动重连）
+  new EventSource('/api/recog/events').onmessage=ev=>{try{applyRecog(JSON.parse(ev.data))}catch(e){}};
+  // 成功态驻留 FRESH_MS 到期回落待机是纯本地状态，用轻量本地定时器驱动（不发请求）
+  setInterval(()=>setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle'),1000);
 }
 </script>
 </body></html>"""
@@ -2757,6 +2758,9 @@ RECOG_MAX_CANDIDATES = 8     # 每次最多带几张候选参考图(带框图)�
 
 _recog_lock = threading.Lock()
 _recog_cv = threading.Condition(_recog_lock)
+# 卡片变更通知（SSE 推送用）：任何新卡/合并/清空都把版本号 +1 并唤醒推送线程
+_recog_gen = 0
+_recog_evt_cv = threading.Condition(_recog_lock)
 # device_id -> [{id,status,name,type,glb_url,frame,t}]，每设备一条独立卡片流（append 顺序=时间顺序）。
 # 切换设备时卡片不清空：/api/recog/list 默认下发当前选中设备的桶，切回来卡片还在。
 _recog_cards = {}
@@ -3085,7 +3089,7 @@ def _recog_worker():
       否则 → 新建卡（ref_img=按物品 box 裁剪的特写，无 box 回退整帧带框图）。
     合并闸门共五道（宁拒勿并，错并比重复建卡严重）：回显校验 → 类型一致 →
     证据自洽 → high 置信 → 名称零重叠拦截。"""
-    global _recog_id
+    global _recog_id, _recog_gen
     while True:
         with _recog_cv:
             while not _recog_pending:
@@ -3202,6 +3206,9 @@ def _recog_worker():
                         "frame": frame, "t": t, "last_ts": now, "rev": 0})
             if len(cards) > RECOG_MAX_CARDS:
                 del cards[:len(cards) - RECOG_MAX_CARDS]
+            if items:                    # 本轮有卡片变更（新卡/合并）→ 通知 SSE 推送线程
+                _recog_gen += 1
+                _recog_evt_cv.notify_all()
 
 
 def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
@@ -3353,20 +3360,55 @@ app.include_router(frame_router)
 set_processor(_da3_frame_processor)
 
 
-@app.get("/api/recog/list")
-def recog_list(device: Optional[str] = None):
-    """指定设备（缺省=当前选中设备）的识别卡片列表（最新在前）；
-    enabled=false 表示识别服务未接入。响应带 device 字段，前端据此判断是否发生了设备切换。"""
-    dev = (device or "").strip() or get_selected_device()
+def _recog_list_payload(dev):
+    """识别卡片列表负载（/api/recog/list 与 SSE 推送共用）：最新在前。"""
     with _recog_lock:
         # 剔除 ref_img（大 dataURI，仅后端去重比对用）；shots(点云 glb 列表) + rev 下发给前端
         cards = [{k: v for k, v in c.items() if k != "ref_img"}
                  for c in _recog_cards.get(dev, []) if c.get("status") != "empty"]
     cards.reverse()   # 最新在前，前端 prepend 到顶部
     tgt = RECOG_TARGETS[_recog_target]
-    return JSONResponse({"enabled": bool(tgt["endpoint"]), "device": dev, "cards": cards,
-                         "target": _recog_target, "model": tgt["model"],
-                         "targets": {k: bool(v["endpoint"]) for k, v in RECOG_TARGETS.items()}})
+    return {"enabled": bool(tgt["endpoint"]), "device": dev, "cards": cards,
+            "target": _recog_target, "model": tgt["model"],
+            "targets": {k: bool(v["endpoint"]) for k, v in RECOG_TARGETS.items()}}
+
+
+@app.get("/api/recog/list")
+def recog_list(device: Optional[str] = None):
+    """指定设备（缺省=当前选中设备）的识别卡片列表（最新在前）；
+    enabled=false 表示识别服务未接入。响应带 device 字段，前端据此判断是否发生了设备切换。"""
+    dev = (device or "").strip() or get_selected_device()
+    return JSONResponse(_recog_list_payload(dev))
+
+
+@app.get("/api/recog/events")
+def recog_events():
+    """识别卡片 SSE 推送（/experience 用，取代 1.5s 轮询）：连上先发一次全量快照，
+    此后卡片变更（新卡/合并/清空）或选中设备切换时即刻推最新列表（负载与
+    /api/recog/list 相同）；无变更时约 15s 发一次注释心跳兼探测断连。
+    同步生成器跑在线程池里（每个连接占一个线程），展台量级（个位数页面）没有压力。"""
+    def gen():
+        last_gen, last_dev, beats = -1, None, 0
+        while True:
+            cur_dev = get_selected_device()
+            with _recog_lock:
+                if _recog_gen == last_gen and cur_dev == last_dev:
+                    # 变更靠 notify 即时唤醒；1s 超时兜底顺带检查设备切换
+                    _recog_evt_cv.wait(timeout=1.0)
+                cur_gen = _recog_gen
+            cur_dev = get_selected_device()
+            if cur_gen != last_gen or cur_dev != last_dev:
+                last_gen, last_dev, beats = cur_gen, cur_dev, 0
+                yield "data: " + json.dumps(_recog_list_payload(cur_dev),
+                                            ensure_ascii=False) + "\n\n"
+            else:
+                beats += 1
+                if beats >= 15:
+                    beats = 0
+                    yield ": ping\n\n"
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store",
+                                      "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/recog/target")
@@ -3395,9 +3437,12 @@ def recog_target_set(body: dict = Body(default=None)):
 @app.post("/api/recog/clear")
 def recog_clear(device: Optional[str] = None):
     """清空指定设备（缺省=当前选中设备）的识别卡片；其他设备的卡片不受影响。"""
+    global _recog_gen
     dev = (device or "").strip() or get_selected_device()
     with _recog_lock:
         _recog_cards.pop(dev, None)
+        _recog_gen += 1              # 清空也算变更，SSE 立即推空列表
+        _recog_evt_cv.notify_all()
     return JSONResponse({"ok": True, "device": dev})
 
 
