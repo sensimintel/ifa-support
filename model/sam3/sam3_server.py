@@ -69,6 +69,77 @@ def _infer_ctx():
         with torch.autocast("cuda", dtype=torch.bfloat16):
             yield
 
+# ── presence / top-K query 原始分调试捕获（供 /v1/segment 的 debug 返回）────────
+# 发布版 SAM3（has_presence_token=True → supervise_joint_box_scores=True）的检测头输出里：
+#   · presence_logit_dec：全局 presence token 的 logit（"概念是否存在于图中"，全图共享）；
+#   · pred_logits：每个 object query 的「联合分」logit = inverse_sigmoid(query条件分 × presence分)，
+#     clamp ±10（见 sam3.model.sam3_image._update_scores_and_boxes）。
+# 库层 API 只回吐过完阈值/NMS 的最终分，这里在 detector.forward_grounding 上包一层，
+# 在 NMS 抹分（logit -1e4）之前捕获原始输出，用于归因"漏检是 presence 门控杀的还是阈值砍的"：
+#   presence_score = sigmoid(presence_logit_dec)
+#   query 条件原始分 = 联合分 / presence_score（除回去还原；受 ±10 clamp 限幅，仅供诊断参考）
+# 捕获开关/结果不额外加锁：所有推理已由 _LOCK 全程串行。
+_dbg = {"on": False, "topk": 10, "calls": []}
+
+
+def _install_debug_hook():
+    """在 detector.forward_grounding 上包一层捕获钩子（加载完成后调用一次）。"""
+    det = _pred.model.detector
+    orig = det.forward_grounding
+
+    def _wrapped(*args, **kwargs):
+        out = orig(*args, **kwargs)
+        if _dbg["on"]:
+            try:
+                entry = {}
+                pl = out.get("presence_logit_dec")
+                if pl is not None:
+                    entry["presence_logit"] = float(pl.detach().float().flatten()[0])
+                lg = out.get("pred_logits")
+                if lg is not None:
+                    logits = lg.detach().float().flatten()
+                    k = max(1, min(int(_dbg["topk"]), logits.numel()))
+                    vals, idxs = logits.topk(k)
+                    entry["topk_joint_logit"] = [float(x) for x in vals]
+                    entry["topk_query_idx"] = [int(x) for x in idxs]
+                    entry["num_queries"] = int(logits.numel())
+                _dbg["calls"].append(entry)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("debug 捕获失败（不影响推理）：%r", e)
+        return out
+
+    det.forward_grounding = _wrapped
+    logger.info("presence/top-K 调试钩子已安装（detector.forward_grounding）")
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-float(x)))
+
+
+def _build_debug_payload(calls):
+    """把捕获到的第一帧原始输出整理成 /v1/segment 的 debug 字段。"""
+    if not calls:
+        return None
+    c = calls[0]
+    presence_logit = c.get("presence_logit")
+    presence = _sigmoid(presence_logit) if presence_logit is not None else None
+    queries = []
+    for rank, (jl, qi) in enumerate(zip(c.get("topk_joint_logit", []),
+                                        c.get("topk_query_idx", [])), start=1):
+        joint = _sigmoid(jl)
+        cond = (min(1.0, joint / presence) if presence is not None and presence > 1e-6
+                else None)
+        queries.append({"rank": rank, "query_idx": qi,
+                        "joint_score": round(joint, 6), "joint_logit": round(float(jl), 4),
+                        "cond_score": round(cond, 6) if cond is not None else None})
+    return {"presence_logit": (round(float(presence_logit), 4)
+                               if presence_logit is not None else None),
+            "presence_score": round(presence, 6) if presence is not None else None,
+            "num_queries": c.get("num_queries"), "topk": queries,
+            "note": "joint=联合分(query条件分×presence, NMS/阈值前); "
+                    "cond=query条件原始分(联合分/presence 还原, 受±10 logit clamp 限幅)"}
+
+
 def _load():
     global _pred, _err
     try:
@@ -78,6 +149,7 @@ def _load():
             logger.info("SAM3 显存上限 fraction=%.3f（本进程最多用这么多）", _mf)
         logger.info("正在加载 SAM3 predictor: %s (version=%s, use_fa3=False)", CKPT, VERSION)
         _pred = sam3.build_sam3_predictor(checkpoint_path=CKPT, version=VERSION, use_fa3=False)
+        _install_debug_hook()
         logger.info("SAM3 加载完成")
     except Exception as e:
         _err = repr(e)
@@ -304,6 +376,8 @@ def models():
 class SegReq(BaseModel):
     image_b64: str
     text: str
+    debug: bool = False        # true=附带 presence 分 + top-K query 原始分（NMS/阈值前）
+    topk: int = 10             # debug 时返回的 top-K query 数量（1~50）
 
 class TrackReq(BaseModel):
     frames_b64: list
@@ -329,14 +403,23 @@ def segment(req: SegReq):
     try:
         img.save(os.path.join(d, "00000.jpg"), quality=95)
         with _LOCK:
+            # debug 捕获窗口在 _LOCK 内开合：推理全程串行，不会混入别的请求的输出
+            if req.debug:
+                _dbg["topk"] = max(1, min(int(req.topk), 50))
+                _dbg["calls"] = []
+                _dbg["on"] = True
             sid = _pred.start_session(resource_path=d)["session_id"]
             try:
                 with _infer_ctx():
                     r = _pred.add_prompt(session_id=sid, frame_idx=0, text=req.text)
                 inst = _pack(r["outputs"], W, H)
             finally:
+                _dbg["on"] = False
                 _pred.close_session(sid)
-        return {"width": W, "height": H, "num_instances": len(inst), "instances": inst}
+        resp = {"width": W, "height": H, "num_instances": len(inst), "instances": inst}
+        if req.debug:
+            resp["debug"] = _build_debug_payload(_dbg["calls"])
+        return resp
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
