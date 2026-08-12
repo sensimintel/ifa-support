@@ -1866,40 +1866,46 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  .bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .45s ease}
  .bg.on{opacity:1}
  #bgmv{position:absolute;inset:0;width:100%;height:100%;display:none;--poster-color:transparent}
- /* 压暗渐变：右侧文字区 + 底部整体，保证文案可读（对应设计稿的压暗矩形层） */
+ /* 压暗层（Figma 653-25294）：四周暗角 radial 渐变——中心透明、边角压黑，保证两侧文案可读 */
  #shade{position:absolute;inset:0;pointer-events:none;
-   background:linear-gradient(90deg,rgba(0,0,0,.32),rgba(0,0,0,0) 40%,rgba(0,0,0,.08) 62%,rgba(0,0,0,.46)),
-              linear-gradient(0deg,rgba(0,0,0,.38),rgba(0,0,0,0) 32%)}
- /* ── 左侧 ODYSS logo（垂直居中） ── */
- #logo{position:absolute;left:1.3rem;top:50%;transform:translateY(-50%);width:2rem;height:auto;opacity:.95}
- /* ── 右侧状态区（两态叠放，淡入淡出切换） ── */
- #panel{position:absolute;left:75.4%;top:50%;transform:translateY(-50%);width:5.15rem;display:grid}
- #panel .state{grid-area:1/1;opacity:0;transition:opacity .5s ease;pointer-events:none}
+   background:radial-gradient(99.6% 99.6% at 50% 50%,rgba(0,0,0,0) 0%,rgba(0,0,0,.92) 100%)}
+ /* ── 左侧 ODYSS logo（Figma：左边距 26px、宽 210px、垂直居中） ── */
+ #logo{position:absolute;left:.26rem;top:50%;transform:translateY(-50%);width:2.1rem;height:auto;opacity:.95}
+ /* ── 右侧状态区（两态叠放，淡入淡出切换；Figma：右边距 26px、宽 532px、垂直居中） ── */
+ #panel{position:absolute;right:.26rem;top:50%;transform:translateY(-50%);width:5.32rem;display:grid}
+ /* 两态同格叠放；状态盒在面板高度内纵向居中（待机态只有一行标题，Figma 上为垂直居中） */
+ #panel .state{grid-area:1/1;opacity:0;transition:opacity .5s ease;pointer-events:none;
+   display:flex;flex-direction:column;justify-content:center}
  #panel .state.on{opacity:1}
  h1{font-family:'ABC Arizona Serif',Georgia,serif;font-weight:400;font-size:.5rem;line-height:1;
     letter-spacing:-.01rem;margin:0}
- #card h1{font-size:.56rem}
- .sub{font-size:.2rem;line-height:1.4;letter-spacing:-.002rem;margin:.16rem 0 0;color:rgba(255,253,247,.92)}
- .rule{border:0;border-top:1px solid rgba(255,253,247,.4);margin:.42rem 0 0}
- /* 识别成功卡：设计稿深色底面板（名称+描述 / Calories / 三列宏量 / Food Classification） */
- #card{background:rgba(17,14,12,.72);border-radius:.08rem;padding:.4rem .44rem .46rem;
-       backdrop-filter:blur(6px)}
- .krow{display:flex;justify-content:space-between;align-items:baseline;gap:.3rem;margin-top:.34rem}
- .klab{font-size:.17rem;letter-spacing:.004rem;color:rgba(255,253,247,.9);white-space:nowrap}
- .kval{font-size:.3rem;letter-spacing:-.004rem;white-space:nowrap}
- #macros{display:flex;justify-content:space-between;text-align:center;margin-top:.34rem;padding:0 .26rem}
- #macros .mlab{display:block;font-size:.17rem;color:rgba(255,253,247,.9)}
- #macros .mval{display:block;font-size:.3rem;letter-spacing:-.004rem;margin-top:.14rem}
- /* ── 食物定位小标：名称+卡路里（与右卡同数据源），锚在识别 box 中心、引线指向食物 ── */
+ #idle h1{text-align:right}
+ .sub{font-size:.2rem;line-height:1.4;letter-spacing:-.002rem;margin:.08rem 0 0;color:var(--white)}
+ .rule{border:0;border-top:1px solid #54514A;margin:.24rem 0 0}
+ /* 识别成功卡（Figma 563-1251）：10% 白 + 强背景模糊的浅色玻璃面板、直角；
+    内边距 44/24、区块间距一律 24（名称+描述 / Calories / 三列宏量 / Food Classification） */
+ #card{background:rgba(255,253,247,.1);padding:.44rem .24rem;backdrop-filter:blur(.2rem)}
+ .krow{display:flex;justify-content:space-between;align-items:center;gap:.3rem;margin-top:.24rem}
+ .klab{font-size:.2rem;letter-spacing:-.002rem;color:var(--white);white-space:nowrap}
+ .kval{font-size:.36rem;letter-spacing:-.0036rem;white-space:nowrap;
+       font-variant-numeric:lining-nums proportional-nums}
+ #macros{display:flex;justify-content:center;gap:.9rem;text-align:left;margin-top:.24rem;padding:.3rem 0}
+ #macros .mlab{display:block;font-size:.2rem;letter-spacing:-.002rem;color:var(--white)}
+ #macros .mval{display:block;font-size:.36rem;letter-spacing:-.0036rem;margin-top:.09rem;
+       font-variant-numeric:lining-nums proportional-nums}
+ /* ── 食物定位小标（Figma 563-1251）：无底框——右对齐两行文字 + 下划线拐弯引线（161×36、4px 描边），
+    引线尾梢=锚点（识别 box 中心）；文字带 2px 半透明黑描边保证亮背景可读 ── */
  #ftag{position:absolute;left:0;top:0;z-index:3;pointer-events:none;opacity:0;
    transition:opacity .35s ease,transform .5s ease;will-change:transform}
  #ftag.on{opacity:1}
- #ftag .ftin{transform:translate(0,-100%);display:inline-flex;flex-direction:column;align-items:flex-start}
- #ftbox{border:1.5px solid var(--white);border-radius:.05rem;padding:.13rem .32rem .15rem;
-   text-align:center;background:rgba(0,0,0,.28);backdrop-filter:blur(3px)}
- #ftname{font-size:.2rem;letter-spacing:.004rem;white-space:nowrap}
- #ftkcal{font-size:.155rem;margin-top:.05rem;color:rgba(255,253,247,.92);white-space:nowrap}
- #ftlead{display:block;margin-top:-1px}
+ #ftag .ftin{transform:translate(0,-100%);display:flex;flex-direction:column;align-items:flex-end;
+   width:1.61rem}
+ #ftname{font-size:.35rem;letter-spacing:-.0035rem;white-space:nowrap;text-align:right;
+   -webkit-text-stroke:.02rem rgba(0,0,0,.2);paint-order:stroke fill}
+ #ftkcal{font-size:.27rem;margin-top:.04rem;color:var(--white);white-space:nowrap;text-align:right;
+   -webkit-text-stroke:.02rem rgba(0,0,0,.2);paint-order:stroke fill;
+   font-variant-numeric:lining-nums proportional-nums}
+ #ftlead{display:block;width:1.61rem;height:.36rem;margin-top:.06rem;flex:none}
  /* ── 流水视图：实时画面小窗 + 当日识别记录列表 ── */
  #tl{position:absolute;inset:0;display:none}
  #tl.on{display:block;background:rgba(0,0,0,.62)}   /* 流水态强压暗背景，突出列表 */
@@ -1975,7 +1981,6 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div id="panel">
   <div class="state" id="idle">
    <h1>Place your food here</h1>
-   <p class="sub">Hold your food in front of the camera. ODYSS will recognize it automatically in seconds.</p>
   </div>
   <div class="state" id="card">
    <h1 id="cname"></h1>
@@ -1994,9 +1999,13 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  </div>
 
  <div id="ftag"><div class="ftin">
-  <div id="ftbox"><div id="ftname"></div><div id="ftkcal"></div></div>
-  <svg id="ftlead" width="44" height="30" viewBox="0 0 44 30" fill="none">
-   <path d="M43 1H14L1 29" stroke="#FFFDF7" stroke-width="1.5"/></svg>
+  <div id="ftname"></div><div id="ftkcal"></div>
+  <svg id="ftlead" viewBox="0 0 165 40" fill="none" preserveAspectRatio="none">
+   <defs><linearGradient id="ftlg" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0" stop-color="#FFFDF7" stop-opacity=".12"/>
+    <stop offset=".22" stop-color="#FFFDF7" stop-opacity=".9"/>
+    <stop offset="1" stop-color="#FFFDF7"/></linearGradient></defs>
+   <path d="M1.7 38L23.6 2H163.3" stroke="url(#ftlg)" stroke-width="4"/></svg>
  </div></div>
 
  <div id="tl">
