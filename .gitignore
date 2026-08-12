@@ -39,3 +39,5 @@ env/
 .DS_Store
 .idea/
 .vscode/
+
+sam3_score_cfg.json
