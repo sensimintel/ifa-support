@@ -405,6 +405,13 @@ def _sam3_stream_start(word):
 # 之后新增的 SAM3 生产参数都收口到这份配置里。
 _sam3_score_cfg = {"alpha": 1.0, "thresh": 0.0}
 _sam3_score_lock = threading.Lock()
+# 口径配置落盘持久化（gitignored 本地态）：重启/部署不丢，启动时回读
+_SCORE_CFG_PATH = Path(__file__).resolve().parent / "sam3_score_cfg.json"
+try:
+    _sam3_score_cfg.update(json.loads(_SCORE_CFG_PATH.read_text()))
+    print(f"[da3-web] 已回读生产 SAM3 口径：{_sam3_score_cfg}", flush=True)
+except Exception:
+    pass
 
 
 def _get_score_cfg():
@@ -3592,6 +3599,10 @@ def sam3tune_config_set(body: dict = Body(default=None)):
                           "label": (w.get("label") if isinstance(w, dict) else None) or "drink"})
     with _sam3_score_lock:
         _sam3_score_cfg = {"alpha": alpha, "thresh": thresh, "words": words}
+        try:
+            _SCORE_CFG_PATH.write_text(json.dumps(_sam3_score_cfg, ensure_ascii=False))
+        except Exception as e:
+            print(f"[da3-web] 口径配置落盘失败：{type(e).__name__}: {e}", flush=True)
     print(f"[da3-web] 生产 SAM3 口径更新：alpha={alpha} thresh={thresh} words={[w['word'] for w in words]}", flush=True)
     return JSONResponse({"ok": True, "alpha": alpha, "thresh": thresh, "words": words})
 
