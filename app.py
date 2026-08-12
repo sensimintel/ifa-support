@@ -4081,12 +4081,12 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5}
  .nav{display:flex;gap:16px;align-items:center;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);font-size:13px}
  .nav a{color:var(--muted);text-decoration:none}.nav a.active{color:var(--accent);font-weight:600}
- .wrap{padding:16px 18px 40px;max-width:1500px;margin:0 auto}
- h1{font-size:17px;margin:2px 0 4px;font-weight:650}
- h2{font-size:14px;margin:22px 0 8px;font-weight:650}
- .sub{font-size:12.5px;color:var(--muted);margin-bottom:14px}
- .sub code{font-family:var(--mono);font-size:11.5px}
- .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:14px}
+ .wrap{padding:10px 14px 30px;max-width:1800px;margin:0 auto}
+ h1{font-size:16px;margin:2px 0 3px;font-weight:650}
+ h2{font-size:13px;margin:14px 0 6px;font-weight:650}
+ .sub{font-size:12px;color:var(--muted);margin-bottom:8px;line-height:1.45}
+ .sub code{font-family:var(--mono);font-size:11px}
+ .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:8px 12px;margin-bottom:10px}
  .bar label{font-size:12.5px;color:var(--muted)}
  .bar input[type=text]{font-size:13px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);width:200px}
  .bar input[type=number]{font-size:13px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);width:62px}
@@ -4097,34 +4097,34 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .btn.on{background:var(--ok)}
  .st{font-size:12px;font-family:var(--mono);color:var(--faint);margin-left:auto}
  .st .ok{color:var(--ok)}.st .err{color:var(--err)}
- .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
- @media (max-width:900px){.grid{grid-template-columns:1fr}}
+ .live{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap}
+ .live figure{flex:0 0 auto}
  figure{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
- figure .cap{padding:9px 12px;font-size:12.5px;font-weight:600;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
- figure .cap span{font-weight:400;color:var(--faint);font-family:var(--mono);font-size:11px;margin-left:auto}
- figure .box{background:#10141a;display:flex;align-items:center;justify-content:center;min-height:280px}
- figure img{width:100%;display:block}
- .empty{color:var(--faint);font-size:13px;padding:40px 10px;text-align:center}
- .scores{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;margin-top:14px}
- .wcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+ figure .cap{padding:6px 10px;font-size:12px;font-weight:600;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
+ figure .cap span{font-weight:400;color:var(--faint);font-family:var(--mono);font-size:10.5px;margin-left:auto}
+ figure .box{background:#10141a;display:flex;align-items:center;justify-content:center;height:300px;min-width:200px}
+ figure img{height:100%;width:auto;max-width:46vw;display:block;object-fit:contain}
+ .empty{color:var(--faint);font-size:12.5px;padding:20px 10px;text-align:center}
+ .scores{flex:1 1 320px;min-width:300px;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:10px;align-content:start}
+ .wcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:9px 12px}
  .whead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
- .wchip{font-size:13px;font-weight:700;padding:1px 10px;border-radius:980px;color:#fff}
- .pres{font-family:var(--mono);font-size:22px;font-weight:700}
+ .wchip{font-size:12.5px;font-weight:700;padding:0 10px;border-radius:980px;color:#fff}
+ .pres{font-family:var(--mono);font-size:18px;font-weight:700}
  .pres.lo{color:var(--err)}.pres.hi{color:var(--ok)}
- .wmeta{font-size:11.5px;color:var(--faint);font-family:var(--mono)}
- table.tk{width:100%;border-collapse:collapse;margin-top:8px;font-family:var(--mono);font-size:11.5px}
- table.tk th{text-align:right;font-weight:600;color:var(--muted);padding:3px 8px;border-bottom:1px solid var(--line)}
- table.tk td{text-align:right;padding:2px 8px;color:var(--ink)}
+ .wmeta{font-size:11px;color:var(--faint);font-family:var(--mono)}
+ table.tk{width:100%;border-collapse:collapse;margin-top:5px;font-family:var(--mono);font-size:11px}
+ table.tk th{text-align:right;font-weight:600;color:var(--muted);padding:1px 6px;border-bottom:1px solid var(--line)}
+ table.tk td{text-align:right;padding:1px 6px;color:var(--ink)}
  table.tk th:first-child,table.tk td:first-child{text-align:left}
  table.tk tr.cut td{color:var(--faint)}
- .hist{display:flex;flex-direction:column;gap:10px}
- .hcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
- .hcard img{width:230px;max-width:44vw;border-radius:8px;display:block;background:#10141a}
- .hmeta{flex:1;min-width:240px;font-size:12px}
- .hmeta .t{font-family:var(--mono);color:var(--faint);font-size:11px}
- .hline{margin:3px 0;font-family:var(--mono);font-size:11.5px}
+ .hist{display:grid;grid-template-columns:repeat(auto-fill,minmax(520px,1fr));gap:8px}
+ .hcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:7px 9px;display:flex;gap:8px;align-items:flex-start}
+ .hcard img{width:148px;max-width:22vw;border-radius:6px;display:block;background:#10141a}
+ .hmeta{flex:1;min-width:0;font-size:11.5px}
+ .hmeta .t{font-family:var(--mono);color:var(--faint);font-size:10.5px}
+ .hline{margin:2px 0;font-family:var(--mono);font-size:11px}
  .hline b{font-family:var(--sans)}
- details summary{cursor:pointer;font-size:11.5px;color:var(--accent);margin-top:4px}
+ details summary{cursor:pointer;font-size:11px;color:var(--accent);margin-top:2px}
  .badge{display:inline-block;padding:0 7px;border-radius:980px;font-size:11px;font-weight:600}
  .badge.lo{background:#fdecec;color:var(--err)}
  .badge.hi{background:#e5f6ed;color:var(--ok)}
@@ -4148,15 +4148,14 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <button class="btn btn2" id="clear">清空历史</button>
   <span class="st" id="st">就绪</span>
  </div>
- <div class="grid">
-  <figure><div class="cap">① 设备实时原图 <span id="m1"></span></div>
+ <div class="live">
+  <figure><div class="cap">① 实时原图 <span id="m1"></span></div>
    <div class="box"><div class="empty" id="e1">等待设备帧…</div><img id="i1" style="display:none"></div></figure>
-  <figure><div class="cap">② SAM3 定位（最近一次运行） <span id="m2"></span></div>
+  <figure><div class="cap">② SAM3 定位 <span id="m2"></span></div>
    <div class="box"><div class="empty" id="e2">点「运行一次」或开自动</div><img id="i2" style="display:none"></div></figure>
+  <div class="scores" id="scores"><div class="empty">—</div></div>
  </div>
- <h2>最近一次运行 · 各词分数</h2>
- <div class="scores" id="scores"><div class="empty">—</div></div>
- <h2>历史（每张图：原图 / 定位 / 分数，服务端保留最近 30 条）</h2>
+ <h2>历史（原图 / 定位 / 分数，服务端保留最近 30 条）</h2>
  <div class="hist" id="hist"><div class="empty">暂无历史</div></div>
 </div>
 <script>
