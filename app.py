@@ -400,26 +400,43 @@ def _sam3_stream_start(word):
     return (r or {}).get("session_id")
 
 
+# ── 生产 SAM3 打分口径（控制面写、生产流式每帧读，实时生效）───────────────────
+# keep = presence^α × cond > thresh；alpha=1 且 thresh=0 时完全等价模型默认行为。
+# 之后新增的 SAM3 生产参数都收口到这份配置里。
+_sam3_score_cfg = {"alpha": 1.0, "thresh": 0.0}
+_sam3_score_lock = threading.Lock()
+
+
+def _get_score_cfg():
+    with _sam3_score_lock:
+        return dict(_sam3_score_cfg)
+
+
 def _sam3_stream_frame(word, rgb):
     """流式步进一帧。session 不存在/过期自动重建一次。
-    返回 (instances, global_index, impl)；流式不可用（老 server 等）返回 (None, None, None)。"""
+    每步随请求带上生产口径配置（presence α / 阈值，控制面可实时改）+ debug 捕获，
+    返回 (instances, global_index, impl, debug)；流式不可用（老 server 等）返回 (None,)*4。"""
     b64 = _b64_jpg(rgb)
     if not b64:
-        return None, None, None
+        return None, None, None, None
+    cfg = _get_score_cfg()
     with _sam3_stream_lock:
         sid = _sam3_stream_sessions.get(word)
     for _retry in range(2):
         if not sid:
             sid = _sam3_stream_start(word)
             if not sid:
-                return None, None, None
+                return None, None, None, None
             with _sam3_stream_lock:
                 _sam3_stream_sessions[word] = sid
-        r = _sam3_post("/v1/stream/frame", {"session_id": sid, "image_b64": b64})
+        r = _sam3_post("/v1/stream/frame", {"session_id": sid, "image_b64": b64,
+                                            "debug": True, "topk": 10,
+                                            "alpha": cfg["alpha"], "det_thresh": cfg["thresh"]})
         if r is not None:
-            return (r.get("instances") or [], r.get("global_index"), r.get("impl"))
+            return (r.get("instances") or [], r.get("global_index"), r.get("impl"),
+                    r.get("debug"))
         sid = None                    # 失败（session 被回收/服务重启）：重建一次再试
-    return None, None, None
+    return None, None, None, None
 
 
 _SAM3_COLORS = [(222, 52, 52), (46, 120, 235), (26, 158, 95), (240, 150, 20),
@@ -1013,25 +1030,30 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
             """优先走流式（server 端长记忆、obj_id 跨请求稳定、每步只传 1 帧）；
             流式不可用（老 server）回退无状态短窗口 track（obj_id 每轮重排）。"""
             query, label = ql
-            inst, gidx, impl = _sam3_stream_frame(query, frames[-1])
+            inst, gidx, impl, dbg = _sam3_stream_frame(query, frames[-1])
             if inst is not None:
-                return (label, inst, gidx, impl)
+                return (query, label, inst, gidx, impl, dbg)
             fr = _sam3_track(frames, query, prompt_frame_index=0)
             last = fr.get(nlast)
             if last is None and fr:
                 last = fr[sorted(fr.keys(), key=lambda k: int(k))[-1]]
-            return (label, last or [], None, None)
+            return (query, label, last or [], None, None, None)
 
         with ThreadPoolExecutor(max_workers=len(SAM3_CLOUD_TARGETS)) as ex:
             results = list(ex.map(trk_one, SAM3_CLOUD_TARGETS))
         track_ms = (time.time() - t0) * 1000.0
-        is_stream = any(g is not None for (_l, _i, g, _im) in results)
-        impls = {im for (_l, _i, _g, im) in results if im}
+        is_stream = any(g is not None for (_q, _l, _i, g, _im, _d) in results)
+        impls = {im for (_q, _l, _i, _g, im, _d) in results if im}
+        # 控制面观测写回：生产流式每帧的 presence/top-K 分数 + 定位图（忠实生产结果，非另跑）
+        try:
+            _sam3tune_record_prod(frames[-1], results, track_ms)
+        except Exception as e:
+            print(f"[da3-web] sam3tune 生产观测写回失败：{type(e).__name__}: {e}", flush=True)
 
         depth0 = np.asarray(pred.depth)[0]
         H0, W0 = depth0.shape
         overlays, id_tags = [], []
-        for label, insts, _g, _im in results:
+        for _query, label, insts, _g, _im, _d in results:
             col = LOCATE_COLORS.get(label, (255, 200, 0))
             for ins in insts:
                 rle = ins.get("mask_rle") or {}
@@ -3506,8 +3528,71 @@ def sam3_health():
 # ══════════════════════════════════════════════════════════════════════
 SAM3TUNE_HISTORY_MAX = 30      # 历史条数上限（缩略图 dataURI 常驻内存，别放太大）
 _sam3tune_history = []         # 最新在前；条目结构同 /api/sam3tune/run 返回（图为缩略图）
+_sam3tune_live = {}            # device -> 生产流式最近一帧的观测条目（控制面实时区数据源）
 _sam3tune_lock = threading.Lock()
 _sam3tune_seq = 0
+
+
+def _sam3tune_record_prod(rgb, results, ms):
+    """生产 SAM3 流式每帧的观测写回：per-device 最新状态 + 滚动历史。
+    results 元素 = (query, label, instances, gidx, impl, debug)，来自 _sam3cloud_refresh。
+    这里只做观测投影（画定位图 + 存分数），不发起任何额外推理——忠实生产结果。"""
+    global _sam3tune_seq
+    cfg = _get_score_cfg()
+    dev = get_selected_device()
+    img, word_infos, n_inst = rgb, [], 0
+    for wi, (query, label, inst, _g, _im, dbg) in enumerate(results):
+        col = _SAM3_COLORS[wi % len(_SAM3_COLORS)]
+        img = _draw_instances(img, inst, color=col, label_prefix=query)
+        n_inst += len(inst)
+        word_infos.append({
+            "word": query, "label": label, "color": "#%02x%02x%02x" % col, "n": len(inst),
+            "instances": [{"obj_id": it.get("obj_id"),
+                           "score": round(float(it.get("score", 0)), 4)} for it in inst],
+            "debug": dbg,
+        })
+    with _sam3tune_lock:
+        _sam3tune_seq += 1
+        entry_id = _sam3tune_seq
+    entry = {"ok": True, "id": entry_id, "ts": time.time(), "src": "prod",
+             "text": ", ".join(q for (q, _l, _i, _g2, _im2, _d) in results),
+             "alpha": cfg["alpha"], "thresh": cfg["thresh"] or 0.5,
+             "seg_ms": round(float(ms), 1), "n_inst": n_inst, "words": word_infos,
+             "device": dev, "raw": _thumb_uri(rgb), "seg": _thumb_uri(img)}
+    with _sam3tune_lock:
+        _sam3tune_live[dev] = entry
+        _sam3tune_history.insert(0, entry)
+        del _sam3tune_history[SAM3TUNE_HISTORY_MAX:]
+
+
+@app.get("/api/sam3tune/config")
+def sam3tune_config_get():
+    """生产 SAM3 打分口径（keep = presence^α × cond > thresh；thresh=0 表示模型默认 0.5）。"""
+    return JSONResponse(_get_score_cfg())
+
+
+@app.post("/api/sam3tune/config")
+def sam3tune_config_set(body: dict = Body(default=None)):
+    """控制面写口径：下一帧生产流式即生效。alpha∈[0,1]；thresh∈[0,0.95]，0=恢复模型默认。"""
+    global _sam3_score_cfg
+    try:
+        alpha = min(max(float((body or {}).get("alpha", 1.0)), 0.0), 1.0)
+        thresh = min(max(float((body or {}).get("thresh", 0.0)), 0.0), 0.95)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "alpha/thresh 必须是数字"}, status_code=400)
+    with _sam3_score_lock:
+        _sam3_score_cfg = {"alpha": alpha, "thresh": thresh}
+    print(f"[da3-web] 生产 SAM3 口径更新：alpha={alpha} thresh={thresh}", flush=True)
+    return JSONResponse({"ok": True, "alpha": alpha, "thresh": thresh})
+
+
+@app.get("/api/sam3tune/state")
+def sam3tune_state():
+    """控制面实时区数据源：口径配置 + 每设备生产流式最近一帧的观测（原图/定位缩略图+分数）。"""
+    with _sam3tune_lock:
+        live = dict(_sam3tune_live)
+    return JSONResponse({"cfg": _get_score_cfg(), "selected": get_selected_device(),
+                         "live": live, "endpoint": SAM3_ENDPOINT})
 
 
 def _thumb_uri(rgb, width=420, quality=72):
@@ -3564,7 +3649,8 @@ def sam3tune_run(body: dict = Body(default=None)):
     with _sam3tune_lock:
         _sam3tune_seq += 1
         entry_id = _sam3tune_seq
-    common = {"ok": True, "id": entry_id, "ts": time.time(), "text": text, "topk": topk,
+    common = {"ok": True, "id": entry_id, "ts": time.time(), "src": "manual",
+              "text": text, "topk": topk,
               "alpha": alpha, "thresh": thresh,   # 阈值口径：keep = presence^α×cond > thresh
               "seg_ms": seg_ms, "n_inst": n_inst, "words": word_infos,
               "device": get_selected_device(),   # 分析帧来自当前选中设备的处理流
