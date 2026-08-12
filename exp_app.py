@@ -59,6 +59,10 @@ _cfg = {
     "sam3_food_queries": "food",
     "sam3_drink_queries": "drink",
     "sam3_thresh": 0.5,          # SAM3 score 阈值（客户端过滤；低于阈值画灰框便于调参）
+    # SAM3 server 端打分口径（与 8060 /sam3tune 同款语义，随请求生效、请求间天然隔离）：
+    # keep = presence^α × cond > det_thresh；α=1 且 det_thresh=0 时完全等价模型默认行为
+    "sam3_alpha": 1.0,           # presence α（presence 指数软化：1=原始行为，0=完全忽略 presence）
+    "sam3_det_thresh": 0.0,      # server 端检测阈值；0=恢复模型默认（0.5，联合分口径）
     "sam3_mask": True,           # 标注帧叠 mask 半透明高亮
     "la_on": False,              # LocateAnything 对照（默认关——实验主题就是不走 LA）
     "la_food_queries": "food",
@@ -163,14 +167,17 @@ def _rle_decode(size, counts):
     return mask.reshape((h, w), order="F")
 
 
-def _sam3_segment(rgb, query):
-    """单查询 SAM3 分割：返回实例列表（归一化 box + score + mask RLE），失败返回 []。"""
+def _sam3_segment(rgb, query, alpha=1.0, det_thresh=0.0):
+    """单查询 SAM3 分割：返回实例列表（归一化 box + score + mask RLE），失败返回 []。
+    alpha/det_thresh=「换阈值口径」旋钮（server 随请求生效、请求间隔离，不影响产线）：
+    keep = presence^α × cond > det_thresh；det_thresh=0 用模型默认（0.5 联合分口径）。"""
     b64 = _b64_jpg(rgb)
     if not b64:
         return []
+    payload = {"image_b64": b64, "text": query,
+               "alpha": float(alpha), "det_thresh": float(det_thresh)}
     try:
-        r = _http_json(SAM3_ENDPOINT + "/v1/segment",
-                       {"image_b64": b64, "text": query}, timeout=SAM3_TIMEOUT)
+        r = _http_json(SAM3_ENDPOINT + "/v1/segment", payload, timeout=SAM3_TIMEOUT)
         return r.get("instances") or []
     except Exception as e:
         print(f"[exp] SAM3({query}) 调用失败：{type(e).__name__}: {e}", flush=True)
@@ -697,7 +704,8 @@ def _run_round(rgb, src_seq, dev, cfg):
         groups = [("food", q) for q in _split_queries(cfg["sam3_food_queries"])] + \
                  [("drink", q) for q in _split_queries(cfg["sam3_drink_queries"])]
         for label, q in groups:   # SAM3 服务端有 GPU 锁，串行发送不排队
-            insts = _sam3_segment(rgb, q)
+            insts = _sam3_segment(rgb, q, alpha=float(cfg["sam3_alpha"]),
+                                  det_thresh=float(cfg["sam3_det_thresh"]))
             kept = [i for i in insts if i.get("score", 0) >= cfg["sam3_thresh"]]
             sam3_res.append((label, q, insts))
             for i in kept:
@@ -961,7 +969,9 @@ EXP_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <div class="wrap">
  <div class="pane l">
   <div class="grid">
-   <div class="cell c1"><div class="bar"><span class="dot" style="background:#0a84ff"></span>设备原帧 <span class="dim" id="devlab">–</span></div>
+   <div class="cell c1"><div class="bar"><span class="dot" style="background:#0a84ff"></span>设备原帧
+     <select id="selDev" style="display:none;background:#1c1c1e;border:1px solid #3a3a3c;color:#e5e5ea;border-radius:6px;padding:2px 6px;font-size:12px" title="选择设备（与 8060 同一选中设备）"></select>
+     <span class="dim" id="devlab">–</span></div>
     <div class="imgbox"><img id="raw"><span class="wait" id="raww">等待设备帧…</span></div></div>
    <div class="cell c2"><div class="bar"><span class="dot" style="background:#34c759"></span>实验检测标注帧 <span class="dim" id="seqinfo">总开关未开</span></div>
     <div class="imgbox"><img id="anno"><span class="wait" id="annow">打开「调节」里的总开关开始实验</span></div></div>
@@ -988,9 +998,13 @@ EXP_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="fld"><label>启用</label><span class="sw"><input type="checkbox" id="c_sam3_on"><i></i></span></div>
  <div class="fld"><label>食物查询词</label><input type="text" id="c_sam3_food_queries" placeholder="food"></div>
  <div class="fld"><label>液体查询词</label><input type="text" id="c_sam3_drink_queries" placeholder="drink; cup"></div>
+ <div class="fld"><label>presence α</label><input type="range" id="c_sam3_alpha" min="0" max="1" step="0.05"><b id="v_alpha">1.00</b></div>
+ <div class="fld"><label>检测阈值</label><input type="number" id="c_sam3_det_thresh" min="0" max="0.95" step="0.05"></div>
+ <div class="hint">server 端口径（与 8060 /sam3tune 同款、随请求生效不碰产线）：keep = presence^α × cond > 检测阈值；
+  α=1 且检测阈值=0 ⇒ 完全等价模型默认（0.5 联合分口径）。α 调低 = 弱化“概念是否在图中”的 presence 门控。</div>
  <div class="fld"><label>score 阈值</label><input type="range" id="c_sam3_thresh" min="0" max="1" step="0.05"><b id="v_thresh">0.50</b></div>
  <div class="fld"><label>mask 高亮</label><span class="sw"><input type="checkbox" id="c_sam3_mask"><i></i></span>
-  <span class="hint">低于阈值的实例画灰框，直观看阈值卡掉了什么</span></div>
+  <span class="hint">score 阈值是返回结果上的客户端二次过滤：低于阈值画灰框，直观看阈值卡掉了什么（设 0 = 全信 server 口径）</span></div>
  <h3>LocateAnything（对照，默认关）</h3>
  <div class="fld"><label>启用</label><span class="sw"><input type="checkbox" id="c_la_on"><i></i></span></div>
  <div class="fld"><label>食物查询词</label><input type="text" id="c_la_food_queries"></div>
@@ -1020,13 +1034,16 @@ function push(){
     body.interval=+$('c_interval').value||1.0;
     body.recog_interval=+$('c_recog_interval').value||4.0;
     body.sam3_thresh=+$('c_sam3_thresh').value;
+    body.sam3_alpha=+$('c_sam3_alpha').value;
+    body.sam3_det_thresh=+$('c_sam3_det_thresh').value||0;
     fetch('/api/exp/config',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(body)}).catch(()=>{});
   },200);
 }
 BOOLS.concat(TEXTS).forEach(k=>$('c_'+k).addEventListener('change',push));
-['c_interval','c_recog_interval'].forEach(id=>$(id).addEventListener('change',push));
+['c_interval','c_recog_interval','c_sam3_det_thresh'].forEach(id=>$(id).addEventListener('change',push));
 $('c_sam3_thresh').addEventListener('input',()=>{$('v_thresh').textContent=(+$('c_sam3_thresh').value).toFixed(2);push();});
+$('c_sam3_alpha').addEventListener('input',()=>{$('v_alpha').textContent=(+$('c_sam3_alpha').value).toFixed(2);push();});
 $('btnCfg').onclick=()=>$('cfg').classList.toggle('on');
 $('cfgClose').onclick=()=>$('cfg').classList.remove('on');
 
@@ -1036,6 +1053,8 @@ function fillCfg(c){   // 只首次回填，之后以页面为准（避免打字
   TEXTS.forEach(k=>$('c_'+k).value=c[k]||'');
   $('c_interval').value=c.interval;$('c_recog_interval').value=c.recog_interval;
   $('c_sam3_thresh').value=c.sam3_thresh;$('v_thresh').textContent=(+c.sam3_thresh).toFixed(2);
+  $('c_sam3_alpha').value=c.sam3_alpha;$('v_alpha').textContent=(+c.sam3_alpha).toFixed(2);
+  $('c_sam3_det_thresh').value=c.sam3_det_thresh;
 }
 function rdLine(r){
   let s='<span class="t">'+r.t+' 帧'+r.src_seq+'</span>';
@@ -1057,9 +1076,26 @@ async function tickExp(){
     $('rounds').innerHTML=(s.rounds||[]).slice().reverse().map(rdLine).join('');
   }catch(e){}
 }
-async function tick8060(){   // 原帧 + 点云产物都来自 8060（只读）
+// 设备下拉：与 8060 /panel /experience 同一套「选中设备」（改这里=全局切换，8060 也跟着切）
+let lastDevKey='';
+function renderDevices(s){
+  const devs=s.devices||[],sel=$('selDev');
+  sel.style.display=devs.length?'':'none';
+  if(document.activeElement!==sel){   // 下拉展开操作中不重建选项
+    const key=devs.map(d=>d.device_id).join('|')+'#'+(s.selected||'');
+    if(key!==lastDevKey){lastDevKey=key;
+      sel.innerHTML=devs.map(d=>'<option value="'+d.device_id+'"'
+        +(d.device_id===s.selected?' selected':'')+'>'+d.device_id+'</option>').join('');}
+  }
+}
+$('selDev').onchange=()=>{
+  fetch(B8060+'/api/frame/select',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({device_id:$('selDev').value})}).catch(()=>{});
+};
+async function tick8060(){   // 原帧 + 点云产物都来自 8060（只读；设备切换除外）
   try{
     const s=await(await fetch(B8060+'/api/frame/status',{cache:'no-store'})).json();
+    renderDevices(s);
     $('devlab').textContent=s.device||'–';
     if(s.has_frame&&s.seq!==lastRawSeq){lastRawSeq=s.seq;
       $('raw').src=B8060+'/api/frame/latest?t='+s.seq;
