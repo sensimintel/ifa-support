@@ -3592,6 +3592,8 @@ def sam3tune_state():
     with _sam3tune_lock:
         live = dict(_sam3tune_live)
     return JSONResponse({"cfg": _get_score_cfg(), "selected": get_selected_device(),
+                         # 生产链路当前在识别的词（SAM3 流式每帧跑的目标），控制面同步展示
+                         "words": [{"word": q, "label": l} for (q, l) in SAM3_CLOUD_TARGETS],
                          "live": live, "endpoint": SAM3_ENDPOINT})
 
 
