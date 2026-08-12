@@ -24,6 +24,8 @@
 | `app.py` | 8060 的全部服务端逻辑（FastAPI 应用 `app:app`，深度推理 + 内嵌 HTML 页面） |
 | `static/` | 静态资源（`/experience` 用的品牌字体等），经 `/static` 路径提供 |
 | `run.sh` | 用 `da3` conda 环境在 `0.0.0.0:8060` 起服务的启动脚本 |
+| `exp_app.py` | **感知链路实验台（8061）**：与产线 8060 完全隔离的检测/分割实验编排——帧取自 8060 只读接口，SAM3(`/v1/segment` 无状态)/LA 直接调既有模型服务、不加载新模型；页面可热调 采样率/查询词/score 阈值/LA 对照开关，留有 embedding 匹配插槽（`_embed_match()`）。手动起停：`nohup ./run-exp.sh > exp.log 2>&1 &`，总开关默认关、零 GPU 增量 |
+| `run-exp.sh` | 起 8061 实验台的启动脚本（复用 `da3` conda 环境与仓根 `.env`） |
 | `dx_backend.py` | **深体验区后端（8070）**：四通道食物秤读数与软件去皮、桌边分组绑定，独立于 8060 |
 | `run-dx.sh` | 起 8070 的启动脚本（复用 `da3` conda 环境） |
 | `dx-backend.service` | 8070 的 systemd 单元 |
