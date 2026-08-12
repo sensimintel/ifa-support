@@ -282,6 +282,7 @@ def _detections_async(arr):
 # ══════════════════════════════════════════════════════════════════════
 # SAM3（6000pro / GCP g4-01 的 8001，自定义 REST、无鉴权；经隧道映射到 5090 本地端口）
 #   · POST /v1/segment 单图分割：{image_b64, text} → instances[{obj_id,score,box_xywh_px,mask_rle}]
+#     可选 {debug:true, topk:N} → 附带 debug{presence_logit/score, topk[联合分/条件原始分]}（调优页用）
 #   · POST /v1/track   短视频跟踪：{frames_b64[], text, prompt_frame_index} → frames{帧idx:[objs]}
 #   · mask 是 COCO 压缩 RLE，本文件自带解码（5090 无 pycocotools，不额外装依赖）
 # ══════════════════════════════════════════════════════════════════════
@@ -361,6 +362,17 @@ def _sam3_segment(rgb, text):
         return []
     r = _sam3_post("/v1/segment", {"image_b64": b64, "text": text})
     return (r or {}).get("instances", []) or []
+
+
+def _sam3_segment_debug(rgb, text, topk=10):
+    """单图分割（带 presence / top-K query 原始分）→ (instances, debug)；失败返回 ([], None)。
+    debug 结构见 sam3_server：presence_logit/presence_score/num_queries/topk[{joint/cond}]。"""
+    b64 = _b64_jpg(rgb)
+    if not b64:
+        return [], None
+    r = _sam3_post("/v1/segment", {"image_b64": b64, "text": text,
+                                   "debug": True, "topk": int(topk)})
+    return ((r or {}).get("instances", []) or []), (r or {}).get("debug")
 
 
 def _sam3_track(frames_rgb, text, prompt_frame_index=0):
@@ -3485,6 +3497,92 @@ def sam3_health():
                              "error": f"{type(e).__name__}: {e}"})
 
 
+# ══════════════════════════════════════════════════════════════════════
+# SAM3 调优页（/sam3tune）：每次运行 = 当前帧对每个词各跑一次带 debug 的 /v1/segment，
+# 拿到 presence 分与 top-K query 原始分做漏检归因；运行历史养在服务端（翻页/多端可见）。
+# ══════════════════════════════════════════════════════════════════════
+SAM3TUNE_HISTORY_MAX = 30      # 历史条数上限（缩略图 dataURI 常驻内存，别放太大）
+_sam3tune_history = []         # 最新在前；条目结构同 /api/sam3tune/run 返回（图为缩略图）
+_sam3tune_lock = threading.Lock()
+_sam3tune_seq = 0
+
+
+def _thumb_uri(rgb, width=420, quality=72):
+    """RGB → 缩略图 JPEG dataURI（历史区用小图，控内存与响应体积）。"""
+    h, w = rgb.shape[:2]
+    if w > width:
+        rgb = cv2.resize(rgb, (width, max(1, round(h * width / w))),
+                         interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                           [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    return ("data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()) if ok else ""
+
+
+@app.post("/api/sam3tune/run")
+def sam3tune_run(body: dict = Body(default=None)):
+    """跑一次调优分析：当前帧 + 每词一次带 debug 的单图分割。
+    返回原图/定位图（全尺寸）+ 每词 presence 分与 top-K query 原始分，并写入服务端历史。"""
+    global _sam3tune_seq
+    text = str(((body or {}).get("text") or SAM3_TEXT_DEFAULT)).strip() or SAM3_TEXT_DEFAULT
+    try:
+        topk = min(max(int((body or {}).get("topk") or 10), 1), 50)
+    except (TypeError, ValueError):
+        topk = 10
+    words = [w.strip() for w in re.split(r"[,，;；\n]+", text) if w.strip()][:4] or [SAM3_TEXT_DEFAULT]
+    frames = _get_recent_frames(1)
+    if not frames:
+        return JSONResponse({"ok": False, "error": "还没有设备帧（等设备传帧或先在 /panel 灌一帧）"},
+                            status_code=400)
+    cur = frames[-1]
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=len(words)) as ex:
+        results = list(ex.map(lambda w: (w, *_sam3_segment_debug(cur, w, topk)), words))
+    seg_ms = round((time.time() - t0) * 1000.0, 1)
+
+    img, word_infos, n_inst = cur, [], 0
+    for wi, (w, inst, dbg) in enumerate(results):
+        col = _SAM3_COLORS[wi % len(_SAM3_COLORS)]
+        img = _draw_instances(img, inst, color=col, label_prefix=w)
+        n_inst += len(inst)
+        word_infos.append({
+            "word": w, "color": "#%02x%02x%02x" % col, "n": len(inst),
+            "instances": [{"obj_id": it.get("obj_id"),
+                           "score": round(float(it.get("score", 0)), 4)} for it in inst],
+            "debug": dbg,   # None=SAM3 调用失败或老版 server 不支持 debug
+        })
+    with _sam3tune_lock:
+        _sam3tune_seq += 1
+        entry_id = _sam3tune_seq
+    common = {"ok": True, "id": entry_id, "ts": time.time(), "text": text, "topk": topk,
+              "seg_ms": seg_ms, "n_inst": n_inst, "words": word_infos,
+              "endpoint": SAM3_ENDPOINT}
+    hist = dict(common)
+    hist["raw"] = _thumb_uri(cur)
+    hist["seg"] = _thumb_uri(img)
+    with _sam3tune_lock:
+        _sam3tune_history.insert(0, hist)
+        del _sam3tune_history[SAM3TUNE_HISTORY_MAX:]
+    full = dict(common)
+    full["raw"] = "data:image/jpeg;base64," + (_b64_jpg(cur) or "")
+    full["seg"] = "data:image/jpeg;base64," + (_b64_jpg(img) or "")
+    return JSONResponse(full)
+
+
+@app.get("/api/sam3tune/history")
+def sam3tune_history():
+    """调优运行历史（最新在前，服务端缓存最近 SAM3TUNE_HISTORY_MAX 条，图为缩略图）。"""
+    with _sam3tune_lock:
+        return JSONResponse({"items": list(_sam3tune_history), "max": SAM3TUNE_HISTORY_MAX})
+
+
+@app.post("/api/sam3tune/clear")
+def sam3tune_clear():
+    """清空调优历史。"""
+    with _sam3tune_lock:
+        _sam3tune_history.clear()
+    return JSONResponse({"ok": True})
+
+
 @app.get("/api/sam3cloud/status")
 def sam3cloud_status():
     """第三图（DA3→SAM3→点云映射）的最新状态：seq 变化=有新产物可拉。
@@ -3674,7 +3772,7 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .newpill.on{opacity:1;transform:translateX(-50%);pointer-events:auto}
  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
-<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
+<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a href="/sam3tune">SAM3 调优</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <div class="head">
   <div class="l1"><h2>实时识别 · Live Recognition</h2>
     <span class="seg" id="seg"><button data-t="qwen">Qwen</button><button data-t="gemini">Gemini Pro</button></span>
@@ -3905,7 +4003,7 @@ SAM3_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  figure img{width:100%;display:block}
  .empty{color:var(--faint);font-size:13px;padding:40px 10px;text-align:center}
 </style></head><body>
-<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a href="/recog">实时识别</a><a class="active" href="/sam3">SAM3 效果</a><a href="/" style="margin-left:auto">↗ 对比首页</a></div>
+<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a href="/recog">实时识别</a><a class="active" href="/sam3">SAM3 效果</a><a href="/sam3tune">SAM3 调优</a><a href="/" style="margin-left:auto">↗ 对比首页</a></div>
 <div class="wrap">
  <h1>SAM3 效果 · 原图 / 单图分割 / 短视频跟踪</h1>
  <div class="sub">取设备最近 <b id="nf">5</b> 帧：当前帧跑 <code>/v1/segment</code> 单图分割；最近 N 帧跑 <code>/v1/track</code> 跟踪（在第 0 帧下 prompt，跨帧保持 obj_id），跟踪结果画在当前帧上。</div>
@@ -3960,6 +4058,213 @@ fetch('/api/sam3/health').then(r=>r.json()).then(d=>{
 def sam3_page():
     """SAM3 效果页：原图 / 单图分割 / 短视频跟踪 三图并排。"""
     return SAM3_PAGE
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SAM3 调优页：动态原图 + 定位 + presence / top-K query 原始分 + 运行历史。
+# 漏检归因口径（SAM3 的分数分解 p(query匹配) = p(query匹配|概念在图中) × p(概念在图中)）：
+#   · presence 低(<0.5) → 概念/词表问题，换词；
+#   · presence 高但联合分被阈值砍 → 纯阈值问题，降阈值；
+#   · top-K 里没有覆盖目标区域的框 → 定位问题（目标太小/被裁），切图。
+# ══════════════════════════════════════════════════════════════════════
+SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SAM3 调优</title>
+<style>
+ :root{--bg:#f4f5f7;--panel:#fff;--ink:#1b1e24;--muted:#69707b;--faint:#98a0ac;--line:#e5e8ec;
+   --accent:#0071e3;--accent-soft:#e7f1fd;--ok:#1a9e5f;--warn:#c77b12;--err:#de3434;
+   --mono:ui-monospace,"SF Mono",Menlo,monospace;--sans:-apple-system,BlinkMacSystemFont,system-ui,"PingFang SC",sans-serif}
+ @media (prefers-color-scheme:dark){:root{--bg:#0c0e11;--panel:#15181d;--ink:#e8eaed;--muted:#98a1ad;--faint:#6b7480;--line:#262b32;--accent:#3b9bff;--accent-soft:#132436}}
+ *{box-sizing:border-box}
+ body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5}
+ .nav{display:flex;gap:16px;align-items:center;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);font-size:13px}
+ .nav a{color:var(--muted);text-decoration:none}.nav a.active{color:var(--accent);font-weight:600}
+ .wrap{padding:16px 18px 40px;max-width:1500px;margin:0 auto}
+ h1{font-size:17px;margin:2px 0 4px;font-weight:650}
+ h2{font-size:14px;margin:22px 0 8px;font-weight:650}
+ .sub{font-size:12.5px;color:var(--muted);margin-bottom:14px}
+ .sub code{font-family:var(--mono);font-size:11.5px}
+ .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:14px}
+ .bar label{font-size:12.5px;color:var(--muted)}
+ .bar input[type=text]{font-size:13px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);width:200px}
+ .bar input[type=number]{font-size:13px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);width:62px}
+ .btn{font-size:13px;font-weight:600;color:#fff;background:var(--accent);border:0;padding:7px 16px;border-radius:8px;cursor:pointer}
+ .btn:disabled{opacity:.5;cursor:default}
+ .btn2{background:var(--panel);color:var(--muted);border:1px solid var(--line)}
+ .btn.on{background:var(--ok)}
+ .st{font-size:12px;font-family:var(--mono);color:var(--faint);margin-left:auto}
+ .st .ok{color:var(--ok)}.st .err{color:var(--err)}
+ .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+ @media (max-width:900px){.grid{grid-template-columns:1fr}}
+ figure{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+ figure .cap{padding:9px 12px;font-size:12.5px;font-weight:600;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
+ figure .cap span{font-weight:400;color:var(--faint);font-family:var(--mono);font-size:11px;margin-left:auto}
+ figure .box{background:#10141a;display:flex;align-items:center;justify-content:center;min-height:280px}
+ figure img{width:100%;display:block}
+ .empty{color:var(--faint);font-size:13px;padding:40px 10px;text-align:center}
+ .scores{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:12px;margin-top:14px}
+ .wcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+ .whead{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+ .wchip{font-size:13px;font-weight:700;padding:1px 10px;border-radius:980px;color:#fff}
+ .pres{font-family:var(--mono);font-size:22px;font-weight:700}
+ .pres.lo{color:var(--err)}.pres.hi{color:var(--ok)}
+ .wmeta{font-size:11.5px;color:var(--faint);font-family:var(--mono)}
+ table.tk{width:100%;border-collapse:collapse;margin-top:8px;font-family:var(--mono);font-size:11.5px}
+ table.tk th{text-align:right;font-weight:600;color:var(--muted);padding:3px 8px;border-bottom:1px solid var(--line)}
+ table.tk td{text-align:right;padding:2px 8px;color:var(--ink)}
+ table.tk th:first-child,table.tk td:first-child{text-align:left}
+ table.tk tr.cut td{color:var(--faint)}
+ .hist{display:flex;flex-direction:column;gap:10px}
+ .hcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 12px;display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap}
+ .hcard img{width:230px;max-width:44vw;border-radius:8px;display:block;background:#10141a}
+ .hmeta{flex:1;min-width:240px;font-size:12px}
+ .hmeta .t{font-family:var(--mono);color:var(--faint);font-size:11px}
+ .hline{margin:3px 0;font-family:var(--mono);font-size:11.5px}
+ .hline b{font-family:var(--sans)}
+ details summary{cursor:pointer;font-size:11.5px;color:var(--accent);margin-top:4px}
+ .badge{display:inline-block;padding:0 7px;border-radius:980px;font-size:11px;font-weight:600}
+ .badge.lo{background:#fdecec;color:var(--err)}
+ .badge.hi{background:#e5f6ed;color:var(--ok)}
+ @media (prefers-color-scheme:dark){.badge.lo{background:#3a1717}.badge.hi{background:#12301f}}
+</style></head><body>
+<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a href="/recog">实时识别</a><a href="/sam3">SAM3 效果</a><a class="active" href="/sam3tune">SAM3 调优</a><a href="/" style="margin-left:auto">↗ 对比首页</a></div>
+<div class="wrap">
+ <h1>SAM3 调优 · presence 分 / top-K query 原始分</h1>
+ <div class="sub">分数分解：<code>p(query匹配) = p(query匹配 | 概念在图中) × p(概念在图中·presence)</code>，presence 是全局乘性门控。
+  归因口径：<b>presence 低(&lt;0.5)</b>→概念/词表问题，换词；<b>presence 高但联合分被阈值砍</b>→纯阈值问题；<b>top-K 里没有覆盖目标区域的框</b>→定位问题，切图。
+  联合分 = 最终检测置信度（NMS/阈值前）；条件原始分 = 联合分 ÷ presence 还原的 query 条件分。</div>
+ <div class="bar">
+  <label>text（英文名词，逗号分隔最多 4 词，每词一色）</label>
+  <input type="text" id="text" value="food" placeholder="如 food / bowl of rice, bottle">
+  <label>top-K</label>
+  <input type="number" id="topk" value="10" min="1" max="50">
+  <button class="btn" id="run">运行一次</button>
+  <button class="btn btn2" id="auto">自动（连续）</button>
+  <button class="btn btn2" id="clear">清空历史</button>
+  <span class="st" id="st">就绪</span>
+ </div>
+ <div class="grid">
+  <figure><div class="cap">① 设备实时原图 <span id="m1"></span></div>
+   <div class="box"><div class="empty" id="e1">等待设备帧…</div><img id="i1" style="display:none"></div></figure>
+  <figure><div class="cap">② SAM3 定位（最近一次运行） <span id="m2"></span></div>
+   <div class="box"><div class="empty" id="e2">点「运行一次」或开自动</div><img id="i2" style="display:none"></div></figure>
+ </div>
+ <h2>最近一次运行 · 各词分数</h2>
+ <div class="scores" id="scores"><div class="empty">—</div></div>
+ <h2>历史（每张图：原图 / 定位 / 分数，服务端保留最近 30 条）</h2>
+ <div class="hist" id="hist"><div class="empty">暂无历史</div></div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let auto=false, busy=false, lastSeq=-1, lastHistId=-1;
+
+// ① 原图动态刷新：与主面板同一套 /api/frame/status + /api/frame/latest 轮询
+async function frameTick(){
+  try{
+    const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
+    if(s.has_frame && s.seq!==lastSeq){ lastSeq=s.seq;
+      $('i1').src='/api/frame/latest?t='+s.seq; $('i1').style.display='block'; $('e1').style.display='none'; }
+    $('m1').textContent = s.has_frame ? ('帧 '+s.seq+(s.interval?(' · 间隔 '+s.interval.toFixed(1)+'s'):'')) : '';
+  }catch(e){}
+}
+setInterval(frameTick, 500); frameTick();
+
+function presClass(p){ return p==null ? '' : (p<0.5?'lo':'hi'); }
+function fmt(x,d){ return x==null ? '—' : Number(x).toFixed(d==null?4:d); }
+
+function tkTable(dbg){
+  if(!dbg || !dbg.topk || !dbg.topk.length) return '<div class="wmeta">无 top-K 数据（SAM3 server 需支持 debug）</div>';
+  let h='<table class="tk"><tr><th>#</th><th>query</th><th>联合分(最终)</th><th>条件原始分</th><th>logit</th></tr>';
+  for(const q of dbg.topk){
+    const cut = q.joint_score!=null && q.joint_score<0.5;   // 演示口径：0.5 为常用最终阈值
+    h+='<tr class="'+(cut?'cut':'')+'"><td>'+q.rank+'</td><td>q'+q.query_idx+'</td><td>'+fmt(q.joint_score)
+      +'</td><td>'+fmt(q.cond_score)+'</td><td>'+fmt(q.joint_logit,2)+'</td></tr>';
+  }
+  return h+'</table>';
+}
+
+function wordCard(w){
+  const dbg=w.debug||null, p=dbg?dbg.presence_score:null;
+  const inst=(w.instances||[]).map(it=>'#'+it.obj_id+' '+fmt(it.score,3)).join('  ')||'无';
+  return '<div class="wcard">'
+    +'<div class="whead"><span class="wchip" style="background:'+w.color+'">'+w.word+'</span>'
+    +'<span class="pres '+presClass(p)+'">presence '+fmt(p)+'</span>'
+    +'<span class="wmeta">logit '+(dbg?fmt(dbg.presence_logit,2):'—')+' · queries '+(dbg&&dbg.num_queries!=null?dbg.num_queries:'—')+'</span></div>'
+    +'<div class="wmeta" style="margin-top:4px">过阈值实例('+w.n+')：'+inst+'</div>'
+    +tkTable(dbg)+'</div>';
+}
+
+function renderScores(d){
+  $('scores').innerHTML = (d.words||[]).map(wordCard).join('') || '<div class="empty">—</div>';
+}
+
+function histLine(w){
+  const dbg=w.debug||null, p=dbg?dbg.presence_score:null;
+  const top = dbg&&dbg.topk&&dbg.topk.length ? dbg.topk[0] : null;
+  return '<div class="hline"><b style="color:'+w.color+'">'+w.word+'</b> '
+    +'<span class="badge '+(p==null?'':(p<0.5?'lo':'hi'))+'">presence '+fmt(p,3)+'</span> '
+    +'实例 '+w.n
+    +(top?(' · top1 联合 '+fmt(top.joint_score,3)+' / 原始 '+fmt(top.cond_score,3)):'')+'</div>';
+}
+
+function renderHist(items){
+  if(!items.length){ $('hist').innerHTML='<div class="empty">暂无历史</div>'; return; }
+  $('hist').innerHTML = items.map(it=>{
+    const t=new Date(it.ts*1000).toLocaleTimeString('zh-CN',{hour12:false});
+    return '<div class="hcard"><img src="'+it.raw+'" alt="原图"><img src="'+it.seg+'" alt="定位">'
+      +'<div class="hmeta"><div class="t">#'+it.id+' · '+t+' · text="'+it.text+'" · '+it.seg_ms+'ms · 实例 '+it.n_inst+'</div>'
+      +(it.words||[]).map(histLine).join('')
+      +'<details><summary>top-K 明细</summary>'+(it.words||[]).map(w=>'<div class="hline"><b style="color:'+w.color+'">'+w.word+'</b></div>'+tkTable(w.debug)).join('')+'</details>'
+      +'</div></div>';
+  }).join('');
+}
+
+async function loadHist(){
+  try{
+    const d=await(await fetch('/api/sam3tune/history',{cache:'no-store'})).json();
+    const items=d.items||[];
+    const newest=items.length?items[0].id:-1;
+    if(newest!==lastHistId){ lastHistId=newest; renderHist(items); }
+  }catch(e){}
+}
+setInterval(loadHist, 5000); loadHist();
+
+async function run(){
+  if(busy) return; busy=true; $('run').disabled=true; $('st').textContent='跑 SAM3 中…';
+  try{
+    const r=await fetch('/api/sam3tune/run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:$('text').value||'food', topk:parseInt($('topk').value)||10})});
+    const d=await r.json();
+    if(!d.ok){ $('st').innerHTML='<span class="err">'+(d.error||'失败')+'</span>'; }
+    else{
+      $('i2').src=d.seg; $('i2').style.display='block'; $('e2').style.display='none';
+      $('m2').textContent='#'+d.id+' · '+d.seg_ms+'ms · 实例 '+d.n_inst;
+      renderScores(d);
+      $('st').innerHTML='<span class="ok">OK</span> · #'+d.id+' · '+d.seg_ms+'ms';
+      loadHist();
+    }
+  }catch(e){ $('st').innerHTML='<span class="err">请求失败：'+e+'</span>'; }
+  busy=false; $('run').disabled=false;
+  if(auto && !document.hidden) setTimeout(run, 300);   // 自动：背靠背连跑，页面隐藏时暂停
+}
+$('run').onclick=run;
+$('auto').onclick=()=>{ auto=!auto; $('auto').textContent=auto?'停止自动':'自动（连续）';
+  $('auto').classList.toggle('on',auto); if(auto)run(); };
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden && auto) run(); });
+$('clear').onclick=async()=>{ await fetch('/api/sam3tune/clear',{method:'POST'}); lastHistId=-1; loadHist(); };
+// 首次探活
+fetch('/api/sam3/health').then(r=>r.json()).then(d=>{
+  $('st').innerHTML = d.ok ? '<span class="ok">SAM3 已接通</span> · '+d.endpoint
+                           : '<span class="err">SAM3 未接通</span> · '+d.endpoint+' · '+(d.error||'');
+}).catch(()=>{});
+</script>
+</body></html>"""
+
+
+@app.get("/sam3tune", response_class=HTMLResponse)
+def sam3tune_page():
+    """SAM3 调优页：动态原图+定位、presence/top-K query 原始分、运行历史。"""
+    return SAM3TUNE_PAGE
 
 
 # ══════════════════════════════════════════════════════════════════════
