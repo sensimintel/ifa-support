@@ -1841,7 +1841,8 @@ setInterval(tunTick,5000);tunTick();
 
 # ══════════════════════════════════════════════════════════════════════
 # 浅体验区展示页（/experience）：IFA 展台品牌化全屏 UI（Figma「IFA 专项 · 浅体验区」）
-# - 全屏背景 = 实时点云/设备帧（默认 SAM3 高亮点云，右下临时按钮循环切换四种来源）
+# - 全屏背景 = 实时点云（默认 SAM3 高亮点云，右下临时按钮在三种点云来源间切换；
+#   本页任何情况不展示设备原图，产物未就绪时保持黑场）
 # - 右侧状态区：待机「Place your food here」 ↔ 识别成功（名称/英文描述/营养标签/食物信号）
 # - 流水视图：临时按钮进入，当日识别记录（名称+时间）+ 实时画面小窗
 # - 设计稿 2240×1260，用 rem 等比缩放（1rem=设计稿 100px）；品牌字体走 /static/fonts
@@ -2020,7 +2021,6 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <option value="hl">高亮点云</option>
   <option value="la">LA点云</option>
   <option value="s3">SAM3点云</option>
-  <option value="raw">原图</option>
  </select>
  <button id="btnHlCfg">调节</button>
  <button id="btnTl">流水</button>
@@ -2173,7 +2173,7 @@ const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无�
 
 // ══ 背景层：四种来源下拉框选择（临时工具），默认 SAM3 高亮点云 ══
 let bgSource=localStorage.getItem('exp_bg')||'hl';
-if(!['hl','la','s3','raw'].includes(bgSource))bgSource='hl';
+if(!['hl','la','s3'].includes(bgSource))bgSource='hl';   // 旧版存过 raw 的自动回落高亮点云
 const MIN_SWAP_MS=1500;               // GLB 换模型最小间隔（同 /panel：防高帧率下一直黑屏加载）
 let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
 
@@ -2387,37 +2387,32 @@ async function bgTick(){
     if(curDev!==null){lastBgKey='';lastMvUrl='';lastBgUrl='';lastInset='';curCard=null;lastCardKey='';}
     curDev=s.device;
   }
-  let shown=false;
-  if(bgSource==='raw'){ if(s.has_frame)shown=showImg('/api/frame/latest?t='+s.seq,'raw:'+s.seq); }
-  else if(bgSource==='la'){
-    if(s.product_kind==='image')shown=showImg('/api/frame/latest-product?t='+s.product_seq,'la:'+s.product_seq);
-    else if(s.product_kind==='model'&&s.product_url)shown=showModel(s.product_url,s.product_meta&&s.product_meta.fov_deg);
+  // 本页任何情况都不展示设备原图：所选来源暂无产物（服务重启/切设备/首轮构建中）时
+  // 保持黑场，等第一份点云产物就绪再上画
+  if(bgSource==='la'){
+    if(s.product_kind==='image')showImg('/api/frame/latest-product?t='+s.product_seq,'la:'+s.product_seq);
+    else if(s.product_kind==='model'&&s.product_url)showModel(s.product_url,s.product_meta&&s.product_meta.fov_deg);
   }else if(bgSource==='s3'){
     const s3=await(await fetch('/api/sam3cloud/status',{cache:'no-store'})).json();
-    if(s3.kind==='image'&&s3.seq)shown=showImg('/api/sam3cloud/latest?t='+s3.seq,'s3:'+s3.seq);
-    else if(s3.kind==='model'&&s3.url)shown=showModel(s3.url,null);
+    if(s3.kind==='image'&&s3.seq)showImg('/api/sam3cloud/latest?t='+s3.seq,'s3:'+s3.seq);
+    else if(s3.kind==='model'&&s3.url)showModel(s3.url,null);
   }else{
     const hl=await(await fetch('/api/sam3hl/status',{cache:'no-store'})).json();
-    if(hl.kind==='model'&&hl.url)shown=showModel(hl.url,null);   // 高亮 GLB：与③同管线直渲
-    else if(hl.kind==='image'&&hl.seq&&hl.meta)shown=showImg('/api/sam3hl/latest?t='+hl.seq,'hl:'+hl.seq);
+    if(hl.kind==='model'&&hl.url)showModel(hl.url,null);   // 高亮 GLB：与③同管线直渲
+    else if(hl.kind==='image'&&hl.seq&&hl.meta)showImg('/api/sam3hl/latest?t='+hl.seq,'hl:'+hl.seq);
   }
-  // 所选来源暂无产物（模型服务未就绪等）→ 兜底显示设备原图，避免黑屏
-  if(!shown&&s.has_frame)showImg('/api/frame/latest?t='+s.seq,'rawfb:'+s.seq);
   // 流水小窗：镜像当前背景画面——图片背景直接复用 url；GLB 背景截取 model-viewer
   // 画布（toDataURL）做镜像（不受流水态压暗影响）。GLB 换模加载中（loaded=false）
-  // 保持上一帧镜像不动，避免与设备原帧来回闪；只有从未截到过镜像时才临时垫原帧。
+  // 保持上一帧镜像不动；镜像未就绪时留等待占位，绝不垫设备原帧（本页不展示原图）。
   if($('tl').classList.contains('on')){
     const mv=$('bgmv'),mvOn=mv.style.display!=='none',tlr=$('tlraw');
     if(mvOn){
       if(mv.loaded&&mv.src){
         try{tlr.src=mv.toDataURL('image/jpeg',0.8);lastInset='';
           tlr.style.display='block';$('tlwait').style.display='none';}catch(e){}
-      }else if(!tlr.src&&s.has_frame){   // 尚无任何镜像可显：先垫设备原帧防空窗
-        tlr.src='/api/frame/latest?t='+s.seq;lastInset='';
-        tlr.style.display='block';$('tlwait').style.display='none';
       }
     }else{
-      const insetUrl=lastBgUrl||(s.has_frame?'/api/frame/latest?t='+s.seq:null);
+      const insetUrl=lastBgUrl;
       if(insetUrl&&insetUrl!==lastInset){lastInset=insetUrl;
         tlr.src=insetUrl;
         tlr.style.display='block';$('tlwait').style.display='none';}

@@ -5,7 +5,7 @@
 5090 服务器上跑在 `0.0.0.0:8060` 的运维/演示 Web 服务（原目录 `~/da3-web`），单文件 FastAPI 应用，纯服务端渲染、零前端构建。一个端口同时挂官方 Gradio 与自研面板：
 
 - **`/` 分栏首页**：左右两栏 iframe 对比 —— 左栏嵌官方 Gradio UI（`/gradio`），右栏嵌自研扩展面板（`/panel`）。顶栏有「浅体验区展示页」入口。
-- **`/experience` 浅体验区展示页**：IFA 展台品牌化全屏 UI（Figma「IFA 专项 · 浅体验区」实现）。全屏背景为实时点云/设备帧（默认 SAM3 高亮点云，右下临时按钮可在 高亮点云/LA点云/SAM3点云/原图 四种来源间循环切换）；右侧状态区在「Place your food here」待机态与识别成功态（浅色玻璃卡片：名称 / 英文短描述 / 卡路里 / 蛋白·碳水·脂肪 / Good·Neutral·Bad 健康分级，营养数字按画面可见份量估算）间切换，识别成功时画面上食物位置处另有定位小标（名称 + 卡路里，锚在 VLM box、随去重合并刷新位置）；另有流水视图（临时按钮进入）展示当日识别记录。品牌字体（ABC Arizona Serif / Seabirds，trial 版）在 `static/fonts/`，经 `/static` 提供。`?demo=1` 为无后端目检模式。
+- **`/experience` 浅体验区展示页**：IFA 展台品牌化全屏 UI（Figma「IFA 专项 · 浅体验区」实现）。全屏背景为实时点云（默认 SAM3 高亮点云，右下临时按钮可在 高亮点云/LA点云/SAM3点云 三种来源间切换；任何情况不展示设备原图，产物未就绪时保持黑场）；右侧状态区在「Place your food here」待机态与识别成功态（浅色玻璃卡片：名称 / 英文短描述 / 卡路里 / 蛋白·碳水·脂肪 / Good·Neutral·Bad 健康分级，营养数字按画面可见份量估算）间切换，识别成功时画面上食物位置处另有定位小标（名称 + 卡路里，锚在 VLM box、随去重合并刷新位置）；另有流水视图（临时按钮进入）展示当日识别记录。品牌字体（ABC Arizona Serif / Seabirds，trial 版）在 `static/fonts/`，经 `/static` 提供。`?demo=1` 为无后端目检模式。
 - **`/gradio` 官方 Gradio UI**：通过 `gr.mount_gradio_app` 挂在同一 FastAPI 上（点云 / 网格 / 3D 量距等）。app.py 内含 gradio 6 兼容 shim，静默丢弃已废弃 kwargs，避免改动上游 DA3 源码。
 - **`/panel` 扩展面板（深度 / 点云 / 网格）**：浏览器上传一张图 + 选产物类型 + 调参，用 Depth Anything 3（DA3NESTED-GIANT-LARGE-1.1）出三种产物：
   - **深度图**：彩色深度图（越亮 = 越近）；
