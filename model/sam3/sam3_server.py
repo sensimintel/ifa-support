@@ -80,7 +80,10 @@ def _infer_ctx():
 # 库层 API 只回吐过完阈值/NMS 的最终分，这里在 detector.forward_grounding 上包一层，
 # 在 NMS 抹分（logit -1e4）之前捕获原始输出，用于归因"漏检是 presence 门控杀的还是阈值砍的"。
 # 捕获开关/结果不额外加锁：所有推理已由 _LOCK 全程串行。
-_dbg = {"on": False, "topk": 10, "calls": [], "raw_q": None}
+# rescore_alpha 非 None 时启用「换阈值口径」：把 pred_logits 原地改写为
+# logit(presence^α × cond)（presence 指数软化，α=1≈原始行为、α=0=完全忽略 presence），
+# 下游 NMS 与 keep 阈值（score_threshold_detection，由 /v1/segment 临时覆盖）即卡在新分上。
+_dbg = {"on": False, "topk": 10, "calls": [], "raw_q": None, "rescore_alpha": None}
 
 
 def _install_debug_hook():
@@ -119,6 +122,18 @@ def _install_debug_hook():
                     raw = _dbg["raw_q"]
                     if raw is not None and raw.numel() == logits.numel():
                         entry["topk_cond_logit"] = [float(raw[i]) for i in idxs]
+                # 换阈值口径：pred_logits 原地改写为 logit(presence^α × cond)，
+                # 下游 NMS/keep 即卡在新分上（entry 里记录的是改写前的原始值）
+                alpha = _dbg["rescore_alpha"]
+                entry["rescore_applied"] = False
+                if alpha is not None and pl is not None and lg is not None:
+                    raw = _dbg["raw_q"]
+                    if raw is not None and raw.numel() == lg.numel():
+                        pres = torch.sigmoid(pl.detach().float().flatten()[0])
+                        score = torch.sigmoid(raw) * pres.pow(float(alpha))
+                        new_logit = torch.logit(score.clamp(1e-6, 1 - 1e-6))
+                        out["pred_logits"] = new_logit.view_as(lg).to(lg.dtype)
+                        entry["rescore_applied"] = True
                 _dbg["calls"].append(entry)
             except Exception as e:  # noqa: BLE001
                 logger.warning("debug 捕获失败（不影响推理）：%r", e)
@@ -398,6 +413,8 @@ class SegReq(BaseModel):
     text: str
     debug: bool = False        # true=附带 presence 分 + top-K query 原始分（NMS/阈值前）
     topk: int = 10             # debug 时返回的 top-K query 数量（1~50）
+    alpha: float = 1.0         # presence 指数软化：score=presence^α×cond；1≈原始行为，0=完全忽略 presence
+    det_thresh: float = 0.0    # >0 时把检测保留/NMS 阈值临时改为该值（卡在上式 score 上）；0=模型默认 0.5
 
 class TrackReq(BaseModel):
     frames_b64: list
@@ -422,12 +439,20 @@ def segment(req: SegReq):
     d = tempfile.mkdtemp(prefix="sam3_seg_")
     try:
         img.save(os.path.join(d, "00000.jpg"), quality=95)
+        # 换阈值口径请求判定：α≠1 或显式给了阈值即启用（钩子捕获 rescore 都要求 _dbg.on）
+        alpha = min(max(float(req.alpha), 0.0), 1.0)
+        det_thresh = min(max(float(req.det_thresh), 0.0), 0.95)
+        rescore = det_thresh > 0.0 or abs(alpha - 1.0) > 1e-6
         with _LOCK:
-            # debug 捕获窗口在 _LOCK 内开合：推理全程串行，不会混入别的请求的输出
-            if req.debug:
+            # debug/rescore 捕获窗口在 _LOCK 内开合：推理全程串行，不会混入别的请求的输出
+            if req.debug or rescore:
                 _dbg["topk"] = max(1, min(int(req.topk), 50))
                 _dbg["calls"] = []
                 _dbg["on"] = True
+                _dbg["rescore_alpha"] = alpha if rescore else None
+            old_thresh = _pred.model.score_threshold_detection
+            if rescore and det_thresh > 0.0:
+                _pred.model.score_threshold_detection = det_thresh
             sid = _pred.start_session(resource_path=d)["session_id"]
             try:
                 with _infer_ctx():
@@ -435,8 +460,13 @@ def segment(req: SegReq):
                 inst = _pack(r["outputs"], W, H)
             finally:
                 _dbg["on"] = False
+                _dbg["rescore_alpha"] = None
+                _pred.model.score_threshold_detection = old_thresh
                 _pred.close_session(sid)
         resp = {"width": W, "height": H, "num_instances": len(inst), "instances": inst}
+        if rescore:
+            resp["rescore"] = {"alpha": alpha, "det_thresh": det_thresh or old_thresh,
+                               "applied": bool(_dbg["calls"] and _dbg["calls"][0].get("rescore_applied"))}
         if req.debug:
             resp["debug"] = _build_debug_payload(_dbg["calls"])
         return resp

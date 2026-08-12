@@ -364,14 +364,16 @@ def _sam3_segment(rgb, text):
     return (r or {}).get("instances", []) or []
 
 
-def _sam3_segment_debug(rgb, text, topk=10):
+def _sam3_segment_debug(rgb, text, topk=10, alpha=1.0, det_thresh=0.0):
     """单图分割（带 presence / top-K query 原始分）→ (instances, debug)；失败返回 ([], None)。
-    debug 结构见 sam3_server：presence_logit/presence_score/num_queries/topk[{joint/cond}]。"""
+    debug 结构见 sam3_server：presence_logit/presence_score/num_queries/topk[{joint/cond}]。
+    alpha/det_thresh 为「换阈值口径」旋钮：检测保留卡在 presence^α×cond > det_thresh 上。"""
     b64 = _b64_jpg(rgb)
     if not b64:
         return [], None
     r = _sam3_post("/v1/segment", {"image_b64": b64, "text": text,
-                                   "debug": True, "topk": int(topk)})
+                                   "debug": True, "topk": int(topk),
+                                   "alpha": float(alpha), "det_thresh": float(det_thresh)})
     return ((r or {}).get("instances", []) or []), (r or {}).get("debug")
 
 
@@ -3529,6 +3531,14 @@ def sam3tune_run(body: dict = Body(default=None)):
         topk = min(max(int((body or {}).get("topk") or 10), 1), 50)
     except (TypeError, ValueError):
         topk = 10
+    try:
+        alpha = min(max(float((body or {}).get("alpha", 1.0)), 0.0), 1.0)
+    except (TypeError, ValueError):
+        alpha = 1.0
+    try:
+        thresh = min(max(float((body or {}).get("thresh", 0.5)), 0.05), 0.95)
+    except (TypeError, ValueError):
+        thresh = 0.5
     words = [w.strip() for w in re.split(r"[,，;；\n]+", text) if w.strip()][:4] or [SAM3_TEXT_DEFAULT]
     frames = _get_recent_frames(1)
     if not frames:
@@ -3537,7 +3547,7 @@ def sam3tune_run(body: dict = Body(default=None)):
     cur = frames[-1]
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=len(words)) as ex:
-        results = list(ex.map(lambda w: (w, *_sam3_segment_debug(cur, w, topk)), words))
+        results = list(ex.map(lambda w: (w, *_sam3_segment_debug(cur, w, topk, alpha, thresh)), words))
     seg_ms = round((time.time() - t0) * 1000.0, 1)
 
     img, word_infos, n_inst = cur, [], 0
@@ -3555,6 +3565,7 @@ def sam3tune_run(body: dict = Body(default=None)):
         _sam3tune_seq += 1
         entry_id = _sam3tune_seq
     common = {"ok": True, "id": entry_id, "ts": time.time(), "text": text, "topk": topk,
+              "alpha": alpha, "thresh": thresh,   # 阈值口径：keep = presence^α×cond > thresh
               "seg_ms": seg_ms, "n_inst": n_inst, "words": word_infos,
               "device": get_selected_device(),   # 分析帧来自当前选中设备的处理流
               "endpoint": SAM3_ENDPOINT}
@@ -4136,7 +4147,8 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <h1>SAM3 调优 · presence 分 / top-K query 原始分</h1>
  <div class="sub">分数分解：<code>p(query匹配) = p(query匹配 | 概念在图中) × p(概念在图中·presence)</code>，presence 是全局乘性门控。
   归因口径：<b>presence 低(&lt;0.5)</b>→概念/词表问题，换词；<b>presence 高但联合分被阈值砍</b>→纯阈值问题；<b>top-K 里没有覆盖目标区域的框</b>→定位问题，切图。
-  联合分 = 最终检测置信度（NMS/阈值前，logit clamp ±10）；原始分 = 直取 dot_prod_scoring 的 <b>pre-sigmoid logit</b>（未经 presence 加权，负样本是 −8/−12 这类明确负数，非除法反推）；联合 logit 触到 clamp 的行<span style="color:var(--err)">标红</span>。</div>
+  联合分 = 最终检测置信度（NMS/阈值前，logit clamp ±10）；原始分 = 直取 dot_prod_scoring 的 <b>pre-sigmoid logit</b>（未经 presence 加权，负样本是 −8/−12 这类明确负数，非除法反推）；联合 logit 触到 clamp 的行<span style="color:var(--err)">标红</span>。
+  <b>阈值口径可调</b>：检测保留改为 <code>presence<sup>α</sup> × cond &gt; 阈值</code>——α=1 即原始行为（联合分口径），α=0 完全忽略 presence（纯 cond 口径），中间值为指数软化的连续旋钮；表中 score(α) 列即该分，过阈值行正常显示、未过灰显。</div>
  <div class="bar">
   <label id="devlbl" style="display:none">设备</label>
   <select id="devsel" style="display:none"></select>
@@ -4144,8 +4156,14 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <input type="text" id="text" value="food" placeholder="如 food / bowl of rice, bottle">
   <label>top-K</label>
   <input type="number" id="topk" value="10" min="1" max="50">
+  <span style="display:inline-flex;gap:8px;align-items:center;border:1px dashed var(--line);border-radius:8px;padding:4px 10px">
+   <label title="score = presence^α × cond：α=1 原始行为(联合分)，α=0 完全忽略 presence，中间为指数软化">presence α</label>
+   <input type="number" id="alpha" value="1" min="0" max="1" step="0.05">
+   <label title="检测保留与 NMS 阈值，卡在 presence^α × cond 上">阈值</label>
+   <input type="number" id="thr" value="0.5" min="0.05" max="0.95" step="0.05">
+  </span>
   <button class="btn" id="run">运行一次</button>
-  <button class="btn btn2" id="auto">自动（连续）</button>
+  <button class="btn btn2" id="auto">自动（新帧驱动）</button>
   <button class="btn btn2" id="clear">清空历史</button>
   <span class="st" id="st">就绪</span>
  </div>
@@ -4161,7 +4179,7 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </div>
 <script>
 const $=id=>document.getElementById(id);
-let auto=false, busy=false, lastSeq=-1, lastHistId=-1, curDev=null, lastDevKey='';
+let auto=false, busy=false, lastSeq=-1, lastRunSeq=-1, lastHistId=-1, curDev=null, lastDevKey='';
 
 // 设备下拉：与主面板同一套 /api/frame/select（选中是全局的，影响处理线程与本页分析帧）
 const devsel=$('devsel');
@@ -4197,6 +4215,8 @@ async function frameTick(){
       $('i1').src='/api/frame/latest?t='+s.seq; $('i1').style.display='block'; $('e1').style.display='none'; }
     $('m1').textContent = s.has_frame ? ((s.device?s.device+' · ':'')+'帧 '+s.seq
       +(s.interval?(' · 间隔 '+s.interval.toFixed(1)+'s'):'')) : '';
+    // 自动模式（新帧驱动）：仅当设备帧 seq 前进且上一次分析已结束时才触发 SAM3
+    if(auto && !busy && !document.hidden && s.has_frame && s.seq!==lastRunSeq){ lastRunSeq=s.seq; run(); }
   }catch(e){}
 }
 setInterval(frameTick, 500); frameTick();
@@ -4204,31 +4224,39 @@ setInterval(frameTick, 500); frameTick();
 function presClass(p){ return p==null ? '' : (p<0.5?'lo':'hi'); }
 function fmt(x,d){ return x==null ? '—' : Number(x).toFixed(d==null?4:d); }
 
-function tkTable(dbg){
+function effScore(dbg,q,alpha){  // 阈值口径分：presence^α × cond（与服务端 keep 同一公式）
+  if(!dbg || dbg.presence_score==null || q.cond_score==null || alpha==null) return null;
+  return Math.pow(dbg.presence_score,alpha)*q.cond_score;
+}
+
+function tkTable(dbg,alpha,thr){
   if(!dbg || !dbg.topk || !dbg.topk.length) return '<div class="wmeta">无 top-K 数据（SAM3 server 需支持 debug）</div>';
-  let h='<table class="tk"><tr><th>#</th><th>query</th><th>联合分(最终)</th><th>原始分</th><th>原始logit</th><th>联合logit</th></tr>';
+  let h='<table class="tk"><tr><th>#</th><th>query</th><th>score(α)</th><th>原始分</th><th>原始logit</th><th>联合分</th><th>联合logit</th></tr>';
   for(const q of dbg.topk){
-    // clamp 标红优先（联合 logit 触 ±10 限幅，数值不可信）；其次联合分低于常用阈值 0.5 灰显
-    const cls = q.clamped ? 'clamp' : (q.joint_score!=null && q.joint_score<0.5 ? 'cut' : '');
-    h+='<tr class="'+cls+'"><td>'+q.rank+'</td><td>q'+q.query_idx+'</td><td>'+fmt(q.joint_score)
-      +'</td><td>'+fmt(q.cond_score)+'</td><td>'+fmt(q.cond_logit,2)+'</td><td>'+fmt(q.joint_logit,2)+(q.clamped?' ⛔':'')+'</td></tr>';
+    const es=effScore(dbg,q,alpha);
+    // clamp 标红优先（联合 logit 触 ±10 限幅，联合列数值不可信）；score(α) 未过阈值灰显
+    const cls = q.clamped ? 'clamp'
+      : (es!=null&&thr!=null ? (es>thr?'':'cut') : (q.joint_score!=null&&q.joint_score<0.5?'cut':''));
+    h+='<tr class="'+cls+'"><td>'+q.rank+'</td><td>q'+q.query_idx+'</td><td><b>'+fmt(es)+'</b></td><td>'+fmt(q.cond_score)
+      +'</td><td>'+fmt(q.cond_logit,2)+'</td><td>'+fmt(q.joint_score)+'</td><td>'+fmt(q.joint_logit,2)+(q.clamped?' ⛔':'')+'</td></tr>';
   }
   return h+'</table>';
 }
 
-function wordCard(w){
+function wordCard(w,alpha,thr){
   const dbg=w.debug||null, p=dbg?dbg.presence_score:null;
   const inst=(w.instances||[]).map(it=>'#'+it.obj_id+' '+fmt(it.score,3)).join('  ')||'无';
   return '<div class="wcard">'
     +'<div class="whead"><span class="wchip" style="background:'+w.color+'">'+w.word+'</span>'
     +'<span class="pres '+presClass(p)+'">presence '+fmt(p)+'</span>'
-    +'<span class="wmeta">logit '+(dbg?fmt(dbg.presence_logit,2):'—')+' · queries '+(dbg&&dbg.num_queries!=null?dbg.num_queries:'—')+'</span></div>'
+    +'<span class="wmeta">logit '+(dbg?fmt(dbg.presence_logit,2):'—')+' · queries '+(dbg&&dbg.num_queries!=null?dbg.num_queries:'—')
+    +(alpha!=null?' · α='+alpha+' thr='+thr:'')+'</span></div>'
     +'<div class="wmeta" style="margin-top:4px">过阈值实例('+w.n+')：'+inst+'</div>'
-    +tkTable(dbg)+'</div>';
+    +tkTable(dbg,alpha,thr)+'</div>';
 }
 
 function renderScores(d){
-  $('scores').innerHTML = (d.words||[]).map(wordCard).join('') || '<div class="empty">—</div>';
+  $('scores').innerHTML = (d.words||[]).map(w=>wordCard(w,d.alpha,d.thresh)).join('') || '<div class="empty">—</div>';
 }
 
 function histLine(w){
@@ -4245,9 +4273,10 @@ function renderHist(items){
   $('hist').innerHTML = items.map(it=>{
     const t=new Date(it.ts*1000).toLocaleTimeString('zh-CN',{hour12:false});
     return '<div class="hcard"><img src="'+it.raw+'" alt="原图"><img src="'+it.seg+'" alt="定位">'
-      +'<div class="hmeta"><div class="t">#'+it.id+' · '+t+(it.device?' · '+it.device:'')+' · text="'+it.text+'" · '+it.seg_ms+'ms · 实例 '+it.n_inst+'</div>'
+      +'<div class="hmeta"><div class="t">#'+it.id+' · '+t+(it.device?' · '+it.device:'')+' · text="'+it.text+'"'
+      +(it.alpha!=null?' · α='+it.alpha+' thr='+it.thresh:'')+' · '+it.seg_ms+'ms · 实例 '+it.n_inst+'</div>'
       +(it.words||[]).map(histLine).join('')
-      +'<details open><summary>top-K 明细</summary>'+(it.words||[]).map(w=>'<div class="hline"><b style="color:'+w.color+'">'+w.word+'</b></div>'+tkTable(w.debug)).join('')+'</details>'
+      +'<details open><summary>top-K 明细</summary>'+(it.words||[]).map(w=>'<div class="hline"><b style="color:'+w.color+'">'+w.word+'</b></div>'+tkTable(w.debug,it.alpha,it.thresh)).join('')+'</details>'
       +'</div></div>';
   }).join('');
 }
@@ -4266,24 +4295,25 @@ async function run(){
   if(busy) return; busy=true; $('run').disabled=true; $('st').textContent='跑 SAM3 中…';
   try{
     const r=await fetch('/api/sam3tune/run',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text:$('text').value||'food', topk:parseInt($('topk').value)||10})});
+      body:JSON.stringify({text:$('text').value||'food', topk:parseInt($('topk').value)||10,
+        alpha:parseFloat($('alpha').value), thresh:parseFloat($('thr').value)})});
     const d=await r.json();
     if(!d.ok){ $('st').innerHTML='<span class="err">'+(d.error||'失败')+'</span>'; }
     else{
       $('i2').src=d.seg; $('i2').style.display='block'; $('e2').style.display='none';
-      $('m2').textContent='#'+d.id+(d.device?' · '+d.device:'')+' · '+d.seg_ms+'ms · 实例 '+d.n_inst;
+      $('m2').textContent='#'+d.id+(d.device?' · '+d.device:'')+' · α='+d.alpha+' thr='+d.thresh+' · '+d.seg_ms+'ms · 实例 '+d.n_inst;
       renderScores(d);
       $('st').innerHTML='<span class="ok">OK</span> · #'+d.id+' · '+d.seg_ms+'ms';
       loadHist();
     }
   }catch(e){ $('st').innerHTML='<span class="err">请求失败：'+e+'</span>'; }
   busy=false; $('run').disabled=false;
-  if(auto && !document.hidden) setTimeout(run, 300);   // 自动：背靠背连跑，页面隐藏时暂停
 }
 $('run').onclick=run;
-$('auto').onclick=()=>{ auto=!auto; $('auto').textContent=auto?'停止自动':'自动（连续）';
-  $('auto').classList.toggle('on',auto); if(auto)run(); };
-document.addEventListener('visibilitychange',()=>{ if(!document.hidden && auto) run(); });
+// 自动模式 = 新帧驱动：不做定时连跑，frameTick 里检测到设备帧 seq 变化才触发一次分析
+// （同一帧不会重复分析；改词/改 α/阈值后想立刻看效果，点「运行一次」即可）
+$('auto').onclick=()=>{ auto=!auto; $('auto').textContent=auto?'停止自动':'自动（新帧驱动）';
+  $('auto').classList.toggle('on',auto); if(auto){ lastRunSeq=lastSeq; run(); } };
 $('clear').onclick=async()=>{ await fetch('/api/sam3tune/clear',{method:'POST'}); lastHistId=-1; loadHist(); };
 // 首次探活
 fetch('/api/sam3/health').then(r=>r.json()).then(d=>{
