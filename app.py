@@ -1279,7 +1279,8 @@ SPLIT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </style></head><body>
  <div class="top"><b>Depth Anything 3</b>
   <span class="tag">左：设备实时帧 + DA3 产物（深度图 · 点云 · 网格，可调参转视角）　·　右：实时识别卡片流　·　同一 8060 端口</span>
-  <a href="/experience" target="_blank" style="margin-left:auto;font-size:13px;color:#0a84ff;text-decoration:none">✨ 浅体验区展示页 ↗</a></div>
+  <a href="/sam3tune" target="_blank" style="margin-left:auto;font-size:13px;color:#0a84ff;text-decoration:none">SAM3 调优 ↗</a>
+  <a href="/experience" target="_blank" style="font-size:13px;color:#0a84ff;text-decoration:none">✨ 浅体验区展示页 ↗</a></div>
  <div class="wrap">
   <div class="pane">
    <div class="bar"><span class="dot" style="background:#0a84ff"></span>设备实时帧 · DA3 产物
@@ -1335,7 +1336,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .seg button.on{background:#0071e3;border-color:#0071e3;color:#fff}
  @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style></head><body>
-<div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
+<div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/sam3tune" target="_top">SAM3 调优</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
 <h1>Depth Anything 3 · 扩展面板</h1>
 
 <div id="tunbar" style="display:flex;gap:8px;align-items:center;font-size:13px;margin:2px 0 12px;color:#6b6b70">
@@ -3555,6 +3556,7 @@ def sam3tune_run(body: dict = Body(default=None)):
         entry_id = _sam3tune_seq
     common = {"ok": True, "id": entry_id, "ts": time.time(), "text": text, "topk": topk,
               "seg_ms": seg_ms, "n_inst": n_inst, "words": word_infos,
+              "device": get_selected_device(),   # 分析帧来自当前选中设备的处理流
               "endpoint": SAM3_ENDPOINT}
     hist = dict(common)
     hist["raw"] = _thumb_uri(cur)
@@ -4088,6 +4090,7 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .bar label{font-size:12.5px;color:var(--muted)}
  .bar input[type=text]{font-size:13px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);width:200px}
  .bar input[type=number]{font-size:13px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);width:62px}
+ .bar select{font-size:13px;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);min-width:150px}
  .btn{font-size:13px;font-weight:600;color:#fff;background:var(--accent);border:0;padding:7px 16px;border-radius:8px;cursor:pointer}
  .btn:disabled{opacity:.5;cursor:default}
  .btn2{background:var(--panel);color:var(--muted);border:1px solid var(--line)}
@@ -4134,6 +4137,8 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   归因口径：<b>presence 低(&lt;0.5)</b>→概念/词表问题，换词；<b>presence 高但联合分被阈值砍</b>→纯阈值问题；<b>top-K 里没有覆盖目标区域的框</b>→定位问题，切图。
   联合分 = 最终检测置信度（NMS/阈值前）；条件原始分 = 联合分 ÷ presence 还原的 query 条件分。</div>
  <div class="bar">
+  <label id="devlbl" style="display:none">设备</label>
+  <select id="devsel" style="display:none"></select>
   <label>text（英文名词，逗号分隔最多 4 词，每词一色）</label>
   <input type="text" id="text" value="food" placeholder="如 food / bowl of rice, bottle">
   <label>top-K</label>
@@ -4156,15 +4161,42 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </div>
 <script>
 const $=id=>document.getElementById(id);
-let auto=false, busy=false, lastSeq=-1, lastHistId=-1;
+let auto=false, busy=false, lastSeq=-1, lastHistId=-1, curDev=null, lastDevKey='';
+
+// 设备下拉：与主面板同一套 /api/frame/select（选中是全局的，影响处理线程与本页分析帧）
+const devsel=$('devsel');
+devsel.addEventListener('change',()=>{
+  fetch('/api/frame/select',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({device_id:devsel.value})}).catch(()=>{});
+});
+function renderDevices(s){
+  const devs=s.devices||[];
+  devsel.style.display=devs.length?'':'none'; $('devlbl').style.display=devs.length?'':'none';
+  if(document.activeElement!==devsel){   // 下拉展开操作中不重建选项，避免选择被打断
+    const key=devs.map(d=>d.device_id).join('|')+'#'+(s.selected||'');
+    if(key!==lastDevKey){ lastDevKey=key;
+      devsel.innerHTML=devs.map(d=>'<option value="'+d.device_id+'"'
+        +(d.device_id===s.selected?' selected':'')+'>'+d.device_id+'</option>').join('');
+    }
+  }
+}
+function resetForSwitch(){   // 切设备：清掉旧设备的原图/定位/分数，等新设备的帧与下一次运行
+  lastSeq=-1;
+  $('i1').style.display='none'; $('e1').style.display='';
+  $('i2').style.display='none'; $('e2').style.display=''; $('m2').textContent='';
+  $('scores').innerHTML='<div class="empty">—</div>';
+}
 
 // ① 原图动态刷新：与主面板同一套 /api/frame/status + /api/frame/latest 轮询
 async function frameTick(){
   try{
     const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
+    renderDevices(s);
+    if(s.device && s.device!==curDev){ if(curDev!==null) resetForSwitch(); curDev=s.device; }
     if(s.has_frame && s.seq!==lastSeq){ lastSeq=s.seq;
       $('i1').src='/api/frame/latest?t='+s.seq; $('i1').style.display='block'; $('e1').style.display='none'; }
-    $('m1').textContent = s.has_frame ? ('帧 '+s.seq+(s.interval?(' · 间隔 '+s.interval.toFixed(1)+'s'):'')) : '';
+    $('m1').textContent = s.has_frame ? ((s.device?s.device+' · ':'')+'帧 '+s.seq
+      +(s.interval?(' · 间隔 '+s.interval.toFixed(1)+'s'):'')) : '';
   }catch(e){}
 }
 setInterval(frameTick, 500); frameTick();
@@ -4212,7 +4244,7 @@ function renderHist(items){
   $('hist').innerHTML = items.map(it=>{
     const t=new Date(it.ts*1000).toLocaleTimeString('zh-CN',{hour12:false});
     return '<div class="hcard"><img src="'+it.raw+'" alt="原图"><img src="'+it.seg+'" alt="定位">'
-      +'<div class="hmeta"><div class="t">#'+it.id+' · '+t+' · text="'+it.text+'" · '+it.seg_ms+'ms · 实例 '+it.n_inst+'</div>'
+      +'<div class="hmeta"><div class="t">#'+it.id+' · '+t+(it.device?' · '+it.device:'')+' · text="'+it.text+'" · '+it.seg_ms+'ms · 实例 '+it.n_inst+'</div>'
       +(it.words||[]).map(histLine).join('')
       +'<details><summary>top-K 明细</summary>'+(it.words||[]).map(w=>'<div class="hline"><b style="color:'+w.color+'">'+w.word+'</b></div>'+tkTable(w.debug)).join('')+'</details>'
       +'</div></div>';
@@ -4238,7 +4270,7 @@ async function run(){
     if(!d.ok){ $('st').innerHTML='<span class="err">'+(d.error||'失败')+'</span>'; }
     else{
       $('i2').src=d.seg; $('i2').style.display='block'; $('e2').style.display='none';
-      $('m2').textContent='#'+d.id+' · '+d.seg_ms+'ms · 实例 '+d.n_inst;
+      $('m2').textContent='#'+d.id+(d.device?' · '+d.device:'')+' · '+d.seg_ms+'ms · 实例 '+d.n_inst;
       renderScores(d);
       $('st').innerHTML='<span class="ok">OK</span> · #'+d.id+' · '+d.seg_ms+'ms';
       loadHist();
