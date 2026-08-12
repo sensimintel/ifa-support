@@ -9,7 +9,7 @@
   lightbox、Qwen/Gemini 切换），卡片字段含 卡路里/宏量/健康分级。
 
 链路（全部在本进程，与 8060 零共享状态）：
-  8060 只读接口拉帧(采样率可调) → SAM3 检测(/v1/segment 可调查询词/阈值/口径 + embedding 匹配插槽)
+  8060 只读接口拉帧(出新帧即消费) → SAM3 检测(/v1/segment 可调查询词/阈值/口径 + embedding 匹配插槽)
   → 命中触发 VLM 识别(与产线同款 prompt/解析/五道合并闸门，可魔改) → 实验卡片流。不走 LA。
 
 隔离与负载：
@@ -49,7 +49,6 @@ UNKNOWN_DEVICE = "unknown"
 # ══════════════════════════════════════════════════════════════════════
 _cfg = {
     "enabled": False,            # 总开关：关=不拉帧不推理，GPU 零增量
-    "interval": 1.0,             # 检测采样间隔（秒）
     "sam3_on": True,             # SAM3 检测（无状态 /v1/segment）
     "sam3_food_queries": "food",
     "sam3_drink_queries": "drink",
@@ -61,7 +60,9 @@ _cfg = {
     "sam3_mask": True,           # 标注帧叠 mask 半透明高亮
     "embed_on": False,           # embedding 匹配插槽（_embed_match 接入前无输出）
     "recog_on": True,            # 命中检测后是否触发 VLM 识别（关=只看检测级）
-    "recog_interval": 4.0,       # 两次 VLM 识别最小间隔（秒），与产线同款节流语义
+    # 无采样间隔、无识别节流：目标=资源允许下最大实时性。检测循环出新帧就跑（节奏由
+    # SAM3 推理速度自然限定）；命中即上送 VLM（识别 worker 单在飞+最新优先丢积压，
+    # 永远在算最新帧，也不会并发打乱去重时序）。
 }
 _cfg_lock = threading.Lock()
 
@@ -212,7 +213,6 @@ _recog_lock = threading.Lock()
 _recog_cv = threading.Condition(_recog_lock)
 _recog_cards = {}            # device_id -> [card...]
 _recog_id = 0
-_recog_last_ts = 0.0
 _recog_pending = []
 _recog_worker_started = False
 
@@ -240,15 +240,28 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0):
         "从图3起（若有）全部是带“HISTORY REF”横幅的历史参考图，只用于任务二对照，**不是当前画面**。\n"
         "检测器在当前画面的命中：食物框×" + str(n_food) + "、液体框×" + str(n_drink) + ""
         "（检测器可能漏检，但当前画面里明显不存在的东西绝不要输出）。\n"
-        "任务一·识别：只识别图1/图2 当前画面里**真实存在**的食物、以及液体/饮料"
-        "（咖啡/水/可乐/茶/杯装饮品等），逐一分别输出，食物和液体必须拆成不同 item；"
+        "任务一·识别：只识别图1/图2 当前画面里**真实存在、且确认为人类可直接食用/饮用**的食物与饮品，"
+        "逐一分别输出，食物和饮品必须拆成不同 item；"
         "不要局限于框，画面里明显的都要识别；但**严禁**把只出现在历史参考图里的物品当成当前物品输出——"
-        "当前画面没有食物/液体时，即使参考图里有，items 也必须为空数组。每个物品输出：\n"
-        "  name：具体名称（简短，优先英文）。食物可用品牌名（如 Banana、Snickers）；"
+        "当前画面没有可食用的食物/饮品时，即使参考图里有，items 也必须为空数组。\n"
+        "可食用性硬约束（一票否决）：\n"
+        "  · 以下一律**不输出**：护肤品/化妆品/洗护清洁用品（爽肤水、乳液、洗手液、消毒液、喷雾瓶）、"
+        "药品与药瓶、餐具与空容器本身、食品包装盒/袋（里面看不到食物时）、电子产品、文具玩具等一切非食品；\n"
+        "  · 判定必须有明确视觉证据：食品/饮料的包装标签或品牌、餐饮容器（杯/碗/盘/吸管/罐）、"
+        "食物本体外观、或正在被吃/喝的动作；\n"
+        "  · 瓶装液体默认存疑：只有包装形态明显是饮料（矿泉水/饮料瓶身、饮用瓶盖、饮料标签）才算饮品；"
+        "化妆品形态的瓶子（扁平/细长瓶身、按压泵头或掀盖、化妆品标签版式、无饮用口）一律不算；\n"
+        "  · 反例：手持细长瓶绿色爽肤水 → 不输出；眼镜盒/充电宝/空杯子 → 不输出；正例：无标签透明杯装水 → 输出 Water；\n"
+        "  · 拿不准是否可食用 → 不输出（宁漏勿误）；说不出具体是哪种食品/饮品（只能叫"
+        "“液体/瓶子/物体”之类）也说明不该输出。\n"
+        "每个物品输出（严格按此顺序，证据先于结论）：\n"
+        "  edible_evidence：一句简短中文，给出“它确认可食用”的视觉证据"
+        "（如“罐身有可乐标签”“正插着吸管在喝”“香蕉果皮外观”）；\n"
+        "  name：具体名称（简短，优先英文），禁止 Liquid/Unknown 之类泛称。食物可用品牌名（如 Banana、Snickers）；"
         "液体一律按**内容物**命名（如 Water、Coffee、Cola、Orange juice）——"
         "容器上的文字只有当它是饮料产品本身的品牌（如可乐罐上的 Coca-Cola）才可用作名称，"
         "杯子/瓶子上的装饰文案（如 Good morning）不是名称；\n"
-        "  type：只能是“食物”或“液体”；\n"
+        "  type：只能是“食物”或“饮品”；\n"
         "  description：一句话中文描述（不超过" + str(RECOG_DESC_MAX) + "字，如“快速补能的小食”）；\n"
         "  description_en：一句话英文描述（不超过 60 字符，如 \"A quick source of everyday energy.\"）；\n"
         "  calories_kcal：整数卡路里；protein_g / carbs_g / fat_g：蛋白质/碳水/脂肪克数（数字，最多 1 位小数）。"
@@ -303,7 +316,8 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0):
               "match_evidence 写“无相似候选”，match_reason 写“无已记录物品”，matched_name 为 null。\n")
     p += (
         "只输出 JSON，不要任何解释："
-        "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
+        "{\"items\":[{\"edible_evidence\":\"香蕉果皮外观，属天然水果\","
+        "\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
         "\"description_en\":\"A quick source of everyday energy.\","
         "\"calories_kcal\":89,\"protein_g\":1.1,\"carbs_g\":22.8,\"fat_g\":0.3,"
         "\"classification\":\"Good\",\"box\":[412,530,668,845],"
@@ -330,6 +344,13 @@ def _parse_recog(content):
         name = str(it.get("name", "")).strip()[:40]
         if not name:
             continue
+        # 泛称名 guardrail：说不出具体是什么可食用物（Green Liquid/Unknown/Object 之类）
+        # 视为可食用性不成立，整个 item 丢弃（prompt 已明令禁止，此处兜底）
+        if re.fullmatch(r"(?:[a-z]+\s+)?(liquid|unknown|object|item|thing|bottle|container)",
+                        name.strip().lower()):
+            print(f"[exp] 识别丢弃（泛称名，可食用性不成立）：『{name}』", flush=True)
+            continue
+        edible = str(it.get("edible_evidence", "")).strip().replace("\n", " ")[:60]
         typ = str(it.get("type", "")).strip().lower()
         is_liquid = ("液" in typ or "饮" in typ or "drink" in typ or "liquid" in typ)
         desc = str(it.get("description", "")).strip().replace("\n", " ")[:RECOG_DESC_MAX]
@@ -359,6 +380,7 @@ def _parse_recog(content):
             except (TypeError, ValueError):
                 box = None
         out.append({"name": name, "type": "液体" if is_liquid else "食物",
+                    "edible_evidence": edible,
                     "description": desc, "description_en": desc_en,
                     "calories_kcal": kcal, "protein_g": protein,
                     "carbs_g": carbs, "fat_g": fat, "classification": cls,
@@ -535,8 +557,9 @@ def _recog_worker():
                     print("[exp] 识别去重：『%s』match=%s(high) → 合并到卡%s『%s』" % (
                         it["name"], m, target["id"], target["name"]), flush=True)
                 else:
-                    print("[exp] 识别新卡：『%s』(%s) match=%s｜理由：%s" % (
+                    print("[exp] 识别新卡：『%s』(%s) match=%s｜可食用证据：%s｜理由：%s" % (
                         it["name"], it["type"], m,
+                        it.get("edible_evidence") or "（模型未给）",
                         it.get("match_reason") or "（模型未给）"), flush=True)
                 shot_url = _save_crop_shot(orig, it.get("box"))
                 if target is not None:
@@ -566,6 +589,7 @@ def _recog_worker():
                     cards.append({
                         "id": _recog_id, "status": "done",
                         "name": it["name"], "type": it["type"], "description": it["description"],
+                        "edible_evidence": it.get("edible_evidence", ""),
                         "description_en": it.get("description_en", ""),
                         "calories_kcal": it.get("calories_kcal"),
                         "protein_g": it.get("protein_g"), "carbs_g": it.get("carbs_g"),
@@ -579,16 +603,14 @@ def _recog_worker():
                 del cards[:len(cards) - RECOG_MAX_CARDS]
 
 
-def _maybe_recognize(orig_rgb, detections, frame, device, min_interval):
-    """检测命中 + 节流通过 → 取活跃卡快照作去重候选、提交异步识别（与产线同款语义）。"""
-    global _recog_last_ts, _recog_worker_started
+def _maybe_recognize(orig_rgb, detections, frame, device):
+    """检测命中即提交异步识别（无节流，最大实时性）：识别 worker 单在飞+最新优先丢积压，
+    在飞的一轮结束后总是拿最新任务，天然贴住最新帧。"""
+    global _recog_worker_started
     if not detections or not RECOG_TARGETS[_recog_target]["endpoint"]:
         return
     now = time.time()
     with _recog_lock:
-        if now - _recog_last_ts < min_interval:
-            return
-        _recog_last_ts = now
         if not _recog_worker_started:
             _recog_worker_started = True
             threading.Thread(target=_recog_worker, daemon=True).start()
@@ -694,27 +716,24 @@ def _run_round(rgb, src_seq, dev, cfg):
         src_seq, n_food, n_drink, rec["ms"].get("sam3", 0)), flush=True)
     # 命中 → 触发实验 VLM 识别（异步、节流；与产线同款语义但完全独立一份）
     if cfg["recog_on"] and detections:
-        _maybe_recognize(rgb, detections, "e%d" % src_seq, dev,
-                         float(cfg["recog_interval"]))
+        _maybe_recognize(rgb, detections, "e%d" % src_seq, dev)
 
 
 def _worker():
-    """检测后台主循环：按采样间隔消费 8060 新帧；总开关关 = 完全静默。"""
-    last_seq, last_run = -1, 0.0
+    """检测后台主循环：8060 出新帧就立刻消费（无固定采样间隔，节奏由 SAM3 推理速度
+    自然限定）；总开关关 = 完全静默。"""
+    last_seq = -1
     while True:
         with _cfg_lock:
             cfg = dict(_cfg)
         if not cfg["enabled"]:
             time.sleep(0.3)
             continue
-        if time.time() - last_run < max(0.2, float(cfg["interval"])):
-            time.sleep(0.1)
-            continue
         rgb, seq, dev = _fetch_frame()
         if rgb is None or seq == last_seq:
-            time.sleep(0.3)
+            time.sleep(0.05)
             continue
-        last_seq, last_run = seq, time.time()
+        last_seq = seq
         try:
             _run_round(rgb, seq, dev, cfg)
         except Exception as e:
@@ -930,7 +949,7 @@ EXP_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <h3>总控</h3>
  <div class="fld"><label>总开关</label><span class="sw"><input type="checkbox" id="c_enabled"><i></i></span>
   <span class="hint">关 = 不拉帧不推理，GPU 零增量</span></div>
- <div class="fld"><label>采样间隔</label><input type="number" id="c_interval" min="0.2" step="0.1"> 秒</div>
+  <div class="hint">无采样间隔/无识别节流：出新帧即检测（节奏=SAM3 推理速度），命中即上送 VLM（单在飞、最新优先）——最大实时性。</div>
  <h3>SAM3 检测（无状态 /v1/segment，不碰产线流式）</h3>
  <div class="fld"><label>启用</label><span class="sw"><input type="checkbox" id="c_sam3_on"><i></i></span></div>
  <div class="fld"><label>食物查询词</label><input type="text" id="c_sam3_food_queries" placeholder="food"></div>
@@ -944,7 +963,6 @@ EXP_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <span class="hint">score 阈值是返回结果上的客户端二次过滤：低于阈值画灰框，直观看阈值卡掉了什么（设 0 = 全信 server 口径）</span></div>
  <h3>VLM 识别（实验独立一份，卡片见右栏）</h3>
  <div class="fld"><label>命中即识别</label><span class="sw"><input type="checkbox" id="c_recog_on"><i></i></span></div>
- <div class="fld"><label>识别节流</label><input type="number" id="c_recog_interval" min="1" step="0.5"> 秒/轮</div>
  <h3>embedding 匹配（插槽）</h3>
  <div class="fld"><label>启用</label><span class="sw"><input type="checkbox" id="c_embed_on"><i></i></span>
   <span class="hint">接入小模型前无输出；实现 exp_app.py 的 _embed_match() 即接通</span></div>
@@ -964,8 +982,6 @@ function push(){
     const body={};
     BOOLS.forEach(k=>body[k]=$('c_'+k).checked);
     TEXTS.forEach(k=>body[k]=$('c_'+k).value);
-    body.interval=+$('c_interval').value||1.0;
-    body.recog_interval=+$('c_recog_interval').value||4.0;
     body.sam3_thresh=+$('c_sam3_thresh').value;
     body.sam3_alpha=+$('c_sam3_alpha').value;
     body.sam3_det_thresh=+$('c_sam3_det_thresh').value||0;
@@ -974,7 +990,7 @@ function push(){
   },200);
 }
 BOOLS.concat(TEXTS).forEach(k=>$('c_'+k).addEventListener('change',push));
-['c_interval','c_recog_interval','c_sam3_det_thresh'].forEach(id=>$(id).addEventListener('change',push));
+['c_sam3_det_thresh'].forEach(id=>$(id).addEventListener('change',push));
 $('c_sam3_thresh').addEventListener('input',()=>{$('v_thresh').textContent=(+$('c_sam3_thresh').value).toFixed(2);push();});
 $('c_sam3_alpha').addEventListener('input',()=>{$('v_alpha').textContent=(+$('c_sam3_alpha').value).toFixed(2);push();});
 $('btnCfg').onclick=()=>$('cfg').classList.toggle('on');
@@ -984,7 +1000,6 @@ function fillCfg(c){   // 只首次回填，之后以页面为准（避免打字
   if(inited)return;inited=true;
   BOOLS.forEach(k=>$('c_'+k).checked=!!c[k]);
   TEXTS.forEach(k=>$('c_'+k).value=c[k]||'');
-  $('c_interval').value=c.interval;$('c_recog_interval').value=c.recog_interval;
   $('c_sam3_thresh').value=c.sam3_thresh;$('v_thresh').textContent=(+c.sam3_thresh).toFixed(2);
   $('c_sam3_alpha').value=c.sam3_alpha;$('v_alpha').textContent=(+c.sam3_alpha).toFixed(2);
   $('c_sam3_det_thresh').value=c.sam3_det_thresh;
