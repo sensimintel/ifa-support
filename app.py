@@ -1832,12 +1832,26 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     letter-spacing:-.01rem;margin:0}
  #card h1{font-size:.56rem}
  .sub{font-size:.2rem;line-height:1.4;letter-spacing:-.002rem;margin:.16rem 0 0;color:rgba(255,253,247,.92)}
- .chips{display:flex;gap:.18rem;flex-wrap:wrap;margin-top:.3rem}
- .chip{background:var(--white);color:#161311;border-radius:9rem;padding:.135rem .3rem;
-       font-size:.155rem;letter-spacing:.012rem;text-transform:uppercase;white-space:nowrap}
  .rule{border:0;border-top:1px solid rgba(255,253,247,.4);margin:.42rem 0 0}
- .sig h2{font-weight:400;font-size:.33rem;letter-spacing:-.004rem;margin:.38rem 0 0}
- .sig p{font-size:.2rem;line-height:1.4;margin:.13rem 0 0;color:rgba(255,253,247,.92)}
+ /* 识别成功卡：设计稿深色底面板（名称+描述 / Calories / 三列宏量 / Food Classification） */
+ #card{background:rgba(17,14,12,.72);border-radius:.08rem;padding:.4rem .44rem .46rem;
+       backdrop-filter:blur(6px)}
+ .krow{display:flex;justify-content:space-between;align-items:baseline;gap:.3rem;margin-top:.34rem}
+ .klab{font-size:.17rem;letter-spacing:.004rem;color:rgba(255,253,247,.9);white-space:nowrap}
+ .kval{font-size:.3rem;letter-spacing:-.004rem;white-space:nowrap}
+ #macros{display:flex;justify-content:space-between;text-align:center;margin-top:.34rem;padding:0 .26rem}
+ #macros .mlab{display:block;font-size:.17rem;color:rgba(255,253,247,.9)}
+ #macros .mval{display:block;font-size:.3rem;letter-spacing:-.004rem;margin-top:.14rem}
+ /* ── 食物定位小标：名称+卡路里（与右卡同数据源），锚在识别 box 中心、引线指向食物 ── */
+ #ftag{position:absolute;left:0;top:0;z-index:3;pointer-events:none;opacity:0;
+   transition:opacity .35s ease,transform .5s ease;will-change:transform}
+ #ftag.on{opacity:1}
+ #ftag .ftin{transform:translate(0,-100%);display:inline-flex;flex-direction:column;align-items:flex-start}
+ #ftbox{border:1.5px solid var(--white);border-radius:.05rem;padding:.13rem .32rem .15rem;
+   text-align:center;background:rgba(0,0,0,.28);backdrop-filter:blur(3px)}
+ #ftname{font-size:.2rem;letter-spacing:.004rem;white-space:nowrap}
+ #ftkcal{font-size:.155rem;margin-top:.05rem;color:rgba(255,253,247,.92);white-space:nowrap}
+ #ftlead{display:block;margin-top:-1px}
  /* ── 流水视图：实时画面小窗 + 当日识别记录列表 ── */
  #tl{position:absolute;inset:0;display:none}
  #tl.on{display:block;background:rgba(0,0,0,.62)}   /* 流水态强压暗背景，突出列表 */
@@ -1918,12 +1932,24 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div class="state" id="card">
    <h1 id="cname"></h1>
    <p class="sub" id="cdesc"></p>
-   <div class="chips" id="cchips"></div>
    <hr class="rule">
-   <div class="sig" id="csig"><h2 id="signame"></h2><p id="sigline"></p></div>
-   <hr class="rule">
+   <div class="krow" id="ckcalrow"><span class="klab">Calories</span><span class="kval" id="ckcal"></span></div>
+   <hr class="rule" id="mrule">
+   <div id="macros">
+    <div class="m" id="mpro"><span class="mlab">Protein</span><span class="mval"></span></div>
+    <div class="m" id="mcarb"><span class="mlab">Carbs</span><span class="mval"></span></div>
+    <div class="m" id="mfat"><span class="mlab">Fat</span><span class="mval"></span></div>
+   </div>
+   <hr class="rule" id="crule">
+   <div class="krow" id="cclsrow"><span class="klab">Food Classification</span><span class="kval" id="ccls"></span></div>
   </div>
  </div>
+
+ <div id="ftag"><div class="ftin">
+  <div id="ftbox"><div id="ftname"></div><div id="ftkcal"></div></div>
+  <svg id="ftlead" width="44" height="30" viewBox="0 0 44 30" fill="none">
+   <path d="M43 1H14L1 29" stroke="#FFFDF7" stroke-width="1.5"/></svg>
+ </div></div>
 
  <div id="tl">
   <div id="tlinset"><img id="tlraw" alt=""><span id="tlwait">Waiting for camera…</span></div>
@@ -2087,23 +2113,6 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <script>
 const $=id=>document.getElementById(id);
 const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无后端时目检布局用
-
-// ── 食物信号 → 英文一句话（设计稿「Quick energy / Fast-access fuel …」段），键=后端 FOOD_SIGNALS 枚举 ──
-const SIGNAL_LINES={
- 'Quick energy':'Fast-access fuel for the next part of your day.',
- 'Sustained energy':'Slow-burning fuel that keeps you going for hours.',
- 'High protein':'Building blocks for muscle and recovery.',
- 'High fiber':'Keeps digestion steady and you fuller for longer.',
- 'Hydration':'Tops up your fluids and keeps you refreshed.',
- 'Healthy fats':'Good fats that support heart and brain.',
- 'Low calorie':'Light on calories, easy on your day.',
- 'Sugar spike':'A fast sugar hit — energy now, dip later.',
- 'Caffeine boost':'A lift for focus and alertness.',
- 'Vitamin boost':'A dose of vitamins to round out your day.',
- 'Balanced nutrition':'A well-rounded mix of what your body needs.',
- 'Indulgent treat':'Pure enjoyment — worth savoring slowly.'};
-// 营养标签展示名（其余枚举直接原词大写展示）
-const TAG_DISPLAY={'Carbs':'Carbohydrates'};
 
 // ══ 背景层：四种来源下拉框选择（临时工具），默认 SAM3 高亮点云 ══
 let bgSource=localStorage.getItem('exp_bg')||'hl';
@@ -2367,17 +2376,41 @@ let lastCardKey='',cardShownAt=0,curCard=null;
 function setState(st){
   $('idle').classList.toggle('on',st==='idle'&&!$('tl').classList.contains('on'));
   $('card').classList.toggle('on',st==='card'&&!$('tl').classList.contains('on'));
+  updateFtag();
 }
 function renderCard(c){
   $('cname').textContent=c.name||'';
   $('cdesc').textContent=c.description_en||c.description||'';
-  $('cchips').innerHTML=(c.nutrition_tags||[]).map(t=>
-    '<span class="chip">'+(TAG_DISPLAY[t]||t)+'</span>').join('');
-  const sig=c.food_signal||'';
-  $('csig').style.display=sig?'block':'none';
-  $('signame').textContent=sig;
-  $('sigline').textContent=SIGNAL_LINES[sig]||'';
+  // 营养数字与分级：VLM 偶发不给（guardrail 置 null/空）→ 对应行整行隐藏
+  const kcal=(c.calories_kcal!=null)?c.calories_kcal+' kcal':'';
+  $('ckcalrow').style.display=kcal?'':'none';$('ckcal').textContent=kcal;
+  let anyMac=false;
+  [['mpro',c.protein_g],['mcarb',c.carbs_g],['mfat',c.fat_g]].forEach(([id,v])=>{
+    const on=v!=null;$(id).style.display=on?'':'none';
+    if(on){$(id).querySelector('.mval').textContent=v+'g';anyMac=true;}});
+  $('macros').style.display=anyMac?'':'none';$('mrule').style.display=anyMac?'':'none';
+  const cls=c.classification||'';
+  $('cclsrow').style.display=cls?'':'none';$('crule').style.display=cls?'':'none';
+  $('ccls').textContent=cls;
+  // 定位小标与右卡同数据源（同一个 kcal 数）
+  $('ftname').textContent=c.name||'';
+  $('ftkcal').textContent=kcal;$('ftkcal').style.display=kcal?'':'none';
 }
+// ── 食物定位小标：VLM box（0-1 归一化、原帧坐标系）→ 屏幕坐标。背景按 object-fit:cover
+// 铺 16:9 画面（原帧/点云渲染同构图），窗口非 16:9 时有裁边，此处做同一套 cover 数学补偿；
+// 锚点=box 中心（引线笔尖落在食物上）。GLB 点云背景的前端相机默认带 10° 俯视角，
+// 与原帧取景有轻微偏差，小标会小幅偏移（原图/服务端渲染图背景则完全对准）。
+function updateFtag(){
+  const el=$('ftag'),c=curCard;
+  if(!(c&&c.box&&$('card').classList.contains('on'))){el.classList.remove('on');return;}
+  const b=c.box,W=innerWidth,H=innerHeight,AR=16/9;
+  let sw,sh,ox,oy;
+  if(W/H>AR){sw=W;sh=W/AR;ox=0;oy=(H-sh)/2;}else{sh=H;sw=H*AR;ox=(W-sw)/2;oy=0;}
+  el.style.transform='translate('+(ox+sw*(b[0]+b[2])/2).toFixed(0)+'px,'
+    +(oy+sh*(b[1]+b[3])/2).toFixed(0)+'px)';
+  el.classList.add('on');
+}
+addEventListener('resize',updateFtag);
 function renderTimeline(cards){
   const list=$('tllist');
   const rows=(cards||[]).slice(0,10).reverse();   // 最新 10 条，按时间升序排布（同设计稿）
@@ -2512,7 +2545,8 @@ $('hlcfgClose').onclick=()=>$('hlcfg').classList.remove('on');
 
 if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布局
   curCard={name:'Banana',description_en:'A quick source of everyday energy.',
-           nutrition_tags:['Carbs','Fiber'],food_signal:'Quick energy'};
+           calories_kcal:89,protein_g:1.1,carbs_g:22.8,fat_g:0.3,
+           classification:'Good',box:[0.30,0.34,0.45,0.66]};
   renderCard(curCard);cardShownAt=Date.now();lastCardKey='demo';
   setInterval(()=>{cardShownAt=Date.now();},5000);   // 常驻成功态
   renderTimeline([
@@ -2679,22 +2713,22 @@ _recog_last_ts = 0.0       # 上次触发识别的时刻(节流用)
 _recog_pending = []        # 待识别任务队列(单线程消费，最新优先、丢弃积压)
 _recog_worker_started = False
 
-# 营养标签 / 食物信号的合法枚举（静态 guardrail 白名单：模型输出只保留集合内的值、其余丢弃）。
-# 想增删标签就改这两个列表即可（prompt 与校验都从这里派生，自动同步）。
-NUTRITION_TAGS = [
-    "Carbs", "Protein", "Fat", "Fiber", "Sugar", "Sodium", "Potassium", "Calcium",
-    "Iron", "Vitamin A", "Vitamin C", "Vitamin D", "Vitamin B", "Omega-3",
-    "Caffeine", "Water", "Electrolytes", "Antioxidants", "Probiotics",
-]
-FOOD_SIGNALS = [
-    "Quick energy", "Sustained energy", "High protein", "High fiber", "Hydration",
-    "Healthy fats", "Low calorie", "Sugar spike", "Caffeine boost", "Vitamin boost",
-    "Balanced nutrition", "Indulgent treat",
-]
-_NUTR_CANON = {t.lower(): t for t in NUTRITION_TAGS}   # 小写→规范写法，校验大小写不敏感
-_SIG_CANON = {s.lower(): s for s in FOOD_SIGNALS}
-RECOG_MAX_TAGS = 3          # 每个物品最多几个营养标签
+# 食物健康分级的合法枚举（静态 guardrail 白名单：模型输出只保留集合内的值、其余置空）。
+FOOD_CLASSIFICATIONS = ["Good", "Neutral", "Bad"]
+_CLS_CANON = {c.lower(): c for c in FOOD_CLASSIFICATIONS}   # 小写→规范写法，校验大小写不敏感
 RECOG_DESC_MAX = 20         # 一句话描述最大字数
+
+
+def _recog_num(v, lo, hi, as_int=False):
+    """营养数字字段 guardrail：转数字并夹进 [lo, hi]；非法/NaN 返回 None（前端隐藏该行）。"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f:   # NaN
+        return None
+    f = min(hi, max(lo, f))
+    return int(round(f)) if as_int else round(f, 1)
 
 def _build_recog_prompt(candidates, n_food=0, n_drink=0):
     """按候选动态生成「识别 + 去重」prompt。
@@ -2719,9 +2753,15 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0):
         "  type：只能是“食物”或“液体”；\n"
         "  description：一句话中文描述（不超过" + str(RECOG_DESC_MAX) + "字，如“快速补能的小食”）；\n"
         "  description_en：一句话英文描述（不超过 60 字符，如 \"A quick source of everyday energy.\"）；\n"
-        "  nutrition_tags：营养标签数组，最多" + str(RECOG_MAX_TAGS) + "个，只能从这些里选："
-        + "、".join(NUTRITION_TAGS) + "；\n"
-        "  food_signal：食物信号，只能从这些里选一个：" + "、".join(FOOD_SIGNALS) + "；\n"
+        "  calories_kcal：整数卡路里；protein_g / carbs_g / fat_g：蛋白质/碳水/脂肪克数（数字，最多 1 位小数）。"
+        "这四个营养数字**一律按画面里这一份的实际可见份量估算**，绝不是每 100 克的标准值：\n"
+        "    · 先目测这份食物的大小/体积/数量（对照画面里的手、餐具、容器等参照物），"
+        "再由份量换算出总卡路里与总克数——一根大香蕉和一根小香蕉的数字必须不同，"
+        "一整盘炒饭和小半碗炒饭的数字必须不同；\n"
+        "    · 只剩一部分（吃剩一半、喝剩小半杯）就按剩下的量估；\n"
+        "    · 液体按容器容量与液面高度估算内容物的量；\n"
+        "  classification：食物健康分级，只能从这些里选一个：" + "、".join(FOOD_CLASSIFICATIONS)
+        + "（营养密度高、天然少加工的选 Good；高糖/高盐/油炸/高度加工的选 Bad；介于两者之间选 Neutral）；\n"
         "  box：该物品在图1中的包围框 [x1,y1,x2,y2]，0-1000 归一化整数（左上、右下），"
         "框要紧贴物品本体。\n"
     )
@@ -2767,8 +2807,8 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0):
         "只输出 JSON，不要任何解释："
         "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
         "\"description_en\":\"A quick source of everyday energy.\","
-        "\"nutrition_tags\":[\"Carbs\",\"Fiber\",\"Potassium\"],\"food_signal\":\"Quick energy\","
-        "\"box\":[412,530,668,845],"
+        "\"calories_kcal\":89,\"protein_g\":1.1,\"carbs_g\":22.8,\"fat_g\":0.3,"
+        "\"classification\":\"Good\",\"box\":[412,530,668,845],"
         "\"match_evidence\":\"无相似候选\",\"match_reason\":\"画面新出现的物品\","
         "\"match\":null,\"matched_name\":null,\"match_confidence\":null}]}。"
         "画面里没有食物也没有液体时，items 为空数组。"
@@ -2884,8 +2924,9 @@ def _parse_recog(content):
       name           非空、限 40 字，否则丢弃该 item；
       type           枚举 → 归一到 “食物”/“液体”；
       description     字符串、去换行、限 RECOG_DESC_MAX 字；
-      nutrition_tags 枚举白名单 NUTRITION_TAGS（大小写不敏感、去重、限 RECOG_MAX_TAGS 个），非法值丢弃；
-      food_signal    枚举白名单 FOOD_SIGNALS，非法值置空。"""
+      calories_kcal  整数、夹到 [0,5000]，非法置 None；
+      protein_g/carbs_g/fat_g  数字（1 位小数）、夹到 [0,500]，非法置 None；
+      classification 枚举白名单 FOOD_CLASSIFICATIONS，非法值置空。"""
     try:
         obj = json.loads(content[content.index("{"): content.rindex("}") + 1])
     except Exception:
@@ -2904,16 +2945,11 @@ def _parse_recog(content):
         is_liquid = ("液" in typ or "饮" in typ or "drink" in typ or "liquid" in typ)
         desc = str(it.get("description", "")).strip().replace("\n", " ")[:RECOG_DESC_MAX]
         desc_en = str(it.get("description_en", "")).strip().replace("\n", " ")[:60]
-        raw_tags = it.get("nutrition_tags") or []
-        if isinstance(raw_tags, str):
-            raw_tags = [raw_tags]
-        tags = []
-        for x in (raw_tags if isinstance(raw_tags, list) else []):
-            canon = _NUTR_CANON.get(str(x).strip().lower())   # 枚举白名单校验 + 规范化
-            if canon and canon not in tags:
-                tags.append(canon)
-        tags = tags[:RECOG_MAX_TAGS]
-        sig = _SIG_CANON.get(str(it.get("food_signal", "")).strip().lower(), "")  # 非法→置空
+        kcal = _recog_num(it.get("calories_kcal"), 0, 5000, as_int=True)
+        protein = _recog_num(it.get("protein_g"), 0, 500)
+        carbs = _recog_num(it.get("carbs_g"), 0, 500)
+        fat = _recog_num(it.get("fat_g"), 0, 500)
+        cls = _CLS_CANON.get(str(it.get("classification", "")).strip().lower(), "")  # 非法→置空
         try:
             match = int(it.get("match"))     # 命中的候选编号；范围校验在 worker（要对齐候选数）
         except (TypeError, ValueError):
@@ -2935,7 +2971,8 @@ def _parse_recog(content):
                 box = None
         out.append({"name": name, "type": "液体" if is_liquid else "食物",
                     "description": desc, "description_en": desc_en,
-                    "nutrition_tags": tags, "food_signal": sig,
+                    "calories_kcal": kcal, "protein_g": protein,
+                    "carbs_g": carbs, "fat_g": fat, "classification": cls,
                     "match": match, "match_evidence": evidence, "match_reason": reason,
                     "matched_name": mname, "match_confidence": conf, "box": box})
     return out
@@ -2960,11 +2997,12 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
             content.append({"type": "image_url", "image_url": {"url": c["ref_img"]}})
     content.append({"type": "text", "text": _build_recog_prompt(candidates, n_food, n_drink)})
     # temperature=0：判同结果下游有硬合并动作，消除轮间抖动、日志巡检可复现；
-    # max_tokens 1024：新增 match_evidence 对照文本后，多物品帧 768 可能截断 JSON——
-    # 截断会被 _parse_recog 的容错整体吞掉 items，表现为静默丢识别。
+    # max_tokens 1536：每 item 的输出字段持续增多（match_evidence 对照文本、营养四数字
+    # + classification），多物品帧 1024 有截断风险——截断会被 _parse_recog 的容错
+    # 整体吞掉 items，表现为静默丢识别。
     payload = {"model": cfg["model"],
                "messages": [{"role": "user", "content": content}],
-               "max_tokens": 1024, "temperature": 0}
+               "max_tokens": 1536, "temperature": 0}
     headers = {"Content-Type": "application/json"}
     if cfg["api_key"]:
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
@@ -3078,6 +3116,10 @@ def _recog_worker():
                         target["shots"].append(shot_url)
                     # shots 只留最近 8 张：磁盘只保留最近 SHOT_KEEP 张，太多前端也摆不下
                     del target["shots"][:-8]
+                    if it.get("box"):
+                        # 位置随本轮刷新（食物会被挪动，/experience 的定位小标要跟着走）；
+                        # 本轮没给 box 就保留旧位置，营养内容仍维持「合并不改内容」策略
+                        target["box"] = it["box"]
                     target["last_ts"] = now
                     target["t"] = t
                     target["frame"] = frame
@@ -3098,7 +3140,10 @@ def _recog_worker():
                         "id": _recog_id, "status": "done",
                         "name": it["name"], "type": it["type"], "description": it["description"],
                         "description_en": it.get("description_en", ""),
-                        "nutrition_tags": it["nutrition_tags"], "food_signal": it["food_signal"],
+                        "calories_kcal": it.get("calories_kcal"),
+                        "protein_g": it.get("protein_g"), "carbs_g": it.get("carbs_g"),
+                        "fat_g": it.get("fat_g"), "classification": it.get("classification", ""),
+                        "box": it.get("box"),
                         "shots": [shot_url] if shot_url else [], "ref_img": ref_uri,
                         "merge_history": [],
                         "latency_ms": int(llm_ms), "latency_model": tgt["label"],
@@ -3682,18 +3727,22 @@ function cardEl(c){
     +'  <div class="fld"><div class="flab">识别对象 / Detected Food</div>'
     +'    <div class="name"><span class="tdot '+typeCls(c.type)+'"></span><span class="nm"></span></div></div>'
     +'  <div class="fld f-desc hide"><div class="flab">一句话描述 / Description</div><div class="desc"></div></div>'
-    +'  <div class="fld f-tags hide"><div class="flab">营养标签 / Nutrition Tags</div><div class="tags"></div></div>'
-    +'  <div class="fld f-sig hide"><div class="flab">食物信号 / Food Signal</div><div class="sig"></div></div>'
+    +'  <div class="fld f-nutr hide"><div class="flab">卡路里与营养（按可见份量估算）/ Nutrition (est.)</div><div class="tags nutr"></div></div>'
+    +'  <div class="fld f-cls hide"><div class="flab">健康分级 / Classification</div><div class="sig cls"></div></div>'
     +'  <div class="meta"><span>帧 '+(c.frame||'')+'</span><span>'+(c.t||'')+'</span></div>'
     +'</div>'
     +'<div class="rlat"><div class="flab">识别延时 / Latency</div><div class="lv"></div><div class="lm"></div></div>';
   latFill(el, c);
   typeInto(el.querySelector('.nm'), c.name||'');
   if(c.description){ el.querySelector('.f-desc').classList.remove('hide'); el.querySelector('.desc').textContent=c.description; }
-  const tags=c.nutrition_tags||[];
-  if(tags.length){ el.querySelector('.f-tags').classList.remove('hide');
-    el.querySelector('.tags').innerHTML=tags.map(t=>'<span class="chip">'+t+'</span>').join(''); }
-  if(c.food_signal){ el.querySelector('.f-sig').classList.remove('hide'); el.querySelector('.sig').textContent=c.food_signal; }
+  const nutr=[];   // 老卡（改版前识别的）没有这些字段 → 整段隐藏，不炸
+  if(c.calories_kcal!=null)nutr.push(c.calories_kcal+' kcal');
+  if(c.protein_g!=null)nutr.push('蛋白 '+c.protein_g+'g');
+  if(c.carbs_g!=null)nutr.push('碳水 '+c.carbs_g+'g');
+  if(c.fat_g!=null)nutr.push('脂肪 '+c.fat_g+'g');
+  if(nutr.length){ el.querySelector('.f-nutr').classList.remove('hide');
+    el.querySelector('.nutr').innerHTML=nutr.map(t=>'<span class="chip">'+t+'</span>').join(''); }
+  if(c.classification){ el.querySelector('.f-cls').classList.remove('hide'); el.querySelector('.cls').textContent=c.classification; }
   return el;
 }
 // —— 卡片右侧延时：最近一次识别该食物的 VLM 耗时 + 所用模型（新建与去重合并都会刷新）——
