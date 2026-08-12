@@ -73,21 +73,34 @@ def _infer_ctx():
 # 发布版 SAM3（has_presence_token=True → supervise_joint_box_scores=True）的检测头输出里：
 #   · presence_logit_dec：全局 presence token 的 logit（"概念是否存在于图中"，全图共享）；
 #   · pred_logits：每个 object query 的「联合分」logit = inverse_sigmoid(query条件分 × presence分)，
-#     clamp ±10（见 sam3.model.sam3_image._update_scores_and_boxes）。
+#     clamp ±10（见 sam3.model.sam3_image._update_scores_and_boxes）——被 clamp 后除法反推会骗人；
+#   · 真·条件原始分：在 dot_prod_scoring 头（DotProductScoring，clamp ±12）上挂 forward hook，
+#     直取未经 presence 加权的 pre-sigmoid logit（负样本是 -8/-12 这种明确负数，一眼可辨），
+#     其 query 维顺序与 pred_logits 逐元素对齐（联合变换是逐元素的，不重排）。
 # 库层 API 只回吐过完阈值/NMS 的最终分，这里在 detector.forward_grounding 上包一层，
-# 在 NMS 抹分（logit -1e4）之前捕获原始输出，用于归因"漏检是 presence 门控杀的还是阈值砍的"：
-#   presence_score = sigmoid(presence_logit_dec)
-#   query 条件原始分 = 联合分 / presence_score（除回去还原；受 ±10 clamp 限幅，仅供诊断参考）
+# 在 NMS 抹分（logit -1e4）之前捕获原始输出，用于归因"漏检是 presence 门控杀的还是阈值砍的"。
 # 捕获开关/结果不额外加锁：所有推理已由 _LOCK 全程串行。
-_dbg = {"on": False, "topk": 10, "calls": []}
+_dbg = {"on": False, "topk": 10, "calls": [], "raw_q": None}
 
 
 def _install_debug_hook():
-    """在 detector.forward_grounding 上包一层捕获钩子（加载完成后调用一次）。"""
+    """在 detector.forward_grounding + dot_prod_scoring 上挂捕获钩子（加载完成后调用一次）。"""
     det = _pred.model.detector
     orig = det.forward_grounding
 
+    def _raw_hook(_mod, _inp, output):
+        # DotProductScoring 输出 (num_layer, bs, num_query, 1)：取最后一层 = 未经 presence 加权的原始 logit
+        if _dbg["on"]:
+            try:
+                _dbg["raw_q"] = output[-1].detach().float().flatten()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("原始 query logit 捕获失败（不影响推理）：%r", e)
+
+    det.dot_prod_scoring.register_forward_hook(_raw_hook)
+
     def _wrapped(*args, **kwargs):
+        if _dbg["on"]:
+            _dbg["raw_q"] = None   # 清上一次残留，防 instance 头路径下错配
         out = orig(*args, **kwargs)
         if _dbg["on"]:
             try:
@@ -103,13 +116,16 @@ def _install_debug_hook():
                     entry["topk_joint_logit"] = [float(x) for x in vals]
                     entry["topk_query_idx"] = [int(x) for x in idxs]
                     entry["num_queries"] = int(logits.numel())
+                    raw = _dbg["raw_q"]
+                    if raw is not None and raw.numel() == logits.numel():
+                        entry["topk_cond_logit"] = [float(raw[i]) for i in idxs]
                 _dbg["calls"].append(entry)
             except Exception as e:  # noqa: BLE001
                 logger.warning("debug 捕获失败（不影响推理）：%r", e)
         return out
 
     det.forward_grounding = _wrapped
-    logger.info("presence/top-K 调试钩子已安装（detector.forward_grounding）")
+    logger.info("presence/top-K 调试钩子已安装（forward_grounding + dot_prod_scoring）")
 
 
 def _sigmoid(x):
@@ -117,27 +133,31 @@ def _sigmoid(x):
 
 
 def _build_debug_payload(calls):
-    """把捕获到的第一帧原始输出整理成 /v1/segment 的 debug 字段。"""
+    """把捕获到的第一帧原始输出整理成 /v1/segment 的 debug 字段。
+    条件原始分直取 dot_prod_scoring 的 pre-sigmoid logit（不用联合分÷presence 反推——
+    联合 logit 被 ±10 clamp 后除法会得出假分）；clamped 标记联合 logit 触到 clamp 限幅的行。"""
     if not calls:
         return None
     c = calls[0]
     presence_logit = c.get("presence_logit")
     presence = _sigmoid(presence_logit) if presence_logit is not None else None
+    cond_logits = c.get("topk_cond_logit")
     queries = []
     for rank, (jl, qi) in enumerate(zip(c.get("topk_joint_logit", []),
                                         c.get("topk_query_idx", [])), start=1):
-        joint = _sigmoid(jl)
-        cond = (min(1.0, joint / presence) if presence is not None and presence > 1e-6
-                else None)
+        cl = cond_logits[rank - 1] if cond_logits and rank - 1 < len(cond_logits) else None
         queries.append({"rank": rank, "query_idx": qi,
-                        "joint_score": round(joint, 6), "joint_logit": round(float(jl), 4),
-                        "cond_score": round(cond, 6) if cond is not None else None})
+                        "joint_score": round(_sigmoid(jl), 6), "joint_logit": round(float(jl), 4),
+                        "cond_score": round(_sigmoid(cl), 6) if cl is not None else None,
+                        "cond_logit": round(float(cl), 4) if cl is not None else None,
+                        "clamped": bool(jl <= -9.99 or jl >= 9.99)})
     return {"presence_logit": (round(float(presence_logit), 4)
                                if presence_logit is not None else None),
             "presence_score": round(presence, 6) if presence is not None else None,
             "num_queries": c.get("num_queries"), "topk": queries,
-            "note": "joint=联合分(query条件分×presence, NMS/阈值前); "
-                    "cond=query条件原始分(联合分/presence 还原, 受±10 logit clamp 限幅)"}
+            "note": "joint=联合分(=最终检测置信度, NMS/阈值前, logit clamp ±10); "
+                    "cond=真·条件原始分(dot_prod_scoring pre-sigmoid logit 直取, 未经 presence 加权, "
+                    "clamp ±12); clamped=联合 logit 触 clamp 限幅"}
 
 
 def _load():
