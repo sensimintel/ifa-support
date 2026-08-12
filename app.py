@@ -409,7 +409,10 @@ _sam3_score_lock = threading.Lock()
 
 def _get_score_cfg():
     with _sam3_score_lock:
-        return dict(_sam3_score_cfg)
+        cfg = dict(_sam3_score_cfg)
+    if not cfg.get("words"):   # 未配置时用默认词表（SAM3_CLOUD_TARGETS 在下文定义，运行期取）
+        cfg["words"] = [{"word": q, "label": l} for (q, l) in SAM3_CLOUD_TARGETS]
+    return cfg
 
 
 def _sam3_stream_frame(word, rgb):
@@ -1039,8 +1042,9 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
                 last = fr[sorted(fr.keys(), key=lambda k: int(k))[-1]]
             return (query, label, last or [], None, None, None)
 
-        with ThreadPoolExecutor(max_workers=len(SAM3_CLOUD_TARGETS)) as ex:
-            results = list(ex.map(trk_one, SAM3_CLOUD_TARGETS))
+        targets = [(w["word"], w.get("label") or "drink") for w in _get_score_cfg()["words"]]
+        with ThreadPoolExecutor(max_workers=len(targets)) as ex:
+            results = list(ex.map(trk_one, targets))
         track_ms = (time.time() - t0) * 1000.0
         is_stream = any(g is not None for (_q, _l, _i, g, _im, _d) in results)
         impls = {im for (_q, _l, _i, _g, im, _d) in results if im}
@@ -3580,10 +3584,16 @@ def sam3tune_config_set(body: dict = Body(default=None)):
         thresh = min(max(float((body or {}).get("thresh", 0.0)), 0.0), 0.95)
     except (TypeError, ValueError):
         return JSONResponse({"error": "alpha/thresh 必须是数字"}, status_code=400)
+    words = []
+    for w in ((body or {}).get("words") or [])[:4]:   # 识别词最多 4 个；空则回落默认词表
+        word = (w.get("word") if isinstance(w, dict) else str(w)).strip()
+        if word:
+            words.append({"word": word,
+                          "label": (w.get("label") if isinstance(w, dict) else None) or "drink"})
     with _sam3_score_lock:
-        _sam3_score_cfg = {"alpha": alpha, "thresh": thresh}
-    print(f"[da3-web] 生产 SAM3 口径更新：alpha={alpha} thresh={thresh}", flush=True)
-    return JSONResponse({"ok": True, "alpha": alpha, "thresh": thresh})
+        _sam3_score_cfg = {"alpha": alpha, "thresh": thresh, "words": words}
+    print(f"[da3-web] 生产 SAM3 口径更新：alpha={alpha} thresh={thresh} words={[w['word'] for w in words]}", flush=True)
+    return JSONResponse({"ok": True, "alpha": alpha, "thresh": thresh, "words": words})
 
 
 @app.get("/api/sam3tune/state")
@@ -3592,8 +3602,8 @@ def sam3tune_state():
     with _sam3tune_lock:
         live = dict(_sam3tune_live)
     return JSONResponse({"cfg": _get_score_cfg(), "selected": get_selected_device(),
-                         # 生产链路当前在识别的词（SAM3 流式每帧跑的目标），控制面同步展示
-                         "words": [{"word": q, "label": l} for (q, l) in SAM3_CLOUD_TARGETS],
+                         # 生产链路当前在识别的词（随口径配置可调，空=默认词表）
+                         "words": _get_score_cfg()["words"],
                          "live": live, "endpoint": SAM3_ENDPOINT})
 
 
