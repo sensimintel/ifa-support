@@ -79,33 +79,50 @@ def _infer_ctx():
 #     其 query 维顺序与 pred_logits 逐元素对齐（联合变换是逐元素的，不重排）。
 # 库层 API 只回吐过完阈值/NMS 的最终分，这里在 detector.forward_grounding 上包一层，
 # 在 NMS 抹分（logit -1e4）之前捕获原始输出，用于归因"漏检是 presence 门控杀的还是阈值砍的"。
-# 捕获开关/结果不额外加锁：所有推理已由 _LOCK 全程串行。
 # rescore_alpha 非 None 时启用「换阈值口径」：把 pred_logits 原地改写为
 # logit(presence^α × cond)（presence 指数软化，α=1≈原始行为、α=0=完全忽略 presence），
-# 下游 NMS 与 keep 阈值（score_threshold_detection，由 /v1/segment 临时覆盖）即卡在新分上。
-_dbg = {"on": False, "topk": 10, "calls": [], "raw_q": None, "rescore_alpha": None}
+# 下游 NMS 与 keep 阈值即卡在新分上（det_thresh>0 时经 property 覆盖 score_threshold_detection）。
+# 状态是 threading.local：推理在请求线程内同步执行（_LOCK 只串行不换线程），
+# 各请求线程互不可见——流式（锁在步进函数内部）与单图并发设置参数也不会串扰。
+class _DbgState(threading.local):
+    def __init__(self):
+        self.on = False
+        self.topk = 10
+        self.calls = []
+        self.raw_q = None
+        self.rescore_alpha = None
+        self.det_thresh = 0.0
+
+_dbg = _DbgState()
 
 
 def _install_debug_hook():
-    """在 detector.forward_grounding + dot_prod_scoring 上挂捕获钩子（加载完成后调用一次）。"""
+    """在 detector.forward_grounding + dot_prod_scoring 上挂捕获钩子（加载完成后调用一次）。
+    另把 model.score_threshold_detection 换成读 thread-local 的 property：请求线程设了
+    det_thresh 就用它，否则用模型默认——keep 与 NMS 阈值随请求生效、请求间天然隔离。"""
     det = _pred.model.detector
     orig = det.forward_grounding
 
+    model = _pred.model
+    default_thresh = float(model.__dict__.pop("score_threshold_detection", 0.5))
+    type(model).score_threshold_detection = property(
+        lambda self: _dbg.det_thresh if _dbg.det_thresh > 0.0 else default_thresh)
+
     def _raw_hook(_mod, _inp, output):
         # DotProductScoring 输出 (num_layer, bs, num_query, 1)：取最后一层 = 未经 presence 加权的原始 logit
-        if _dbg["on"]:
+        if _dbg.on:
             try:
-                _dbg["raw_q"] = output[-1].detach().float().flatten()
+                _dbg.raw_q = output[-1].detach().float().flatten()
             except Exception as e:  # noqa: BLE001
                 logger.warning("原始 query logit 捕获失败（不影响推理）：%r", e)
 
     det.dot_prod_scoring.register_forward_hook(_raw_hook)
 
     def _wrapped(*args, **kwargs):
-        if _dbg["on"]:
-            _dbg["raw_q"] = None   # 清上一次残留，防 instance 头路径下错配
+        if _dbg.on:
+            _dbg.raw_q = None   # 清上一次残留，防 instance 头路径下错配
         out = orig(*args, **kwargs)
-        if _dbg["on"]:
+        if _dbg.on:
             try:
                 entry = {}
                 pl = out.get("presence_logit_dec")
@@ -114,33 +131,54 @@ def _install_debug_hook():
                 lg = out.get("pred_logits")
                 if lg is not None:
                     logits = lg.detach().float().flatten()
-                    k = max(1, min(int(_dbg["topk"]), logits.numel()))
+                    k = max(1, min(int(_dbg.topk), logits.numel()))
                     vals, idxs = logits.topk(k)
                     entry["topk_joint_logit"] = [float(x) for x in vals]
                     entry["topk_query_idx"] = [int(x) for x in idxs]
                     entry["num_queries"] = int(logits.numel())
-                    raw = _dbg["raw_q"]
+                    raw = _dbg.raw_q
                     if raw is not None and raw.numel() == logits.numel():
                         entry["topk_cond_logit"] = [float(raw[i]) for i in idxs]
                 # 换阈值口径：pred_logits 原地改写为 logit(presence^α × cond)，
                 # 下游 NMS/keep 即卡在新分上（entry 里记录的是改写前的原始值）
-                alpha = _dbg["rescore_alpha"]
+                alpha = _dbg.rescore_alpha
                 entry["rescore_applied"] = False
                 if alpha is not None and pl is not None and lg is not None:
-                    raw = _dbg["raw_q"]
+                    raw = _dbg.raw_q
                     if raw is not None and raw.numel() == lg.numel():
                         pres = torch.sigmoid(pl.detach().float().flatten()[0])
                         score = torch.sigmoid(raw) * pres.pow(float(alpha))
                         new_logit = torch.logit(score.clamp(1e-6, 1 - 1e-6))
                         out["pred_logits"] = new_logit.view_as(lg).to(lg.dtype)
                         entry["rescore_applied"] = True
-                _dbg["calls"].append(entry)
+                _dbg.calls.append(entry)
             except Exception as e:  # noqa: BLE001
                 logger.warning("debug 捕获失败（不影响推理）：%r", e)
         return out
 
     det.forward_grounding = _wrapped
-    logger.info("presence/top-K 调试钩子已安装（forward_grounding + dot_prod_scoring）")
+    logger.info("presence/top-K 调试钩子已安装（forward_grounding + dot_prod_scoring + 阈值 property）")
+
+
+def _dbg_begin(debug, topk, alpha, det_thresh):
+    """按请求参数布置本线程的捕获/口径状态。返回 (rescore 是否启用, 规整后的 alpha/det_thresh)。"""
+    alpha = min(max(float(alpha), 0.0), 1.0)
+    det_thresh = min(max(float(det_thresh), 0.0), 0.95)
+    rescore = det_thresh > 0.0 or abs(alpha - 1.0) > 1e-6
+    if debug or rescore:
+        _dbg.topk = max(1, min(int(topk), 50))
+        _dbg.calls = []
+        _dbg.on = True
+        _dbg.rescore_alpha = alpha if rescore else None
+        _dbg.det_thresh = det_thresh
+    return rescore, alpha, det_thresh
+
+
+def _dbg_end():
+    """清空本线程的捕获/口径状态（calls 保留给响应组装读取）。"""
+    _dbg.on = False
+    _dbg.rescore_alpha = None
+    _dbg.det_thresh = 0.0
 
 
 def _sigmoid(x):
@@ -429,6 +467,10 @@ class StreamStartReq(BaseModel):
 class StreamFrameReq(BaseModel):
     session_id: str
     image_b64: str
+    debug: bool = False        # true=附带最新帧的 presence 分 + top-K query 原始分
+    topk: int = 10             # debug 时返回的 top-K query 数量（1~50）
+    alpha: float = 1.0         # presence 指数软化（同 /v1/segment），作用于本步整个检测窗口
+    det_thresh: float = 0.0    # >0 时本步检测保留/NMS 阈值卡在 presence^α×cond 上；0=模型默认
 
 @app.post("/v1/segment")
 def segment(req: SegReq):
@@ -439,36 +481,23 @@ def segment(req: SegReq):
     d = tempfile.mkdtemp(prefix="sam3_seg_")
     try:
         img.save(os.path.join(d, "00000.jpg"), quality=95)
-        # 换阈值口径请求判定：α≠1 或显式给了阈值即启用（钩子捕获 rescore 都要求 _dbg.on）
-        alpha = min(max(float(req.alpha), 0.0), 1.0)
-        det_thresh = min(max(float(req.det_thresh), 0.0), 0.95)
-        rescore = det_thresh > 0.0 or abs(alpha - 1.0) > 1e-6
+        # 捕获/口径状态是 thread-local：推理在本请求线程内同步执行，无需与别的请求互斥
+        rescore, alpha, det_thresh = _dbg_begin(req.debug, req.topk, req.alpha, req.det_thresh)
         with _LOCK:
-            # debug/rescore 捕获窗口在 _LOCK 内开合：推理全程串行，不会混入别的请求的输出
-            if req.debug or rescore:
-                _dbg["topk"] = max(1, min(int(req.topk), 50))
-                _dbg["calls"] = []
-                _dbg["on"] = True
-                _dbg["rescore_alpha"] = alpha if rescore else None
-            old_thresh = _pred.model.score_threshold_detection
-            if rescore and det_thresh > 0.0:
-                _pred.model.score_threshold_detection = det_thresh
             sid = _pred.start_session(resource_path=d)["session_id"]
             try:
                 with _infer_ctx():
                     r = _pred.add_prompt(session_id=sid, frame_idx=0, text=req.text)
                 inst = _pack(r["outputs"], W, H)
             finally:
-                _dbg["on"] = False
-                _dbg["rescore_alpha"] = None
-                _pred.model.score_threshold_detection = old_thresh
+                _dbg_end()
                 _pred.close_session(sid)
         resp = {"width": W, "height": H, "num_instances": len(inst), "instances": inst}
         if rescore:
-            resp["rescore"] = {"alpha": alpha, "det_thresh": det_thresh or old_thresh,
-                               "applied": bool(_dbg["calls"] and _dbg["calls"][0].get("rescore_applied"))}
+            resp["rescore"] = {"alpha": alpha, "det_thresh": det_thresh,
+                               "applied": bool(_dbg.calls and _dbg.calls[0].get("rescore_applied"))}
         if req.debug:
-            resp["debug"] = _build_debug_payload(_dbg["calls"])
+            resp["debug"] = _build_debug_payload(_dbg.calls)
         return resp
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -635,29 +664,42 @@ def stream_frame(req: StreamFrameReq):
             del s["ring"][:len(s["ring"]) - s["window"]]
         g = s["next_global"]
         t0 = time.time()
-        if s["impl"] == "incremental":
-            try:
-                inst = _step_incremental(s, img, g)
-            except Exception as e:
-                # 上游内部结构不符/运行时异常：本 session 永久降级 replay，服务不断
-                logger.exception("增量路径失败，session %s 降级 replay：%s", req.session_id, e)
-                _close_live(s)
-                s["live_sid"] = None
-                s["impl"] = "replay"
+        # 捕获/口径状态是 thread-local（推理在本线程同步执行）：α/阈值作用于本步整个检测
+        # 窗口（增量=新帧一帧；replay/开代=全窗口，口径一致）；debug 取最新帧那次前向
+        rescore, alpha, det_thresh = _dbg_begin(req.debug, req.topk, req.alpha, req.det_thresh)
+        try:
+            if s["impl"] == "incremental":
+                try:
+                    inst = _step_incremental(s, img, g)
+                except Exception as e:
+                    # 上游内部结构不符/运行时异常：本 session 永久降级 replay，服务不断
+                    logger.exception("增量路径失败，session %s 降级 replay：%s", req.session_id, e)
+                    _close_live(s)
+                    s["live_sid"] = None
+                    s["impl"] = "replay"
+                    inst = _step_replay(s)
+            else:
                 inst = _step_replay(s)
-        else:
-            inst = _step_replay(s)
+        finally:
+            _dbg_end()
         run_ms = (time.time() - t0) * 1000.0
         s["next_global"] = g + 1
         n_reg = len(s["registry"])
         impl, gen_frames = s["impl"], s["gen_frames"]
     W, H = img.size
     gpu_mb = int(torch.cuda.memory_allocated() // (1024 * 1024)) if torch.cuda.is_available() else 0
-    return {"session_id": req.session_id, "global_index": g,
+    resp = {"session_id": req.session_id, "global_index": g,
             "width": W, "height": H, "window_frames": min(g + 1, s["window"]),
             "num_instances": len(inst), "instances": inst,
             "active_objects": n_reg, "run_ms": round(run_ms, 1),
             "impl": impl, "gen_frames": gen_frames, "gpu_mb": gpu_mb}
+    if rescore:
+        resp["rescore"] = {"alpha": alpha, "det_thresh": det_thresh,
+                           "applied": bool(_dbg.calls and _dbg.calls[-1].get("rescore_applied"))}
+    if req.debug:
+        # 多次前向（replay/开代）时最后一次 = 最新帧；增量路径本就只有一次
+        resp["debug"] = _build_debug_payload(_dbg.calls[-1:])
+    return resp
 
 @app.get("/v1/stream")
 def stream_list():
