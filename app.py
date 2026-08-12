@@ -4117,6 +4117,7 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  table.tk td{text-align:right;padding:1px 6px;color:var(--ink)}
  table.tk th:first-child,table.tk td:first-child{text-align:left}
  table.tk tr.cut td{color:var(--faint)}
+ table.tk tr.clamp td{color:var(--err)}
  .hist{display:grid;grid-template-columns:repeat(auto-fill,minmax(520px,1fr));gap:8px}
  .hcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:7px 9px;display:flex;gap:8px;align-items:flex-start}
  .hcard img{width:148px;max-width:22vw;border-radius:6px;display:block;background:#10141a}
@@ -4135,7 +4136,7 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <h1>SAM3 调优 · presence 分 / top-K query 原始分</h1>
  <div class="sub">分数分解：<code>p(query匹配) = p(query匹配 | 概念在图中) × p(概念在图中·presence)</code>，presence 是全局乘性门控。
   归因口径：<b>presence 低(&lt;0.5)</b>→概念/词表问题，换词；<b>presence 高但联合分被阈值砍</b>→纯阈值问题；<b>top-K 里没有覆盖目标区域的框</b>→定位问题，切图。
-  联合分 = 最终检测置信度（NMS/阈值前）；条件原始分 = 联合分 ÷ presence 还原的 query 条件分。</div>
+  联合分 = 最终检测置信度（NMS/阈值前，logit clamp ±10）；原始分 = 直取 dot_prod_scoring 的 <b>pre-sigmoid logit</b>（未经 presence 加权，负样本是 −8/−12 这类明确负数，非除法反推）；联合 logit 触到 clamp 的行<span style="color:var(--err)">标红</span>。</div>
  <div class="bar">
   <label id="devlbl" style="display:none">设备</label>
   <select id="devsel" style="display:none"></select>
@@ -4205,11 +4206,12 @@ function fmt(x,d){ return x==null ? '—' : Number(x).toFixed(d==null?4:d); }
 
 function tkTable(dbg){
   if(!dbg || !dbg.topk || !dbg.topk.length) return '<div class="wmeta">无 top-K 数据（SAM3 server 需支持 debug）</div>';
-  let h='<table class="tk"><tr><th>#</th><th>query</th><th>联合分(最终)</th><th>条件原始分</th><th>logit</th></tr>';
+  let h='<table class="tk"><tr><th>#</th><th>query</th><th>联合分(最终)</th><th>原始分</th><th>原始logit</th><th>联合logit</th></tr>';
   for(const q of dbg.topk){
-    const cut = q.joint_score!=null && q.joint_score<0.5;   // 演示口径：0.5 为常用最终阈值
-    h+='<tr class="'+(cut?'cut':'')+'"><td>'+q.rank+'</td><td>q'+q.query_idx+'</td><td>'+fmt(q.joint_score)
-      +'</td><td>'+fmt(q.cond_score)+'</td><td>'+fmt(q.joint_logit,2)+'</td></tr>';
+    // clamp 标红优先（联合 logit 触 ±10 限幅，数值不可信）；其次联合分低于常用阈值 0.5 灰显
+    const cls = q.clamped ? 'clamp' : (q.joint_score!=null && q.joint_score<0.5 ? 'cut' : '');
+    h+='<tr class="'+cls+'"><td>'+q.rank+'</td><td>q'+q.query_idx+'</td><td>'+fmt(q.joint_score)
+      +'</td><td>'+fmt(q.cond_score)+'</td><td>'+fmt(q.cond_logit,2)+'</td><td>'+fmt(q.joint_logit,2)+(q.clamped?' ⛔':'')+'</td></tr>';
   }
   return h+'</table>';
 }
@@ -4245,7 +4247,7 @@ function renderHist(items){
     return '<div class="hcard"><img src="'+it.raw+'" alt="原图"><img src="'+it.seg+'" alt="定位">'
       +'<div class="hmeta"><div class="t">#'+it.id+' · '+t+(it.device?' · '+it.device:'')+' · text="'+it.text+'" · '+it.seg_ms+'ms · 实例 '+it.n_inst+'</div>'
       +(it.words||[]).map(histLine).join('')
-      +'<details><summary>top-K 明细</summary>'+(it.words||[]).map(w=>'<div class="hline"><b style="color:'+w.color+'">'+w.word+'</b></div>'+tkTable(w.debug)).join('')+'</details>'
+      +'<details open><summary>top-K 明细</summary>'+(it.words||[]).map(w=>'<div class="hline"><b style="color:'+w.color+'">'+w.word+'</b></div>'+tkTable(w.debug)).join('')+'</details>'
       +'</div></div>';
   }).join('');
 }
