@@ -2660,6 +2660,11 @@ async function bgTick(){
       const sh=await(await fetch('/api/stereohl/status',{cache:'no-store'})).json();
       // device 比对：切设备后旧设备的双目 GLB 不上画（保持黑场等新产物）
       if(sh.url&&sh.device===s.selected)showModel(sh.url,sh.meta&&sh.meta.fov_deg);
+    }else{
+      // 不支持双目的设备：主动清掉上一台设备残留的双目 GLB（该设备永远不会有新
+      // 双目产物顶掉旧画面），回到黑场
+      $('bgmv').style.display='none';lastMvUrl='';
+      $('bgA').classList.remove('on');$('bgB').classList.remove('on');
     }
   }else if(bgSource==='s3'){
     const s3=await(await fetch('/api/sam3cloud/status',{cache:'no-store'})).json();
