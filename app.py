@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 import threading
 import time
@@ -632,20 +633,140 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
     return hit_labels
 
 
-def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
-                                num_max_points=800000, show_cameras=True,
-                                mask_overlays=None, outlier_mad=12.0,
-                                point_scale=None, color_gamma=None,
-                                hl_cfg=None, bake_conf_alpha=False):
-    """双视角（左右 IR）点云 GLB：每个视角各自反投影后，经 DA3 估计的相对位姿统一
-    合到「视角 0（左目）相机坐标系」，再 flip Y/Z 到 glTF 约定——与单目链路同一坐标
-    语义（左目相机=原点、光轴固定），前端同一套取景逻辑直接可用。
+# GLB 产物 POSITION 量化回退开关（KHR_mesh_quantization）：默认开——点坐标用 uint16
+# 归一化存储（12B/点 → 6B/点，产物省约 1/3 传输量），node 挂 scale/translation 还原。
+# 前端 model-viewer 若出现异常（点云消失/取景错乱/尺度不对等），在 .env 置 GLB_QUANTIZE=0
+# 重启即回退 float32 存储，无需改代码。
+GLB_QUANTIZE = os.environ.get("GLB_QUANTIZE", "1") not in ("0", "false", "False")
 
-    pred.extrinsics 是 w2c（DA3 约定）：视角 i 相机点 → 视角 0 相机系的变换为
-    T_i = ext0 @ inv(ext_i)。mask_overlays 只作用于视角 0（SAM3 跑左目图）。
-    point_scale 非空则整体缩放点云与相机线框（用真实基线恢复米制尺度）。
-    返回视角 0 的相机内参 K0（前端算 FOV 用）。"""
-    from depth_anything_3.utils.export import glb as _glb  # 复用官方降采样/相机线框
+
+def _write_pointcloud_glb(out_path, pc_pts, pc_cols, cam_wires=None, quantize=False):
+    """手写二进制 glTF(GLB) 导出器：替代 trimesh Scene 组装 + export（两项合计 ~43ms/份，
+    是构建耗时的最大单项；手写序列化只做必要的字节拼接，毫秒级）。
+
+    产物结构与 trimesh 版对齐：
+      · 点云：1 个 POINTS primitive（POSITION VEC3 + COLOR_0 uint8 VEC4 normalized）
+      · 1mm 锚三角面：model-viewer 的 load 事件/取景依赖场景里存在三角面 mesh，必须保留
+      · 相机线框：LINES primitive（逐顶点颜色），cam_wires=[(segs(M,2,3), rgb), ...]，
+        None/空则不写
+    quantize=True 时点云 POSITION 用 uint16 归一化存储（KHR_mesh_quantization），
+    node 挂 scale/translation 还原坐标（量化误差 ≤ 包围盒边长/65535/2，场景尺度下亚毫米）；
+    锚三角/相机线框保持 float32（体量可忽略，不值得引入额外还原节点）。
+
+    GLB 布局：12B header + JSON chunk（4 对齐，空格补齐）+ BIN chunk（4 对齐，零补齐）。"""
+    def _pad4(b, fill=b"\x00"):
+        return b + fill * (-len(b) % 4)
+
+    bin_parts, views, accessors = [], [], []
+    _off = [0]
+
+    def _add_view(data):
+        # 追加一个 4 对齐的 bufferView，返回其下标（对齐保证后续 accessor 偏移合法）
+        padded = _pad4(data)
+        bin_parts.append(padded)
+        views.append({"buffer": 0, "byteOffset": _off[0], "byteLength": len(data)})
+        _off[0] += len(padded)
+        return len(views) - 1
+
+    meshes, nodes = [], []
+    n = int(pc_pts.shape[0])
+    node_pc = None
+    if n > 0:
+        pts = np.ascontiguousarray(pc_pts, dtype=np.float32)
+        lo = pts.min(axis=0); hi = pts.max(axis=0)
+        node_pc = {"mesh": 0}
+        if quantize:
+            # uint16 归一化量化：存 [0,65535]，accessor.normalized 解码回 [0,1]，再由
+            # node 的 scale=包围盒边长 / translation=包围盒角点 还原到原坐标
+            span = np.maximum(hi - lo, np.float32(1e-6))
+            q = np.clip(np.rint((pts - lo) / span * 65535.0),
+                        0, 65535).astype(np.uint16)
+            vi = _add_view(q.tobytes())
+            accessors.append({"bufferView": vi, "componentType": 5123, "count": n,
+                              "type": "VEC3", "normalized": True,
+                              # 规范要求 min/max 写存储原值（归一化前的整数）
+                              "min": [int(x) for x in q.min(axis=0)],
+                              "max": [int(x) for x in q.max(axis=0)]})
+            node_pc["scale"] = [float(x) for x in span]
+            node_pc["translation"] = [float(x) for x in lo]
+        else:
+            vi = _add_view(pts.tobytes())
+            accessors.append({"bufferView": vi, "componentType": 5126, "count": n,
+                              "type": "VEC3",
+                              "min": [float(x) for x in lo],
+                              "max": [float(x) for x in hi]})
+        vi = _add_view(np.ascontiguousarray(pc_cols, dtype=np.uint8).tobytes())
+        accessors.append({"bufferView": vi, "componentType": 5121, "count": n,
+                          "type": "VEC4", "normalized": True})
+        meshes.append({"primitives": [{"attributes": {"POSITION": 0, "COLOR_0": 1},
+                                       "mode": 0}]})           # mode 0 = POINTS
+        nodes.append(node_pc)
+        # 1mm 三角面 mesh 锚：确保 model-viewer 触发 load（理由同单目链路）。
+        # 独立 node、不挂量化还原变换——锚三角始终 float32
+        anchor = np.array([[0, 0, 0], [1e-3, 0, 0], [0, 1e-3, 0]], dtype=np.float32)
+        vi = _add_view(anchor.tobytes())
+        accessors.append({"bufferView": vi, "componentType": 5126, "count": 3,
+                          "type": "VEC3", "min": [0.0, 0.0, 0.0],
+                          "max": [1e-3, 1e-3, 0.0]})
+        meshes.append({"primitives": [{"attributes": {"POSITION": len(accessors) - 1},
+                                       "mode": 4}]})           # mode 4 = TRIANGLES
+        nodes.append({"mesh": len(meshes) - 1})
+    if cam_wires:
+        # 相机线框合并成一个 LINES primitive（非索引、顶点两两成段），逐顶点烘相机颜色
+        seg_pts = np.concatenate([np.asarray(s, np.float32).reshape(-1, 3)
+                                  for (s, _c) in cam_wires])
+        seg_cols = np.concatenate(
+            [np.tile(np.array([c[0], c[1], c[2], 255], np.uint8),
+                     (np.asarray(s).reshape(-1, 3).shape[0], 1))
+             for (s, c) in cam_wires])
+        vi = _add_view(np.ascontiguousarray(seg_pts).tobytes())
+        accessors.append({"bufferView": vi, "componentType": 5126,
+                          "count": int(seg_pts.shape[0]), "type": "VEC3",
+                          "min": [float(x) for x in seg_pts.min(axis=0)],
+                          "max": [float(x) for x in seg_pts.max(axis=0)]})
+        pos_ai = len(accessors) - 1
+        vi = _add_view(np.ascontiguousarray(seg_cols).tobytes())
+        accessors.append({"bufferView": vi, "componentType": 5121,
+                          "count": int(seg_cols.shape[0]), "type": "VEC4",
+                          "normalized": True})
+        meshes.append({"primitives": [{"attributes": {"POSITION": pos_ai,
+                                                      "COLOR_0": len(accessors) - 1},
+                                       "mode": 1}]})           # mode 1 = LINES
+        nodes.append({"mesh": len(meshes) - 1})
+
+    bin_chunk = b"".join(bin_parts)
+    j = {"asset": {"version": "2.0", "generator": "da3-web"},
+         "scene": 0, "scenes": [{"nodes": list(range(len(nodes)))}],
+         "nodes": nodes, "meshes": meshes,
+         "bufferViews": views, "accessors": accessors,
+         "buffers": [{"byteLength": len(bin_chunk)}]}
+    if quantize and node_pc is not None and "scale" in node_pc:
+        j["extensionsUsed"] = ["KHR_mesh_quantization"]
+        j["extensionsRequired"] = ["KHR_mesh_quantization"]
+    jb = _pad4(json.dumps(j, separators=(",", ":")).encode("utf-8"), b" ")
+    bin_padded = _pad4(bin_chunk)
+    total = 12 + 8 + len(jb) + 8 + len(bin_padded)
+    with open(out_path, "wb") as f:
+        f.write(b"glTF" + struct.pack("<II", 2, total)
+                + struct.pack("<I", len(jb)) + b"JSON" + jb
+                + struct.pack("<I", len(bin_padded)) + b"BIN\x00" + bin_padded)
+
+
+def _stereo_geometry(pred, conf_thresh_percentile, num_max_points, outlier_mad,
+                     point_scale):
+    """双目点云「几何阶段」：反投影/conf 分位裁剪/随机降采样/MAD 裁离群，一次算好与
+    颜色无关的全部中间结果。主产物与高亮版共享同一份几何（各自只做顶点色 bake +
+    glTF 导出），两份 GLB 不再重复算几何管线。
+
+    返回 dict：
+      pts        最终点坐标 (M,3) float32（已合到左目系/flip/缩放/降采样/裁离群）
+      vidx       各视角有效像素的扁平下标列表（上色阶段按它抽取整图颜色）
+      final_idx  最终点在「各视角有效点拼接序」里的下标（颜色/conf 与点一一对应的桥）
+      cf_concat  拼接序逐点 conf（float32；无 conf 时 None，alpha 烘焙用）
+      K/ext      相机内外参（相机线框与返回 K0 用）
+      shape      (N, H, W)
+      key        几何参数指纹（conf 分位/点预算/MAD 倍数/缩放）——不等时不得复用"""
+    from depth_anything_3.utils.export import glb as _glb  # 复用官方外参齐次化
 
     depth = np.asarray(pred.depth).astype(np.float32)       # (N,H,W)
     K = np.asarray(pred.intrinsics).astype(np.float64)      # (N,3,3)
@@ -656,6 +777,78 @@ def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
     else:
         ext = np.stack([_glb._as_homogeneous44(np.asarray(e).astype(np.float64))
                         for e in ext])
+    conf = pred.conf
+    conf_thr = None
+    if conf is not None:
+        conf = np.asarray(conf).astype(np.float32)
+        # 绝对下限传 0：理由同单目链路（写死 1.05 会钉死阈值、分位滑块失效）。
+        # 与 get_conf_thresh 同语义，但两次 percentile 合成一趟算完
+        _p_lo, _p90 = np.percentile(conf, [float(conf_thresh_percentile), 90.0])
+        conf_thr = float(min(max(0.0, float(_p_lo)), float(_p90)))
+
+    ext0 = ext[0]
+    scale = float(point_scale) if point_scale else 1.0
+    pts_all, cf_all, vidx_list = [], [], []
+    for i in range(N):
+        d = depth[i]
+        valid = np.isfinite(d) & (d > 0)
+        if getattr(pred, "sky", None) is not None:
+            valid &= ~np.asarray(pred.sky)[i].astype(bool)
+        if conf is not None:
+            valid &= conf[i] >= conf_thr
+        vidx = np.flatnonzero(valid.reshape(-1))
+        vidx_list.append(vidx)
+        if vidx.size == 0:
+            continue
+        # 先按 valid 下标取像素子集再反投影（原实现整图 H*W 像素乘完才筛，白算被裁掉
+        # 的大半）；矩阵乘全程 float32——点云精度足够，比 float64 快约一倍
+        u = (vidx % W).astype(np.float32)
+        v = (vidx // W).astype(np.float32)
+        pix = np.stack([u, v, np.ones_like(u)], 0)          # (3, M) 齐次像素坐标
+        K_inv = np.linalg.inv(K[i]).astype(np.float32)
+        Xc = (K_inv @ pix).T * d.reshape(-1)[vidx][:, None]  # 视角 i 相机坐标 (M,3)
+        T = (ext0 @ np.linalg.inv(ext[i])).astype(np.float32)  # 视角 i 相机 → 视角 0 相机
+        X0 = Xc @ T[:3, :3].T + T[:3, 3]
+        X0[:, 1] *= -1.0                                    # flip Y（glTF Y 向上）
+        X0[:, 2] *= -1.0                                    # flip Z（glTF 相机看 -Z）
+        if scale != 1.0:
+            X0 *= scale
+        pts_all.append(X0)
+        if conf is not None:
+            cf_all.append(conf[i].reshape(-1)[vidx])
+    if not pts_all:
+        raise RuntimeError("双目点云为空（有效深度点不足）")
+    pc_pts = np.concatenate(pts_all)
+    cf_concat = np.concatenate(cf_all) if cf_all else None
+    # 随机降采样（与官方 _filter_and_downsample 同语义：先剔非有限值，超预算无放回抽样；
+    # default_rng 的无放回抽样比传统 np.random.choice 快约一个量级）。全程记录下标
+    # final_idx，供上色阶段对拼接序的颜色/conf 做同样抽取，点与色严格一一对应
+    idx = np.flatnonzero(np.isfinite(pc_pts).all(axis=1))
+    if idx.size > int(num_max_points):
+        idx = idx[np.random.default_rng().choice(idx.size, int(num_max_points),
+                                                 replace=False)]
+    pc_pts = pc_pts[idx]
+    # 深度(Z)方向 MAD 稳健裁离群：理由与参数同单目链路（防深度爆点撑爆取景包围盒）
+    if pc_pts.shape[0] > 200:
+        zc = -pc_pts[:, 2]
+        med = float(np.median(zc))
+        mad = float(np.median(np.abs(zc - med))) + 1e-6
+        keep = zc <= med + float(outlier_mad) * mad
+        pc_pts = pc_pts[keep]
+        idx = idx[keep]
+    return {"pts": pc_pts, "vidx": vidx_list, "final_idx": idx,
+            "cf_concat": cf_concat, "K": K, "ext": ext, "shape": (N, H, W),
+            "key": (float(conf_thresh_percentile), int(num_max_points),
+                    float(outlier_mad),
+                    None if point_scale is None else float(point_scale))}
+
+
+def _stereo_bake_colors(pred, geo, mask_overlays, color_gamma, hl_cfg,
+                        bake_conf_alpha):
+    """双目点云「上色阶段」：gamma 提亮/HSV 调色/mask 染色（或高亮样式）烘进整图颜色，
+    再按几何阶段记录的下标抽取成逐点 RGBA (M,4) uint8。调色逻辑与原实现逐行同款，
+    仅从几何循环里拆出——主产物与高亮版对同一份几何各跑一次本阶段即可。"""
+    N, H, W = geo["shape"]
     rgb = (np.asarray(pred.processed_images)
            if getattr(pred, "processed_images", None) is not None else None)
     if rgb is None or rgb.shape[:3] != (N, H, W):
@@ -698,94 +891,83 @@ def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
                        + np.array(_col, np.float32) * 0.5).astype(np.uint8)
         rgb = np.concatenate([v0[None], rgb[1:]], axis=0)
 
-    conf = pred.conf
-    conf_thr = None
-    if conf is not None:
-        conf = np.asarray(conf).astype(np.float32)
-        # 绝对下限传 0：理由同单目链路（写死 1.05 会钉死阈值、分位滑块失效）
-        conf_thr = _glb.get_conf_thresh(pred, None, 0.0, conf_thresh_percentile, 90.0)
-
-    us, vs = np.meshgrid(np.arange(W), np.arange(H))
-    pix = np.stack([us, vs, np.ones_like(us)], -1).reshape(-1, 3).astype(np.float64)
-    ext0 = ext[0]
-    scale = float(point_scale) if point_scale else 1.0
-    pts_all, col_all, cf_all = [], [], []
-    for i in range(N):
-        d = depth[i]
-        valid = np.isfinite(d) & (d > 0)
-        if getattr(pred, "sky", None) is not None:
-            valid &= ~np.asarray(pred.sky)[i].astype(bool)
-        if conf is not None:
-            valid &= conf[i] >= conf_thr
-        vmask = valid.reshape(-1)
-        if not vmask.any():
-            continue
-        rays = np.linalg.inv(K[i]) @ pix.T                  # (3, H*W)
-        Xc = (rays * d.reshape(-1)[None, :]).T              # 视角 i 相机坐标
-        T = ext0 @ np.linalg.inv(ext[i])                    # 视角 i 相机 → 视角 0 相机
-        X0 = Xc @ T[:3, :3].T + T[:3, 3]
-        X0[:, 1] *= -1.0                                    # flip Y（glTF Y 向上）
-        X0[:, 2] *= -1.0                                    # flip Z（glTF 相机看 -Z）
-        pts_all.append((X0[vmask] * scale).astype(np.float32))
-        col_all.append(rgb[i].reshape(-1, 3)[vmask].astype(np.uint8))
-        if conf is not None:
-            cf_all.append(conf[i].reshape(-1)[vmask].astype(np.float32))
-    if not pts_all:
-        raise RuntimeError("双目点云为空（有效深度点不足）")
-    pc_pts = np.concatenate(pts_all)
-    pc_cols = np.concatenate(col_all)
+    # 按几何阶段的下标抽色：先拼各视角有效点颜色，再取降采样/MAD 后的最终下标
+    cols = np.concatenate([rgb[i].reshape(-1, 3)[geo["vidx"][i]] for i in range(N)])
+    cols = cols[geo["final_idx"]].astype(np.uint8)
     # 颜色带 alpha 通道：默认 255；bake_conf_alpha 时把逐点置信度（5/95 分位稳健归一，
-    # 跨两视角统一标定）烘进 alpha [40,255]——供前端「置信度→点大小/透明度」联动
-    if bake_conf_alpha and cf_all:
-        _cf = np.concatenate(cf_all)
-        _lo = float(np.percentile(_cf, 5.0)); _hi = float(np.percentile(_cf, 95.0))
-        _t = np.clip((_cf - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
+    # 跨两视角统一标定——分位按降采样前全量 conf 算，与原实现一致）烘进 alpha
+    # [40,255]——供前端「置信度→点大小/透明度」联动
+    if bake_conf_alpha and geo["cf_concat"] is not None:
+        _cf = geo["cf_concat"]
+        _lo, _hi = (float(x) for x in np.percentile(_cf, [5.0, 95.0]))
+        _t = np.clip((_cf[geo["final_idx"]] - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
         alpha = (40.0 + _t * 215.0).astype(np.uint8)
     else:
-        alpha = np.full(pc_pts.shape[0], 255, np.uint8)
-    pc_pts, pc_cols = _glb._filter_and_downsample(
-        pc_pts, np.concatenate([pc_cols, alpha[:, None]], axis=1), int(num_max_points))
-    # 深度(Z)方向 MAD 稳健裁离群：理由与参数同单目链路（防深度爆点撑爆取景包围盒）
-    if pc_pts.shape[0] > 200:
-        zc = -pc_pts[:, 2]
-        med = float(np.median(zc))
-        mad = float(np.median(np.abs(zc - med))) + 1e-6
-        keep = zc <= med + float(outlier_mad) * mad
-        pc_pts, pc_cols = pc_pts[keep], pc_cols[keep]
+        alpha = np.full(cols.shape[0], 255, np.uint8)
+    return np.concatenate([cols, alpha[:, None]], axis=1)
 
-    scene = trimesh.Scene()
-    if scene.metadata is None:
-        scene.metadata = {}
-    A_cam = np.eye(4)
-    A_cam[1, 1] = -1.0
-    A_cam[2, 2] = -1.0
-    scene.metadata["hf_alignment"] = A_cam
-    # 米制缩放下相机位置也要同尺度：把相对位姿的平移分量乘 scale（线框尺寸由
-    # scene_scale 决定，已含缩放，不能再把 scale 烘进 A_cam 造成二次缩放）
-    def _rel_ext(i):
-        pose = np.linalg.inv(ext[i] @ np.linalg.inv(ext0))
-        pose[:3, 3] *= scale
-        return np.linalg.inv(pose)
-    if pc_pts.shape[0] > 0:
-        scene.add_geometry(trimesh.points.PointCloud(vertices=pc_pts, colors=pc_cols))
-        # 1mm 三角面 mesh 锚：确保 model-viewer 触发 load（理由同单目链路）
-        _anchor = trimesh.Trimesh(
-            vertices=np.array([[0, 0, 0], [1e-3, 0, 0], [0, 1e-3, 0]], dtype=np.float32),
-            faces=np.array([[0, 1, 2]]), process=False)
-        scene.add_geometry(_anchor)
 
+def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
+                                num_max_points=800000, show_cameras=True,
+                                mask_overlays=None, outlier_mad=12.0,
+                                point_scale=None, color_gamma=None,
+                                hl_cfg=None, bake_conf_alpha=False, geo=None):
+    """双视角（左右 IR）点云 GLB：每个视角各自反投影后，经 DA3 估计的相对位姿统一
+    合到「视角 0（左目）相机坐标系」，再 flip Y/Z 到 glTF 约定——与单目链路同一坐标
+    语义（左目相机=原点、光轴固定），前端同一套取景逻辑直接可用。
+
+    pred.extrinsics 是 w2c（DA3 约定）：视角 i 相机点 → 视角 0 相机系的变换为
+    T_i = ext0 @ inv(ext_i)。mask_overlays 只作用于视角 0（SAM3 跑左目图）。
+    point_scale 非空则整体缩放点云与相机线框（用真实基线恢复米制尺度）。
+    返回视角 0 的相机内参 K0（前端算 FOV 用）。
+
+    实现拆成「几何阶段」（_stereo_geometry）与「上色导出阶段」（_stereo_bake_colors +
+    _write_pointcloud_glb 手写 GLB 序列化，不再走 trimesh）。geo 传入外部预算好的
+    几何结果时两份产物共享一份几何；其参数指纹与本次调用不一致（面板把主产物与
+    高亮版的 conf 分位/outlier_mad 调不等）时自动忽略、回退独立几何计算，行为与
+    共享前完全一致。"""
+    from depth_anything_3.utils.export import glb as _glb  # 复用官方相机线框几何/场景尺度
+
+    _key = (float(conf_thresh_percentile), int(num_max_points), float(outlier_mad),
+            None if point_scale is None else float(point_scale))
+    if geo is None or geo.get("key") != _key:
+        geo = _stereo_geometry(pred, conf_thresh_percentile, num_max_points,
+                               outlier_mad, point_scale)
+    pc_pts = geo["pts"]
+    pc_cols = _stereo_bake_colors(pred, geo, mask_overlays, color_gamma, hl_cfg,
+                                  bake_conf_alpha)
+    K, ext = geo["K"], geo["ext"]
+    N, H, W = geo["shape"]
+
+    cam_wires = None
     if show_cameras:
         try:
-            # 相对外参：视角 0 = identity，视角 i = ext_i @ inv(ext0)（配合 A_cam 只 flip）
-            ext_rel = np.stack([_rel_ext(i) for i in range(N)])
-            scene_scale = _glb._estimate_scene_scale(pc_pts, fallback=1.0)
-            _glb._add_cameras_to_scene(
-                scene=scene, K=K, ext_w2c=ext_rel,
-                image_sizes=[(H, W)] * N, scale=scene_scale * 0.03)
-        except Exception:
-            pass
+            ext0 = ext[0]
+            scale = float(point_scale) if point_scale else 1.0
 
-    scene.export(out_path)
+            # 米制缩放下相机位置也要同尺度：把相对位姿的平移分量乘 scale（线框尺寸由
+            # scene_scale 决定，已含缩放，不能再二次缩放）。
+            # 相对外参：视角 0 = identity，视角 i = ext_i @ inv(ext0)
+            def _rel_ext(i):
+                pose = np.linalg.inv(ext[i] @ np.linalg.inv(ext0))
+                pose[:3, 3] *= scale
+                return np.linalg.inv(pose)
+
+            scene_scale = _glb._estimate_scene_scale(pc_pts, fallback=1.0)
+            cam_wires = []
+            for i in range(N):
+                segs = np.asarray(_glb._camera_frustum_lines(
+                    K[i], _rel_ext(i), W, H, scene_scale * 0.03), np.float64)
+                # 与点云同坐标系：仅 flip Y/Z（相机固定在原点，等价原 hf_alignment 矩阵）
+                segs[..., 1] *= -1.0
+                segs[..., 2] *= -1.0
+                cam_wires.append((segs.astype(np.float32),
+                                  _glb._index_color_rgb(i, N)))
+        except Exception:
+            cam_wires = None
+
+    _write_pointcloud_glb(out_path, pc_pts, pc_cols, cam_wires=cam_wires,
+                          quantize=GLB_QUANTIZE)
     return K[0]
 
 
@@ -3817,10 +3999,16 @@ def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
     outdir = GLB_DIR / token
     outdir.mkdir(parents=True, exist_ok=True)
     glb = outdir / "scene.glb"
+    # 几何阶段只算一次：主产物与下面的高亮版共享反投影/conf 裁剪/降采样/MAD 结果，
+    # 各自只做「顶点色 bake + GLB 导出」。高亮版参数（conf 分位、outlier_mad 来自
+    # /api/sam3hl/config）与主产物调不等时，build_stereo_pointcloud_glb 按参数指纹
+    # 自动回退独立几何计算，行为与共享前一致
+    geo = _stereo_geometry(pred, conf, nmp, 12.0, point_scale)
     K0 = build_stereo_pointcloud_glb(
         pred, str(glb), conf_thresh_percentile=conf, num_max_points=nmp,
         show_cameras=show_cam, mask_overlays=overlays, point_scale=point_scale,
-        color_gamma=0.55)   # IR 暗部提亮：无环境光的后景点在黑底上才可见
+        color_gamma=0.55,   # IR 暗部提亮：无环境光的后景点在黑底上才可见
+        geo=geo)
     sz = glb.stat().st_size / 1024 if glb.exists() else 0
     _prune_glb()
 
@@ -3875,7 +4063,9 @@ def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
             outlier_mad=float(hcfg["outlier_mad"]), point_scale=point_scale,
             color_gamma=0.55, hl_cfg=hcfg,
             bake_conf_alpha=(hcfg["pt_conf_size"] > 1e-3
-                             or hcfg["pt_conf_alpha"] > 1e-3))
+                             or hcfg["pt_conf_alpha"] > 1e-3),
+            # 与主产物共享几何（默认两套参数相等；被调不等时函数内自动回退独立计算）
+            geo=geo)
         with _stereo_hl_lock:
             _stereo_hl.update({
                 "url": f"/glb/{htoken}/scene.glb", "seq": _stereo_hl["seq"] + 1,
