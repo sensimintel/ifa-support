@@ -2248,6 +2248,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  </select>
  <button id="btnHlCfg">调节</button>
  <button id="btnTl">流水</button>
+ <button id="btnFs" title="整页铺满显示器（Esc 退出）">全屏</button>
 </div>
 
 <div id="hlcfg">
@@ -2789,6 +2790,16 @@ $('btnTl').onclick=()=>{
   $('btnTl').textContent=on?'实时':'流水';
   setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
 };
+// ══ 全屏：Fullscreen API 整页铺满显示器（展台演示用；须由用户点击手势触发）══
+function fsOn(){return !!(document.fullscreenElement||document.webkitFullscreenElement);}
+$('btnFs').onclick=()=>{
+  const root=document.documentElement;
+  if(fsOn())(document.exitFullscreen||document.webkitExitFullscreen).call(document);
+  else (root.requestFullscreen||root.webkitRequestFullscreen).call(root);
+};
+// 状态跟随浏览器事件（Esc/系统手势退出也能同步按钮文案）
+['fullscreenchange','webkitfullscreenchange'].forEach(ev=>
+  document.addEventListener(ev,()=>{$('btnFs').textContent=fsOn()?'退出全屏':'全屏';}));
 syncStyleUI();
 
 // ══ 高亮点云样式调节抽屉：读写 /api/sam3hl/config（与 /panel 的「高亮样式调节」同一套配置） ══
