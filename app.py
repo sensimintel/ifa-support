@@ -2455,6 +2455,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div class="sec">深度渲染（写回推流端，约 2~4s 生效）</div>
  <div class="fld"><label>色彩映射</label>
   <select id="dd_cmap">
+   <option value="lidar">LIDAR 蓝青（近亮青远深蓝）</option>
    <option value="turbo">TURBO（默认）</option><option value="jet">JET</option>
    <option value="viridis">VIRIDIS</option><option value="plasma">PLASMA</option>
    <option value="inferno">INFERNO</option><option value="magma">MAGMA</option>

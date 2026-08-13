@@ -294,6 +294,21 @@ _DEPTH_CMAPS = {name: getattr(cv2, "COLORMAP_" + name.upper(), cv2.COLORMAP_TURB
                              "twilight_shifted", "deepgreen")}
 
 
+def _lidar_lut() -> np.ndarray:
+    """自建「激光雷达蓝青」色表（256x3 BGR，索引 0=远、255=近）：远端深藏青、
+    中程蔚蓝、近端亮青白——单一蓝青色系靠明度/色温拉开前后空间，不像 turbo/jet
+    满屏红绿蓝混杂（对齐经典 LiDAR 点云可视化观感）。"""
+    stops_i = np.array([0.0, 90.0, 170.0, 225.0, 255.0], dtype=np.float32)
+    stops_rgb = np.array([(3, 10, 40), (0, 60, 180), (0, 140, 255),
+                          (0, 220, 220), (170, 255, 225)], dtype=np.float32)
+    idx = np.arange(256, dtype=np.float32)
+    rgb = np.stack([np.interp(idx, stops_i, stops_rgb[:, c]) for c in range(3)], axis=1)
+    return np.ascontiguousarray(rgb[:, ::-1]).astype(np.uint8)   # RGB→BGR
+
+
+_LIDAR_LUT = _lidar_lut()
+
+
 def _cfg_num(cfg: dict, key: str, default: float) -> float:
     """读数值配置项；缺失/非法一律回默认值（服务端已钳制过范围，这里只做兜底）。"""
     try:
@@ -377,6 +392,8 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     cmap = str(cfg.get("depth_colormap", "turbo"))
     if cmap == "gray":
         img = cv2.cvtColor(t8, cv2.COLOR_GRAY2BGR)
+    elif cmap == "lidar":
+        img = _LIDAR_LUT[t8]   # numpy 查表（不依赖 OpenCV 自定义色表接口）
     else:
         img = cv2.applyColorMap(t8, _DEPTH_CMAPS.get(cmap, cv2.COLORMAP_TURBO))
 
