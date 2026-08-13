@@ -18,9 +18,11 @@
   PUSH_FPS      推帧频率兜底值，默认 3——仅在拿不到服务端配置时生效
   JPEG_QUALITY  非 MJPG 相机转码 JPEG 质量，默认 80
 
-推帧频率的权威来源是 8060 服务端配置（/panel「推帧 fps」滑杆 POST 到
-/api/frame/config 的 push_fps 字段，与手机 App 同一套约定）：后台线程每 2s
-轮询 /api/frame/status 读取并热生效，服务端不可达时沿用最后一次的值。
+推帧频率的权威来源是 8060 服务端配置，**按设备分桶、两台相机各调各的**：
+/panel 设备栏滑杆与 /experience「调节」抽屉都 POST /api/frame/device-config
+（per-device merge-patch），后台线程每 2s 轮询 /api/frame/status 的
+devices[].config.push_fps 热生效；取值优先级 per-device ＞ 全局 config.push_fps
+（旧口径兜底）＞ PUSH_FPS。服务端不可达时沿用最后一次的值。
 """
 import json
 import logging
@@ -56,34 +58,56 @@ _stop = threading.Event()
 # SDK 设备枚举/开流不保证并发安全，统一串行化
 _sdk_lock = threading.Lock()
 
-# 当前生效的推帧频率：以服务端配置为准，PUSH_FPS 仅兜底（见模块头注释）
-_effective_fps = PUSH_FPS
+# 当前生效的推帧频率：以服务端配置为准（per-device 优先、全局旧口径兜底），
+# 都没有时用 PUSH_FPS（见模块头注释）。dict 按 device_id 分桶，两台相机各调各的
 _fps_lock = threading.Lock()
+_dev_fps: dict = {}                   # device_id -> per-device push_fps（服务端下发）
+_global_fps: float = 0.0              # 全局 config.push_fps（旧口径兜底；0=未下发）
 
 
-def get_push_interval() -> float:
-    """当前推帧间隔（秒）。频率钳制在 0.2~15fps：防误配 0 值忙等或打爆链路。"""
+def _valid_fps(raw) -> float:
+    """把服务端字段解析成合法 fps；无效/未下发返回 0。"""
+    try:
+        fps = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    return fps if fps > 0 else 0.0
+
+
+def get_push_interval(device_id: str) -> float:
+    """该设备当前推帧间隔（秒）。频率钳制在 0.2~15fps：防误配 0 值忙等或打爆链路。"""
     with _fps_lock:
-        fps = _effective_fps
+        fps = _dev_fps.get(device_id) or _global_fps or PUSH_FPS
     return 1.0 / min(max(fps, 0.2), 15.0)
 
 
 def _config_poller():
-    """每 2s 从 8060 读一次服务端配置里的 push_fps 并热生效。"""
-    global _effective_fps
+    """每 2s 从 8060 读一次帧率配置并热生效：devices[].config.push_fps（per-device）
+    与全局 config.push_fps（旧口径兜底）。服务端不可达时沿用当前值。"""
+    global _global_fps
     session = requests.Session()
+    last_desc = None
     while not _stop.is_set():
         try:
             resp = session.get(f"{RELAY_URL}/api/frame/status", timeout=(3.05, 5))
             resp.raise_for_status()
-            raw = (resp.json().get("config") or {}).get("push_fps")
-            fps = float(raw) if raw is not None else None
-            if fps and fps > 0:
-                with _fps_lock:
-                    if abs(fps - _effective_fps) > 1e-6:
-                        log.info("推帧频率随服务端配置调整: %.1f → %.1f fps",
-                                 _effective_fps, fps)
-                        _effective_fps = fps
+            st = resp.json()
+            g = _valid_fps((st.get("config") or {}).get("push_fps"))
+            dev = {}
+            for d in st.get("devices") or []:
+                fps = _valid_fps((d.get("config") or {}).get("push_fps"))
+                if fps:
+                    dev[str(d.get("device_id") or "")] = fps
+            with _fps_lock:
+                _global_fps = g
+                _dev_fps.clear()
+                _dev_fps.update(dev)
+            desc = (g, tuple(sorted(dev.items())))
+            if desc != last_desc:
+                if last_desc is not None or g or dev:   # 启动即空配置不打日志
+                    log.info("推帧频率随服务端配置调整: per-device=%s 全局兜底=%s",
+                             dev or "无", g or "无")
+                last_desc = desc
         except (requests.RequestException, ValueError, TypeError):
             pass  # 服务端不可达/字段异常时沿用当前值，推帧线程自身会报连不上
         _stop.wait(2)
@@ -195,7 +219,7 @@ def _camera_worker(pid: int, device_id: str):
                              cf.get_width(), cf.get_height(), cf.get_format())
                     first = False
                 now = time.time()
-                if now - last_push < get_push_interval():
+                if now - last_push < get_push_interval(device_id):
                     continue
                 jpeg = _to_jpeg(cf)
                 # 同帧组里带硬件深度帧则伪彩后随同上报（帧组偶尔缺深度帧属正常，
@@ -251,7 +275,8 @@ def _camera_worker(pid: int, device_id: str):
 def main():
     signal.signal(signal.SIGTERM, lambda *_: _stop.set())
     signal.signal(signal.SIGINT, lambda *_: _stop.set())
-    log.info("cam-pusher 启动：目标=%s 兜底频率=%.1ffps 质量=%d（实际频率跟随 /panel 滑杆）",
+    log.info("cam-pusher 启动：目标=%s 兜底频率=%.1ffps 质量=%d"
+             "（实际频率按设备跟随服务端 device-config，两台相机各调各的）",
              RELAY_URL, PUSH_FPS, JPEG_QUALITY)
     threading.Thread(target=_config_poller, name="config-poller",
                      daemon=True).start()
