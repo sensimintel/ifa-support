@@ -608,6 +608,7 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
             # 开流成功即报活并登记 pipe（watchdog 强拆用）；给出帧留满一个自检窗口
             _watch_touch(device_id, gen, pipe=pipe)
             last_fs = time.time()
+            last_cf = time.time()   # 最近一次拿到彩色帧的时刻（color 流僵死自检用）
             first = True
             first_depth = True
             depth_err = 0
@@ -644,7 +645,16 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                                         device_id, e)
                             aux_err_logged = True
                 if cf is None:
+                    # 看门狗盲区自检：帧组持续到达但一直没有彩色帧（如开流时
+                    # uvc_stream_open_ctrl 失败、深度/IR 仍在流动——帧组会把
+                    # 两级看门狗全喂活，线程却什么都不推、什么都不报）。彩色流
+                    # 属于预期流时超时即重建管线（interleave 偶发缺帧不受影响）
+                    if "color" in streams and time.time() - last_cf >= FRAME_STALL_S:
+                        raise RuntimeError(
+                            f"连续 {FRAME_STALL_S:.0f} 秒帧组无彩色帧"
+                            "（color 流疑似僵死），主动重建取帧管线")
                     continue
+                last_cf = time.time()
                 if first:
                     log.info("[%s] 首帧 %dx%d 格式=%s", device_id,
                              cf.get_width(), cf.get_height(), cf.get_format())
