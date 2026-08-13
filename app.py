@@ -1385,6 +1385,9 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <span style="flex:none">设备：</span>
  <select id="devsel" style="width:auto;min-width:200px;font-size:13px;padding:5px 8px;border:1px solid #d0d0d5;border-radius:8px;background:#fff"></select>
  <span id="devinfo"></span>
+ <span style="flex:none;margin-left:14px">推帧 fps：</span>
+ <input type="range" id="fps" min="0.5" max="10" step="0.5" value="2" style="width:130px">
+ <b id="fpv" style="font-variant-numeric:tabular-nums">2.0</b>
 </div>
 
 <div class="grid">
@@ -1498,8 +1501,6 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    </select></div>
   <div class="fld"><label>处理分辨率 process_res <span class="rngval" id="prv">504</span></label>
    <input type="range" id="pr" min="196" max="1120" step="28" value="504"></div>
-  <div class="fld"><label>推帧 fps push_fps（Mac 相机推流端轮询生效）<span class="rngval" id="fpv">2.0</span></label>
-   <input type="range" id="fps" min="0.5" max="10" step="0.5" value="2"></div>
  </div>
  <div class="glbopts" id="glbopts">
   <div class="row">

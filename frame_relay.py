@@ -171,8 +171,7 @@ def _worker_loop() -> None:
             while True:
                 dev = _effective_device_locked()
                 st = _devices.get(dev) if dev else None
-                if (_processor is not None and st is not None and st["image"] is not None
-                        and not _ext_active_locked(st, time.time())):
+                if _processor is not None and st is not None and st["image"] is not None:
                     # 键须含 received_at：设备桶过期重建后 seq 从 1 重新计数，若只看
                     # (dev, seq, 配置版本) 会与旧桶首帧撞键 → 新帧被误判"已处理"而永久漏处理
                     key = (dev, st["seq"], st["received_at"], _config_gen)
@@ -188,7 +187,10 @@ def _worker_loop() -> None:
             product, err = None, f"{type(e).__name__}: {e}"
         with _cv:
             st2 = _devices.get(dev)
-            if st2 is not None:      # 设备可能在处理期间过期下线，桶没了就丢弃产物
+            # 设备可能在处理期间过期下线，桶没了就丢弃产物；外部产物接管窗口内 DA3
+            # 照常跑（SAM3 映射/高亮/实时识别等链路靠其副作用驱动），但产物槽位归
+            # 外部方（如 Astra 真深度点云），DA3 的处理结果不写回
+            if st2 is not None and not _ext_active_locked(st2, time.time()):
                 st2["product"] = product if product is not None else st2["product"]
                 st2["product_seq"] = seq
                 st2["product_gen"] = gen
