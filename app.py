@@ -1856,6 +1856,10 @@ function resetPanesForSwitch(){   // 切设备：清空各格显示与序号缓�
 async function tick(){
  try{
   const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
+  // 轮询节奏自适应到帧率：显示刷新率受轮询间隔封顶（固定 500ms 时原图最多 2fps），
+  // 按实际到帧率加密（1.5 倍过采样防节拍差拍），钳制 80~500ms——高帧率跟得上、
+  // 低帧率不空转。图片均按 seq 门控换图，轮询加密不会重复拉图
+  tickDelay=s.fps?Math.max(80,Math.min(500,1000/(s.fps*1.5))):500;
   // 服务端重启后配置清零（config_gen=0 → 回落 depth 模式、识别不触发）：自动重推当前面板配置
   if(s.processor && s.config_gen===0) pushConfig();
   // 设备下拉 + 切换检测（本页或其他页面触发的切换都会在这里被发现）
@@ -1965,7 +1969,9 @@ async function tick(){
      +' · 产物帧 <b>'+s.product_seq+'</b>'+(s.product_error?' · <span class="err">'+s.product_error+'</span>':'');}
  }catch(e){/* 单次轮询失败忽略，下个周期重试 */}
 }
-setInterval(tick,500);tick();
+// 自适应轮询：每轮结束后按 tickDelay 排下一轮（串行，慢请求不会堆积并发轮询）
+let tickDelay=500;
+(async function tickLoop(){ await tick(); setTimeout(tickLoop, tickDelay); })();
 
 // ── Qwen 识别隧道状态：5s 轮询。断了给「一键重建」，指令由 Mac 上的守护进程领走执行 ──
 let tunReqAt=0;   // 本页最近一次下发重建指令的时刻，用于显示「重建中…」
