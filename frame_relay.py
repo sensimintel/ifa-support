@@ -49,6 +49,15 @@ _selected: Optional[str] = None       # 当前选中设备（粘性；None=还�
 _config: dict = {}
 _config_gen = 0                       # 配置版本号：变更时 +1，用于触发对最新帧的重算
 
+# per-device 帧率类配置（device_id -> {push_fps, product_interval}）。与 _config 分开存，
+# 原因有二：(1) /api/frame/config 是全量覆盖语义，/panel 与 /experience 都会整体 POST，
+# 塞进去会被互相抹掉；(2) 设备桶超时会被清理，而帧率配置要在设备掉线重连后仍然生效。
+# 写入走 POST /api/frame/device-config（merge-patch 语义），推流端经 /api/frame/status
+# 的 devices[].config 轮询生效；后续 18091 控制面（superadmin 经 /da3-api 反代）走同一对接口。
+_dev_config: dict = {}
+# 可写键与钳制范围：push_fps=RGB 推帧频率（fps）；product_interval=点云产物上传间隔（秒）
+DEV_CONFIG_LIMITS = {"push_fps": (0.1, 30.0), "product_interval": (0.5, 30.0)}
+
 # DA3 处理回调：fn(image_bytes, config, device_id) -> 产物描述字典；由 app.py 在有模型时注入
 #   {"kind":"image","bytes":b"...","content_type":"image/jpeg","meta":{...}}  # 深度图
 #   {"kind":"model","url":"/glb/<token>/scene.glb","meta":{...}}              # 点云/网格 GLB
@@ -331,6 +340,51 @@ def latest_product_model(device: Optional[str] = Query(None)):
     )
 
 
+@router.post("/api/frame/device-config")
+async def set_device_config(body: dict = Body(...)):
+    """按设备写帧率类配置（merge-patch：只改传入的键；键值传 null/空串=删除该键恢复兜底）。
+
+    body 形如 {"device_id": "macmini-astra", "config": {"push_fps": 5, "product_interval": 1.5}}。
+    与 /api/frame/config（全局一份、全量覆盖）不同：本配置按设备分桶、只接受
+    DEV_CONFIG_LIMITS 里的键并按范围钳制；设备不必在线（先下发配置再起推流端同样生效）。
+    """
+    dev = str((body or {}).get("device_id") or "").strip()
+    if not dev:
+        return JSONResponse({"ok": False, "error": "缺少 device_id"}, status_code=400)
+    patch = (body or {}).get("config")
+    if not isinstance(patch, dict) or not patch:
+        return JSONResponse({"ok": False, "error": "缺少 config（应为非空对象）"}, status_code=400)
+    unknown = sorted(k for k in patch if k not in DEV_CONFIG_LIMITS)
+    if unknown:
+        return JSONResponse({"ok": False, "error": f"不支持的键：{unknown}；"
+                             f"可用：{sorted(DEV_CONFIG_LIMITS)}"}, status_code=400)
+    # 先在锁外完成校验与钳制，锁内只做原子合并，坏值不会留下半套配置
+    norm: dict = {}
+    for k, v in patch.items():
+        if v is None or v == "":
+            norm[k] = None
+        else:
+            try:
+                lo, hi = DEV_CONFIG_LIMITS[k]
+                norm[k] = min(hi, max(lo, float(v)))
+            except (TypeError, ValueError):
+                return JSONResponse({"ok": False, "error": f"{k} 不是数字：{v!r}"},
+                                    status_code=400)
+    with _cv:
+        cfg = dict(_dev_config.get(dev) or {})
+        for k, v in norm.items():
+            if v is None:
+                cfg.pop(k, None)
+            else:
+                cfg[k] = v
+        if cfg:
+            _dev_config[dev] = cfg
+        else:
+            _dev_config.pop(dev, None)
+        _cv.notify_all()
+    return JSONResponse({"ok": True, "device": dev, "config": cfg})
+
+
 @router.post("/api/frame/config")
 async def set_frame_config(config: dict = Body(...)):
     """由 /panel 下发处理配置（产物类型/分辨率/置信度/点数/相机线框等），
@@ -415,6 +469,8 @@ def frame_status(device: Optional[str] = Query(None)):
                 "age": (now - b["received_at"]) if b["received_at"] else None,
                 "fps": (1.0 / itv) if itv > 0 else None,
                 "selected": d == selected,
+                # 该设备已下发的帧率类配置（/api/frame/device-config），推流端与控制面都从这读
+                "config": dict(_dev_config.get(d) or {}),
             })
         if st is None:
             return JSONResponse({

@@ -1630,8 +1630,7 @@ function currentConfig(){return {
   process_res:+$('pr').value,
   conf_thresh_percentile:+$('ct').value,
   num_max_points:Math.round(+$('nmp').value*1e6),
-  show_cameras:$('cam').value,
-  push_fps:+$('fps').value
+  show_cameras:$('cam').value
 };}
 
 let pushTimer=null;
@@ -1642,8 +1641,9 @@ function pushConfig(){
       body:JSON.stringify(currentConfig())}).catch(()=>{});
   },300);
 }
-// 控件任意改动 → 同步显隐 + 推配置（debounce）
-['fmt','pr','ct','nmp','cam','fps'].forEach(id=>{
+// 控件任意改动 → 同步显隐 + 推配置（debounce）。推帧 fps 不在其中：它是 per-device
+// 配置（/api/frame/device-config），不能塞进全量覆盖语义的 /api/frame/config
+['fmt','pr','ct','nmp','cam'].forEach(id=>{
   $(id).addEventListener('change',()=>{syncOpts();pushConfig();});
   $(id).addEventListener('input',pushConfig);
 });
@@ -1719,7 +1719,25 @@ function renderDevices(s){
   const sel=devs.find(d=>d.device_id===s.selected);
   $('devinfo').textContent=(devs.length>1?('共 '+devs.length+' 台在传 · '):'')
     +(sel&&sel.fps?('选中 '+sel.fps.toFixed(1)+' fps'):'');
+  // 滑条回填：显示选中设备已下发的 push_fps（切设备时跟着换）。拖动中或刚下发 1.5s 内
+  // 不回写，避免回填与手上的拖动打架
+  const dc=(sel&&sel.config)||{};
+  if(dc.push_fps!=null&&document.activeElement!==$('fps')&&Date.now()-fpsTouched>1500){
+    $('fps').value=dc.push_fps;$('fpv').textContent=(+dc.push_fps).toFixed(1);}
 }
+// 推帧 fps：per-device 配置（POST /api/frame/device-config），只作用当前选中设备。
+// 与 /api/frame/config 分开——那边是全量覆盖语义且全局一份，两台摄像机没法各调各的
+let fpsTimer=null,fpsTouched=0;
+$('fps').addEventListener('input',()=>{
+  fpsTouched=Date.now();
+  clearTimeout(fpsTimer);
+  fpsTimer=setTimeout(()=>{
+    const dev=devsel.value||curDev;
+    if(!dev)return;
+    fetch('/api/frame/device-config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({device_id:dev,config:{push_fps:+$('fps').value}})}).catch(()=>{});
+  },300);
+});
 function resetPanesForSwitch(){   // 切设备：清空四框显示与序号缓存，等新设备的帧/产物
   $('prodcap').textContent='DA3 产物';
   lastSeq=-1;lastDepth=-1;lastProdKey='';lastS3=-1;lastSwap=0;lastSwap3=0;lastHl=-1;lastSwapH=0;
@@ -2058,8 +2076,18 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 </div>
 
 <div id="hlcfg">
- <div class="hd">高亮点云样式调节 <button id="hlcfgClose" title="关闭">✕</button></div>
- <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">高亮样式（只作用于高亮点云）</div>
+ <div class="hd">展示调节 <button id="hlcfgClose" title="关闭">✕</button></div>
+ <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">数据源帧率（当前设备）</div>
+ <div class="fld"><label>RGB 推帧 <b id="v_push_fps">2.0</b> fps</label>
+  <input type="range" id="r_push_fps" min="0.5" max="10" step="0.5" value="2"></div>
+ <div class="fld"><label>点云直传间隔 <b id="v_prod_itv">2.5</b> s</label>
+  <input type="range" id="r_prod_itv" min="0.5" max="10" step="0.5" value="2.5"></div>
+ <div class="hint" style="margin-top:8px">按设备生效（推流端每 2s 轮询取走）。<b>RGB 推帧</b>驱动
+  DA3/SAM3 处理链路，是高亮/SAM3 点云的帧率上限；<b>点云直传间隔</b>只对带真深度直传的
+  设备（如 macmini-astra）生效，决定 LA 点云来源的刷新节奏。Mac↔5090 链路仅约 8Mbps，
+  两台摄像机同推时调密任何一路都会挤占另一路，调完盯一眼画面是否跟得上。</div>
+ <div id="hlonly">
+ <div class="sec">高亮样式（只作用于高亮点云）</div>
  <div class="seg" id="hlseg">
   <button data-s="tint" class="on">染色</button>
   <button data-s="solid">纯色</button>
@@ -2196,6 +2224,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   作用于最终画面<b>含高亮色</b>。置信度联动首次开启需等下一轮 GLB（把置信度烘进
   顶点 alpha，仅高亮/SAM3 点云有此数据），之后实时。自动旋转在每次换模时回正。
   默认值均为中性观感。</div>
+ </div>
 </div>
 
 <script>
@@ -2408,6 +2437,39 @@ $('selDev').onchange=()=>{
     body:JSON.stringify({device_id:$('selDev').value})}).catch(()=>{});
 };
 
+// ── 数据源帧率（调节抽屉顶部）：per-device 配置，POST /api/frame/device-config ──
+// push_fps=RGB 推帧频率（高亮/SAM3 点云链路的帧率上限）；product_interval=点云直传
+// 间隔（Astra 类真深度设备，LA 点云来源的刷新节奏）。只作用当前选中设备；推流端每 2s
+// 轮询 /api/frame/status 取走。与 /api/frame/config 分开——那边全量覆盖且全局一份
+const RATE_SLIDERS={push_fps:['r_push_fps','v_push_fps'],product_interval:['r_prod_itv','v_prod_itv']};
+let ratePend={},rateTimer=null,rateTouched=0;
+Object.keys(RATE_SLIDERS).forEach(key=>{
+  const [rid,vid]=RATE_SLIDERS[key];
+  $(rid).addEventListener('input',()=>{
+    $(vid).textContent=(+$(rid).value).toFixed(1);
+    if(!curDev)return;
+    rateTouched=Date.now();
+    ratePend[key]=+$(rid).value;
+    clearTimeout(rateTimer);
+    rateTimer=setTimeout(()=>{
+      const cfg=ratePend;ratePend={};
+      fetch('/api/frame/device-config',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({device_id:curDev,config:cfg})}).catch(()=>{});
+    },300);
+  });
+});
+function renderRate(s){
+  // 滑条回填选中设备已下发的值（切设备跟着换）；拖动中或刚下发 1.5s 内不回写，避免打架
+  if(Date.now()-rateTouched<1500)return;
+  const d=(s.devices||[]).find(x=>x.device_id===s.selected);
+  const c=(d&&d.config)||{};
+  [['push_fps',c.push_fps!=null?c.push_fps:(s.config||{}).push_fps],
+   ['product_interval',c.product_interval]].forEach(([key,val])=>{
+    const [rid,vid]=RATE_SLIDERS[key],el=$(rid);
+    if(val!=null&&document.activeElement!==el){el.value=val;$(vid).textContent=(+el.value).toFixed(1);}
+  });
+}
+
 let lastInset='';
 async function bgTick(){
  if(DEMO)return;
@@ -2415,6 +2477,7 @@ async function bgTick(){
   const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
   if(s.processor&&s.config_gen===0)pushDefaultConfig();
   renderDevices(s);
+  renderRate(s);
   if(s.device&&s.device!==curDev){   // 切设备：清背景与卡片缓存，等新设备的帧/产物
     if(curDev!==null){lastBgKey='';lastMvUrl='';lastBgUrl='';lastInset='';curCard=null;lastCardKey='';}
     curDev=s.device;
@@ -2519,8 +2582,8 @@ function applyRecog(r){
 // ══ 右下临时工具：来源下拉框 + 高亮调节抽屉开关 + 流水视图开关 ══
 function syncStyleUI(){
   $('selStyle').value=bgSource;
-  $('btnHlCfg').style.display=bgSource==='hl'?'':'none';   // 仅高亮点云来源可调样式
-  if(bgSource!=='hl')$('hlcfg').classList.remove('on');
+  // 抽屉常驻可开（帧率区对所有来源有意义）；高亮样式区只在高亮点云来源展示
+  $('hlonly').style.display=bgSource==='hl'?'':'none';
 }
 $('selStyle').onchange=()=>{
   bgSource=$('selStyle').value;

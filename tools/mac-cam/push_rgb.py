@@ -2,8 +2,10 @@
 """Mac 相机 RGB 推流器：抓 AVFoundation 相机帧，按 8060 面板配置的 push_fps 推到 /api/frame。
 
 与手机 App 同款 multipart 契约（image + camera_info{device_id, upload_at_ms} + timestamp），
-在 /panel 设备下拉里表现为一台虚拟设备。fps 由服务端 /api/frame/status 的 config.push_fps
-下发（面板「推帧 fps」滑条），脚本周期轮询生效；服务端不可达时指数退避重试。
+在 /panel 设备下拉里表现为一台虚拟设备。fps 按设备下发：脚本周期轮询 /api/frame/status，
+优先取 devices[].config.push_fps（本设备的 per-device 配置，由 /panel 设备栏滑条、
+/experience 调节抽屉或 18091 控制面经 POST /api/frame/device-config 写入），
+兜底依次为全局 config.push_fps（旧口径）与 --fps；服务端不可达时指数退避重试。
 """
 import argparse
 import json
@@ -29,11 +31,19 @@ def avf_index_by_name(name_sub: str):
 
 
 class ConfigPoller:
-    """轮询 /api/frame/status 拿面板下发的 push_fps（顺带确认服务端可达）。"""
+    """轮询 /api/frame/status 拿面板/控制面下发的帧率配置（顺带确认服务端可达）。
 
-    def __init__(self, server: str, session: requests.Session, fallback_fps: float):
+    push_fps 取值优先级：本设备 devices[].config.push_fps（per-device 配置）＞
+    全局 config.push_fps（旧口径兜底）＞保持当前值。dev_config 里保留本设备的完整
+    per-device 配置字典，供扩展方读取其余键（如 push_astra 的 product_interval）。
+    """
+
+    def __init__(self, server: str, session: requests.Session, fallback_fps: float,
+                 device_id: str):
         self.server, self.session = server, session
+        self.device_id = device_id
         self.fps = fallback_fps
+        self.dev_config: dict = {}
         self._next_poll = 0.0
 
     def poll(self):
@@ -41,8 +51,15 @@ class ConfigPoller:
             return
         self._next_poll = time.time() + 2.0
         try:
-            cfg = self.session.get(f"{self.server}/api/frame/status", timeout=3).json().get("config") or {}
-            fps = float(cfg.get("push_fps") or 0)
+            st = self.session.get(f"{self.server}/api/frame/status", timeout=3).json()
+            cfg = st.get("config") or {}
+            dev_cfg = {}
+            for d in st.get("devices") or []:
+                if d.get("device_id") == self.device_id:
+                    dev_cfg = d.get("config") or {}
+                    break
+            self.dev_config = dev_cfg
+            fps = float(dev_cfg.get("push_fps") or cfg.get("push_fps") or 0)
             if 0.1 <= fps <= 30:
                 self.fps = fps
         except Exception:
@@ -51,9 +68,10 @@ class ConfigPoller:
 
 def push_loop(cap, server: str, device_id: str, fallback_fps: float, quality: int,
               on_tick=None):
-    """主循环：按 push_fps 抓帧→JPEG→POST /api/frame。on_tick(now) 供扩展方挂周期任务。"""
+    """主循环：按 push_fps 抓帧→JPEG→POST /api/frame。
+    on_tick(now, poller) 供扩展方挂周期任务并读取 per-device 配置（poller.dev_config）。"""
     session = requests.Session()
-    poller = ConfigPoller(server, session, fallback_fps)
+    poller = ConfigPoller(server, session, fallback_fps, device_id)
     n_sent, n_err, last_log = 0, 0, time.time()
     while True:
         t0 = time.time()
@@ -88,7 +106,7 @@ def push_loop(cap, server: str, device_id: str, fallback_fps: float, quality: in
                 print(f"推帧失败（累计 {n_err}）：{e}", flush=True)
             time.sleep(min(5.0, 0.5 * n_err))
         if on_tick is not None:
-            on_tick(time.time())
+            on_tick(time.time(), poller)
         if time.time() - last_log > 10:
             print(f"[{time.strftime('%H:%M:%S')}] 已推 {n_sent} 帧 · 目标 {poller.fps:.1f} fps"
                   f"（面板可调）· 失败 {n_err}", flush=True)
