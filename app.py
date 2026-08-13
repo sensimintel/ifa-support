@@ -1396,16 +1396,8 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 
 <div class="grid">
  <figure>
-  <div class="box">
-   <img id="prodimg" style="display:none">
-   <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y"
-     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
-     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
-     min-field-of-view="10deg" max-field-of-view="60deg"
-     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
-   <span class="wait" id="prodwait">等待产物…</span>
-  </div>
-  <figcaption><span id="prodcap">DA3 产物</span> <span class="m" id="prodmeta"></span></figcaption>
+  <div class="box"><img id="hwd" style="display:none"><span class="wait" id="hwdwait">等待相机深度帧…（仅带深度相机的帧源，如 mac mini）</span></div>
+  <figcaption>相机硬件深度图（越亮越暖 = 越近 · 黑 = 无效点）<span class="m" id="hwdmeta"></span></figcaption>
  </figure>
  <figure>
   <div class="box">
@@ -1436,6 +1428,18 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <figcaption>接收到的设备帧 <span class="m" id="rawmeta"></span></figcaption>
   <figcaption id="rawlat" style="font-variant-numeric:tabular-nums"
     title="拍摄=设备时钟 · 上传=手机时钟 · 服务器=5090 时钟 · 展示=浏览器时钟；跨时钟差值含偏差，负值≈时钟不同步"></figcaption>
+ </figure>
+ <figure>
+  <div class="box">
+   <img id="prodimg" style="display:none">
+   <model-viewer id="mv" style="display:none" camera-controls touch-action="pan-y"
+     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
+     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
+     min-field-of-view="10deg" max-field-of-view="60deg"
+     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
+   <span class="wait" id="prodwait">等待产物…</span>
+  </div>
+  <figcaption><span id="prodcap">DA3 产物</span> <span class="m" id="prodmeta"></span></figcaption>
  </figure>
 </div>
 
@@ -1692,7 +1696,7 @@ function renderLatency(s){
     +'</b> · 端到端延时 <b>'+fmtLag(e2eMs)+'</b>';
 }
 
-let lastSeq=-1,lastProdKey='',lastSwap=0,lastS3=-1,lastSwap3=0,lastHl=-1,lastSwapH=0;
+let lastSeq=-1,lastDepth=-1,lastProdKey='',lastSwap=0,lastS3=-1,lastSwap3=0,lastHl=-1,lastSwapH=0;
 const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显示，避免高帧率下一直卡在"加载中"(黑屏)
 
 // ── 多设备：下拉选设备（服务端只处理选中设备一路；非选中设备的帧只进各自缓存） ──
@@ -1718,9 +1722,10 @@ function renderDevices(s){
 }
 function resetPanesForSwitch(){   // 切设备：清空四框显示与序号缓存，等新设备的帧/产物
   $('prodcap').textContent='DA3 产物';
-  lastSeq=-1;lastProdKey='';lastS3=-1;lastSwap=0;lastSwap3=0;lastHl=-1;lastSwapH=0;
+  lastSeq=-1;lastDepth=-1;lastProdKey='';lastS3=-1;lastSwap=0;lastSwap3=0;lastHl=-1;lastSwapH=0;
   pendingE2E=null;e2eMs=null;$('rawlat').textContent='';
   $('raw').style.display='none';$('rawwait').style.display='';
+  $('hwd').style.display='none';$('hwdwait').style.display='';
   $('prodimg').style.display='none';$('mv').style.display='none';$('prodwait').style.display='';
   $('s3img').style.display='none';$('mv2').style.display='none';$('s3wait').style.display='';
   $('hlimg').style.display='none';$('mv3').style.display='none';$('hlwait').style.display='';
@@ -1739,6 +1744,11 @@ async function tick(){
     $('raw').src='/api/frame/latest?t='+s.seq;$('raw').style.display='block';$('rawwait').style.display='none';}
   $('rawmeta').textContent = s.has_frame ? ('帧 '+s.seq+(s.interval?(' · 间隔 '+s.interval.toFixed(1)+'s'):'')) : '';
   renderLatency(s);
+
+  // 左上框：相机硬件深度图（帧源随彩色帧一并上报的伪彩 JPEG；无深度能力的帧源保持占位）
+  if(s.has_depth && s.depth_seq!==lastDepth){lastDepth=s.depth_seq;
+    $('hwd').src='/api/frame/latest-depth?t='+s.depth_seq;$('hwd').style.display='block';$('hwdwait').style.display='none';}
+  $('hwdmeta').textContent = s.has_depth ? ('帧 '+s.depth_seq) : '';
 
   // 右框：DA3 产物（图片=深度图；模型=GLB）
   const prodKey=(s.product_kind||'')+':'+(s.product_url||'')+':'+s.product_seq;

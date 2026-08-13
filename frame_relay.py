@@ -117,6 +117,9 @@ def _parse_device_id(camera_info: Optional[str]) -> str:
 def _new_bucket(now: float) -> dict:
     return {
         "seq": 0, "image": None, "content_type": "image/jpeg",
+        # 相机硬件深度图（帧源已伪彩渲染好的 JPEG，如 mac mini 推帧器）：独立计数，
+        # 不参与 DA3 处理，仅供 /panel 左上角展示
+        "depth_image": None, "depth_seq": 0, "depth_content_type": "image/jpeg",
         "received_at": 0.0, "prev_received_at": 0.0,
         "camera_info": None, "timestamp": None, "first_seen": now,
         "product": None, "product_seq": 0, "product_gen": 0, "product_error": None,
@@ -210,17 +213,20 @@ def _target_device_locked(device: Optional[str]):
 @router.post("/api/frame")
 async def ingest_frame(
     image: UploadFile = File(...),
+    depth: Optional[UploadFile] = File(None),
     camera_info: Optional[str] = Form(None),
     timestamp: Optional[str] = Form(None),
 ):
     """接收设备实时帧（与现有 /device/media/upload/image 同款 multipart 字段）。
 
-    字段：image（二进制图片）、camera_info（可选 JSON 字符串，其中 device_id 用于分桶）、
+    字段：image（二进制图片）、depth（可选，相机硬件深度图的伪彩 JPEG，随彩色帧
+    一并上报）、camera_info（可选 JSON 字符串，其中 device_id 用于分桶）、
     timestamp（可选）。仅更新该设备桶的最新帧并唤醒处理线程，立即返回，不阻塞在 GPU 推理上。
     """
     data = await image.read()
     if not data:
         return JSONResponse({"ok": False, "error": "空图片"}, status_code=400)
+    depth_data = await depth.read() if depth is not None else None
     dev = _parse_device_id(camera_info)
     now = time.time()
     with _cv:
@@ -231,6 +237,10 @@ async def ingest_frame(
         seq = st["seq"]
         st["image"] = data
         st["content_type"] = image.content_type or "image/jpeg"
+        if depth_data:
+            st["depth_seq"] += 1
+            st["depth_image"] = depth_data
+            st["depth_content_type"] = depth.content_type or "image/jpeg"
         st["prev_received_at"] = st["received_at"]
         st["received_at"] = now
         st["camera_info"] = camera_info
@@ -351,6 +361,24 @@ def latest_frame(device: Optional[str] = Query(None)):
     )
 
 
+@router.get("/api/frame/latest-depth")
+def latest_depth(device: Optional[str] = Query(None)):
+    """返回指定设备（缺省=选中设备）最新的相机硬件深度图字节（帧源已伪彩渲染，
+    供 /panel 左上角 <img> 直接展示）。没有深度能力的帧源（如手机 App）恒 404。"""
+    with _cv:
+        _dev, st = _target_device_locked(device)
+        img = st["depth_image"] if st else None
+        ct = st["depth_content_type"] if st else "image/jpeg"
+        seq = st["depth_seq"] if st else 0
+    if img is None:
+        return JSONResponse({"error": "暂无深度帧"}, status_code=404)
+    return Response(
+        content=img,
+        media_type=ct,
+        headers={"Cache-Control": "no-store", "X-Frame-Seq": str(seq)},
+    )
+
+
 @router.get("/api/frame/latest-product")
 def latest_product(device: Optional[str] = Query(None)):
     """返回指定设备（缺省=选中设备）最新的 DA3 图片类产物（如彩色深度图）字节。
@@ -390,7 +418,8 @@ def frame_status(device: Optional[str] = Query(None)):
             })
         if st is None:
             return JSONResponse({
-                "seq": 0, "has_frame": False, "device": dev, "selected": selected,
+                "seq": 0, "has_frame": False, "has_depth": False, "depth_seq": 0,
+                "device": dev, "selected": selected,
                 "devices": devices, "processor": _processor is not None,
                 "config": _config, "config_gen": _config_gen,
                 "received_at": None, "age": None, "interval": None, "fps": None,
@@ -404,6 +433,8 @@ def frame_status(device: Optional[str] = Query(None)):
         return JSONResponse({
             "seq": st["seq"],
             "has_frame": st["image"] is not None,
+            "has_depth": st["depth_image"] is not None,
+            "depth_seq": st["depth_seq"],
             "device": dev,
             "selected": selected,
             "devices": devices,

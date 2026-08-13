@@ -37,6 +37,10 @@ from pyorbbecsdk import Config, Context, OBFormat, OBSensorType, Pipeline
 RELAY_URL = os.environ.get("RELAY_URL", "http://192.168.0.50:8060").rstrip("/")
 PUSH_FPS = float(os.environ.get("PUSH_FPS", "3"))
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
+# 硬件深度图伪彩的固定量程（米）：固定而非逐帧 min/max 自适应——展台上手/物进出画面
+# 时整图颜色才不会跳变闪烁。桌面演示场景默认 0.2~2m，按展台纵深经 .env 调整。
+DEPTH_MIN_M = float(os.environ.get("DEPTH_MIN_M", "0.2"))
+DEPTH_MAX_M = float(os.environ.get("DEPTH_MAX_M", "2.0"))
 
 # 已知相机 PID → 稳定可读的 device_id 尾缀（新相机接入时补这张表即可）
 KNOWN_CAMERAS = {
@@ -123,15 +127,40 @@ def _to_jpeg(frame) -> bytes:
     return jpeg.tobytes()
 
 
-def _open_color_pipeline(dev):
-    """对设备开彩色流（显式取 default profile——简写 enable_stream(sensor) 在
-    1.3.2 绑定上会段错误，勿改回）。返回已 start 的 Pipeline。"""
+def _depth_to_jpeg(frame) -> bytes:
+    """硬件深度帧（uint16，单位由 depth_scale 折算毫米）→ 伪彩 JPEG。
+    固定量程归一化：近 → 亮/暖（TURBO 红端），远 → 暗/冷，无效点（0 值）→ 黑。"""
+    w, h = frame.get_width(), frame.get_height()
+    scale = float(getattr(frame, "get_depth_scale", lambda: 1.0)() or 1.0)
+    d = np.frombuffer(bytes(frame.get_data()), dtype=np.uint16).reshape(h, w)
+    d_mm = d.astype(np.float32) * scale
+    lo, hi = DEPTH_MIN_M * 1000.0, DEPTH_MAX_M * 1000.0
+    t = np.clip((hi - d_mm) / max(hi - lo, 1.0), 0.0, 1.0)
+    img = cv2.applyColorMap((t * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+    img[d == 0] = 0
+    ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    if not ok:
+        raise ValueError("深度图 JPEG 编码失败")
+    return jpeg.tobytes()
+
+
+def _open_pipeline(dev):
+    """对设备开彩色+深度流（显式取 default profile——简写 enable_stream(sensor) 在
+    1.3.2 绑定上会段错误，勿改回）。深度流开不出来时降级为只推彩色。
+    返回 (已 start 的 Pipeline, 是否含深度流)。"""
     pipe = Pipeline(dev)
     cfg = Config()
     profiles = pipe.get_stream_profile_list(OBSensorType.COLOR_SENSOR)
     cfg.enable_stream(profiles.get_default_video_stream_profile())
+    has_depth = False
+    try:
+        dprofiles = pipe.get_stream_profile_list(OBSensorType.DEPTH_SENSOR)
+        cfg.enable_stream(dprofiles.get_default_video_stream_profile())
+        has_depth = True
+    except Exception as e:
+        log.warning("深度流不可用，降级只推彩色: %s", e)
     pipe.start(cfg)
-    return pipe
+    return pipe, has_depth
 
 
 def _camera_worker(pid: int, device_id: str):
@@ -148,9 +177,11 @@ def _camera_worker(pid: int, device_id: str):
                 dev = _find_device(ctx, pid)
                 if dev is None:
                     raise RuntimeError("设备未找到（未插 / 被占用 / 尚未就绪）")
-                pipe = _open_color_pipeline(dev)
-            log.info("[%s] 彩色流已启动", device_id)
+                pipe, has_depth = _open_pipeline(dev)
+            log.info("[%s] 彩色%s流已启动", device_id, "+深度" if has_depth else "")
             first = True
+            first_depth = True
+            depth_err = 0
             last_push = 0.0
             while not _stop.is_set():
                 fs = pipe.wait_for_frames(500)
@@ -167,10 +198,27 @@ def _camera_worker(pid: int, device_id: str):
                 if now - last_push < get_push_interval():
                     continue
                 jpeg = _to_jpeg(cf)
+                # 同帧组里带硬件深度帧则伪彩后随同上报（帧组偶尔缺深度帧属正常，
+                # 面板端保留上一张；伪彩失败只丢深度不影响彩色帧）
+                files = {"image": ("frame.jpg", jpeg, "image/jpeg")}
+                df = fs.get_depth_frame() if has_depth else None
+                if df is not None:
+                    try:
+                        files["depth"] = ("depth.jpg", _depth_to_jpeg(df), "image/jpeg")
+                        if first_depth:
+                            log.info("[%s] 首帧深度 %dx%d 量程 %.1f~%.1fm", device_id,
+                                     df.get_width(), df.get_height(),
+                                     DEPTH_MIN_M, DEPTH_MAX_M)
+                            first_depth = False
+                    except Exception as e:
+                        depth_err += 1
+                        if depth_err == 1 or depth_err % 100 == 0:
+                            log.warning("[%s] 深度帧伪彩失败 %d 次: %s",
+                                        device_id, depth_err, e)
                 try:
                     resp = session.post(
                         f"{RELAY_URL}/api/frame",
-                        files={"image": ("frame.jpg", jpeg, "image/jpeg")},
+                        files=files,
                         data={
                             "camera_info": json.dumps(
                                 {"device_id": device_id, "source": "mac-mini"}),

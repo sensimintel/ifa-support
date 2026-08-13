@@ -12,8 +12,11 @@
 | Orbbec Gemini 335 | `0x0800` | `macmini-g335` | 1280×720 MJPG（JPEG 直传不转码） |
 | Astra Pro Plus | `0x060F` | `macmini-astra` | 默认 profile，非 MJPG 时 cv2 转码 |
 
-只开彩色流不开深度（8060 只吃 RGB，深度由 DA3 自己算）。默认 3fps/台（`.env`
-可调），LAN 带宽占用约几百 KB/s。
+彩色流之外同时开**硬件深度流**：深度帧在 mini 端做固定量程伪彩（近亮暖/远暗冷/
+无效点黑，默认 0.2~2m，`DEPTH_MIN_M`/`DEPTH_MAX_M` 可调）后随彩色帧一并 POST
+（multipart 可选字段 `depth`），供 `/panel` 左上角「相机硬件深度图」格展示；深度不
+参与 DA3 处理（DA3 点云仍由 RGB 算）。深度与彩色 FOV 不同、纯展示不做 D2C 对齐。
+默认 3fps/台（面板滑杆可调），LAN 带宽占用约几百 KB/s。
 
 ## 运行形态
 
