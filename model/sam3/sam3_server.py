@@ -426,7 +426,7 @@ def _sweep_streams():
 threading.Thread(target=_sweep_streams, daemon=True).start()
 
 app = FastAPI(title="SAM3 Inference Server", version="2.0.0")
-# Prometheus 埋点：暴露 /metrics，含每端点 QPS/延时直方图/in-flight/错误率（对标 LocateAnything 观测）
+# Prometheus 埋点：暴露 /metrics，含每端点 QPS/延时直方图/in-flight/错误率
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 @app.on_event("startup")
