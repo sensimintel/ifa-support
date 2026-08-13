@@ -41,6 +41,8 @@ env/
 .vscode/
 
 sam3_score_cfg.json
+sam3hl_preset.json
+sam3hl_preset.json.tmp
 
 # per-device 帧率配置（frame_relay 落盘持久化，运行时生成）
 dev_config.json
