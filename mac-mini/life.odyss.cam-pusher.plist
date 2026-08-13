@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- mac mini 摄像头推帧器常驻单元。装到 /Library/LaunchDaemons（必须是系统级
+     Daemon 而非用户 Agent：pyorbbecsdk 经 libusb 直读 USB 需要 root，且要在
+     无人登录的开机态就拉起）。安装/更新由 mac-mini/deploy.sh 负责。 -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>life.odyss.cam-pusher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/odyss/ifa-support/mac-mini/run-pusher.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/odyss/Library/Logs/cam-pusher.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/odyss/Library/Logs/cam-pusher.log</string>
+</dict>
+</plist>

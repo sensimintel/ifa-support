@@ -19,12 +19,14 @@ import json
 import os
 import re
 import shutil
+import struct
 import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -48,7 +50,9 @@ from depth_anything_3.api import DepthAnything3  # noqa: E402
 from depth_anything_3.app.gradio_app import DepthAnything3App  # noqa: E402
 
 from frame_relay import (  # noqa: E402
-    UNKNOWN_DEVICE, get_selected_device, router as frame_router, set_processor)
+    DEFERRED, UNKNOWN_DEVICE, get_latest_frame, get_selected_device,
+    router as frame_router,
+    set_processor, set_product, set_stereo_processor, set_stereo_product)
 
 MODEL_DIR = str(DA3_ROOT / "models" / "DA3NESTED-GIANT-LARGE-1.1")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -177,111 +181,10 @@ def build_mesh_glb(pred, out_path, conf_thresh_percentile=40.0, edge_ratio=0.06)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# LocateAnything 检测：调 5090 本地 LocateAnything 网关（localhost:8000，OpenAI 兼容），
-# 在帧上定位 food / drink，并把检测框内点云的 3D 包围盒画成彩色粗线框叠到点云 GLB 上。
-#   · 输入务必用 DA3 处理后的 processed_images（与深度同一张图），检测框归一化坐标零错位。
-#   · 坐标契约：响应 content 里 `<ref>label</ref><box><x1><y1><x2><y2></box>`，0-999 归一化，
-#     未命中 `<box>None</box>`；多类以 `</c>` 分隔（逗号分隔在真实第一视角帧上会崩，勿用）。
+# 检测标签配色：food 红 / drink 蓝（SAM3 mask 染色、3D 框与 2D 框绘制共用）。
 # ══════════════════════════════════════════════════════════════════════
-LOCATE_ENDPOINT = "http://127.0.0.1:8000/v1/chat/completions"
-LOCATE_MODEL = "nvidia/LocateAnything-3B"
-# 每项 =（LocateAnything 查询词, 显示/颜色 label）。液体改用具体容器词(bottle/glass)替代抽象 "drink"：
-# 检测分工（识别工作流）：食物走 LA（只发 food 一路）；液体走 SAM3 流式（bottle/glass，
-# 见 SAM3_CLOUD_TARGETS）。"drink" 抽象词召回差(实测饮料罐召回 0)，液体用具体容器词。
-LOCATE_TARGETS = [
-    ("food", "food"),        # 食物 → 红框
-]
-LOCATE_TIMEOUT = 20.0                     # 单次检测超时（秒）；已挪到 GPU 锁外，不阻塞产线
-LOCATE_COLORS = {"food": (222, 52, 52),   # food = 红
-                 "drink": (46, 120, 235)}  # drink = 蓝
-_LOCATE_RE = re.compile(r"<ref>(.*?)</ref>\s*<box>(.*?)</box>", re.S)
-_LOCATE_INT_RE = re.compile(r"<(-?\d+)>")
-
-
-def _locate_one(rgb: np.ndarray, query: str, label: str):
-    """单类 LocateAnything 检测：用 query 词定位，命中框统一归到 label（决定颜色/语义）。
-
-    入参 rgb 为 uint8 RGB。返回 [(label, nx1, ny1, nx2, ny2), ...]，坐标归一化 0-1（左上、右下）；
-    未命中/失败返回 []。label 用调用方指定值（如 bottle/glass 查询都归 "drink"），不看模型 ref。"""
-    try:
-        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-        if not ok:
-            return []
-        b64 = base64.b64encode(buf.tobytes()).decode()
-        payload = {
-            "model": LOCATE_MODEL,
-            "messages": [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-                {"type": "text",
-                 "text": f"Locate all the instances that matches the following description: {query}."},
-            ]}],
-            "max_tokens": 2048, "temperature": 0.0,   # 大 token 上限避免多目标时截断→漏检
-        }
-        req = urllib.request.Request(
-            LOCATE_ENDPOINT, data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=LOCATE_TIMEOUT) as r:
-            content = json.loads(r.read().decode())["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"[da3-web] LocateAnything({query}) 调用失败：{type(e).__name__}: {e}", flush=True)
-        return []
-    dets = []
-    for _ref, box in _LOCATE_RE.findall(content):
-        if "none" in box.lower():
-            continue
-        ints = [int(x) for x in _LOCATE_INT_RE.findall(box)]
-        # 每 4 个整数一个框，兼容单/多实例
-        for k in range(0, len(ints) - 3, 4):
-            x1, y1, x2, y2 = ints[k:k + 4]
-            nx1, ny1 = min(x1, x2) / 1000.0, min(y1, y2) / 1000.0
-            nx2, ny2 = max(x1, x2) / 1000.0, max(y1, y2) / 1000.0
-            if nx2 - nx1 < 0.01 or ny2 - ny1 < 0.01:  # 退化框丢弃
-                continue
-            dets.append((label, nx1, ny1, nx2, ny2))
-    return dets
-
-
-def _locate_food_drink(rgb: np.ndarray):
-    """并发对 LOCATE_TARGETS 每个（查询词, label）各发独立单类请求，聚合成 food/drink 框。
-
-    液体用具体容器词 bottle/glass 替代抽象 "drink"（"drink" 召回差、实测饮料罐召回 0）；
-    每项独立请求各自专注、召回更稳，且都走线程池并发，总耗时≈单次而非累加。
-    入参 rgb 为 uint8 RGB（应传与点云同视图的图）。返回 [(label, nx1, ny1, nx2, ny2), ...]
-    归一化 0-1；全失败返回 []（点云仍能出、只是没框）。"""
-    with ThreadPoolExecutor(max_workers=len(LOCATE_TARGETS)) as ex:
-        results = list(ex.map(lambda ql: _locate_one(rgb, ql[0], ql[1]), LOCATE_TARGETS))
-    dets = []
-    for r in results:
-        dets.extend(r)
-    return dets
-
-
-# 检测异步化：cloudimg 每帧渲染不等检测(检测占整段 ~280ms)；用最近缓存的框，后台线程按 TTL 异步刷新。
-LOCATE_CACHE_TTL = 2.0
-_locate_cache = {"dets": [], "ts": 0.0, "running": False}
-_locate_cache_lock = threading.Lock()
-
-
-def _locate_refresh(arr):
-    try:
-        d = _locate_food_drink(arr)
-        with _locate_cache_lock:
-            _locate_cache["dets"] = d
-            _locate_cache["ts"] = time.time()
-    finally:
-        with _locate_cache_lock:
-            _locate_cache["running"] = False
-
-
-def _detections_async(arr):
-    """返回最近缓存的 food/drink 框（不阻塞渲染）；缓存过期且无在跑则后台异步刷新一次。"""
-    now = time.time()
-    with _locate_cache_lock:
-        dets = _locate_cache["dets"]
-        if now - _locate_cache["ts"] > LOCATE_CACHE_TTL and not _locate_cache["running"]:
-            _locate_cache["running"] = True
-            threading.Thread(target=_locate_refresh, args=(arr.copy(),), daemon=True).start()
-    return dets
+LABEL_COLORS = {"food": (222, 52, 52),   # food = 红
+                "drink": (46, 120, 235)}  # drink = 蓝
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -452,6 +355,38 @@ def _sam3_stream_frame(word, rgb):
                     r.get("debug"))
         sid = None                    # 失败（session 被回收/服务重启）：重建一次再试
     return None, None, None, None
+
+
+# ── 双目 IR 专用流式 session（与 RGB 主链路的 _sam3_stream_sessions 完全隔离：
+#    IR 帧混入 RGB session 会污染其跟踪记忆，反之亦然，故各养各的）──────────────
+_sam3_ir_sessions = {}      # 词 -> session_id（左目 IR 流式）
+_sam3_ir_lock = threading.Lock()
+
+
+def _sam3_ir_stream_frame(word, rgb):
+    """左目 IR 帧对单个词做流式增量步进（与 _sam3_stream_frame 同构、独立 session 表）。
+    增量步进比每帧无状态整图分割便宜，且 obj_id 跨帧稳定（同物同色不闪）。
+    返回 instances 列表；失败/流式不可用返回 []。"""
+    b64 = _b64_jpg(rgb)
+    if not b64:
+        return []
+    cfg = _get_score_cfg()
+    with _sam3_ir_lock:
+        sid = _sam3_ir_sessions.get(word)
+    for _retry in range(2):
+        if not sid:
+            sid = _sam3_stream_start(word)
+            if not sid:
+                return []
+            with _sam3_ir_lock:
+                _sam3_ir_sessions[word] = sid
+        r = _sam3_post("/v1/stream/frame", {"session_id": sid, "image_b64": b64,
+                                            "alpha": cfg["alpha"],
+                                            "det_thresh": cfg["thresh"]})
+        if r is not None:
+            return r.get("instances") or []
+        sid = None                    # session 被回收/服务重启：重建一次再试
+    return []
 
 
 _SAM3_COLORS = [(222, 52, 52), (46, 120, 235), (26, 158, 95), (240, 150, 20),
@@ -665,7 +600,7 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
         lo = np.percentile(sub_pts, 2, axis=0)
         hi = np.percentile(sub_pts, 98, axis=0)
         hi = np.where(hi - lo < 1e-3, lo + 1e-3, hi)   # 防退化成面/线
-        color = LOCATE_COLORS.get(label, (255, 200, 0))
+        color = LABEL_COLORS.get(label, (255, 200, 0))
         for m in _box_wireframe_meshes(lo, hi, color, radius):
             scene.add_geometry(m)
         hit_labels.append(label)
@@ -696,6 +631,344 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
 
     scene.export(out_path)
     return hit_labels
+
+
+# GLB 产物 POSITION 量化回退开关（KHR_mesh_quantization）：默认开——点坐标用 uint16
+# 归一化存储（12B/点 → 6B/点，产物省约 1/3 传输量），node 挂 scale/translation 还原。
+# 前端 model-viewer 若出现异常（点云消失/取景错乱/尺度不对等），在 .env 置 GLB_QUANTIZE=0
+# 重启即回退 float32 存储，无需改代码。
+GLB_QUANTIZE = os.environ.get("GLB_QUANTIZE", "1") not in ("0", "false", "False")
+
+
+def _write_pointcloud_glb(out_path, pc_pts, pc_cols, cam_wires=None, quantize=False):
+    """手写二进制 glTF(GLB) 导出器：替代 trimesh Scene 组装 + export（两项合计 ~43ms/份，
+    是构建耗时的最大单项；手写序列化只做必要的字节拼接，毫秒级）。
+
+    产物结构与 trimesh 版对齐：
+      · 点云：1 个 POINTS primitive（POSITION VEC3 + COLOR_0 uint8 VEC4 normalized）
+      · 1mm 锚三角面：model-viewer 的 load 事件/取景依赖场景里存在三角面 mesh，必须保留
+      · 相机线框：LINES primitive（逐顶点颜色），cam_wires=[(segs(M,2,3), rgb), ...]，
+        None/空则不写
+    quantize=True 时点云 POSITION 用 uint16 归一化存储（KHR_mesh_quantization），
+    node 挂 scale/translation 还原坐标（量化误差 ≤ 包围盒边长/65535/2，场景尺度下亚毫米）；
+    锚三角/相机线框保持 float32（体量可忽略，不值得引入额外还原节点）。
+
+    GLB 布局：12B header + JSON chunk（4 对齐，空格补齐）+ BIN chunk（4 对齐，零补齐）。"""
+    def _pad4(b, fill=b"\x00"):
+        return b + fill * (-len(b) % 4)
+
+    bin_parts, views, accessors = [], [], []
+    _off = [0]
+
+    def _add_view(data):
+        # 追加一个 4 对齐的 bufferView，返回其下标（对齐保证后续 accessor 偏移合法）
+        padded = _pad4(data)
+        bin_parts.append(padded)
+        views.append({"buffer": 0, "byteOffset": _off[0], "byteLength": len(data)})
+        _off[0] += len(padded)
+        return len(views) - 1
+
+    meshes, nodes = [], []
+    n = int(pc_pts.shape[0])
+    node_pc = None
+    if n > 0:
+        pts = np.ascontiguousarray(pc_pts, dtype=np.float32)
+        lo = pts.min(axis=0); hi = pts.max(axis=0)
+        node_pc = {"mesh": 0}
+        if quantize:
+            # uint16 归一化量化：存 [0,65535]，accessor.normalized 解码回 [0,1]，再由
+            # node 的 scale=包围盒边长 / translation=包围盒角点 还原到原坐标
+            span = np.maximum(hi - lo, np.float32(1e-6))
+            q = np.clip(np.rint((pts - lo) / span * 65535.0),
+                        0, 65535).astype(np.uint16)
+            vi = _add_view(q.tobytes())
+            accessors.append({"bufferView": vi, "componentType": 5123, "count": n,
+                              "type": "VEC3", "normalized": True,
+                              # 规范要求 min/max 写存储原值（归一化前的整数）
+                              "min": [int(x) for x in q.min(axis=0)],
+                              "max": [int(x) for x in q.max(axis=0)]})
+            node_pc["scale"] = [float(x) for x in span]
+            node_pc["translation"] = [float(x) for x in lo]
+        else:
+            vi = _add_view(pts.tobytes())
+            accessors.append({"bufferView": vi, "componentType": 5126, "count": n,
+                              "type": "VEC3",
+                              "min": [float(x) for x in lo],
+                              "max": [float(x) for x in hi]})
+        vi = _add_view(np.ascontiguousarray(pc_cols, dtype=np.uint8).tobytes())
+        accessors.append({"bufferView": vi, "componentType": 5121, "count": n,
+                          "type": "VEC4", "normalized": True})
+        meshes.append({"primitives": [{"attributes": {"POSITION": 0, "COLOR_0": 1},
+                                       "mode": 0}]})           # mode 0 = POINTS
+        nodes.append(node_pc)
+        # 1mm 三角面 mesh 锚：确保 model-viewer 触发 load（理由同单目链路）。
+        # 独立 node、不挂量化还原变换——锚三角始终 float32
+        anchor = np.array([[0, 0, 0], [1e-3, 0, 0], [0, 1e-3, 0]], dtype=np.float32)
+        vi = _add_view(anchor.tobytes())
+        accessors.append({"bufferView": vi, "componentType": 5126, "count": 3,
+                          "type": "VEC3", "min": [0.0, 0.0, 0.0],
+                          "max": [1e-3, 1e-3, 0.0]})
+        meshes.append({"primitives": [{"attributes": {"POSITION": len(accessors) - 1},
+                                       "mode": 4}]})           # mode 4 = TRIANGLES
+        nodes.append({"mesh": len(meshes) - 1})
+    if cam_wires:
+        # 相机线框合并成一个 LINES primitive（非索引、顶点两两成段），逐顶点烘相机颜色
+        seg_pts = np.concatenate([np.asarray(s, np.float32).reshape(-1, 3)
+                                  for (s, _c) in cam_wires])
+        seg_cols = np.concatenate(
+            [np.tile(np.array([c[0], c[1], c[2], 255], np.uint8),
+                     (np.asarray(s).reshape(-1, 3).shape[0], 1))
+             for (s, c) in cam_wires])
+        vi = _add_view(np.ascontiguousarray(seg_pts).tobytes())
+        accessors.append({"bufferView": vi, "componentType": 5126,
+                          "count": int(seg_pts.shape[0]), "type": "VEC3",
+                          "min": [float(x) for x in seg_pts.min(axis=0)],
+                          "max": [float(x) for x in seg_pts.max(axis=0)]})
+        pos_ai = len(accessors) - 1
+        vi = _add_view(np.ascontiguousarray(seg_cols).tobytes())
+        accessors.append({"bufferView": vi, "componentType": 5121,
+                          "count": int(seg_cols.shape[0]), "type": "VEC4",
+                          "normalized": True})
+        meshes.append({"primitives": [{"attributes": {"POSITION": pos_ai,
+                                                      "COLOR_0": len(accessors) - 1},
+                                       "mode": 1}]})           # mode 1 = LINES
+        nodes.append({"mesh": len(meshes) - 1})
+
+    bin_chunk = b"".join(bin_parts)
+    j = {"asset": {"version": "2.0", "generator": "da3-web"},
+         "scene": 0, "scenes": [{"nodes": list(range(len(nodes)))}],
+         "nodes": nodes, "meshes": meshes,
+         "bufferViews": views, "accessors": accessors,
+         "buffers": [{"byteLength": len(bin_chunk)}]}
+    if quantize and node_pc is not None and "scale" in node_pc:
+        j["extensionsUsed"] = ["KHR_mesh_quantization"]
+        j["extensionsRequired"] = ["KHR_mesh_quantization"]
+    jb = _pad4(json.dumps(j, separators=(",", ":")).encode("utf-8"), b" ")
+    bin_padded = _pad4(bin_chunk)
+    total = 12 + 8 + len(jb) + 8 + len(bin_padded)
+    with open(out_path, "wb") as f:
+        f.write(b"glTF" + struct.pack("<II", 2, total)
+                + struct.pack("<I", len(jb)) + b"JSON" + jb
+                + struct.pack("<I", len(bin_padded)) + b"BIN\x00" + bin_padded)
+
+
+def _stereo_geometry(pred, conf_thresh_percentile, num_max_points, outlier_mad,
+                     point_scale):
+    """双目点云「几何阶段」：反投影/conf 分位裁剪/随机降采样/MAD 裁离群，一次算好与
+    颜色无关的全部中间结果。主产物与高亮版共享同一份几何（各自只做顶点色 bake +
+    glTF 导出），两份 GLB 不再重复算几何管线。
+
+    返回 dict：
+      pts        最终点坐标 (M,3) float32（已合到左目系/flip/缩放/降采样/裁离群）
+      vidx       各视角有效像素的扁平下标列表（上色阶段按它抽取整图颜色）
+      final_idx  最终点在「各视角有效点拼接序」里的下标（颜色/conf 与点一一对应的桥）
+      cf_concat  拼接序逐点 conf（float32；无 conf 时 None，alpha 烘焙用）
+      K/ext      相机内外参（相机线框与返回 K0 用）
+      shape      (N, H, W)
+      key        几何参数指纹（conf 分位/点预算/MAD 倍数/缩放）——不等时不得复用"""
+    from depth_anything_3.utils.export import glb as _glb  # 复用官方外参齐次化
+
+    depth = np.asarray(pred.depth).astype(np.float32)       # (N,H,W)
+    K = np.asarray(pred.intrinsics).astype(np.float64)      # (N,3,3)
+    N, H, W = depth.shape
+    ext = pred.extrinsics
+    if ext is None:
+        ext = np.tile(np.eye(4, dtype=np.float64), (N, 1, 1))
+    else:
+        ext = np.stack([_glb._as_homogeneous44(np.asarray(e).astype(np.float64))
+                        for e in ext])
+    conf = pred.conf
+    conf_thr = None
+    if conf is not None:
+        conf = np.asarray(conf).astype(np.float32)
+        # 绝对下限传 0：理由同单目链路（写死 1.05 会钉死阈值、分位滑块失效）。
+        # 与 get_conf_thresh 同语义，但两次 percentile 合成一趟算完
+        _p_lo, _p90 = np.percentile(conf, [float(conf_thresh_percentile), 90.0])
+        conf_thr = float(min(max(0.0, float(_p_lo)), float(_p90)))
+
+    ext0 = ext[0]
+    scale = float(point_scale) if point_scale else 1.0
+    pts_all, cf_all, vidx_list = [], [], []
+    for i in range(N):
+        d = depth[i]
+        valid = np.isfinite(d) & (d > 0)
+        if getattr(pred, "sky", None) is not None:
+            valid &= ~np.asarray(pred.sky)[i].astype(bool)
+        if conf is not None:
+            valid &= conf[i] >= conf_thr
+        vidx = np.flatnonzero(valid.reshape(-1))
+        vidx_list.append(vidx)
+        if vidx.size == 0:
+            continue
+        # 先按 valid 下标取像素子集再反投影（原实现整图 H*W 像素乘完才筛，白算被裁掉
+        # 的大半）；矩阵乘全程 float32——点云精度足够，比 float64 快约一倍
+        u = (vidx % W).astype(np.float32)
+        v = (vidx // W).astype(np.float32)
+        pix = np.stack([u, v, np.ones_like(u)], 0)          # (3, M) 齐次像素坐标
+        K_inv = np.linalg.inv(K[i]).astype(np.float32)
+        Xc = (K_inv @ pix).T * d.reshape(-1)[vidx][:, None]  # 视角 i 相机坐标 (M,3)
+        T = (ext0 @ np.linalg.inv(ext[i])).astype(np.float32)  # 视角 i 相机 → 视角 0 相机
+        X0 = Xc @ T[:3, :3].T + T[:3, 3]
+        X0[:, 1] *= -1.0                                    # flip Y（glTF Y 向上）
+        X0[:, 2] *= -1.0                                    # flip Z（glTF 相机看 -Z）
+        if scale != 1.0:
+            X0 *= scale
+        pts_all.append(X0)
+        if conf is not None:
+            cf_all.append(conf[i].reshape(-1)[vidx])
+    if not pts_all:
+        raise RuntimeError("双目点云为空（有效深度点不足）")
+    pc_pts = np.concatenate(pts_all)
+    cf_concat = np.concatenate(cf_all) if cf_all else None
+    # 随机降采样（与官方 _filter_and_downsample 同语义：先剔非有限值，超预算无放回抽样；
+    # default_rng 的无放回抽样比传统 np.random.choice 快约一个量级）。全程记录下标
+    # final_idx，供上色阶段对拼接序的颜色/conf 做同样抽取，点与色严格一一对应
+    idx = np.flatnonzero(np.isfinite(pc_pts).all(axis=1))
+    if idx.size > int(num_max_points):
+        idx = idx[np.random.default_rng().choice(idx.size, int(num_max_points),
+                                                 replace=False)]
+    pc_pts = pc_pts[idx]
+    # 深度(Z)方向 MAD 稳健裁离群：理由与参数同单目链路（防深度爆点撑爆取景包围盒）
+    if pc_pts.shape[0] > 200:
+        zc = -pc_pts[:, 2]
+        med = float(np.median(zc))
+        mad = float(np.median(np.abs(zc - med))) + 1e-6
+        keep = zc <= med + float(outlier_mad) * mad
+        pc_pts = pc_pts[keep]
+        idx = idx[keep]
+    return {"pts": pc_pts, "vidx": vidx_list, "final_idx": idx,
+            "cf_concat": cf_concat, "K": K, "ext": ext, "shape": (N, H, W),
+            "key": (float(conf_thresh_percentile), int(num_max_points),
+                    float(outlier_mad),
+                    None if point_scale is None else float(point_scale))}
+
+
+def _stereo_bake_colors(pred, geo, mask_overlays, color_gamma, hl_cfg,
+                        bake_conf_alpha):
+    """双目点云「上色阶段」：gamma 提亮/HSV 调色/mask 染色（或高亮样式）烘进整图颜色，
+    再按几何阶段记录的下标抽取成逐点 RGBA (M,4) uint8。调色逻辑与原实现逐行同款，
+    仅从几何循环里拆出——主产物与高亮版对同一份几何各跑一次本阶段即可。"""
+    N, H, W = geo["shape"]
+    rgb = (np.asarray(pred.processed_images)
+           if getattr(pred, "processed_images", None) is not None else None)
+    if rgb is None or rgb.shape[:3] != (N, H, W):
+        rgb = np.full((N, H, W, 3), 180, np.uint8)
+    elif rgb.dtype != np.uint8:
+        # processed_images 可能是 0-1 浮点：与 _rgb_uint8 同款换算，直接转 uint8 会全黑
+        rgb = np.clip(rgb * (255 if rgb.max() <= 1.0 else 1), 0, 255).astype(np.uint8)
+    if color_gamma:
+        # 顶点色伽马提亮（<1 提暗部）：IR 无环境光时后景灰度极低，点云黑底上后景点
+        # 肉眼不可见——只提显示颜色，不影响喂给 DA3 的原始输入与几何
+        lut = (np.power(np.arange(256, dtype=np.float32) / 255.0,
+                        float(color_gamma)) * 255.0).astype(np.uint8)
+        rgb = lut[rgb]
+    if hl_cfg is not None:
+        # 高亮模式（/experience「双目高亮点云」来源）：与单目④同语义——先按配置调
+        # 底色（色相/饱和/明度，逐视角），再把样式化染色/纯色/提亮/描边 + 背景压暗
+        # 写进顶点色（mask 只在左目，无框）
+        _gs = float(hl_cfg.get("sat", 1.0)); _gv = float(hl_cfg.get("val", 1.0))
+        _gh = float(hl_cfg.get("hue", 0.0))
+        if abs(_gs - 1.0) > 1e-3 or abs(_gv - 1.0) > 1e-3 or abs(_gh) > 0.5:
+            graded = []
+            for i in range(N):
+                _hsv = cv2.cvtColor(rgb[i], cv2.COLOR_RGB2HSV).astype(np.float32)
+                _hsv[..., 0] = np.mod(_hsv[..., 0] + _gh / 2.0, 180.0)  # OpenCV H 范围 [0,180)
+                _hsv[..., 1] *= _gs
+                _hsv[..., 2] *= _gv
+                _h = np.mod(_hsv[..., 0], 180.0)
+                _sv = np.clip(_hsv[..., 1:], 0, 255)
+                _hsv = np.concatenate([_h[..., None], _sv], -1)
+                graded.append(cv2.cvtColor(_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB))
+            rgb = np.stack(graded)
+        if mask_overlays:
+            v0, _ = _apply_hl_styles(rgb[0].copy(), mask_overlays, hl_cfg)
+            rgb = np.concatenate([v0[None], rgb[1:]], axis=0)
+    elif mask_overlays:
+        # SAM3 mask 染进左目视角的点颜色（与③同款 0.5 混合）
+        v0 = rgb[0].copy()
+        for (_label, _col, _mk) in mask_overlays:
+            v0[_mk] = (v0[_mk].astype(np.float32) * 0.5
+                       + np.array(_col, np.float32) * 0.5).astype(np.uint8)
+        rgb = np.concatenate([v0[None], rgb[1:]], axis=0)
+
+    # 按几何阶段的下标抽色：先拼各视角有效点颜色，再取降采样/MAD 后的最终下标
+    cols = np.concatenate([rgb[i].reshape(-1, 3)[geo["vidx"][i]] for i in range(N)])
+    cols = cols[geo["final_idx"]].astype(np.uint8)
+    # 颜色带 alpha 通道：默认 255；bake_conf_alpha 时把逐点置信度（5/95 分位稳健归一，
+    # 跨两视角统一标定——分位按降采样前全量 conf 算，与原实现一致）烘进 alpha
+    # [40,255]——供前端「置信度→点大小/透明度」联动
+    if bake_conf_alpha and geo["cf_concat"] is not None:
+        _cf = geo["cf_concat"]
+        _lo, _hi = (float(x) for x in np.percentile(_cf, [5.0, 95.0]))
+        _t = np.clip((_cf[geo["final_idx"]] - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
+        alpha = (40.0 + _t * 215.0).astype(np.uint8)
+    else:
+        alpha = np.full(cols.shape[0], 255, np.uint8)
+    return np.concatenate([cols, alpha[:, None]], axis=1)
+
+
+def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
+                                num_max_points=800000, show_cameras=True,
+                                mask_overlays=None, outlier_mad=12.0,
+                                point_scale=None, color_gamma=None,
+                                hl_cfg=None, bake_conf_alpha=False, geo=None):
+    """双视角（左右 IR）点云 GLB：每个视角各自反投影后，经 DA3 估计的相对位姿统一
+    合到「视角 0（左目）相机坐标系」，再 flip Y/Z 到 glTF 约定——与单目链路同一坐标
+    语义（左目相机=原点、光轴固定），前端同一套取景逻辑直接可用。
+
+    pred.extrinsics 是 w2c（DA3 约定）：视角 i 相机点 → 视角 0 相机系的变换为
+    T_i = ext0 @ inv(ext_i)。mask_overlays 只作用于视角 0（SAM3 跑左目图）。
+    point_scale 非空则整体缩放点云与相机线框（用真实基线恢复米制尺度）。
+    返回视角 0 的相机内参 K0（前端算 FOV 用）。
+
+    实现拆成「几何阶段」（_stereo_geometry）与「上色导出阶段」（_stereo_bake_colors +
+    _write_pointcloud_glb 手写 GLB 序列化，不再走 trimesh）。geo 传入外部预算好的
+    几何结果时两份产物共享一份几何；其参数指纹与本次调用不一致（面板把主产物与
+    高亮版的 conf 分位/outlier_mad 调不等）时自动忽略、回退独立几何计算，行为与
+    共享前完全一致。"""
+    from depth_anything_3.utils.export import glb as _glb  # 复用官方相机线框几何/场景尺度
+
+    _key = (float(conf_thresh_percentile), int(num_max_points), float(outlier_mad),
+            None if point_scale is None else float(point_scale))
+    if geo is None or geo.get("key") != _key:
+        geo = _stereo_geometry(pred, conf_thresh_percentile, num_max_points,
+                               outlier_mad, point_scale)
+    pc_pts = geo["pts"]
+    pc_cols = _stereo_bake_colors(pred, geo, mask_overlays, color_gamma, hl_cfg,
+                                  bake_conf_alpha)
+    K, ext = geo["K"], geo["ext"]
+    N, H, W = geo["shape"]
+
+    cam_wires = None
+    if show_cameras:
+        try:
+            ext0 = ext[0]
+            scale = float(point_scale) if point_scale else 1.0
+
+            # 米制缩放下相机位置也要同尺度：把相对位姿的平移分量乘 scale（线框尺寸由
+            # scene_scale 决定，已含缩放，不能再二次缩放）。
+            # 相对外参：视角 0 = identity，视角 i = ext_i @ inv(ext0)
+            def _rel_ext(i):
+                pose = np.linalg.inv(ext[i] @ np.linalg.inv(ext0))
+                pose[:3, 3] *= scale
+                return np.linalg.inv(pose)
+
+            scene_scale = _glb._estimate_scene_scale(pc_pts, fallback=1.0)
+            cam_wires = []
+            for i in range(N):
+                segs = np.asarray(_glb._camera_frustum_lines(
+                    K[i], _rel_ext(i), W, H, scene_scale * 0.03), np.float64)
+                # 与点云同坐标系：仅 flip Y/Z（相机固定在原点，等价原 hf_alignment 矩阵）
+                segs[..., 1] *= -1.0
+                segs[..., 2] *= -1.0
+                cam_wires.append((segs.astype(np.float32),
+                                  _glb._index_color_rgb(i, N)))
+        except Exception:
+            cam_wires = None
+
+    _write_pointcloud_glb(out_path, pc_pts, pc_cols, cam_wires=cam_wires,
+                          quantize=GLB_QUANTIZE)
+    return K[0]
 
 
 def _hex_rgb(s, fallback=(255, 159, 10)):
@@ -920,7 +1193,7 @@ def _render_pointcloud_image(pred, detections=None, conf_thresh_percentile=40.0,
 # 最后一帧(=当前帧)的 mask 解码后映射到同一帧的 DA3 点云——mask 点染色 + 3D AABB 框，
 # 用与 cloudimg 相同的固定相机服务端渲染成图，前端 /panel 第三框轮询展示。
 # ══════════════════════════════════════════════════════════════════════
-# SAM3 流式只追液体（bottle/glass → drink 蓝），食物由 LA 负责（LOCATE_TARGETS）。
+# SAM3 流式只追液体（bottle/glass → drink 蓝）。
 # 流式配置（窗口/关代周期等旋钮）不动，只改目标词。
 SAM3_CLOUD_TARGETS = [
     ("bottle", "drink"),     # 瓶装 → 蓝(液体)
@@ -999,7 +1272,7 @@ _HL_NUM_FIELDS = {
     "pt_pulse_speed": (0.2, 3.0, float),    # 脉冲/闪烁频率（Hz）
     "pt_sparkle": (0.0, 1.0, float),   # 星光闪烁强度（逐点错相位）
     # 置信度联动（读顶点色 alpha 通道里烘焙的置信度；任一 >0 时服务端才开始烘焙，
-    # 首次开启需等下一轮 GLB，之后实时调节；仅③④，LA 点云无此数据）
+    # 首次开启需等下一轮 GLB，之后实时调节；仅③④，单目点云无此数据）
     "pt_conf_size": (0.0, 1.0, float),   # 置信度→点大小（低置信点变小）
     "pt_conf_alpha": (0.0, 1.0, float),  # 置信度→透明度（低置信点变透明）
 }
@@ -1065,6 +1338,13 @@ def _save_sam3hl_preset():
 _load_sam3hl_preset()
 _sam3hl = {"kind": None, "url": None, "bytes": None, "seq": 0, "meta": None, "error": None}
 
+# 双目高亮点云槽（/experience「双目高亮点云」来源）：stereo worker 每帧同 pred 追加构建，
+# 样式读同一份 _sam3hl_cfg（高亮样式/点云整体样式滑杆对两种来源同时生效）。
+# device 字段供前端做陈旧守卫：切设备后旧 GLB 不再展示
+_stereo_hl_lock = threading.Lock()
+_stereo_hl = {"kind": "model", "url": None, "seq": 0, "meta": None, "error": None,
+              "device": None}
+
 
 def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
     """后台任务：SAM3 track（多词并发）→ mask 解码/缩放到深度分辨率 → 与第二图**同源**产出：
@@ -1090,14 +1370,21 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
             return (query, label, last or [], None, None, None)
 
         targets = [(w["word"], w.get("label") or "drink") for w in _get_score_cfg()["words"]]
+        # 食物高亮：识别词都是液体词，高亮点云因此默认只亮液体。
+        # 额外补一路 food 查询专供高亮/染色——只进 overlays，不进液体证据缓存、
+        # 不进 sam3tune 口径观测（那页只认配置词）。口径里已有 food 标签词则不重复补
+        n_prod = len(targets)
+        if not any(l == "food" for (_w, l) in targets):
+            targets = targets + [(SAM3_TEXT_DEFAULT, "food")]
         with ThreadPoolExecutor(max_workers=len(targets)) as ex:
             results = list(ex.map(trk_one, targets))
         track_ms = (time.time() - t0) * 1000.0
         is_stream = any(g is not None for (_q, _l, _i, g, _im, _d) in results)
         impls = {im for (_q, _l, _i, _g, im, _d) in results if im}
-        # 控制面观测写回：生产流式每帧的 presence/top-K 分数 + 定位图（忠实生产结果，非另跑）
+        # 控制面观测写回：生产流式每帧的 presence/top-K 分数 + 定位图（忠实生产结果，
+        # 非另跑）。只回配置词的结果，补跑的 food 高亮查询不进口径观测
         try:
-            _sam3tune_record_prod(frames[-1], results, track_ms)
+            _sam3tune_record_prod(frames[-1], results[:n_prod], track_ms)
         except Exception as e:
             print(f"[da3-web] sam3tune 生产观测写回失败：{type(e).__name__}: {e}", flush=True)
 
@@ -1105,7 +1392,7 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
         H0, W0 = depth0.shape
         overlays, id_tags = [], []
         for _query, label, insts, _g, _im, _d in results:
-            col = LOCATE_COLORS.get(label, (255, 200, 0))
+            col = LABEL_COLORS.get(label, (255, 200, 0))
             for ins in insts:
                 rle = ins.get("mask_rle") or {}
                 if not (rle.get("counts") and rle.get("size")):
@@ -1124,10 +1411,13 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
                 overlays.append((tag, col, mk))
                 id_tags.append(tag)
 
-        # 液体证据缓存：mask → 归一化外接框，供识别工作流（食物走 LA、液体走 SAM3）取用。
-        # 深度图与原图等比无裁剪，归一化坐标可与 LA 框同系混用（偏差 <2% 可忽略）。
+        # 液体证据缓存：mask → 归一化外接框，供识别工作流取用。
+        # 深度图与原图等比无裁剪，直接用归一化坐标（偏差 <2% 可忽略）。
+        # food 高亮查询的 mask 只用于染色，绝不混进液体证据（按 tag 前缀过滤）
         drink_dets = []
         for (_tag, _col, mk) in overlays:
+            if _tag.startswith("food"):
+                continue
             ys, xs = np.where(mk)
             if xs.size == 0:
                 continue
@@ -1279,7 +1569,7 @@ def _prune_glb():
 
 # ══════════════════════════════════════════════════════════════════════
 # 多设备单路处理：DA3/SAM3/识别 这条重链路同一时刻只跑「当前选中设备」一路，
-# 但 _recent_frames / LA 框缓存 / SAM3 流式长记忆等跨帧时序状态都是单流假设——
+# 但 _recent_frames / SAM3 流式长记忆等跨帧时序状态都是单流假设——
 # 切换选中设备时必须整组重置，防止上一台设备的帧污染新设备的时序语义。
 # _stream_gen 是流代号：切设备 +1；在飞的 SAM3 后台任务凭它丢弃过期写回。
 # ══════════════════════════════════════════════════════════════════════
@@ -1299,9 +1589,6 @@ def _reset_stream_state():
     global _sam3_stream_sessions
     with _recent_lock:
         del _recent_frames[:]
-    with _locate_cache_lock:
-        _locate_cache["dets"] = []
-        _locate_cache["ts"] = 0.0
     with _sam3_stream_lock:
         _sam3_stream_sessions = {}
     with _sam3_dets_lock:
@@ -1430,6 +1717,19 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </div>
 
 <div class="grid">
+ <!-- ① 双目点云：左右 IR 喂 DA3 双视角 + SAM3 左目染色（stereo_product 槽） -->
+ <figure>
+  <div class="box">
+   <model-viewer id="mvst" style="display:none" camera-controls touch-action="pan-y"
+     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
+     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
+     min-field-of-view="10deg" max-field-of-view="60deg"
+     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
+   <span class="wait" id="stwait">等待双目点云…</span>
+  </div>
+  <figcaption><span id="stcap">双目点云（DA3×2视角 + SAM3）</span> <span class="m" id="stmeta"></span></figcaption>
+ </figure>
+ <!-- ② 单图点云：原单目链路产物格，逻辑原样（depth/glb/cloudimg/mesh 按产物类型） -->
  <figure>
   <div class="box">
    <img id="prodimg" style="display:none">
@@ -1440,42 +1740,35 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
      interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
    <span class="wait" id="prodwait">等待产物…</span>
   </div>
-  <figcaption><span id="prodcap">DA3 产物</span> <span class="m" id="prodmeta"></span></figcaption>
+  <figcaption><span id="prodcap">单图点云（DA3 + SAM3）</span> <span class="m" id="prodmeta"></span></figcaption>
  </figure>
+ <!-- ③ 原设备深度图：相机硬件深度（mini 端固定量程伪彩，随主帧 depth 字段上报） -->
  <figure>
-  <div class="box">
-   <img id="s3img" style="display:none">
-   <model-viewer id="mv2" style="display:none" touch-action="none"
-     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
-     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
-     min-field-of-view="10deg" max-field-of-view="60deg"
-     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
-   <span class="wait" id="s3wait">等待 SAM3 点云映射…</span>
-  </div>
-  <figcaption>SAM3→点云映射（同②点云 · 相机跟随②）<span class="m" id="s3meta"></span></figcaption>
+  <div class="box"><img id="devdepth" style="display:none"><span class="wait" id="ddwait">等待设备深度帧…</span></div>
+  <figcaption>原设备深度图（硬件深度 · 越亮越暖=越近 · 黑=无效点）<span class="m" id="ddmeta"></span></figcaption>
  </figure>
+ <!-- ④ 空位（按排版设计留白） -->
+ <figure aria-hidden="true"></figure>
+ <!-- ⑤ 双目原图：左右 IR 两张并排 -->
  <figure>
-  <div class="box">
-   <img id="hlimg" style="display:none">
-   <model-viewer id="mv3" style="display:none" touch-action="none"
-     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
-     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
-     min-field-of-view="10deg" max-field-of-view="60deg"
-     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
-   <span class="wait" id="hlwait">等待 SAM3 高亮点云…</span>
+  <div class="box" style="gap:4px">
+   <img id="irleft" style="display:none;max-width:calc(50% - 2px)">
+   <img id="irright" style="display:none;max-width:calc(50% - 2px)">
+   <span class="wait" id="irwait">等待双目帧…</span>
   </div>
-  <figcaption>SAM3 高亮点云（同③点云 · 无框 · 相机跟随②）<span class="m" id="hlmeta"></span></figcaption>
+  <figcaption>双目原图（左 / 右 IR）<span class="m" id="irmeta"></span></figcaption>
  </figure>
+ <!-- ⑥ 单图原图：原设备帧格，逻辑原样 -->
  <figure>
   <div class="box"><img id="raw" style="display:none"><span class="wait" id="rawwait">等待设备帧…</span></div>
-  <figcaption>接收到的设备帧 <span class="m" id="rawmeta"></span></figcaption>
+  <figcaption>单图原图（接收到的设备帧）<span class="m" id="rawmeta"></span></figcaption>
   <figcaption id="rawlat" style="font-variant-numeric:tabular-nums"
     title="拍摄=设备时钟 · 上传=手机时钟 · 服务器=5090 时钟 · 展示=浏览器时钟；跨时钟差值含偏差，负值≈时钟不同步"></figcaption>
  </figure>
 </div>
 
 <div class="card" id="hlcard" style="margin-top:16px">
- <div style="font-size:13px;color:#3a3a3c;margin-bottom:10px"><b>高亮样式调节</b>（只作用于「SAM3 高亮点云」这张图）</div>
+ <div style="font-size:13px;color:#3a3a3c;margin-bottom:10px"><b>高亮样式调节</b>（作用于 /experience 背景的「SAM3 高亮点云」，本页不再展示该图）</div>
  <div class="row">
   <div class="fld" style="flex:1 1 260px"><label>高亮样式</label>
    <div class="seg" id="hlseg">
@@ -1501,14 +1794,14 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </div>
 
 <div class="card" id="pccard">
- <div style="font-size:13px;color:#3a3a3c;margin-bottom:10px"><b>点云整体样式</b>（同样只作用于「SAM3 高亮点云」这张图）</div>
+ <div style="font-size:13px;color:#3a3a3c;margin-bottom:10px"><b>点云整体样式</b>（同样作用于 /experience 背景的「SAM3 高亮点云」）</div>
  <div class="row">
   <div class="fld"><label>基础点大小 <span class="rngval" id="pcspv">1</span>px</label>
    <input type="range" id="pcsp" min="1" max="4" step="1" value="1"></div>
-  <div class="fld"><label>俯视角 <span class="rngval" id="pctv">10</span>°</label>
-   <input type="range" id="pct" min="0" max="45" step="1" value="10"></div>
-  <div class="fld"><label>相机距离 ×<span class="rngval" id="pczv">1.25</span></label>
-   <input type="range" id="pcz" min="0.6" max="2.0" step="0.05" value="1.25"></div>
+  <div class="fld"><label>俯视角 <span class="rngval" id="pctv">0</span>°</label>
+   <input type="range" id="pct" min="0" max="45" step="1" value="0"></div>
+  <div class="fld"><label>相机距离 ×<span class="rngval" id="pczv">1.00</span></label>
+   <input type="range" id="pcz" min="0.6" max="2.0" step="0.05" value="1"></div>
   <div class="fld"><label>附加抬升 ×<span class="rngval" id="pclv">0.00</span></label>
    <input type="range" id="pcl" min="0" max="0.5" step="0.05" value="0"></div>
   <div class="fld"><label>附加后撤 ×<span class="rngval" id="pcbv">0.00</span></label>
@@ -1534,12 +1827,14 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="fld"><label>产物类型 export_format</label>
    <select id="fmt">
     <option value="depth">深度图（彩色）</option>
-    <option value="glb" selected>点云 + LA food 框（GLB · 可转视角）</option>
+    <option value="glb" selected>点云（GLB · 可转视角）</option>
     <option value="cloudimg">点云图（服务端渲染 · 快）</option>
     <option value="mesh">网格 mesh（GLB · 可转视角）</option>
    </select></div>
   <div class="fld"><label>处理分辨率 process_res <span class="rngval" id="prv">504</span></label>
    <input type="range" id="pr" min="196" max="1120" step="28" value="504"></div>
+  <div class="fld"><label>双目处理分辨率 stereo_process_res <span class="rngval" id="sprv">504</span></label>
+   <input type="range" id="spr" min="196" max="1120" step="28" value="504"></div>
  </div>
  <div class="glbopts" id="glbopts">
   <div class="row">
@@ -1553,7 +1848,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    <div class="fld" id="camwrap"><label>相机线框 show_cameras</label>
     <select id="cam"><option value="1">显示</option><option value="0">隐藏</option></select></div>
   </div>
-  <div class="hint">点云由深度反投影自建；②叠加 LocateAnything 检测的 food 红框（液体由③SAM3 负责）；网格由深度反投影自建三角面（conf 分位越高越干净，num_max_points 仅点云生效）。分辨率越高越细、越吃显存，OOM 时会提示调低。</div>
+  <div class="hint">点云由深度反投影自建（液体由③SAM3 负责）；网格由深度反投影自建三角面（conf 分位越高越干净，num_max_points 仅点云生效）。分辨率越高越细、越吃显存，OOM 时会提示调低。</div>
  </div>
  <div class="status" id="status">等待设备帧… 请让手机 App（或模拟脚本）向 /api/frame 发帧。</div>
 </div>
@@ -1563,8 +1858,8 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <div class="card" id="camcard" style="display:none">
  <div class="fld"><label>视角（二选一 · 固定）</label>
   <div style="display:flex;gap:22px;align-items:center;flex-wrap:wrap">
-   <label style="display:inline;margin:0;cursor:pointer"><input type="radio" name="viewmode" value="tuned" checked> 调优视角（抬高·拉远·俯视）</label>
-   <label style="display:inline;margin:0;cursor:pointer"><input type="radio" name="viewmode" value="raw"> 原始视角（正视 -Z · 与深度图一致）</label>
+   <label style="display:inline;margin:0;cursor:pointer"><input type="radio" name="viewmode" value="tuned"> 调优视角（抬高·拉远·俯视）</label>
+   <label style="display:inline;margin:0;cursor:pointer"><input type="radio" name="viewmode" value="raw" checked> 原始视角（正视 -Z · 与深度图一致）</label>
   </div>
  </div>
  <div class="hint">两个固定视角二选一：<b>调优视角</b>略俯视、更立体，适合演示；<b>原始视角</b>沿拍摄光轴正视、相机在原点不飘，与深度图同视角。仍可鼠标拖动临时查看，下一帧自动回到所选视角。</div>
@@ -1573,6 +1868,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <script>
 const $=id=>document.getElementById(id);
 $('pr').oninput=()=>$('prv').textContent=$('pr').value;
+$('spr').oninput=()=>$('sprv').textContent=$('spr').value;
 $('fps').oninput=()=>$('fpv').textContent=(+$('fps').value).toFixed(1);
 $('ct').oninput=()=>$('ctv').textContent=$('ct').value;
 $('nmp').oninput=()=>$('nmv').textContent=(+$('nmp').value).toFixed(1);
@@ -1591,7 +1887,7 @@ function syncOpts(){const f=$('fmt').value;
 // 两预设都沿光轴、对准点云中心、FOV 用后端真实相机内参；每帧 load 后回到所选预设。
 const mv=$('mv');
 let photoFov=55;              // 后端真实相机垂直 FOV（fov_deg），拿到前用占位
-let viewMode='tuned';         // 'tuned'=调优视角(抬高·拉远·俯视) | 'raw'=原始视角(正视 -Z)
+let viewMode='raw';           // 默认原始拍摄视角(相机在原点·零offset)；'tuned'=调优视角
 let interacting=false, interactTimer;   // 鼠标拖动查看期间不被新帧 load 拉回
 function markInteract(){interacting=true;clearTimeout(interactTimer);interactTimer=setTimeout(()=>{interacting=false;},600);}
 let lastView=null;            // 上次应用的视角{orbit,target,fov}字符串，供换模型前预摆消抖
@@ -1628,41 +1924,32 @@ mv.addEventListener('camera-change',(e)=>{ if(e.detail && e.detail.source==='use
 // 每帧点云载入后：用户正在拖则不打断，否则回到所选固定视角
 mv.addEventListener('load',()=>{ if(!interacting) applyView(); });
 
-// ── 第三框相机跟随第二框（单向同步：拖②、③跟着转，保证两团点云永远同一视角） ──
-const mv2=$('mv2');
-function syncS3Cam(){
-  if(mv2.style.display==='none'||!mv2.loaded)return;
+// ── 双目点云格（①）：独立 model-viewer，固定视角逻辑与②同款（用双目自己的 FOV）──
+const mvst=$('mvst');
+let stFov=55;                 // 双目左目真实垂直 FOV（stereo meta fov_deg）
+let stInteracting=false, stInteractTimer;
+mvst.addEventListener('camera-change',(e)=>{ if(e.detail && e.detail.source==='user-interaction'){
+  stInteracting=true;clearTimeout(stInteractTimer);stInteractTimer=setTimeout(()=>{stInteracting=false;},600);} });
+function stApplyView(){       // 双目格视角：与②同一套预设（调优/原始跟随单选按钮）
   try{
-    mv2.cameraOrbit=mv.getCameraOrbit().toString();
-    mv2.cameraTarget=mv.getCameraTarget().toString();
-    mv2.fieldOfView=mv.getFieldOfView()+'deg';
-    mv2.jumpCameraToGoal&&mv2.jumpCameraToGoal();
+    const c=mvst.getBoundingBoxCenter();
+    const cz=(c.z<-0.001)?c.z:-1.5;
+    const phi=(viewMode==='raw')?90:VIEW_PHI, k=(viewMode==='raw')?1.0:VIEW_K;
+    mvst.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
+    mvst.cameraOrbit='0deg '+phi+'deg '+(Math.abs(cz)*k).toFixed(4)+'m';
+    mvst.fieldOfView=stFov+'deg';
+    mvst.jumpCameraToGoal&&mvst.jumpCameraToGoal();
   }catch(e){}
 }
-mv.addEventListener('camera-change',syncS3Cam);
-mv2.addEventListener('load',syncS3Cam);
-
-// ── 第四框（高亮 GLB 模式）相机同样跟随第二框：与③保证三团点云永远同一视角 ──
-const mv3=$('mv3');
-function syncHlCam(){
-  if(mv3.style.display==='none'||!mv3.loaded)return;
-  try{
-    mv3.cameraOrbit=mv.getCameraOrbit().toString();
-    mv3.cameraTarget=mv.getCameraTarget().toString();
-    mv3.fieldOfView=mv.getFieldOfView()+'deg';
-    mv3.jumpCameraToGoal&&mv3.jumpCameraToGoal();
-  }catch(e){}
-}
-mv.addEventListener('camera-change',syncHlCam);
-mv3.addEventListener('load',syncHlCam);
+mvst.addEventListener('load',()=>{ if(!stInteracting) stApplyView(); });
 
 function currentConfig(){return {
   export_format:$('fmt').value,
   process_res:+$('pr').value,
+  stereo_process_res:+$('spr').value,
   conf_thresh_percentile:+$('ct').value,
   num_max_points:Math.round(+$('nmp').value*1e6),
-  show_cameras:$('cam').value,
-  push_fps:+$('fps').value
+  show_cameras:$('cam').value
 };}
 
 let pushTimer=null;
@@ -1673,8 +1960,9 @@ function pushConfig(){
       body:JSON.stringify(currentConfig())}).catch(()=>{});
   },300);
 }
-// 控件任意改动 → 同步显隐 + 推配置（debounce）
-['fmt','pr','ct','nmp','cam','fps'].forEach(id=>{
+// 控件任意改动 → 同步显隐 + 推配置（debounce）。推帧 fps 不在其中：它是 per-device
+// 配置（/api/frame/device-config），不能塞进全量覆盖语义的 /api/frame/config
+['fmt','pr','spr','ct','nmp','cam'].forEach(id=>{
   $(id).addEventListener('change',()=>{syncOpts();pushConfig();});
   $(id).addEventListener('input',pushConfig);
 });
@@ -1727,8 +2015,8 @@ function renderLatency(s){
     +'</b> · 端到端延时 <b>'+fmtLag(e2eMs)+'</b>';
 }
 
-let lastSeq=-1,lastProdKey='',lastSwap=0,lastS3=-1,lastSwap3=0,lastHl=-1,lastSwapH=0;
-const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显示，避免高帧率下一直卡在"加载中"(黑屏)
+let lastSeq=-1,lastDepth=-1,lastProdKey='',lastSwap=0,lastStKey='',lastSwapSt=0,lastAuxSeq=-1;
+const MIN_SWAP_MS=0;   // 换图节流已停用（2026-08-13 应用户要求，有线大屏跟上后端节拍）；"加载中不打断"守卫仍在，慢网表现为持续加载
 
 // ── 多设备：下拉选设备（服务端只处理选中设备一路；非选中设备的帧只进各自缓存） ──
 const devsel=$('devsel');
@@ -1750,19 +2038,45 @@ function renderDevices(s){
   const sel=devs.find(d=>d.device_id===s.selected);
   $('devinfo').textContent=(devs.length>1?('共 '+devs.length+' 台在传 · '):'')
     +(sel&&sel.fps?('选中 '+sel.fps.toFixed(1)+' fps'):'');
+  // 滑条回填：显示选中设备已下发的 push_fps（切设备时跟着换）。拖动中或刚下发 1.5s 内
+  // 不回写，避免回填与手上的拖动打架
+  const dc=(sel&&sel.config)||{};
+  if(dc.push_fps!=null&&document.activeElement!==$('fps')&&Date.now()-fpsTouched>1500){
+    $('fps').value=dc.push_fps;$('fpv').textContent=(+dc.push_fps).toFixed(1);}
 }
-function resetPanesForSwitch(){   // 切设备：清空四框显示与序号缓存，等新设备的帧/产物
-  $('prodcap').textContent='DA3 产物';
-  lastSeq=-1;lastProdKey='';lastS3=-1;lastSwap=0;lastSwap3=0;lastHl=-1;lastSwapH=0;
+// 推帧 fps：per-device 配置（POST /api/frame/device-config），只作用当前选中设备。
+// 与 /api/frame/config 分开——那边是全量覆盖语义且全局一份，两台摄像机没法各调各的。
+// 同一设备的双目 aux 与主帧在推帧器端同节拍，此滑杆天然同控该设备两条链路
+let fpsTimer=null,fpsTouched=0;
+$('fps').addEventListener('input',()=>{
+  fpsTouched=Date.now();
+  clearTimeout(fpsTimer);
+  fpsTimer=setTimeout(()=>{
+    const dev=devsel.value||curDev;
+    if(!dev)return;
+    fetch('/api/frame/device-config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({device_id:dev,config:{push_fps:+$('fps').value}})}).catch(()=>{});
+  },300);
+});
+function resetPanesForSwitch(){   // 切设备：清空各格显示与序号缓存，等新设备的帧/产物
+  $('prodcap').textContent='单图点云（DA3 + SAM3）';
+  lastSeq=-1;lastDepth=-1;lastProdKey='';lastSwap=0;lastStKey='';lastSwapSt=0;lastAuxSeq=-1;
   pendingE2E=null;e2eMs=null;$('rawlat').textContent='';
   $('raw').style.display='none';$('rawwait').style.display='';
   $('prodimg').style.display='none';$('mv').style.display='none';$('prodwait').style.display='';
-  $('s3img').style.display='none';$('mv2').style.display='none';$('s3wait').style.display='';
-  $('hlimg').style.display='none';$('mv3').style.display='none';$('hlwait').style.display='';
+  $('mvst').style.display='none';$('stwait').style.display='';$('stwait').textContent='等待双目点云…';
+  $('devdepth').style.display='none';$('ddwait').style.display='';$('ddwait').textContent='等待设备深度帧…';
+  $('irleft').style.display='none';$('irright').style.display='none';
+  $('irwait').style.display='';$('irwait').textContent='等待双目帧…';
+  $('stmeta').textContent='';$('ddmeta').textContent='';$('irmeta').textContent='';
 }
 async function tick(){
  try{
   const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
+  // 轮询节奏自适应到帧率：显示刷新率受轮询间隔封顶（固定 500ms 时原图最多 2fps），
+  // 按实际到帧率加密（1.5 倍过采样防节拍差拍），钳制 80~500ms——高帧率跟得上、
+  // 低帧率不空转。图片均按 seq 门控换图，轮询加密不会重复拉图
+  tickDelay=s.fps?Math.max(80,Math.min(500,1000/(s.fps*1.5))):500;
   // 服务端重启后配置清零（config_gen=0 → 回落 depth 模式、识别不触发）：自动重推当前面板配置
   if(s.processor && s.config_gen===0) pushConfig();
   // 设备下拉 + 切换检测（本页或其他页面触发的切换都会在这里被发现）
@@ -1775,7 +2089,7 @@ async function tick(){
   $('rawmeta').textContent = s.has_frame ? ('帧 '+s.seq+(s.interval?(' · 间隔 '+s.interval.toFixed(1)+'s'):'')) : '';
   renderLatency(s);
 
-  // 右框：DA3 产物（图片=深度图；模型=GLB）
+  // ②格：DA3 产物（图片=深度图；模型=GLB）
   const prodKey=(s.product_kind||'')+':'+(s.product_url||'')+':'+s.product_seq;
   if(s.product_kind && prodKey!==lastProdKey){
     if(s.product_kind==='image'){
@@ -1812,54 +2126,58 @@ async function tick(){
   // 外部产物（meta.ext，如 Mac 直传真深度点云）不是 DA3 在算，不显示"处理中"；标题跟随 meta.cap
   const isExt=s.product_meta&&s.product_meta.ext;
   if(s.has_frame && s.product_seq<s.seq && !s.product_error && !isExt) pm+=' <span class="dim">（处理中…）</span>';
-  $('prodcap').textContent=(isExt&&s.product_meta.cap)?s.product_meta.cap:'DA3 产物';
+  $('prodcap').textContent=(isExt&&s.product_meta.cap)?s.product_meta.cap:'单图点云（DA3 + SAM3）';
   $('prodmeta').innerHTML=pm;
 
-  // 第三框：DA3→SAM3→点云映射（与②同源：model=GLB 相机跟随②；image=同参 cloudimg 渲染）
-  try{
-    const s3=await(await fetch('/api/sam3cloud/status',{cache:'no-store'})).json();
-    if(s3.seq && s3.seq!==lastS3){
-      if(s3.kind==='model' && s3.url){
-        // 与②同款换模型节流：上一个没加载完不换、加载完至少停 MIN_SWAP_MS（读 src 属性 + 8s 兜底，同②）
-        if((mv2.loaded || !mv2.src || Date.now()-lastSwap3>=25000) && Date.now()-lastSwap3>=MIN_SWAP_MS){
-          lastSwap3=Date.now(); lastS3=s3.seq;
-          mv2.src=s3.url;
-          mv2.style.display='block';$('s3img').style.display='none';$('s3wait').style.display='none';
-        }
-      }else if(s3.kind==='image'){
-        lastS3=s3.seq;
-        $('s3img').src='/api/sam3cloud/latest?t='+s3.seq;
-        $('s3img').style.display='block';mv2.style.display='none';$('s3wait').style.display='none';
+  // 双目三格（①点云 / ③设备深度 / ⑤左右原图）：数据全在同一个 status 里，无额外轮询。
+  // stereo_supported：true=有双目；false/null=无（Astra/手机 App）→ ①⑤ 显示不支持提示
+  const stereoOK = s.stereo_supported===true;
+  if(!stereoOK){
+    $('mvst').style.display='none';$('stwait').style.display='';
+    $('stwait').textContent='该设备不支持双目';$('stmeta').textContent='';
+    $('irleft').style.display='none';$('irright').style.display='none';
+    $('irwait').style.display='';$('irwait').textContent='该设备不支持双目';$('irmeta').textContent='';
+  }else{
+    // ① 双目点云 GLB：换模节流与②同款（未加载完不换 + 最少停 MIN_SWAP_MS + 25s 兜底）
+    const stKey=(s.stereo_product_kind||'')+':'+(s.stereo_product_url||'')+':'+s.stereo_product_seq;
+    if(s.stereo_product_kind==='model' && s.stereo_product_url && stKey!==lastStKey){
+      if((mvst.loaded || !mvst.src || Date.now()-lastSwapSt>=25000) && Date.now()-lastSwapSt>=MIN_SWAP_MS){
+        lastSwapSt=Date.now(); lastStKey=stKey;
+        mvst.src=s.stereo_product_url;
+        mvst.style.display='block';$('stwait').style.display='none';
       }
     }
     let sm='';
-    if(s3.error){sm='<span class="err">'+s3.error+'</span>';}
-    else if(s3.meta){const m=s3.meta;
-      sm=(m.label||'')+(m.track_ms?(' · 跟踪'+m.track_ms+'ms'):'')+(m.render_ms?(' · 渲染'+m.render_ms+'ms'):'');}
-    if(s3.running) sm+=' <span class="dim">（处理中…）</span>';
-    $('s3meta').innerHTML=sm;
-  }catch(e){/* 第三框轮询失败忽略 */}
-
-  // 第四框：SAM3 高亮点云（与③同一轮 mask 结果，无框、样式可调）
-  // kind=model → 高亮 GLB 与②③同管线 model-viewer 直渲（换模节流同②③、相机跟随②）；
-  // kind=image →（产物类型=点云图时）服务端渲染 JPEG，meta 非空才拉图防 404
-  try{
-    const hl=await(await fetch('/api/sam3hl/status',{cache:'no-store'})).json();
-    if(hl.seq && hl.seq!==lastHl){
-      if(hl.kind==='model' && hl.url){
-        if((mv3.loaded || !mv3.src || Date.now()-lastSwapH>=25000) && Date.now()-lastSwapH>=MIN_SWAP_MS){
-          lastSwapH=Date.now(); lastHl=hl.seq;
-          mv3.src=hl.url;
-          mv3.style.display='block';$('hlimg').style.display='none';$('hlwait').style.display='none';
-        }
-      }else if(hl.kind==='image' && hl.meta){lastHl=hl.seq;
-        $('hlimg').src='/api/sam3hl/latest?t='+hl.seq;
-        $('hlimg').style.display='block';mv3.style.display='none';$('hlwait').style.display='none';
-      }
+    if(s.stereo_product_error){sm='<span class="err">'+s.stereo_product_error+'</span>';}
+    else if(s.stereo_product_meta){const m=s.stereo_product_meta;
+      sm=(m.label||'')+(m.dt?(' · '+m.dt.toFixed(2)+'s'):'')+(m.stat?(' · '+m.stat):'');
+      if(m.fov_deg && m.fov_deg!==stFov){stFov=m.fov_deg; if(mvst.loaded && !stInteracting) stApplyView();}}
+    if(s.has_aux_stereo && s.stereo_product_seq<s.aux_seq && !s.stereo_product_error)
+      sm+=' <span class="dim">（处理中…）</span>';
+    $('stmeta').innerHTML=sm;
+    // ⑤ 双目原图：aux_seq 变了才刷新两张 IR
+    if(s.has_aux_stereo && s.aux_seq!==lastAuxSeq){
+      $('irleft').src='/api/frame/aux-image?kind=left&t='+s.aux_seq;
+      $('irright').src='/api/frame/aux-image?kind=right&t='+s.aux_seq;
+      $('irleft').style.display='block';$('irright').style.display='block';
+      $('irwait').style.display='none';
+      $('irmeta').textContent='辅助帧 '+s.aux_seq
+        +(s.aux_info&&s.aux_info.baseline_mm?(' · 基线 '+s.aux_info.baseline_mm+'mm'):'')
+        +(s.aux_info&&s.aux_info.laser_mode?(' · 激光 '+s.aux_info.laser_mode):'');
     }
-    $('hlmeta').innerHTML=hl.error?('<span class="err">'+hl.error+'</span>')
-      :(hl.meta?((hl.meta.label||'')+(hl.meta.render_ms?(' · 渲染'+hl.meta.render_ms+'ms'):'')):'');
-  }catch(e){/* 第四框轮询失败忽略 */}
+  }
+  // ③ 原设备深度图：帧源随彩色帧一并上报的伪彩 JPEG（Astra 也有；手机 App 没有）
+  if(s.has_depth){
+    if(s.depth_seq!==lastDepth){lastDepth=s.depth_seq;
+      $('devdepth').src='/api/frame/latest-depth?t='+s.depth_seq;
+      $('devdepth').style.display='block';$('ddwait').style.display='none';}
+    $('ddmeta').textContent='帧 '+s.depth_seq;
+  }else{
+    $('devdepth').style.display='none';$('ddwait').style.display='';
+    $('ddwait').textContent=(s.stereo_supported==null)?'该设备无硬件深度':'等待设备深度帧…';
+    $('ddmeta').textContent='';
+  }
+  if(s.aux_seq!==undefined && s.has_aux_stereo) lastAuxSeq=s.aux_seq;
 
   // 顶部状态行
   if(!s.processor){$('status').innerHTML='<span class="err">未接入 DA3 模型（纯中继）。</span>';}
@@ -1868,7 +2186,9 @@ async function tick(){
      +' · 产物帧 <b>'+s.product_seq+'</b>'+(s.product_error?' · <span class="err">'+s.product_error+'</span>':'');}
  }catch(e){/* 单次轮询失败忽略，下个周期重试 */}
 }
-setInterval(tick,500);tick();
+// 自适应轮询：每轮结束后按 tickDelay 排下一轮（串行，慢请求不会堆积并发轮询）
+let tickDelay=500;
+(async function tickLoop(){ await tick(); setTimeout(tickLoop, tickDelay); })();
 
 // ── Qwen 识别隧道状态：5s 轮询。断了给「一键重建」，指令由 Mac 上的守护进程领走执行 ──
 let tunReqAt=0;   // 本页最近一次下发重建指令的时刻，用于显示「重建中…」
@@ -1986,6 +2306,12 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  #tlempty{font-family:'ABC Arizona Serif',Georgia,serif;font-size:.3rem;color:rgba(255,253,247,.55)}
  /* ── 右下临时工具按钮（后期调样式用，刻意低调；尺寸用物理像素不随设计稿缩放） ── */
  #tools{position:fixed;right:20px;bottom:18px;display:flex;gap:8px;z-index:9}
+ /* 右键菜单：控制台（右下调试按钮组）显隐开关 */
+ #ctxmenu{position:fixed;display:none;z-index:99;background:rgba(24,24,26,.96);
+  border:1px solid #3a3a3c;border-radius:10px;padding:5px;backdrop-filter:blur(10px)}
+ #ctxmenu .ctxitem{padding:9px 16px;border-radius:7px;cursor:pointer;font-size:13px;
+  color:#e8e8ea;white-space:nowrap;user-select:none}
+ #ctxmenu .ctxitem:hover{background:#3a3a3c}
  #tools button{background:rgba(255,253,247,.08);border:1px solid rgba(255,253,247,.22);
    color:rgba(255,253,247,.72);font:12px system-ui,sans-serif;padding:6px 14px;border-radius:99px;
    cursor:pointer;backdrop-filter:blur(6px)}
@@ -2075,16 +2401,31 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <select id="selDev" style="display:none" title="选择设备"></select>
  <select id="selStyle">
   <option value="hl">高亮点云</option>
-  <option value="la">LA点云</option>
+  <option value="stereo" title="仅 G335 等双目相机支持">双目高亮点云</option>
+  <option value="la">单目点云</option>
   <option value="s3">SAM3点云</option>
  </select>
  <button id="btnHlCfg">调节</button>
  <button id="btnTl">流水</button>
+ <button id="btnFs" title="整页铺满显示器（Esc 退出）">全屏</button>
 </div>
 
+<!-- 右键菜单：控制台显隐（右下调试按钮组默认隐藏，展台观众看不到） -->
+<div id="ctxmenu"><div class="ctxitem" id="ctxToggle">显示控制台</div></div>
+
 <div id="hlcfg">
- <div class="hd">高亮点云样式调节 <button id="hlcfgClose" title="关闭">✕</button></div>
- <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">高亮样式（只作用于高亮点云）</div>
+ <div class="hd">展示调节 <button id="hlcfgClose" title="关闭">✕</button></div>
+ <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">数据源帧率（当前设备）</div>
+ <div class="fld"><label>RGB 推帧 <b id="v_push_fps">2.0</b> fps</label>
+  <input type="range" id="r_push_fps" min="0.5" max="10" step="0.5" value="2"></div>
+ <div class="fld"><label>点云直传间隔 <b id="v_prod_itv">2.5</b> s</label>
+  <input type="range" id="r_prod_itv" min="0.5" max="10" step="0.5" value="2.5"></div>
+ <div class="hint" style="margin-top:8px">按设备生效（推流端每 2s 轮询取走）。<b>RGB 推帧</b>驱动
+  DA3/SAM3 处理链路，是高亮/SAM3 点云的帧率上限；<b>点云直传间隔</b>只对带真深度直传的
+  设备（如 macmini-astra）生效，决定单目点云来源的刷新节奏。Mac↔5090 链路仅约 8Mbps，
+  两台摄像机同推时调密任何一路都会挤占另一路，调完盯一眼画面是否跟得上。</div>
+ <div id="hlonly">
+ <div class="sec">高亮样式（只作用于高亮点云）</div>
  <div class="seg" id="hlseg">
   <button data-s="tint" class="on">染色</button>
   <button data-s="solid">纯色</button>
@@ -2102,10 +2443,10 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <input type="color" id="hlcolor" value="#ff9f0a">
   </div></div>
  <div class="sec">点云整体样式</div>
- <div class="fld"><label>俯视角 <b id="v_view_tilt">10</b>°</label>
-  <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="10"></div>
- <div class="fld"><label>相机距离 ×<b id="v_view_zoom">1.25</b></label>
-  <input type="range" id="r_view_zoom" min="0.6" max="2.0" step="0.05" value="1.25"></div>
+ <div class="fld"><label>俯视角 <b id="v_view_tilt">0</b>°</label>
+  <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="0"></div>
+ <div class="fld"><label>相机距离 ×<b id="v_view_zoom">1.00</b></label>
+  <input type="range" id="r_view_zoom" min="0.6" max="2.0" step="0.05" value="1"></div>
  <div class="fld"><label>附加抬升 ×<b id="v_eye_lift">0.00</b></label>
   <input type="range" id="r_eye_lift" min="0" max="0.5" step="0.05" value="0"></div>
  <div class="fld"><label>附加后撤 ×<b id="v_eye_back">0.00</b></label>
@@ -2217,10 +2558,11 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <b>俯视角/相机距离/抬升/后撤</b>是前端相机参数，拖动立即生效；高亮样式、
   <b>饱和度/明度/底色色相/置信度分位/离群裁剪</b>写进 GLB，下一轮 SAM3 结果生效
   （约 1~3 秒）、只调底色不动高亮色。<b>点渲染</b>各区直改浏览器内 three.js
-  点材质/着色器，拖动立即生效、对所有 GLB 背景（高亮/SAM3/LA 点云）通用，色彩类
+  点材质/着色器，拖动立即生效、对所有 GLB 背景（高亮/SAM3/单目点云）通用，色彩类
   作用于最终画面<b>含高亮色</b>。置信度联动首次开启需等下一轮 GLB（把置信度烘进
   顶点 alpha，仅高亮/SAM3 点云有此数据），之后实时。自动旋转在每次换模时回正。
   默认值均为中性观感。</div>
+ </div>
 </div>
 
 <script>
@@ -2229,8 +2571,8 @@ const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无�
 
 // ══ 背景层：四种来源下拉框选择（临时工具），默认 SAM3 高亮点云 ══
 let bgSource=localStorage.getItem('exp_bg')||'hl';
-if(!['hl','la','s3'].includes(bgSource))bgSource='hl';   // 旧版存过 raw 的自动回落高亮点云
-const MIN_SWAP_MS=1500;               // GLB 换模型最小间隔（同 /panel：防高帧率下一直黑屏加载）
+if(!['hl','stereo','la','s3'].includes(bgSource))bgSource='hl';   // 旧版存过 raw 的自动回落高亮点云
+const MIN_SWAP_MS=0;               // 换图节流已停用（同 /panel，2026-08-13）；"加载中不打断"守卫仍在
 let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
 
 let lastBgUrl='';                     // 当前背景图 url（流水小窗镜像用）
@@ -2248,7 +2590,7 @@ function showImg(url,key){            // 双缓冲交叉淡入：新图解码完
   im.src=url;
   return true;
 }
-function showModel(url,fov){          // GLB 产物（LA 点云等）：全屏 model-viewer 展示
+function showModel(url,fov){          // GLB 产物（单目点云等）：全屏 model-viewer 展示
   const mv=$('bgmv');
   if(fov)mvFov=fov;
   if(url===lastMvUrl){mv.style.display='block';return true;}
@@ -2262,10 +2604,10 @@ function showModel(url,fov){          // GLB 产物（LA 点云等）：全屏 m
 // GLB 加载完自动摆「调优视角」（同 /panel：略俯视、拉远，FOV 用真实相机内参）。
 // 高亮点云来源时视角参数可调（抽屉「点云整体样式」，与服务端渲染同语义：绕点云中心
 // 俯视 tilt、距离=|cz|×zoom、附加抬升/后撤 ×|cz|）；默认 10°/1.25/0/0 与②③取景逐位一致。
-const DEF_VIEW={view_tilt:10,view_zoom:1.25,eye_lift:0,eye_back:0};
+const DEF_VIEW={view_tilt:0,view_zoom:1.0,eye_lift:0,eye_back:0};  // 拍摄视角零offset
 function applyExpView(){const mv=$('bgmv');
   try{const c=mv.getBoundingBoxCenter();const cz=(c.z<-0.001)?c.z:-1.5;
-    const v=bgSource==='hl'?hlView:DEF_VIEW;
+    const v=(bgSource==='hl'||bgSource==='stereo')?hlView:DEF_VIEW;
     const t=v.view_tilt*Math.PI/180;
     const dy=v.view_zoom*Math.sin(t)+v.eye_lift, dz=v.view_zoom*Math.cos(t)+v.eye_back;
     mv.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
@@ -2433,6 +2775,39 @@ $('selDev').onchange=()=>{
     body:JSON.stringify({device_id:$('selDev').value})}).catch(()=>{});
 };
 
+// ── 数据源帧率（调节抽屉顶部）：per-device 配置，POST /api/frame/device-config ──
+// push_fps=RGB 推帧频率（高亮/SAM3 点云链路的帧率上限）；product_interval=点云直传
+// 间隔（Astra 类真深度设备，单目点云来源的刷新节奏）。只作用当前选中设备；推流端每 2s
+// 轮询 /api/frame/status 取走。与 /api/frame/config 分开——那边全量覆盖且全局一份
+const RATE_SLIDERS={push_fps:['r_push_fps','v_push_fps'],product_interval:['r_prod_itv','v_prod_itv']};
+let ratePend={},rateTimer=null,rateTouched=0;
+Object.keys(RATE_SLIDERS).forEach(key=>{
+  const [rid,vid]=RATE_SLIDERS[key];
+  $(rid).addEventListener('input',()=>{
+    $(vid).textContent=(+$(rid).value).toFixed(1);
+    if(!curDev)return;
+    rateTouched=Date.now();
+    ratePend[key]=+$(rid).value;
+    clearTimeout(rateTimer);
+    rateTimer=setTimeout(()=>{
+      const cfg=ratePend;ratePend={};
+      fetch('/api/frame/device-config',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({device_id:curDev,config:cfg})}).catch(()=>{});
+    },300);
+  });
+});
+function renderRate(s){
+  // 滑条回填选中设备已下发的值（切设备跟着换）；拖动中或刚下发 1.5s 内不回写，避免打架
+  if(Date.now()-rateTouched<1500)return;
+  const d=(s.devices||[]).find(x=>x.device_id===s.selected);
+  const c=(d&&d.config)||{};
+  [['push_fps',c.push_fps!=null?c.push_fps:(s.config||{}).push_fps],
+   ['product_interval',c.product_interval]].forEach(([key,val])=>{
+    const [rid,vid]=RATE_SLIDERS[key],el=$(rid);
+    if(val!=null&&document.activeElement!==el){el.value=val;$(vid).textContent=(+el.value).toFixed(1);}
+  });
+}
+
 let lastInset='';
 async function bgTick(){
  if(DEMO)return;
@@ -2440,15 +2815,30 @@ async function bgTick(){
   const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
   if(s.processor&&s.config_gen===0)pushDefaultConfig();
   renderDevices(s);
+  renderRate(s);
   if(s.device&&s.device!==curDev){   // 切设备：清背景与卡片缓存，等新设备的帧/产物
     if(curDev!==null){lastBgKey='';lastMvUrl='';lastBgUrl='';lastInset='';curCard=null;lastCardKey='';}
     curDev=s.device;
   }
   // 本页任何情况都不展示设备原图：所选来源暂无产物（服务重启/切设备/首轮构建中）时
   // 保持黑场，等第一份点云产物就绪再上画
+  // 双目来源仅双目设备（G335）可用：选中设备不支持时禁用选项置灰；已选双目时保持黑场
+  const stOpt=$('selStyle').querySelector('option[value=stereo]');
+  if(stOpt)stOpt.disabled=s.stereo_supported!==true;
   if(bgSource==='la'){
     if(s.product_kind==='image')showImg('/api/frame/latest-product?t='+s.product_seq,'la:'+s.product_seq);
     else if(s.product_kind==='model'&&s.product_url)showModel(s.product_url,s.product_meta&&s.product_meta.fov_deg);
+  }else if(bgSource==='stereo'){
+    if(s.stereo_supported===true){
+      const sh=await(await fetch('/api/stereohl/status',{cache:'no-store'})).json();
+      // device 比对：切设备后旧设备的双目 GLB 不上画（保持黑场等新产物）
+      if(sh.url&&sh.device===s.selected)showModel(sh.url,sh.meta&&sh.meta.fov_deg);
+    }else{
+      // 不支持双目的设备：主动清掉上一台设备残留的双目 GLB（该设备永远不会有新
+      // 双目产物顶掉旧画面），回到黑场
+      $('bgmv').style.display='none';lastMvUrl='';
+      $('bgA').classList.remove('on');$('bgB').classList.remove('on');
+    }
   }else if(bgSource==='s3'){
     const s3=await(await fetch('/api/sam3cloud/status',{cache:'no-store'})).json();
     if(s3.kind==='image'&&s3.seq)showImg('/api/sam3cloud/latest?t='+s3.seq,'s3:'+s3.seq);
@@ -2544,8 +2934,9 @@ function applyRecog(r){
 // ══ 右下临时工具：来源下拉框 + 高亮调节抽屉开关 + 流水视图开关 ══
 function syncStyleUI(){
   $('selStyle').value=bgSource;
-  $('btnHlCfg').style.display=bgSource==='hl'?'':'none';   // 仅高亮点云来源可调样式
-  if(bgSource!=='hl')$('hlcfg').classList.remove('on');
+  // 抽屉常驻可开（帧率区对所有来源有意义）；高亮样式区在高亮/双目高亮两个来源展示
+  // （双目高亮 GLB 读同一份 /api/sam3hl/config，全部滑杆同样生效）
+  $('hlonly').style.display=(bgSource==='hl'||bgSource==='stereo')?'':'none';
 }
 $('selStyle').onchange=()=>{
   bgSource=$('selStyle').value;
@@ -2561,6 +2952,42 @@ $('btnTl').onclick=()=>{
   $('btnTl').textContent=on?'实时':'流水';
   setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
 };
+// ══ 控制台显隐：右下调试按钮组默认隐藏（观众看不到），右键菜单「显示/隐藏控制台」
+// 切换，选择记进 localStorage（刷新保持；从未设置过=默认隐藏）══
+let consoleOn=localStorage.getItem('exp_console')==='1';
+function applyConsole(){
+  $('tools').style.display=consoleOn?'':'none';
+  if(!consoleOn)$('hlcfg').classList.remove('on');   // 隐藏控制台时顺手收起调节抽屉
+  $('ctxToggle').textContent=consoleOn?'隐藏控制台':'显示控制台';
+}
+document.addEventListener('contextmenu',e=>{
+  e.preventDefault();
+  const m=$('ctxmenu');
+  m.style.display='block';
+  // 先显示再量尺寸，钳制进视口（右/下边缘右键时菜单不出界）
+  m.style.left=Math.max(4,Math.min(e.clientX,innerWidth-m.offsetWidth-8))+'px';
+  m.style.top=Math.max(4,Math.min(e.clientY,innerHeight-m.offsetHeight-8))+'px';
+});
+document.addEventListener('click',()=>{$('ctxmenu').style.display='none';});
+$('ctxToggle').addEventListener('click',e=>{
+  e.stopPropagation();
+  consoleOn=!consoleOn;
+  localStorage.setItem('exp_console',consoleOn?'1':'0');
+  applyConsole();
+  $('ctxmenu').style.display='none';
+});
+applyConsole();
+
+// ══ 全屏：Fullscreen API 整页铺满显示器（展台演示用；须由用户点击手势触发）══
+function fsOn(){return !!(document.fullscreenElement||document.webkitFullscreenElement);}
+$('btnFs').onclick=()=>{
+  const root=document.documentElement;
+  if(fsOn())(document.exitFullscreen||document.webkitExitFullscreen).call(document);
+  else (root.requestFullscreen||root.webkitRequestFullscreen).call(root);
+};
+// 状态跟随浏览器事件（Esc/系统手势退出也能同步按钮文案）
+['fullscreenchange','webkitfullscreenchange'].forEach(ev=>
+  document.addEventListener(ev,()=>{$('btnFs').textContent=fsOn()?'退出全屏':'全屏';}));
 syncStyleUI();
 
 // ══ 高亮点云样式调节抽屉：读写 /api/sam3hl/config（与 /panel 的「高亮样式调节」同一套配置） ══
@@ -2583,7 +3010,7 @@ const PT_RADIOS={ptshape:'pt_shape',ptatten:'pt_atten',ptblend:'pt_blend',
   ptinvert:'pt_invert',ptcm:'pt_colormode',ptrot:'pt_rotate',ptpulse:'pt_pulse'};
 const PT_COLORS={c_pt_duo_a:'pt_duo_a',c_pt_duo_b:'pt_duo_b',c_pt_bg:'pt_bg'};
 const VIEW_KEYS=['view_tilt','view_zoom','eye_lift','eye_back'];
-let hlView={view_tilt:10,view_zoom:1.25,eye_lift:0,eye_back:0};
+let hlView={view_tilt:0,view_zoom:1.0,eye_lift:0,eye_back:0};  // 拍摄视角零offset（服务端配置可调）
 let hlStyle='tint',hlPushTimer=null;
 function hlLabel(k){$('v_'+k).textContent=(HL_FMT[k]||(v=>v))($('r_'+k).value);}
 function pushHlCfg(){
@@ -2719,7 +3146,7 @@ async def api_infer(
     model = get_model()
     try:
         t0 = time.time()
-        # GPU 推理放锁内串行化；点云构建 / LocateAnything 检测（CPU+网络）挪到锁外，短占锁。
+        # GPU 推理放锁内串行化；点云构建（CPU）挪到锁外，短占锁。
         with _gpu_lock:  # 与官方 Gradio 共用同一模型，串行化 GPU 推理
             with torch.no_grad():
                 pred = model.inference([arr], process_res=res, export_format="mini_npz")
@@ -2730,22 +3157,18 @@ async def api_infer(
             outdir.mkdir(parents=True, exist_ok=True)
             glb = outdir / "scene.glb"
             if export_format == "glb":
-                # 点云叠 food/drink 检测框：LocateAnything 用原图检测（高分辨率、召回更好）。
-                # DA3 预处理是等比缩放(upper_bound_resize)无裁剪，原图归一化坐标≈深度图，
-                # 直接乘深度宽高映射，偏差 <2%(patch 对齐)可忽略。
-                detections = _locate_food_drink(arr)
-                labels = build_pointcloud_boxes_glb(
-                    pred, detections, str(glb),
+                # 纯点云 GLB（无检测框）：检测能力已下线，传空检测列表即不画框
+                build_pointcloud_boxes_glb(
+                    pred, [], str(glb),
                     conf_thresh_percentile=float(conf_thresh_percentile),
                     num_max_points=int(num_max_points), show_cameras=show_cam)
                 dt = time.time() - t0
                 sz = glb.stat().st_size / 1024 if glb.exists() else 0
                 depth = np.asarray(pred.depth)[0]
-                n_food, n_drink = labels.count("food"), labels.count("drink")
                 _prune_glb()
                 return JSONResponse({
                     "mode": "glb", "glb_url": f"/glb/{token}/scene.glb", "dt": dt,
-                    "label": f"点云 + food/drink 框（food×{n_food} · drink×{n_drink}）",
+                    "label": "点云（GLB）",
                     "stat": f"GLB {sz:.0f}KB",
                     "shape": [int(depth.shape[1]), int(depth.shape[0])]})
             else:  # mesh：由 prediction（含 intrinsics）自建网格
@@ -2780,7 +3203,7 @@ async def api_infer(
 
 # ── 设备实时帧中继：接收 mobile 直发的帧 → 缓存展示 + DA3 深度处理 ──────────
 # ══════════════════════════════════════════════════════════════════════
-# 实时识别（Qwen3-VL 多模态）：LocateAnything 命中某帧 → 取原图 + 带框图，送 GCP g4-01 的
+# 实时识别（Qwen3-VL 多模态）：SAM3 流式液体命中某帧 → 取原图 + 带框图，送 GCP g4-01 的
 # Qwen3-VL（OpenAI 兼容）识别「具体是什么」，产出 名称 + 类型(食物/液体)。
 #   · 识别是慢操作（多模态 LLM 数秒），放独立后台线程 + 节流，绝不阻塞 DA3 产线。
 #   · 结果进 _recog_cards，前端 /recog 轮询 /api/recog/list 渲染卡片、名称流式打字。
@@ -2941,7 +3364,7 @@ SHOT_KEEP = 160                             # 磁盘最多保留的缩略图数�
 def _save_cloud_shot(pred, dets, conf):
     """识别缩略图：用该帧 DA3 pred 走与②/③相同的服务端点云渲染链路，
     叠 Qwen 给的 box（食物红/液体蓝 3D 框），存盘返回 /shotimg url；渲染失败返回 None。
-    dets: [(label, nx1, ny1, nx2, ny2)]，坐标 0-1 归一化（同 LA 框约定）；空则渲无框点云。"""
+    dets: [(label, nx1, ny1, nx2, ny2)]，坐标 0-1 归一化（左上、右下）；空则渲无框点云。"""
     try:
         # 相机模型已改为「调优视角」（对准点云中心、按场景深度定距，场景相对不跳帧）：
         # 缩略图取稍近距离(1.0×) + 俯视 20°；splat=1 + out_size=1140 保持点状离散
@@ -3302,13 +3725,49 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
         _recog_cv.notify()
 
 
-def _da3_frame_processor(raw: bytes, config: dict, device_id: str) -> dict:
-    """把收到的一帧按「面板控件配置」跑 DA3，产出：
-      - export_format=depth → 彩色深度图（图片类产物，返回 JPEG 字节）
-      - export_format=glb   → 点云 + food/drink 3D 检测框 + 相机线框 scene.glb（返回 url）
-      - export_format=mesh  → 深度反投影自建网格 GLB（模型类产物，返回 url）
+class _PipelineBuilder:
+    """流水线构建级：单槽 latest-wins 信箱 + 常驻消化线程。
+
+    GPU 级把「构建闭包」丢进来立即返回去吃下一帧；本线程串行消化最新一份，
+    没消化完就被新的顶掉（旧帧产物直接放弃）。链路吞吐从 sum(GPU+构建) 变
+    max(GPU, 构建)——每帧延时不变，但出产物变成流式连续。"""
+
+    def __init__(self, name: str):
+        self._cv = threading.Condition()
+        self._job = None
+        threading.Thread(target=self._loop, daemon=True, name=name).start()
+
+    def submit(self, job) -> None:
+        with self._cv:
+            self._job = job
+            self._cv.notify()
+
+    def _loop(self) -> None:
+        while True:
+            with self._cv:
+                while self._job is None:
+                    self._cv.wait()
+                job, self._job = self._job, None
+            try:
+                job()
+            except Exception as e:   # 闭包内部已各自兜错，这里只防手滑
+                print(f"[da3-web] 流水线构建级异常：{type(e).__name__}: {e}", flush=True)
+
+
+_mono_builder = _PipelineBuilder("mono-product-builder")
+_stereo_builder = _PipelineBuilder("stereo-product-builder")
+
+
+def _da3_frame_processor(raw: bytes, config: dict, device_id: str,
+                         seq: int, gen: int):
+    """单目链路 GPU 级（两级流水线的第一级）：解码 → DA3 推理（GPU 锁内）→ 触发
+    sam3cloud → 把产物构建闭包交给 _mono_builder 后立即返回 DEFERRED，让 worker
+    马上取下一帧。构建级（第二级）做 GLB/渲染等 CPU 重活，完成后
+    经 set_product 异步写回。产物形态：
+      - export_format=depth → 彩色深度图（图片类产物，JPEG 字节）
+      - export_format=glb   → 点云 + 相机线框 scene.glb（url）
+      - export_format=mesh  → 深度反投影自建网格 GLB（模型类产物，url）
     与官方 Gradio 共用同一模型、同一把 GPU 锁串行化，避免撞显存。首帧到达才懒加载模型。
-    glb 分支额外调 5090 本地 LocateAnything 检测 food/drink，框与点云同坐标系严格对齐。
     device_id=本帧来源设备（frame_relay 只把选中设备的帧送进来）：与上一帧不同即视为
     切换，先重置全部跨帧时序缓存再处理，识别卡片落到该设备自己的桶。"""
     try:
@@ -3317,7 +3776,7 @@ def _da3_frame_processor(raw: bytes, config: dict, device_id: str) -> dict:
         raise RuntimeError(f"读取图片失败：{e}")
     arr = np.array(img)
 
-    gen = _track_stream_device(device_id)   # 切设备先重置时序缓存，再入队本帧
+    sgen = _track_stream_device(device_id)  # 切设备先重置时序缓存，再入队本帧
     _push_recent_frame(arr)        # 存最近帧，供 /sam3 的短视频跟踪取「过去 N 张图」
 
     fmt = str(config.get("export_format", "depth"))
@@ -3327,93 +3786,350 @@ def _da3_frame_processor(raw: bytes, config: dict, device_id: str) -> dict:
     show_cam = str(config.get("show_cameras", "1")) in ("1", "true", "True", "on", "显示")
 
     model = get_model()
+    t0 = time.time()
     try:
-        t0 = time.time()
-        # GPU 推理放锁内串行化；点云构建 / LocateAnything 检测（CPU+网络）挪到锁外，
-        # 避免检测网络往返长时间占着 GPU 锁、阻塞产线与其他产物。
+        # GPU 推理放锁内串行化；产物构建（CPU）在构建级，
+        # 不占 GPU 锁也不挡本线程吃下一帧。
         with _gpu_lock:  # 与官方 Gradio 共用同一模型，串行化 GPU 推理
             with torch.no_grad():
                 pred = model.inference([arr], process_res=res, export_format="mini_npz")
-        infer_ms = (time.time() - t0) * 1000.0     # DA3 推理耗时（收到帧→推理完）
-
-        # 第三图：DA3→SAM3→点云映射（任意产物类型都触发；后台异步跑、忙时跳过，不阻塞产线）
-        _maybe_sam3cloud(pred, conf, fmt, nmp, show_cam, gen)
-
-        if fmt == "cloudimg":
-            # 方案A：服务端(5090 GPU)把点云渲成 2D 图，前端只显示图片。
-            # 检测异步：渲染不等 LocateAnything，用最近缓存的框(后台按 TTL 刷新)→ 整段砍到 ~100ms。
-            detections = _detections_async(arr)
-            _tr = time.time()
-            cimg = _render_pointcloud_image(pred, detections, conf_thresh_percentile=conf)
-            render_ms = (time.time() - _tr) * 1000.0
-            if cimg is None:
-                raise RuntimeError("点云为空，无法渲染")
-            _te = time.time()
-            ok, buf = cv2.imencode(".jpg", cv2.cvtColor(cimg, cv2.COLOR_RGB2BGR))
-            encode_ms = (time.time() - _te) * 1000.0
-            if not ok:
-                raise RuntimeError("点云图编码失败")
-            n_food = sum(1 for d in detections if d[0] == "food")
-            return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
-                    "meta": {"label": f"点云图·服务端渲染（LA food×{n_food}·框异步·液体走③SAM3）",
-                             "dt": time.time() - t0, "infer_ms": round(infer_ms, 1),
-                             "render_ms": round(render_ms, 1), "encode_ms": round(encode_ms, 1),
-                             "res": res, "shape": [cimg.shape[1], cimg.shape[0]]}}
-        elif fmt == "glb":
-            token = uuid.uuid4().hex
-            outdir = GLB_DIR / token
-            outdir.mkdir(parents=True, exist_ok=True)
-            glb = outdir / "scene.glb"
-            # LocateAnything 用原图检测（高分辨率、召回更好）。DA3 预处理等比缩放无裁剪，
-            # 原图归一化坐标≈深度图，直接乘深度宽高映射，偏差 <2%(patch 对齐)可忽略。
-            detections = _locate_food_drink(arr)
-            labels = build_pointcloud_boxes_glb(
-                pred, detections, str(glb), conf_thresh_percentile=conf,
-                num_max_points=nmp, show_cameras=show_cam)
-            sz = glb.stat().st_size / 1024 if glb.exists() else 0
-            _prune_glb()
-            n_food = labels.count("food")
-            # 识别工作流：食物证据=LA food 框，液体证据=SAM3 流式命中（缓存框），
-            # 任一命中即异步送 Qwen3-VL 识别（节流、后台线程，不阻塞产线）
-            _maybe_recognize(arr, detections + _sam3_recent_drinks(),
-                             f"/glb/{token}/scene.glb", token[:6], pred=pred, conf=conf,
-                             device=device_id)
-            # 真实相机垂直 FOV（复现拍摄视角用）：fov_y = 2·atan(H/(2·fy))，fy=K[1,1]。
-            # 前端据此把点云相机摆回光心正视 -Z，使点云成像与深度图/原图同视角。
-            _K = np.asarray(pred.intrinsics)[0]
-            _H = int(np.asarray(pred.depth)[0].shape[0])
-            _fov_deg = round(float(np.degrees(2 * np.arctan(_H / (2 * _K[1, 1])))), 2)
-            return {"kind": "model", "url": f"/glb/{token}/scene.glb",
-                    "meta": {"label": f"点云 + LA food 框（food×{n_food} · 液体走③SAM3）",
-                             "dt": time.time() - t0, "stat": f"GLB {sz:.0f}KB · res {res}",
-                             "fov_deg": _fov_deg}}
-        elif fmt == "mesh":
-            token = uuid.uuid4().hex
-            outdir = GLB_DIR / token
-            outdir.mkdir(parents=True, exist_ok=True)
-            glb = outdir / "scene.glb"
-            nv, nf = build_mesh_glb(pred, str(glb), conf_thresh_percentile=conf)
-            sz = glb.stat().st_size / 1024 if glb.exists() else 0
-            _prune_glb()
-            return {"kind": "model", "url": f"/glb/{token}/scene.glb",
-                    "meta": {"label": "三角网格 mesh", "dt": time.time() - t0,
-                             "stat": f"顶点 {nv:,} · 面 {nf:,} · GLB {sz:.0f}KB · res {res}"}}
-        else:  # depth
-            depth = np.asarray(pred.depth)[0]
-            ok, buf = cv2.imencode(".jpg", colorize_depth(depth))
-            if not ok:
-                raise RuntimeError("深度图编码失败")
-            return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
-                    "meta": {"label": "彩色深度图（越亮=越近）", "dt": time.time() - t0,
-                             "dmin": float(np.nanmin(depth)), "dmax": float(np.nanmax(depth)),
-                             "shape": [int(depth.shape[1]), int(depth.shape[0])], "res": res}}
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         raise RuntimeError("GPU 显存不足（5090 与产线共享），请调低处理分辨率后重试")
+    infer_ms = (time.time() - t0) * 1000.0     # DA3 推理耗时（收到帧→推理完）
+
+    # 第三图：DA3→SAM3→点云映射（任意产物类型都触发；后台异步跑、忙时跳过，不阻塞产线）
+    _maybe_sam3cloud(pred, conf, fmt, nmp, show_cam, sgen)
+
+    def _build():
+        try:
+            product = _build_mono_product(arr, pred, fmt, res, conf, nmp, show_cam,
+                                          device_id, t0, infer_ms)
+            set_product(device_id, seq, gen, product)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            set_product(device_id, seq, gen, None,
+                        "GPU 显存不足（5090 与产线共享），请调低处理分辨率后重试")
+        except Exception as e:
+            set_product(device_id, seq, gen, None, f"{type(e).__name__}: {e}")
+
+    _mono_builder.submit(_build)
+    return DEFERRED
+
+
+def _build_mono_product(arr, pred, fmt, res, conf, nmp, show_cam,
+                        device_id, t0, infer_ms) -> dict:
+    """单目产物构建级：按 export_format 出产物字典（在 _mono_builder 线程串行执行）。"""
+    if fmt == "cloudimg":
+        # 方案A：服务端(5090 GPU)把点云渲成 2D 图，前端只显示图片（无检测框）。
+        _tr = time.time()
+        cimg = _render_pointcloud_image(pred, [], conf_thresh_percentile=conf)
+        render_ms = (time.time() - _tr) * 1000.0
+        if cimg is None:
+            raise RuntimeError("点云为空，无法渲染")
+        _te = time.time()
+        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(cimg, cv2.COLOR_RGB2BGR))
+        encode_ms = (time.time() - _te) * 1000.0
+        if not ok:
+            raise RuntimeError("点云图编码失败")
+        return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
+                "meta": {"label": "点云图·服务端渲染（液体走③SAM3）",
+                         "dt": time.time() - t0, "infer_ms": round(infer_ms, 1),
+                         "render_ms": round(render_ms, 1), "encode_ms": round(encode_ms, 1),
+                         "res": res, "shape": [cimg.shape[1], cimg.shape[0]]}}
+    elif fmt == "glb":
+        token = uuid.uuid4().hex
+        outdir = GLB_DIR / token
+        outdir.mkdir(parents=True, exist_ok=True)
+        glb = outdir / "scene.glb"
+        # 纯点云 GLB（无检测框）：检测能力已下线，传空检测列表即不画框
+        build_pointcloud_boxes_glb(
+            pred, [], str(glb), conf_thresh_percentile=conf,
+            num_max_points=nmp, show_cameras=show_cam)
+        sz = glb.stat().st_size / 1024 if glb.exists() else 0
+        _prune_glb()
+        # 识别工作流：证据=SAM3 流式液体命中（缓存框），
+        # 命中即异步送 Qwen3-VL 识别（节流、后台线程，不阻塞产线）
+        _maybe_recognize(arr, _sam3_recent_drinks(),
+                         f"/glb/{token}/scene.glb", token[:6], pred=pred, conf=conf,
+                         device=device_id)
+        # 真实相机垂直 FOV（复现拍摄视角用）：fov_y = 2·atan(H/(2·fy))，fy=K[1,1]。
+        # 前端据此把点云相机摆回光心正视 -Z，使点云成像与深度图/原图同视角。
+        _K = np.asarray(pred.intrinsics)[0]
+        _H = int(np.asarray(pred.depth)[0].shape[0])
+        _fov_deg = round(float(np.degrees(2 * np.arctan(_H / (2 * _K[1, 1])))), 2)
+        return {"kind": "model", "url": f"/glb/{token}/scene.glb",
+                "meta": {"label": "点云（GLB · 液体走③SAM3）",
+                         "dt": time.time() - t0, "stat": f"GLB {sz:.0f}KB · res {res}",
+                         "fov_deg": _fov_deg}}
+    elif fmt == "mesh":
+        token = uuid.uuid4().hex
+        outdir = GLB_DIR / token
+        outdir.mkdir(parents=True, exist_ok=True)
+        glb = outdir / "scene.glb"
+        nv, nf = build_mesh_glb(pred, str(glb), conf_thresh_percentile=conf)
+        sz = glb.stat().st_size / 1024 if glb.exists() else 0
+        _prune_glb()
+        return {"kind": "model", "url": f"/glb/{token}/scene.glb",
+                "meta": {"label": "三角网格 mesh", "dt": time.time() - t0,
+                         "stat": f"顶点 {nv:,} · 面 {nf:,} · GLB {sz:.0f}KB · res {res}"}}
+    else:  # depth
+        depth = np.asarray(pred.depth)[0]
+        ok, buf = cv2.imencode(".jpg", colorize_depth(depth))
+        if not ok:
+            raise RuntimeError("深度图编码失败")
+        return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
+                "meta": {"label": "彩色深度图（越亮=越近）", "dt": time.time() - t0,
+                         "dmin": float(np.nanmin(depth)), "dmax": float(np.nanmax(depth)),
+                         "shape": [int(depth.shape[1]), int(depth.shape[0])], "res": res}}
+
+
+def _stereo_sam3_overlays(pred):
+    """双目链路的 SAM3：对左目 processed_image（与深度同一张图，坐标零错位）按生产
+    识别词逐词做**流式增量步进**（_sam3_ir_stream_frame，IR 专用 session、与 RGB
+    主链路的流式记忆完全隔离）——增量步进比旧的每帧无状态 /v1/segment 便宜，且
+    obj_id 跨帧稳定。返回 (overlays, 命中标签列表)。"""
+    left = np.asarray(pred.processed_images)[0]
+    H0, W0 = np.asarray(pred.depth)[0].shape
+    targets = [(w["word"], w.get("label") or "drink") for w in _get_score_cfg()["words"]]
+    # 食物高亮：识别词都是液体词，补一路 food 查询让食物也染色（与单目③④同款；
+    # 双目链路本就不产证据，无污染问题）
+    if not any(l == "food" for (_w, l) in targets):
+        targets = targets + [(SAM3_TEXT_DEFAULT, "food")]
+    if not targets:
+        return [], []
+    with ThreadPoolExecutor(max_workers=len(targets)) as ex:
+        results = list(ex.map(lambda ql: (ql[0], ql[1], _sam3_ir_stream_frame(ql[0], left)),
+                              targets))
+    overlays, id_tags = [], []
+    for _query, label, insts in results:
+        col = LABEL_COLORS.get(label, (255, 200, 0))
+        for ins in insts:
+            rle = ins.get("mask_rle") or {}
+            if not (rle.get("counts") and rle.get("size")):
+                continue
+            try:
+                mk = _rle_decode(rle["size"], rle["counts"])
+            except Exception as e:
+                print(f"[da3-web] 双目 SAM3 mask 解码失败：{type(e).__name__}: {e}",
+                      flush=True)
+                continue
+            if mk.shape != (H0, W0):
+                mk = cv2.resize(mk, (W0, H0), interpolation=cv2.INTER_NEAREST)
+            mk = mk.astype(bool)
+            if not mk.any():
+                continue
+            tag = f"{label}#{ins.get('obj_id', '?')}"
+            overlays.append((tag, col, mk))
+            id_tags.append(tag)
+    return overlays, id_tags
+
+
+def _da3_stereo_processor(left_raw: bytes, right_raw: bytes, aux_info: dict,
+                          config: dict, device_id: str, seq: int, gen: int):
+    """双目链路 GPU 级（两级流水线的第一级）：左右 IR 解码 → DA3 any-view 双视角
+    推理（GPU 锁内）→ 把构建闭包交给 _stereo_builder 后立即返回 DEFERRED。构建级
+    做 SAM3 左目分割染色（网络调用，560ms 量级——正是流水线要重叠掉的大头）+
+    合并点云 GLB，完成后经 set_stereo_product 异步写回 stereo_product 槽。
+
+    与单目链路完全平行：不碰单目产物槽、不碰跨帧时序缓存（识别/流式 SAM3/最近帧
+    都是 RGB 主链路的状态），GPU 推理与单目共用同一把 _gpu_lock 串行。
+    米制尺度：aux_info 带真实双目基线（毫米）时，用「真实基线 ÷ DA3 估计的左右
+    相机间距」整体缩放点云，恢复接近米制的尺度（单目链路做不到）。"""
+    l_gray = cv2.imdecode(np.frombuffer(left_raw, np.uint8), cv2.IMREAD_GRAYSCALE)
+    r_gray = cv2.imdecode(np.frombuffer(right_raw, np.uint8), cv2.IMREAD_GRAYSCALE)
+    if l_gray is None or r_gray is None:
+        raise RuntimeError("左右 IR 解码失败")
+    # IR 是灰度：复制成 3 通道喂 DA3（模型输入约定 RGB）
+    arrs = [np.stack([l_gray] * 3, -1), np.stack([r_gray] * 3, -1)]
+
+    res = int(max(140, min(1120, int(float(
+        config.get("stereo_process_res", config.get("process_res", PROCESS_RES)))))))
+    # conf 分位跟随面板滑杆但减半：40% 分位在 IR 上几乎全砍在暗背景区（散斑打不远、
+    # 后景纹理弱 → conf 低），按单目口径裁会把后景整片裁没（2026-08-13 实测）
+    conf = float(config.get("conf_thresh_percentile", 40.0)) * 0.5
+    # 点预算 = 单目预算 × 2 视角：合并点云共用一份预算会把每视角密度砍半——双目实测
+    # 恰好卡死在单目预算上限（98937/100000），后景先被随机抽稀（同日实测）
+    nmp = min(2 * int(float(config.get("num_max_points", 800000))), 2_000_000)
+    show_cam = str(config.get("show_cameras", "1")) in ("1", "true", "True", "on", "显示")
+
+    model = get_model()
+    t0 = time.time()
+    try:
+        with _gpu_lock:  # 与单目/Gradio 共用同一模型，串行化 GPU 推理
+            with torch.no_grad():
+                pred = model.inference(arrs, process_res=res, export_format="mini_npz")
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        raise RuntimeError("GPU 显存不足（5090 与产线共享），请调低双目处理分辨率后重试")
+    infer_ms = (time.time() - t0) * 1000.0
+
+    def _build():
+        try:
+            product = _build_stereo_product(pred, aux_info, res, conf, nmp,
+                                            show_cam, device_id, t0, infer_ms)
+            set_stereo_product(device_id, seq, gen, product)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            set_stereo_product(device_id, seq, gen, None,
+                               "GPU 显存不足（5090 与产线共享），请调低双目处理分辨率后重试")
+        except Exception as e:
+            set_stereo_product(device_id, seq, gen, None, f"{type(e).__name__}: {e}")
+
+    _stereo_builder.submit(_build)
+    return DEFERRED
+
+
+# ── 双目取景参数的帧间平滑（治换图缩放抖动）：DA3 逐帧估计的内参 FOV 与双目基线
+# 都有帧间噪声（实测 fov 42.8~52.2° 抖、基线估计 36~40mm 抖、场景变化时更大），
+# 逐帧直出会让前端每次换图都按新值重新取景 → 视觉上"快速缩放一下"。
+# 按设备取近 N 帧滑动中位数输出：中位数对离群帧（如手挡住画面时的离谱估计）比
+# 均值稳，收敛也够快（N=10 @1.4张/s ≈ 7 秒窗口）。──────────────────────────
+_STEREO_SMOOTH_N = 10
+_stereo_smooth: dict = {}          # device_id -> {"scale": deque, "fov": deque}
+_stereo_smooth_lock = threading.Lock()
+
+
+def _smooth_stereo_param(device_id: str, key: str, value):
+    """当帧估计值滑进该设备窗口，返回窗口中位数；value=None 时返回历史中位数（可能 None）。"""
+    with _stereo_smooth_lock:
+        dq = _stereo_smooth.setdefault(device_id, {}).setdefault(
+            key, deque(maxlen=_STEREO_SMOOTH_N))
+        if value is not None:
+            dq.append(float(value))
+        return float(np.median(dq)) if dq else None
+
+
+def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
+                          device_id, t0, infer_ms) -> dict:
+    """双目产物构建级：SAM3 左目分割 + 米制缩放 + 合并点云 GLB（在 _stereo_builder
+    线程串行执行）。取景相关的逐帧估计量（point_scale/fov）经滑动中位数平滑输出。"""
+    # SAM3 一次性分割左目（网络调用，不占 GPU 锁）
+    _ts = time.time()
+    try:
+        overlays, id_tags = _stereo_sam3_overlays(pred)
+    except Exception as e:
+        print(f"[da3-web] 双目 SAM3 分割失败（降级无染色）：{type(e).__name__}: {e}",
+              flush=True)
+        overlays, id_tags = [], []
+    sam3_ms = (time.time() - _ts) * 1000.0
+
+    # 米制尺度：真实基线 ÷ DA3 估计的左右相机光心间距
+    point_scale = None
+    est_mm = None
+    baseline_mm = aux_info.get("baseline_mm")
+    ext = pred.extrinsics
+    if baseline_mm and ext is not None and len(ext) >= 2:
+        e0, e1 = (np.asarray(x).astype(np.float64) for x in (ext[0], ext[1]))
+        c0 = -e0[:3, :3].T @ e0[:3, 3]   # w2c → 相机光心（世界系）
+        c1 = -e1[:3, :3].T @ e1[:3, 3]
+        est = float(np.linalg.norm(c0 - c1))
+        if est > 1e-6:
+            est_mm = est * 1000.0
+            point_scale = (float(baseline_mm) / 1000.0) / est
+    # 帧间平滑：尺度进滑动中位数（本帧估不出时沿用历史中位数），点云整体大小不再逐帧呼吸
+    point_scale = _smooth_stereo_param(device_id, "scale", point_scale)
+
+    token = uuid.uuid4().hex
+    outdir = GLB_DIR / token
+    outdir.mkdir(parents=True, exist_ok=True)
+    glb = outdir / "scene.glb"
+    # 几何阶段只算一次：主产物与下面的高亮版共享反投影/conf 裁剪/降采样/MAD 结果，
+    # 各自只做「顶点色 bake + GLB 导出」。高亮版参数（conf 分位、outlier_mad 来自
+    # /api/sam3hl/config）与主产物调不等时，build_stereo_pointcloud_glb 按参数指纹
+    # 自动回退独立几何计算，行为与共享前一致
+    geo = _stereo_geometry(pred, conf, nmp, 12.0, point_scale)
+    K0 = build_stereo_pointcloud_glb(
+        pred, str(glb), conf_thresh_percentile=conf, num_max_points=nmp,
+        show_cameras=show_cam, mask_overlays=overlays, point_scale=point_scale,
+        color_gamma=0.55,   # IR 暗部提亮：无环境光的后景点在黑底上才可见
+        geo=geo)
+    sz = glb.stat().st_size / 1024 if glb.exists() else 0
+    _prune_glb()
+
+    # VLM 识别触发（前置依赖挂在双目链：单目停用时识别仍然活着）：
+    # 证据 = 左目 SAM3 命中（food/drink mask → 归一化框），识别图 = 该设备最新 RGB 帧
+    # （VLM 吃彩色图；IR 灰度图识别菜品不可靠）。RGB 与左 IR 镜头有厘米级基线差，
+    # 框只作大致位置引导（VLM prompt 本就按"疑似位置"用框）。pred 不传——它的深度
+    # 是 IR 坐标系，与 RGB 帧不对齐，点云快照参考图优雅降级为无。
+    try:
+        raw_rgb = get_latest_frame(device_id)
+        if raw_rgb and overlays:
+            H0, W0 = np.asarray(pred.depth)[0].shape
+            dets = []
+            for (tag, _col, mk) in overlays:
+                ys, xs = np.where(mk)
+                if xs.size == 0:
+                    continue
+                dets.append((tag.split("#", 1)[0],
+                             xs.min() / W0, ys.min() / H0,
+                             (xs.max() + 1) / W0, (ys.max() + 1) / H0))
+            if dets:
+                rgb_img = np.array(ImageOps.exif_transpose(
+                    Image.open(io.BytesIO(raw_rgb))).convert("RGB"))
+                _maybe_recognize(rgb_img, dets, f"/glb/{token}/scene.glb",
+                                 token[:6], pred=None, conf=conf, device=device_id)
+    except Exception as e:   # 识别触发失败不影响双目产物
+        print(f"[da3-web] 双目链识别触发失败（忽略）：{type(e).__name__}: {e}", flush=True)
+
+    # 真实相机垂直 FOV：与单目链路同款，前端把点云相机摆回左目光心正视 -Z
+    _H = int(np.asarray(pred.depth)[0].shape[0])
+    _fov_raw = float(np.degrees(2 * np.arctan(_H / (2 * K0[1, 1]))))
+    # 帧间平滑：FOV 逐帧估计噪声 ±10° 是换图缩放抖动的主凶，中位数稳住取景
+    _fov_deg = round(_smooth_stereo_param(device_id, "fov", _fov_raw) or _fov_raw, 2)
+    scale_note = (f"·米制×{point_scale:.3f}(估计基线{est_mm:.0f}mm·已平滑)"
+                  if point_scale else "")
+
+    # 双目高亮 GLB（/experience 背景来源）：同一 pred/overlays 追加构建，样式读
+    # /api/sam3hl/config（与单目④/面板调节卡同一套配置）。独立 try 隔离——高亮
+    # 构建失败只记 _stereo_hl.error，不影响 /panel 的双目产物
+    try:
+        with _sam3hl_lock:
+            hcfg = dict(_sam3hl_cfg)
+        htoken = uuid.uuid4().hex
+        houtdir = GLB_DIR / htoken
+        houtdir.mkdir(parents=True, exist_ok=True)
+        hglb = houtdir / "scene.glb"
+        build_stereo_pointcloud_glb(
+            pred, str(hglb),
+            # conf 分位同双目主产物口径减半：40% 分位在 IR 上集中裁暗背景
+            conf_thresh_percentile=float(hcfg["conf"]) * 0.5,
+            num_max_points=nmp, show_cameras=False, mask_overlays=overlays,
+            outlier_mad=float(hcfg["outlier_mad"]), point_scale=point_scale,
+            color_gamma=0.55, hl_cfg=hcfg,
+            bake_conf_alpha=(hcfg["pt_conf_size"] > 1e-3
+                             or hcfg["pt_conf_alpha"] > 1e-3),
+            # 与主产物共享几何（默认两套参数相等；被调不等时函数内自动回退独立计算）
+            geo=geo)
+        with _stereo_hl_lock:
+            _stereo_hl.update({
+                "url": f"/glb/{htoken}/scene.glb", "seq": _stereo_hl["seq"] + 1,
+                "error": None, "device": device_id,
+                "meta": {"label": "双目高亮（%s）" % (
+                             "、".join(id_tags) if id_tags else "无目标"),
+                         "fov_deg": _fov_deg}})
+    except Exception as e:
+        with _stereo_hl_lock:
+            _stereo_hl["error"] = f"{type(e).__name__}: {e}"
+    return {"kind": "model", "url": f"/glb/{token}/scene.glb",
+            "meta": {"label": "双目点云 DA3×2 + SAM3（%s）%s" % (
+                         "、".join(id_tags) if id_tags else "无目标", scale_note),
+                     "dt": time.time() - t0, "infer_ms": round(infer_ms, 1),
+                     "sam3_ms": round(sam3_ms, 1),
+                     "stat": f"GLB {sz:.0f}KB · res {res} · 2视角",
+                     "fov_deg": _fov_deg}}
 
 
 app.include_router(frame_router)
-set_processor(_da3_frame_processor)
+# 单目链路总闸：.env 设 DISABLE_MONO_PIPELINE=1 时不注册单目处理器——frame_relay 对
+# RGB 帧退化为纯中继（原图/硬件深度展示、双目 aux 入帧照常），DA3 单目产物、SAM3
+# 点云映射/高亮、VLM 识别触发全停，把 GPU 与 SAM3 算力整体让给双目链路。
+# 恢复：删掉该环境变量重启即可。
+if os.environ.get("DISABLE_MONO_PIPELINE", "0") not in ("1", "true", "True"):
+    set_processor(_da3_frame_processor)
+else:
+    print("[da3-web] 单目链路已停用（DISABLE_MONO_PIPELINE=1）：算力让给双目", flush=True)
+set_stereo_processor(_da3_stereo_processor)
 
 
 def _recog_list_payload(dev):
@@ -3841,6 +4557,14 @@ def sam3hl_status():
         return JSONResponse({"kind": _sam3hl["kind"], "url": _sam3hl["url"],
                              "seq": _sam3hl["seq"], "meta": _sam3hl["meta"],
                              "error": _sam3hl["error"], "cfg": dict(_sam3hl_cfg)})
+
+
+@app.get("/api/stereohl/status")
+def stereohl_status():
+    """双目高亮点云状态（/experience「双目高亮点云」来源）：url 为高亮 GLB；device=
+    产出时的设备 id，前端与当前选中设备比对做陈旧守卫（切设备后旧 GLB 不上画）。"""
+    with _stereo_hl_lock:
+        return JSONResponse(dict(_stereo_hl))
 
 
 @app.get("/api/sam3hl/latest")

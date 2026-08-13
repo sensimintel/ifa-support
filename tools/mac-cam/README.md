@@ -24,8 +24,22 @@ cd tools/mac-cam && ./setup.sh    # 需要 uv；建 .venv(Python 3.11) 并装依
 .venv/bin/python push_astra.py
 ```
 
-默认服务端 `http://192.168.0.50:8060`，可用 `--server` 覆盖。推帧频率在 8060 `/panel`
-「产物参数调节」卡的 **推帧 fps** 滑条上调，脚本轮询生效；服务端不可达时脚本自动重试。
+默认服务端 `http://192.168.0.50:8060`，可用 `--server` 覆盖。
+
+## 帧率调节（按设备，两台摄像机各调各的）
+
+推帧频率与点云直传间隔都是 **per-device 配置**，脚本每 2s 轮询
+`/api/frame/status` 的 `devices[].config` 生效（服务端不可达时自动重试）。调节入口：
+
+- 8060 `/panel` 设备栏的 **推帧 fps** 滑条（作用于当前选中设备）；
+- 8060 `/experience` 右下「调节」抽屉的 **数据源帧率** 区（RGB 推帧 fps + 点云直传间隔）；
+- 直接调接口（18091 控制面经 superadmin `/da3-api` 反代走的就是这条）：
+  `POST /api/frame/device-config`，body 形如
+  `{"device_id":"macmini-astra","config":{"push_fps":5,"product_interval":1.5}}`
+  （merge-patch：只改传入的键，键值传 null 恢复兜底）。
+
+没有下发配置时兜底：全局 `config.push_fps`（旧口径）→ 脚本 `--fps` / `--product-interval`。
+点云直传的接管窗 hold 随间隔联动（3 倍且不小于 10s），间隔调大不会让 DA3 中途抢回槽位。
 
 ## 注意
 

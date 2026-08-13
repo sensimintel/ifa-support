@@ -13,10 +13,17 @@
 ```
        秤(四通道模块) ──→ 交换机 ──┐
                                   │
-       5090 服务器 ───────────────┼──→ 演示路由器 ──→ 外网
-                                  │   LAN 192.168.0.1  (展会: 现场网线)
-       开发机 / 演示手机 / 项链 ───┘   (WiFi + LAN 口)   (公司: 热点/4G)
+       5090 服务器 ───────────────┤
+                                  ├──→ 演示路由器 ──→ 外网
+  mac mini(×2 Orbbec 相机) ───────┤   LAN 192.168.0.1  (展会: 现场网线)
+                                  │   (WiFi + LAN 口)   (公司: 热点/4G)
+       开发机 / 演示手机 / 项链 ───┘
 ```
+
+mac mini（浅体验区相机帧源，见 [`mac-mini/README.md`](mac-mini/README.md)）走 DHCP 网线接入，
+无人依赖其地址（它只出站推帧到 `192.168.0.50:8060`）；SSH 运维找不到它时用
+`ping OdyssdeMac-mini.local`。已配 `pmset sleep 0 + autorestart 1`，断电来电自动开机、
+推帧器 LaunchDaemon 自启，搬迁后插电即活。
 
 公司模拟与展会的**唯一差别是 WAN 接什么**，LAN 侧一根线、一个地址都不用变。这就是这套编址的全部价值。
 
@@ -100,6 +107,9 @@ done
 
 # 6. 外网通路（5090 侧，DNS 与出网一起验）
 ssh odyss@192.168.0.50 'curl -s -o /dev/null -w "%{http_code}\n" -m 8 https://www.google.com/generate_204'
+
+# 7. 浅体验区相机帧源（mac mini 推帧器，应列出 macmini-g335 / macmini-astra）
+curl -s http://192.168.0.50:8060/api/frame/status | grep -o 'macmini-[a-z0-9]*' | sort -u
 ```
 
 第 2 项若显示"不在本网段"，不要去查服务和代码——先查线。

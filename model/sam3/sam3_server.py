@@ -3,6 +3,16 @@
 # 依据实测 API：build_sam3_predictor -> Sam3VideoPredictorMultiGPU，session 式调用，use_fa3=False 走 torch SDPA。
 # 推理统一包在 torch.autocast(bf16)+inference_mode，规避 bf16/fp32 conv bias 不一致。
 #
+# 并发模型（v4）：_LOCK 从互斥锁改为有界信号量（SAM3_MAX_CONCURRENCY，默认 2）——语义是
+#   「限流」而非「互斥」，生产两个词（food/drink）各一路流式 session 可并行推理（同一 predictor
+#   双线程并发已前置实验验证：零异常零死锁、输出与串行逐位一致；每线程各自进 _infer_ctx）。
+#   各共享可变状态自持锁：_streams 增删查由 _streams_lock；同一 session 的步进由 per-session
+#   step_lock（回收/驱逐/关闭路径在关活会话前也先取它，防关到推理中段的会话）；debug 捕获是
+#   threading.local；backbone 特征缓存自带小锁；predictor 内部 session 注册表是 uuid 键 +
+#   GIL 原子的 dict 存取（实核对过上游源码），无需加锁。SAM3_MAX_CONCURRENCY=1 即回退旧串行。
+# backbone 特征缓存（SAM3_EMB_CACHE，默认开）：视觉编码与文本 prompt 无关，两个词对同一帧
+#   背靠背步进时第二个词必命中，省一次 backbone 前向（LRU=2，详见 _install_backbone_cache）。
+#
 # 流式长记忆（/v1/stream/*）——真·增量实现（v3）：
 #   模型本身天然增量：propagate 算第 t 帧时只对历史帧的 memory bank（tracker_inference_states 里的
 #   SAM2 系 spatial memory + object pointer）做 cross-attention，不回头重算旧帧。缺的只是库层
@@ -19,6 +29,7 @@
 #   风险面：_append_frame_to_state 耦合 sam3 内部字段名（Sam3VideoInference 的 state 结构），
 #   上游升级若变动，运行时会抛错——自动回退到 v2 的"滚动窗口全量重放"路径（replay），功能不断。
 import io, os, base64, shutil, tempfile, threading, time, uuid, logging, contextlib
+import hashlib, collections
 import numpy as np, torch
 from PIL import Image
 from fastapi import FastAPI, HTTPException
@@ -36,7 +47,10 @@ try:
 except Exception:  # noqa: BLE001
     _INCR_IMPORTS_OK = False
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# force=True：import sam3 时上游已给 root logger 挂过 handler，若不强制接管，本配置会
+# 变成 no-op、root 停在 WARNING——本文件所有 INFO 日志（含「加载完成」「缓存统计」）会被吞
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s",
+                    force=True)
 logger = logging.getLogger("sam3-server")
 
 CKPT = os.environ.get("SAM3_CKPT", "/home/odyss/models/sam3/sam3.pt")
@@ -55,12 +69,19 @@ STREAM_MATCH_IOU = float(os.environ.get("SAM3_STREAM_MATCH_IOU", "0.4"))  # 身�
 STREAM_INCREMENTAL = os.environ.get("SAM3_STREAM_INCREMENTAL", "1") not in ("0", "false", "False")
 STREAM_REBUILD_EVERY = int(os.environ.get("SAM3_STREAM_REBUILD_EVERY", "60"))
 
-_LOCK = threading.Lock()
+# 推理有界并发限流（默认 2=两路流式 session 并行；=1 回退旧的全串行行为）。
+# 注意 _LOCK 语义是「限流」而非「互斥」：临界区内不得依赖它保护共享可变状态（见文件头注释）。
+MAX_CONCURRENCY = int(os.environ.get("SAM3_MAX_CONCURRENCY", "2"))
+_LOCK = threading.BoundedSemaphore(MAX_CONCURRENCY)
 _pred = None
 _err = None
 
+# backbone 视觉特征内容寻址缓存："0" 时不安装钩子；容量固定 LRU=2（两个词的生产场景恰好覆盖）
+EMB_CACHE_ON = os.environ.get("SAM3_EMB_CACHE", "1") not in ("0", "false", "False")
+EMB_CACHE_SIZE = 2
+
 _streams = {}                     # session_id -> 流式 session 状态字典
-_streams_lock = threading.Lock()  # 保护 _streams 的增删查（推理仍由 _LOCK 串行）
+_streams_lock = threading.Lock()  # 保护 _streams 的增删查（推理由 _LOCK 限流、session 内步进由各自 step_lock 串行）
 
 @contextlib.contextmanager
 def _infer_ctx():
@@ -82,8 +103,9 @@ def _infer_ctx():
 # rescore_alpha 非 None 时启用「换阈值口径」：把 pred_logits 原地改写为
 # logit(presence^α × cond)（presence 指数软化，α=1≈原始行为、α=0=完全忽略 presence），
 # 下游 NMS 与 keep 阈值即卡在新分上（det_thresh>0 时经 property 覆盖 score_threshold_detection）。
-# 状态是 threading.local：推理在请求线程内同步执行（_LOCK 只串行不换线程），
-# 各请求线程互不可见——流式（锁在步进函数内部）与单图并发设置参数也不会串扰。
+# 状态是 threading.local：推理在请求线程内同步执行（_LOCK 只限流不换线程，捕获始终
+# 发生在发起请求的线程），各请求线程互不可见——流式（锁在步进函数内部）与单图并发
+# 设置参数也不会串扰。
 class _DbgState(threading.local):
     def __init__(self):
         self.on = False
@@ -160,6 +182,76 @@ def _install_debug_hook():
     logger.info("presence/top-K 调试钩子已安装（forward_grounding + dot_prod_scoring + 阈值 property）")
 
 
+def _install_backbone_cache():
+    """给 detector.backbone.forward_image 包一层内容寻址 LRU 缓存（加载完成后调用一次）。
+
+    依据前置实验：视觉编码入口只吃图像、与文本 prompt 无关，输出 dict（backbone_fpn /
+    vision_pos_enc / sam2_backbone_out）同一输入两次逐位相同；生产负载是两个词（food/drink）
+    各一路流式 session 对同一帧背靠背步进，每帧每 session 恰好各调一次 forward_image——
+    容量 LRU=2 即可让第二个词必命中，省掉一次 backbone 前向（单帧缓存实测 ~218MB 显存）。
+      · key = 张量 shape + fp16 内容 md5（bf16 无法直转 numpy，统一降 fp16 取字节；hash 开销
+        ~6MB 拷贝，远小于一次 backbone 前向）+ 额外 kwargs 的 repr（兼容未来 backbone 变体
+        传参；出现未知位置参数时不猜 key，本次直接绕过缓存）；
+      · miss → 调原函数，输出里所有张量 clone 后入缓存、并返回缓存值（防未来 compile/
+        cudagraph 复用输出 buffer）；hit → 直接返回缓存引用（前置实验已证下游不原地改）；
+      · 线程安全（与 _LOCK 有界并发共存）：缓存自持小锁；同 key 并发 miss 允许重复计算、
+        后写覆盖，不做等待逻辑；任一环节异常 → 中文警告并回退直调原函数，服务不断。"""
+    backbone = _pred.model.detector.backbone
+    orig = backbone.forward_image
+    cache = collections.OrderedDict()   # key -> 输出 dict（张量已 clone）
+    cache_lock = threading.Lock()
+    stats = {"hit": 0, "miss": 0}
+
+    def _clone_tensors(obj):
+        # 递归 clone 容器里的所有张量（结构不变；非张量成员原样引用）
+        if torch.is_tensor(obj):
+            return obj.clone()
+        if isinstance(obj, dict):
+            return {k: _clone_tensors(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(_clone_tensors(v) for v in obj)
+        return obj
+
+    def _wrapped(samples, *args, **kwargs):
+        try:
+            if args:                    # 未知位置参数：不猜 key，本次绕过缓存
+                return orig(samples, *args, **kwargs)
+            t = samples.detach().to(torch.float16)
+            key = (tuple(t.shape),
+                   hashlib.md5(t.cpu().numpy().tobytes()).hexdigest(),
+                   repr(sorted(kwargs.items())))
+            with cache_lock:
+                hit = cache.get(key)
+                if hit is not None:
+                    cache.move_to_end(key)
+                    stats["hit"] += 1
+                else:
+                    stats["miss"] += 1
+                n = stats["hit"] + stats["miss"]
+            if n % 500 == 0:            # 低频打点，便于线上确认缓存生效
+                logger.info("backbone 缓存统计：hit=%d miss=%d", stats["hit"], stats["miss"])
+            if hit is not None:
+                return hit
+        except Exception as e:  # noqa: BLE001
+            logger.warning("backbone 缓存查询失败（回退直调原函数，不影响推理）：%r", e)
+            return orig(samples, **kwargs)
+        out = orig(samples, **kwargs)
+        try:
+            cached = _clone_tensors(out)
+            with cache_lock:
+                cache[key] = cached     # 同 key 并发 miss：后写覆盖
+                cache.move_to_end(key)
+                while len(cache) > EMB_CACHE_SIZE:
+                    cache.popitem(last=False)
+            return cached
+        except Exception as e:  # noqa: BLE001
+            logger.warning("backbone 缓存写入失败（本次结果不入缓存，不影响推理）：%r", e)
+            return out
+
+    backbone.forward_image = _wrapped
+    logger.info("backbone 特征缓存已安装（LRU=%d，SAM3_EMB_CACHE=0 可关闭）", EMB_CACHE_SIZE)
+
+
 def _dbg_begin(debug, topk, alpha, det_thresh):
     """按请求参数布置本线程的捕获/口径状态。返回 (rescore 是否启用, 规整后的 alpha/det_thresh)。"""
     alpha = min(max(float(alpha), 0.0), 1.0)
@@ -223,6 +315,14 @@ def _load():
         logger.info("正在加载 SAM3 predictor: %s (version=%s, use_fa3=False)", CKPT, VERSION)
         _pred = sam3.build_sam3_predictor(checkpoint_path=CKPT, version=VERSION, use_fa3=False)
         _install_debug_hook()
+        # 特征缓存安装失败只降级不致命（不能让它把整次加载标成失败）
+        try:
+            if EMB_CACHE_ON:
+                _install_backbone_cache()
+            else:
+                logger.info("backbone 特征缓存未启用（SAM3_EMB_CACHE=0）")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("backbone 特征缓存安装失败（跳过，不影响推理）：%r", e)
         logger.info("SAM3 加载完成")
     except Exception as e:
         _err = repr(e)
@@ -419,14 +519,17 @@ def _sweep_streams():
             for sid, _s in dead:
                 del _streams[sid]
         for sid, s in dead:
-            _close_live(s)
+            # 已从 _streams 摘除；限流（非互斥）下须先取 step_lock 再关活会话，
+            # 防把正在步进中段的 sam3 会话关到半截（锁序 step_lock→_LOCK 与步进一致，无死锁）
+            with s["step_lock"]:
+                _close_live(s)
         if dead:
             logger.info("回收空闲流式 session：%s", [sid for sid, _ in dead])
 
 threading.Thread(target=_sweep_streams, daemon=True).start()
 
 app = FastAPI(title="SAM3 Inference Server", version="2.0.0")
-# Prometheus 埋点：暴露 /metrics，含每端点 QPS/延时直方图/in-flight/错误率（对标 LocateAnything 观测）
+# Prometheus 埋点：暴露 /metrics，含每端点 QPS/延时直方图/in-flight/错误率
 Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 @app.on_event("startup")
@@ -559,7 +662,9 @@ def stream_start(req: StreamStartReq):
             "step_lock": threading.Lock(),   # 同一 session 的步进串行
         }
     if evicted is not None:
-        _close_live(evicted)
+        # 先取被驱逐 session 的 step_lock 再关（同 _sweep_streams：防关到步进中段的会话）
+        with evicted["step_lock"]:
+            _close_live(evicted)
     return {"session_id": sid, "text": req.text, "window": window, "forget_frames": forget,
             "impl": _streams[sid]["impl"]}
 
@@ -717,7 +822,9 @@ def stream_close(session_id: str):
     with _streams_lock:
         s = _streams.pop(session_id, None)
     if s is not None:
-        _close_live(s)
+        # 先取 step_lock 再关（同 _sweep_streams：防关到步进中段的会话）
+        with s["step_lock"]:
+            _close_live(s)
     return {"closed": s is not None}
 
 if __name__ == "__main__":
