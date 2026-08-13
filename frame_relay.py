@@ -34,6 +34,11 @@ router = APIRouter()
 DEVICE_TTL = 60.0        # 设备条目过期时间（秒）：超过没有新帧即视为下线并清理
 UNKNOWN_DEVICE = "unknown"   # camera_info 缺失/无 device_id 时的兜底桶
 
+# 流水线契约：处理回调返回 DEFERRED 表示「GPU 级已完成、产物由构建级稍后经
+# set_product / set_stereo_product 异步写回」。worker 收到即取下一帧，不写产物槽——
+# 这样 GPU 推理与 CPU 构建/网络调用重叠流水，链路吞吐从 sum(阶段) 变 max(阶段)。
+DEFERRED = "__deferred__"
+
 # ── 共享状态：一把 Condition 同时兜住状态互斥与"新帧/新配置/切设备"的唤醒 ──────
 _cv = threading.Condition()
 
@@ -58,13 +63,16 @@ _dev_config: dict = {}
 # 可写键与钳制范围：push_fps=RGB 推帧频率（fps）；product_interval=点云产物上传间隔（秒）
 DEV_CONFIG_LIMITS = {"push_fps": (0.1, 30.0), "product_interval": (0.5, 30.0)}
 
-# DA3 处理回调：fn(image_bytes, config, device_id) -> 产物描述字典；由 app.py 在有模型时注入
+# DA3 处理回调：fn(image_bytes, config, device_id, seq, gen) -> 产物描述字典，
+# 或返回 DEFERRED（流水线模式：产物由构建级稍后经 set_product(device_id, seq, gen, …)
+# 异步写回）；由 app.py 在有模型时注入
 #   {"kind":"image","bytes":b"...","content_type":"image/jpeg","meta":{...}}  # 深度图
 #   {"kind":"model","url":"/glb/<token>/scene.glb","meta":{...}}              # 点云/网格 GLB
 _processor: Optional[Callable[[bytes, dict, str], dict]] = None
 _worker_started = False
 
-# 双目处理回调：fn(left_bytes, right_bytes, aux_info, config, device_id) -> 产物描述字典
+# 双目处理回调：fn(left_bytes, right_bytes, aux_info, config, device_id, seq, gen)
+# -> 产物描述字典，或 DEFERRED（构建级经 set_stereo_product 异步写回）
 # （形态同上）。由独立的 stereo worker 驱动，产物写 stereo_product 槽，与单目链路完全平行。
 # （硬件深度不走 aux——深度伪彩随主帧 /api/frame 的可选 depth 字段上报，见 ingest_frame）
 _stereo_processor: Optional[Callable[[bytes, bytes, dict, dict, str], dict]] = None
@@ -240,10 +248,15 @@ def _worker_loop() -> None:
             seq, gen, img, proc = st["seq"], _config_gen, st["image"], _processor
             config = dict(_config)
         try:
-            product = proc(img, config, dev)
+            product = proc(img, config, dev, seq, gen)
             err = None
         except Exception as e:  # 处理失败不影响原图展示，仅记录错误
             product, err = None, f"{type(e).__name__}: {e}"
+        if product == DEFERRED:
+            # 流水线模式：GPU 级已完成，产物由构建级经 set_product 异步写回；
+            # 立即取下一帧，让 GPU 与构建级重叠
+            last_key = key
+            continue
         with _cv:
             st2 = _devices.get(dev)
             # 设备可能在处理期间过期下线，桶没了就丢弃产物；外部产物接管窗口内 DA3
@@ -281,10 +294,13 @@ def _stereo_worker_loop() -> None:
             proc = _stereo_processor
             config = dict(_config)
         try:
-            product = proc(left, right, info, config, dev)
+            product = proc(left, right, info, config, dev, seq, gen)
             err = None
         except Exception as e:  # 处理失败不影响原图/单目链路，仅记录到双目槽
             product, err = None, f"{type(e).__name__}: {e}"
+        if product == DEFERRED:
+            last_key = key      # 流水线模式：构建级经 set_stereo_product 异步写回
+            continue
         with _cv:
             st2 = _devices.get(dev)
             if st2 is not None:
@@ -295,6 +311,41 @@ def _stereo_worker_loop() -> None:
                 st2["stereo_product_error"] = err
                 _cv.notify_all()
         last_key = key
+
+
+def set_product(device_id: str, seq: int, gen: int, product, error=None) -> None:
+    """流水线构建级的异步产物写回口（线程安全）。
+
+    语义与 worker 同步写回一致：设备下线丢弃、外部产物接管窗口内不写、
+    product=None 时保留旧产物只更新 seq/gen/error。seq 落后于当前槽位（构建级
+    单线程本不该发生，防御桶重建）时丢弃。"""
+    with _cv:
+        st = _devices.get(device_id)
+        if st is None or _ext_active_locked(st, time.time()):
+            return
+        if seq < st["product_seq"]:
+            return
+        st["product"] = product if product is not None else st["product"]
+        st["product_seq"] = seq
+        st["product_gen"] = gen
+        st["product_error"] = error
+        _cv.notify_all()
+
+
+def set_stereo_product(device_id: str, seq: int, gen: int, product, error=None) -> None:
+    """流水线构建级的双目产物异步写回口（线程安全），语义同 set_product（双目槽无
+    外部接管概念）。"""
+    with _cv:
+        st = _devices.get(device_id)
+        if st is None:
+            return
+        if seq < st["stereo_product_seq"]:
+            return
+        st["stereo_product"] = product if product is not None else st["stereo_product"]
+        st["stereo_product_seq"] = seq
+        st["stereo_product_gen"] = gen
+        st["stereo_product_error"] = error
+        _cv.notify_all()
 
 
 def _target_device_locked(device: Optional[str]):

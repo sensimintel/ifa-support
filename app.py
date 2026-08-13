@@ -48,8 +48,8 @@ from depth_anything_3.api import DepthAnything3  # noqa: E402
 from depth_anything_3.app.gradio_app import DepthAnything3App  # noqa: E402
 
 from frame_relay import (  # noqa: E402
-    UNKNOWN_DEVICE, get_selected_device, router as frame_router,
-    set_processor, set_stereo_processor)
+    DEFERRED, UNKNOWN_DEVICE, get_selected_device, router as frame_router,
+    set_processor, set_product, set_stereo_processor, set_stereo_product)
 
 MODEL_DIR = str(DA3_ROOT / "models" / "DA3NESTED-GIANT-LARGE-1.1")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -3530,13 +3530,49 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
         _recog_cv.notify()
 
 
-def _da3_frame_processor(raw: bytes, config: dict, device_id: str) -> dict:
-    """把收到的一帧按「面板控件配置」跑 DA3，产出：
-      - export_format=depth → 彩色深度图（图片类产物，返回 JPEG 字节）
-      - export_format=glb   → 点云 + food/drink 3D 检测框 + 相机线框 scene.glb（返回 url）
-      - export_format=mesh  → 深度反投影自建网格 GLB（模型类产物，返回 url）
+class _PipelineBuilder:
+    """流水线构建级：单槽 latest-wins 信箱 + 常驻消化线程。
+
+    GPU 级把「构建闭包」丢进来立即返回去吃下一帧；本线程串行消化最新一份，
+    没消化完就被新的顶掉（旧帧产物直接放弃）。链路吞吐从 sum(GPU+构建) 变
+    max(GPU, 构建)——每帧延时不变，但出产物变成流式连续。"""
+
+    def __init__(self, name: str):
+        self._cv = threading.Condition()
+        self._job = None
+        threading.Thread(target=self._loop, daemon=True, name=name).start()
+
+    def submit(self, job) -> None:
+        with self._cv:
+            self._job = job
+            self._cv.notify()
+
+    def _loop(self) -> None:
+        while True:
+            with self._cv:
+                while self._job is None:
+                    self._cv.wait()
+                job, self._job = self._job, None
+            try:
+                job()
+            except Exception as e:   # 闭包内部已各自兜错，这里只防手滑
+                print(f"[da3-web] 流水线构建级异常：{type(e).__name__}: {e}", flush=True)
+
+
+_mono_builder = _PipelineBuilder("mono-product-builder")
+_stereo_builder = _PipelineBuilder("stereo-product-builder")
+
+
+def _da3_frame_processor(raw: bytes, config: dict, device_id: str,
+                         seq: int, gen: int):
+    """单目链路 GPU 级（两级流水线的第一级）：解码 → DA3 推理（GPU 锁内）→ 触发
+    sam3cloud → 把产物构建闭包交给 _mono_builder 后立即返回 DEFERRED，让 worker
+    马上取下一帧。构建级（第二级）做 LocateAnything/GLB/渲染等 CPU+网络重活，完成后
+    经 set_product 异步写回。产物形态：
+      - export_format=depth → 彩色深度图（图片类产物，JPEG 字节）
+      - export_format=glb   → 点云 + food/drink 3D 检测框 + 相机线框 scene.glb（url）
+      - export_format=mesh  → 深度反投影自建网格 GLB（模型类产物，url）
     与官方 Gradio 共用同一模型、同一把 GPU 锁串行化，避免撞显存。首帧到达才懒加载模型。
-    glb 分支额外调 5090 本地 LocateAnything 检测 food/drink，框与点云同坐标系严格对齐。
     device_id=本帧来源设备（frame_relay 只把选中设备的帧送进来）：与上一帧不同即视为
     切换，先重置全部跨帧时序缓存再处理，识别卡片落到该设备自己的桶。"""
     try:
@@ -3545,7 +3581,7 @@ def _da3_frame_processor(raw: bytes, config: dict, device_id: str) -> dict:
         raise RuntimeError(f"读取图片失败：{e}")
     arr = np.array(img)
 
-    gen = _track_stream_device(device_id)   # 切设备先重置时序缓存，再入队本帧
+    sgen = _track_stream_device(device_id)  # 切设备先重置时序缓存，再入队本帧
     _push_recent_frame(arr)        # 存最近帧，供 /sam3 的短视频跟踪取「过去 N 张图」
 
     fmt = str(config.get("export_format", "depth"))
@@ -3555,89 +3591,108 @@ def _da3_frame_processor(raw: bytes, config: dict, device_id: str) -> dict:
     show_cam = str(config.get("show_cameras", "1")) in ("1", "true", "True", "on", "显示")
 
     model = get_model()
+    t0 = time.time()
     try:
-        t0 = time.time()
-        # GPU 推理放锁内串行化；点云构建 / LocateAnything 检测（CPU+网络）挪到锁外，
-        # 避免检测网络往返长时间占着 GPU 锁、阻塞产线与其他产物。
+        # GPU 推理放锁内串行化；产物构建 / LocateAnything 检测（CPU+网络）在构建级，
+        # 不占 GPU 锁也不挡本线程吃下一帧。
         with _gpu_lock:  # 与官方 Gradio 共用同一模型，串行化 GPU 推理
             with torch.no_grad():
                 pred = model.inference([arr], process_res=res, export_format="mini_npz")
-        infer_ms = (time.time() - t0) * 1000.0     # DA3 推理耗时（收到帧→推理完）
-
-        # 第三图：DA3→SAM3→点云映射（任意产物类型都触发；后台异步跑、忙时跳过，不阻塞产线）
-        _maybe_sam3cloud(pred, conf, fmt, nmp, show_cam, gen)
-
-        if fmt == "cloudimg":
-            # 方案A：服务端(5090 GPU)把点云渲成 2D 图，前端只显示图片。
-            # 检测异步：渲染不等 LocateAnything，用最近缓存的框(后台按 TTL 刷新)→ 整段砍到 ~100ms。
-            detections = _detections_async(arr)
-            _tr = time.time()
-            cimg = _render_pointcloud_image(pred, detections, conf_thresh_percentile=conf)
-            render_ms = (time.time() - _tr) * 1000.0
-            if cimg is None:
-                raise RuntimeError("点云为空，无法渲染")
-            _te = time.time()
-            ok, buf = cv2.imencode(".jpg", cv2.cvtColor(cimg, cv2.COLOR_RGB2BGR))
-            encode_ms = (time.time() - _te) * 1000.0
-            if not ok:
-                raise RuntimeError("点云图编码失败")
-            n_food = sum(1 for d in detections if d[0] == "food")
-            return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
-                    "meta": {"label": f"点云图·服务端渲染（LA food×{n_food}·框异步·液体走③SAM3）",
-                             "dt": time.time() - t0, "infer_ms": round(infer_ms, 1),
-                             "render_ms": round(render_ms, 1), "encode_ms": round(encode_ms, 1),
-                             "res": res, "shape": [cimg.shape[1], cimg.shape[0]]}}
-        elif fmt == "glb":
-            token = uuid.uuid4().hex
-            outdir = GLB_DIR / token
-            outdir.mkdir(parents=True, exist_ok=True)
-            glb = outdir / "scene.glb"
-            # LocateAnything 用原图检测（高分辨率、召回更好）。DA3 预处理等比缩放无裁剪，
-            # 原图归一化坐标≈深度图，直接乘深度宽高映射，偏差 <2%(patch 对齐)可忽略。
-            detections = _locate_food_drink(arr)
-            labels = build_pointcloud_boxes_glb(
-                pred, detections, str(glb), conf_thresh_percentile=conf,
-                num_max_points=nmp, show_cameras=show_cam)
-            sz = glb.stat().st_size / 1024 if glb.exists() else 0
-            _prune_glb()
-            n_food = labels.count("food")
-            # 识别工作流：食物证据=LA food 框，液体证据=SAM3 流式命中（缓存框），
-            # 任一命中即异步送 Qwen3-VL 识别（节流、后台线程，不阻塞产线）
-            _maybe_recognize(arr, detections + _sam3_recent_drinks(),
-                             f"/glb/{token}/scene.glb", token[:6], pred=pred, conf=conf,
-                             device=device_id)
-            # 真实相机垂直 FOV（复现拍摄视角用）：fov_y = 2·atan(H/(2·fy))，fy=K[1,1]。
-            # 前端据此把点云相机摆回光心正视 -Z，使点云成像与深度图/原图同视角。
-            _K = np.asarray(pred.intrinsics)[0]
-            _H = int(np.asarray(pred.depth)[0].shape[0])
-            _fov_deg = round(float(np.degrees(2 * np.arctan(_H / (2 * _K[1, 1])))), 2)
-            return {"kind": "model", "url": f"/glb/{token}/scene.glb",
-                    "meta": {"label": f"点云 + LA food 框（food×{n_food} · 液体走③SAM3）",
-                             "dt": time.time() - t0, "stat": f"GLB {sz:.0f}KB · res {res}",
-                             "fov_deg": _fov_deg}}
-        elif fmt == "mesh":
-            token = uuid.uuid4().hex
-            outdir = GLB_DIR / token
-            outdir.mkdir(parents=True, exist_ok=True)
-            glb = outdir / "scene.glb"
-            nv, nf = build_mesh_glb(pred, str(glb), conf_thresh_percentile=conf)
-            sz = glb.stat().st_size / 1024 if glb.exists() else 0
-            _prune_glb()
-            return {"kind": "model", "url": f"/glb/{token}/scene.glb",
-                    "meta": {"label": "三角网格 mesh", "dt": time.time() - t0,
-                             "stat": f"顶点 {nv:,} · 面 {nf:,} · GLB {sz:.0f}KB · res {res}"}}
-        else:  # depth
-            depth = np.asarray(pred.depth)[0]
-            ok, buf = cv2.imencode(".jpg", colorize_depth(depth))
-            if not ok:
-                raise RuntimeError("深度图编码失败")
-            return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
-                    "meta": {"label": "彩色深度图（越亮=越近）", "dt": time.time() - t0,
-                             "dmin": float(np.nanmin(depth)), "dmax": float(np.nanmax(depth)),
-                             "shape": [int(depth.shape[1]), int(depth.shape[0])], "res": res}}
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         raise RuntimeError("GPU 显存不足（5090 与产线共享），请调低处理分辨率后重试")
+    infer_ms = (time.time() - t0) * 1000.0     # DA3 推理耗时（收到帧→推理完）
+
+    # 第三图：DA3→SAM3→点云映射（任意产物类型都触发；后台异步跑、忙时跳过，不阻塞产线）
+    _maybe_sam3cloud(pred, conf, fmt, nmp, show_cam, sgen)
+
+    def _build():
+        try:
+            product = _build_mono_product(arr, pred, fmt, res, conf, nmp, show_cam,
+                                          device_id, t0, infer_ms)
+            set_product(device_id, seq, gen, product)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            set_product(device_id, seq, gen, None,
+                        "GPU 显存不足（5090 与产线共享），请调低处理分辨率后重试")
+        except Exception as e:
+            set_product(device_id, seq, gen, None, f"{type(e).__name__}: {e}")
+
+    _mono_builder.submit(_build)
+    return DEFERRED
+
+
+def _build_mono_product(arr, pred, fmt, res, conf, nmp, show_cam,
+                        device_id, t0, infer_ms) -> dict:
+    """单目产物构建级：按 export_format 出产物字典（在 _mono_builder 线程串行执行）。"""
+    if fmt == "cloudimg":
+        # 方案A：服务端(5090 GPU)把点云渲成 2D 图，前端只显示图片。
+        # 检测异步：渲染不等 LocateAnything，用最近缓存的框(后台按 TTL 刷新)→ 整段砍到 ~100ms。
+        detections = _detections_async(arr)
+        _tr = time.time()
+        cimg = _render_pointcloud_image(pred, detections, conf_thresh_percentile=conf)
+        render_ms = (time.time() - _tr) * 1000.0
+        if cimg is None:
+            raise RuntimeError("点云为空，无法渲染")
+        _te = time.time()
+        ok, buf = cv2.imencode(".jpg", cv2.cvtColor(cimg, cv2.COLOR_RGB2BGR))
+        encode_ms = (time.time() - _te) * 1000.0
+        if not ok:
+            raise RuntimeError("点云图编码失败")
+        n_food = sum(1 for d in detections if d[0] == "food")
+        return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
+                "meta": {"label": f"点云图·服务端渲染（LA food×{n_food}·框异步·液体走③SAM3）",
+                         "dt": time.time() - t0, "infer_ms": round(infer_ms, 1),
+                         "render_ms": round(render_ms, 1), "encode_ms": round(encode_ms, 1),
+                         "res": res, "shape": [cimg.shape[1], cimg.shape[0]]}}
+    elif fmt == "glb":
+        token = uuid.uuid4().hex
+        outdir = GLB_DIR / token
+        outdir.mkdir(parents=True, exist_ok=True)
+        glb = outdir / "scene.glb"
+        # LocateAnything 用原图检测（高分辨率、召回更好）。DA3 预处理等比缩放无裁剪，
+        # 原图归一化坐标≈深度图，直接乘深度宽高映射，偏差 <2%(patch 对齐)可忽略。
+        detections = _locate_food_drink(arr)
+        labels = build_pointcloud_boxes_glb(
+            pred, detections, str(glb), conf_thresh_percentile=conf,
+            num_max_points=nmp, show_cameras=show_cam)
+        sz = glb.stat().st_size / 1024 if glb.exists() else 0
+        _prune_glb()
+        n_food = labels.count("food")
+        # 识别工作流：食物证据=LA food 框，液体证据=SAM3 流式命中（缓存框），
+        # 任一命中即异步送 Qwen3-VL 识别（节流、后台线程，不阻塞产线）
+        _maybe_recognize(arr, detections + _sam3_recent_drinks(),
+                         f"/glb/{token}/scene.glb", token[:6], pred=pred, conf=conf,
+                         device=device_id)
+        # 真实相机垂直 FOV（复现拍摄视角用）：fov_y = 2·atan(H/(2·fy))，fy=K[1,1]。
+        # 前端据此把点云相机摆回光心正视 -Z，使点云成像与深度图/原图同视角。
+        _K = np.asarray(pred.intrinsics)[0]
+        _H = int(np.asarray(pred.depth)[0].shape[0])
+        _fov_deg = round(float(np.degrees(2 * np.arctan(_H / (2 * _K[1, 1])))), 2)
+        return {"kind": "model", "url": f"/glb/{token}/scene.glb",
+                "meta": {"label": f"点云 + LA food 框（food×{n_food} · 液体走③SAM3）",
+                         "dt": time.time() - t0, "stat": f"GLB {sz:.0f}KB · res {res}",
+                         "fov_deg": _fov_deg}}
+    elif fmt == "mesh":
+        token = uuid.uuid4().hex
+        outdir = GLB_DIR / token
+        outdir.mkdir(parents=True, exist_ok=True)
+        glb = outdir / "scene.glb"
+        nv, nf = build_mesh_glb(pred, str(glb), conf_thresh_percentile=conf)
+        sz = glb.stat().st_size / 1024 if glb.exists() else 0
+        _prune_glb()
+        return {"kind": "model", "url": f"/glb/{token}/scene.glb",
+                "meta": {"label": "三角网格 mesh", "dt": time.time() - t0,
+                         "stat": f"顶点 {nv:,} · 面 {nf:,} · GLB {sz:.0f}KB · res {res}"}}
+    else:  # depth
+        depth = np.asarray(pred.depth)[0]
+        ok, buf = cv2.imencode(".jpg", colorize_depth(depth))
+        if not ok:
+            raise RuntimeError("深度图编码失败")
+        return {"kind": "image", "bytes": buf.tobytes(), "content_type": "image/jpeg",
+                "meta": {"label": "彩色深度图（越亮=越近）", "dt": time.time() - t0,
+                         "dmin": float(np.nanmin(depth)), "dmax": float(np.nanmax(depth)),
+                         "shape": [int(depth.shape[1]), int(depth.shape[0])], "res": res}}
 
 
 def _stereo_sam3_overlays(pred):
@@ -3681,9 +3736,11 @@ def _stereo_sam3_overlays(pred):
 
 
 def _da3_stereo_processor(left_raw: bytes, right_raw: bytes, aux_info: dict,
-                          config: dict, device_id: str) -> dict:
-    """把左右 IR 一对灰度图喂 DA3 any-view 双视角推理 → SAM3 左目分割染色 →
-    合并点云 GLB（stereo worker 驱动，产物写 stereo_product 槽）。
+                          config: dict, device_id: str, seq: int, gen: int):
+    """双目链路 GPU 级（两级流水线的第一级）：左右 IR 解码 → DA3 any-view 双视角
+    推理（GPU 锁内）→ 把构建闭包交给 _stereo_builder 后立即返回 DEFERRED。构建级
+    做 SAM3 左目分割染色（网络调用，560ms 量级——正是流水线要重叠掉的大头）+
+    合并点云 GLB，完成后经 set_stereo_product 异步写回 stereo_product 槽。
 
     与单目链路完全平行：不碰单目产物槽、不碰跨帧时序缓存（识别/流式 SAM3/最近帧
     都是 RGB 主链路的状态），GPU 推理与单目共用同一把 _gpu_lock 串行。
@@ -3707,93 +3764,113 @@ def _da3_stereo_processor(left_raw: bytes, right_raw: bytes, aux_info: dict,
     show_cam = str(config.get("show_cameras", "1")) in ("1", "true", "True", "on", "显示")
 
     model = get_model()
+    t0 = time.time()
     try:
-        t0 = time.time()
         with _gpu_lock:  # 与单目/Gradio 共用同一模型，串行化 GPU 推理
             with torch.no_grad():
                 pred = model.inference(arrs, process_res=res, export_format="mini_npz")
-        infer_ms = (time.time() - t0) * 1000.0
-
-        # SAM3 一次性分割左目（网络调用放 GPU 锁外，不长时间占锁）
-        _ts = time.time()
-        try:
-            overlays, id_tags = _stereo_sam3_overlays(pred)
-        except Exception as e:
-            print(f"[da3-web] 双目 SAM3 分割失败（降级无染色）：{type(e).__name__}: {e}",
-                  flush=True)
-            overlays, id_tags = [], []
-        sam3_ms = (time.time() - _ts) * 1000.0
-
-        # 米制尺度：真实基线 ÷ DA3 估计的左右相机光心间距
-        point_scale = None
-        est_mm = None
-        baseline_mm = aux_info.get("baseline_mm")
-        ext = pred.extrinsics
-        if baseline_mm and ext is not None and len(ext) >= 2:
-            e0, e1 = (np.asarray(x).astype(np.float64) for x in (ext[0], ext[1]))
-            c0 = -e0[:3, :3].T @ e0[:3, 3]   # w2c → 相机光心（世界系）
-            c1 = -e1[:3, :3].T @ e1[:3, 3]
-            est = float(np.linalg.norm(c0 - c1))
-            if est > 1e-6:
-                est_mm = est * 1000.0
-                point_scale = (float(baseline_mm) / 1000.0) / est
-
-        token = uuid.uuid4().hex
-        outdir = GLB_DIR / token
-        outdir.mkdir(parents=True, exist_ok=True)
-        glb = outdir / "scene.glb"
-        K0 = build_stereo_pointcloud_glb(
-            pred, str(glb), conf_thresh_percentile=conf, num_max_points=nmp,
-            show_cameras=show_cam, mask_overlays=overlays, point_scale=point_scale,
-            color_gamma=0.55)   # IR 暗部提亮：无环境光的后景点在黑底上才可见
-        sz = glb.stat().st_size / 1024 if glb.exists() else 0
-        _prune_glb()
-
-        # 真实相机垂直 FOV：与单目链路同款，前端把点云相机摆回左目光心正视 -Z
-        _H = int(np.asarray(pred.depth)[0].shape[0])
-        _fov_deg = round(float(np.degrees(2 * np.arctan(_H / (2 * K0[1, 1])))), 2)
-        scale_note = (f"·米制×{point_scale:.3f}(估计基线{est_mm:.0f}mm)"
-                      if point_scale else "")
-
-        # 双目高亮 GLB（/experience 背景来源）：同一 pred/overlays 追加构建，样式读
-        # /api/sam3hl/config（与单目④/面板调节卡同一套配置）。独立 try 隔离——高亮
-        # 构建失败只记 _stereo_hl.error，不影响 /panel 的双目产物
-        try:
-            with _sam3hl_lock:
-                hcfg = dict(_sam3hl_cfg)
-            htoken = uuid.uuid4().hex
-            houtdir = GLB_DIR / htoken
-            houtdir.mkdir(parents=True, exist_ok=True)
-            hglb = houtdir / "scene.glb"
-            build_stereo_pointcloud_glb(
-                pred, str(hglb),
-                # conf 分位同双目主产物口径减半：40% 分位在 IR 上集中裁暗背景
-                conf_thresh_percentile=float(hcfg["conf"]) * 0.5,
-                num_max_points=nmp, show_cameras=False, mask_overlays=overlays,
-                outlier_mad=float(hcfg["outlier_mad"]), point_scale=point_scale,
-                color_gamma=0.55, hl_cfg=hcfg,
-                bake_conf_alpha=(hcfg["pt_conf_size"] > 1e-3
-                                 or hcfg["pt_conf_alpha"] > 1e-3))
-            with _stereo_hl_lock:
-                _stereo_hl.update({
-                    "url": f"/glb/{htoken}/scene.glb", "seq": _stereo_hl["seq"] + 1,
-                    "error": None, "device": device_id,
-                    "meta": {"label": "双目高亮（%s）" % (
-                                 "、".join(id_tags) if id_tags else "无目标"),
-                             "fov_deg": _fov_deg}})
-        except Exception as e:
-            with _stereo_hl_lock:
-                _stereo_hl["error"] = f"{type(e).__name__}: {e}"
-        return {"kind": "model", "url": f"/glb/{token}/scene.glb",
-                "meta": {"label": "双目点云 DA3×2 + SAM3（%s）%s" % (
-                             "、".join(id_tags) if id_tags else "无目标", scale_note),
-                         "dt": time.time() - t0, "infer_ms": round(infer_ms, 1),
-                         "sam3_ms": round(sam3_ms, 1),
-                         "stat": f"GLB {sz:.0f}KB · res {res} · 2视角",
-                         "fov_deg": _fov_deg}}
     except torch.cuda.OutOfMemoryError:
         torch.cuda.empty_cache()
         raise RuntimeError("GPU 显存不足（5090 与产线共享），请调低双目处理分辨率后重试")
+    infer_ms = (time.time() - t0) * 1000.0
+
+    def _build():
+        try:
+            product = _build_stereo_product(pred, aux_info, res, conf, nmp,
+                                            show_cam, device_id, t0, infer_ms)
+            set_stereo_product(device_id, seq, gen, product)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            set_stereo_product(device_id, seq, gen, None,
+                               "GPU 显存不足（5090 与产线共享），请调低双目处理分辨率后重试")
+        except Exception as e:
+            set_stereo_product(device_id, seq, gen, None, f"{type(e).__name__}: {e}")
+
+    _stereo_builder.submit(_build)
+    return DEFERRED
+
+
+def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
+                          device_id, t0, infer_ms) -> dict:
+    """双目产物构建级：SAM3 左目分割 + 米制缩放 + 合并点云 GLB（在 _stereo_builder
+    线程串行执行）。"""
+    # SAM3 一次性分割左目（网络调用，不占 GPU 锁）
+    _ts = time.time()
+    try:
+        overlays, id_tags = _stereo_sam3_overlays(pred)
+    except Exception as e:
+        print(f"[da3-web] 双目 SAM3 分割失败（降级无染色）：{type(e).__name__}: {e}",
+              flush=True)
+        overlays, id_tags = [], []
+    sam3_ms = (time.time() - _ts) * 1000.0
+
+    # 米制尺度：真实基线 ÷ DA3 估计的左右相机光心间距
+    point_scale = None
+    est_mm = None
+    baseline_mm = aux_info.get("baseline_mm")
+    ext = pred.extrinsics
+    if baseline_mm and ext is not None and len(ext) >= 2:
+        e0, e1 = (np.asarray(x).astype(np.float64) for x in (ext[0], ext[1]))
+        c0 = -e0[:3, :3].T @ e0[:3, 3]   # w2c → 相机光心（世界系）
+        c1 = -e1[:3, :3].T @ e1[:3, 3]
+        est = float(np.linalg.norm(c0 - c1))
+        if est > 1e-6:
+            est_mm = est * 1000.0
+            point_scale = (float(baseline_mm) / 1000.0) / est
+
+    token = uuid.uuid4().hex
+    outdir = GLB_DIR / token
+    outdir.mkdir(parents=True, exist_ok=True)
+    glb = outdir / "scene.glb"
+    K0 = build_stereo_pointcloud_glb(
+        pred, str(glb), conf_thresh_percentile=conf, num_max_points=nmp,
+        show_cameras=show_cam, mask_overlays=overlays, point_scale=point_scale,
+        color_gamma=0.55)   # IR 暗部提亮：无环境光的后景点在黑底上才可见
+    sz = glb.stat().st_size / 1024 if glb.exists() else 0
+    _prune_glb()
+
+    # 真实相机垂直 FOV：与单目链路同款，前端把点云相机摆回左目光心正视 -Z
+    _H = int(np.asarray(pred.depth)[0].shape[0])
+    _fov_deg = round(float(np.degrees(2 * np.arctan(_H / (2 * K0[1, 1])))), 2)
+    scale_note = (f"·米制×{point_scale:.3f}(估计基线{est_mm:.0f}mm)"
+                  if point_scale else "")
+
+    # 双目高亮 GLB（/experience 背景来源）：同一 pred/overlays 追加构建，样式读
+    # /api/sam3hl/config（与单目④/面板调节卡同一套配置）。独立 try 隔离——高亮
+    # 构建失败只记 _stereo_hl.error，不影响 /panel 的双目产物
+    try:
+        with _sam3hl_lock:
+            hcfg = dict(_sam3hl_cfg)
+        htoken = uuid.uuid4().hex
+        houtdir = GLB_DIR / htoken
+        houtdir.mkdir(parents=True, exist_ok=True)
+        hglb = houtdir / "scene.glb"
+        build_stereo_pointcloud_glb(
+            pred, str(hglb),
+            # conf 分位同双目主产物口径减半：40% 分位在 IR 上集中裁暗背景
+            conf_thresh_percentile=float(hcfg["conf"]) * 0.5,
+            num_max_points=nmp, show_cameras=False, mask_overlays=overlays,
+            outlier_mad=float(hcfg["outlier_mad"]), point_scale=point_scale,
+            color_gamma=0.55, hl_cfg=hcfg,
+            bake_conf_alpha=(hcfg["pt_conf_size"] > 1e-3
+                             or hcfg["pt_conf_alpha"] > 1e-3))
+        with _stereo_hl_lock:
+            _stereo_hl.update({
+                "url": f"/glb/{htoken}/scene.glb", "seq": _stereo_hl["seq"] + 1,
+                "error": None, "device": device_id,
+                "meta": {"label": "双目高亮（%s）" % (
+                             "、".join(id_tags) if id_tags else "无目标"),
+                         "fov_deg": _fov_deg}})
+    except Exception as e:
+        with _stereo_hl_lock:
+            _stereo_hl["error"] = f"{type(e).__name__}: {e}"
+    return {"kind": "model", "url": f"/glb/{token}/scene.glb",
+            "meta": {"label": "双目点云 DA3×2 + SAM3（%s）%s" % (
+                         "、".join(id_tags) if id_tags else "无目标", scale_note),
+                     "dt": time.time() - t0, "infer_ms": round(infer_ms, 1),
+                     "sam3_ms": round(sam3_ms, 1),
+                     "stat": f"GLB {sz:.0f}KB · res {res} · 2视角",
+                     "fov_deg": _fov_deg}}
 
 
 app.include_router(frame_router)
