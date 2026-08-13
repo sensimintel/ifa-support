@@ -42,5 +42,8 @@ env/
 
 sam3_score_cfg.json
 
+# per-device 帧率配置（frame_relay 落盘持久化，运行时生成）
+dev_config.json
+
 # Orbbec SDK 运行时日志目录（mac-cam 推流脚本运行时生成）
 tools/mac-cam/Log/

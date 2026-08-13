@@ -24,6 +24,7 @@
 import json
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Optional
 
 from fastapi import APIRouter, Body, File, Form, Query, UploadFile
@@ -62,6 +63,32 @@ _config_gen = 0                       # 配置版本号：变更时 +1，用于�
 _dev_config: dict = {}
 # 可写键与钳制范围：push_fps=RGB 推帧频率（fps）；product_interval=点云产物上传间隔（秒）
 DEV_CONFIG_LIMITS = {"push_fps": (0.1, 30.0), "product_interval": (0.5, 30.0)}
+
+# per-device 配置落盘持久化（gitignored 本地态，学 sam3_score_cfg.json 的做法）：
+# 服务重启不再回落默认帧率——此前配置是纯内存态，每次重启都得重新下发
+_DEV_CONFIG_PATH = Path(__file__).resolve().parent / "dev_config.json"
+try:
+    _dev_config.update({str(d): dict(c) for d, c in
+                        json.loads(_DEV_CONFIG_PATH.read_text()).items()
+                        if isinstance(c, dict)})
+    print(f"[frame-relay] 已回读 per-device 配置：{_dev_config}", flush=True)
+except FileNotFoundError:
+    pass
+except Exception as e:
+    print(f"[frame-relay] per-device 配置回读失败（忽略）：{type(e).__name__}: {e}",
+          flush=True)
+
+
+def _save_dev_config_locked() -> None:
+    """持锁快照后落盘（写临时文件再原子替换，防写一半被杀留坏文件）。"""
+    snap = json.dumps(_dev_config, ensure_ascii=False, indent=1)
+    try:
+        tmp = _DEV_CONFIG_PATH.with_suffix(".json.tmp")
+        tmp.write_text(snap)
+        tmp.replace(_DEV_CONFIG_PATH)
+    except Exception as e:
+        print(f"[frame-relay] per-device 配置落盘失败（忽略）：{type(e).__name__}: {e}",
+              flush=True)
 
 # DA3 处理回调：fn(image_bytes, config, device_id, seq, gen) -> 产物描述字典，
 # 或返回 DEFERRED（流水线模式：产物由构建级稍后经 set_product(device_id, seq, gen, …)
@@ -595,6 +622,7 @@ async def set_device_config(body: dict = Body(...)):
             _dev_config[dev] = cfg
         else:
             _dev_config.pop(dev, None)
+        _save_dev_config_locked()
         _cv.notify_all()
     return JSONResponse({"ok": True, "device": dev, "config": cfg})
 
