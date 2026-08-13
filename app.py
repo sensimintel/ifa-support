@@ -3221,6 +3221,21 @@ function dotEdgeBuild(){
     else{const a=dotHash(i)*6.28318;nx=Math.cos(a);ny=Math.sin(a);}
     const b=i*3;dotEdge[b]=e;dotEdge[b+1]=nx;dotEdge[b+2]=ny;
   }
+  // 膨胀两轮：把边缘场向两侧各扩一格（强度按 0.55/格衰减、方向继承最强邻居）——
+  // 参与消散的是一条带而不是一条线，量感和「炸」的规模由此而来
+  for(let pass=0;pass<2;pass++){
+    const src=dotEdge;dotEdge=new Float32Array(src.length);dotEdge.set(src);
+    for(let y=1;y<dotRows-1;y++)for(let x=1;x<dotCols-1;x++){
+      const i=y*dotCols+x,b=i*3;
+      let best=src[b]; let bi=-1;
+      for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
+        if(!dx&&!dy)continue;
+        const nb=((y+dy)*dotCols+x+dx)*3,v=src[nb]*0.55;
+        if(v>best){best=v;bi=nb;}
+      }
+      if(bi>=0){dotEdge[b]=best;dotEdge[b+1]=src[bi+1];dotEdge[b+2]=src[bi+2];}
+    }
+  }
 }
 function dotHash(i){
   // 逐点稳定伪随机 [0,1)：只随下标变、帧间不变——抖动排布不逐帧乱跳
@@ -3252,10 +3267,11 @@ function dotDraw(tSec){
     if(pf>0&&dotEdge){   // 边缘消散：边缘格的点沿外散方向飘出，越远越淡越小（缓慢起伏）
       const eb=idx*3,e=dotEdge[eb];
       if(e>0.05){
-        const h3=dotHash(idx+3571);
-        const fly=e*pf*3*(0.25+0.75*h3)*(1+0.3*Math.sin(t*spd*0.8+h3*TAU));
+        // 飞行上限随强度非线性抬升：低档轻雾（~3格），拉满真炸（~11格）
+        const h3=dotHash(idx+3571),F=2+9*pf;
+        const fly=e*pf*F*(0.25+0.75*h3)*(1+0.3*Math.sin(t*spd*0.8+h3*TAU));
         x+=dotEdge[eb+1]*fly*P;y+=dotEdge[eb+2]*fly*P;
-        al*=1-Math.min(0.85,fly*0.3);r*=1-0.35*Math.min(1,fly/3);
+        al*=1-Math.min(0.85,fly/F*0.9);r*=1-0.35*Math.min(1,fly/F);
       }
     }
     if(r<=0.2)continue;
@@ -3331,17 +3347,22 @@ function pcDraw(t){
       if(e>0.05){
         const h=ph*0.159155;   // 相位归一化 [0,1) 作逐粒子稳定随机
         const prog=(t*spd*(0.1+0.2*h)+h*7)%1;
-        const dist=e*pf*(40+80*h)*dpr*prog;
-        ex=dotEdge[eb+1]*dist;ey=dotEdge[eb+2]*dist;
+        // 飞行距离随强度非线性抬升（拉满约 300px×dpr），加垂直向摆动让轨迹带弧度
+        const dist=e*(30+270*pf*pf+120*pf*h)*dpr*prog;
+        const sway=Math.sin(prog*9+ph)*dist*0.18;
+        ex=dotEdge[eb+1]*dist-dotEdge[eb+2]*sway;
+        ey=dotEdge[eb+2]*dist+dotEdge[eb+1]*sway;
         al=1-prog*0.9;
       }
     }
     if(al!==curAl){ctx.globalAlpha=al;curAl=al;}
     const s=Math.max(1,pcPool[b+3]*psz);
     ctx.fillRect(x+ex,y+ey,s,s);
-    if(ex||ey){   // 拖尾：沿来路补一颗更淡的小点，扫出消散的流线感
-      ctx.globalAlpha=al*0.45;
-      ctx.fillRect(x+ex*0.72,y+ey*0.72,s*0.8,s*0.8);
+    if(ex||ey){   // 拖尾：沿来路补两颗渐淡渐小的点，扫出消散的流线感
+      ctx.globalAlpha=al*0.5;
+      ctx.fillRect(x+ex*0.75,y+ey*0.75,s*0.85,s*0.85);
+      ctx.globalAlpha=al*0.25;
+      ctx.fillRect(x+ex*0.5,y+ey*0.5,s*0.7,s*0.7);
       curAl=-1;
     }
   }
