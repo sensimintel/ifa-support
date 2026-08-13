@@ -233,8 +233,10 @@ def _new_bucket(now: float) -> dict:
     return {
         "seq": 0, "image": None, "content_type": "image/jpeg",
         # 相机硬件深度图（帧源已伪彩渲染好的 JPEG，如 mac mini 推帧器）：独立计数，
-        # 不参与 DA3 处理，仅供 /panel 左上角展示
+        # 不参与 DA3 处理，仅供 /panel 左上角展示。depth_received_at 单独记时：
+        # 深度独立帧率高于 RGB 时存在 depth-only 上报，须一并续设备 TTL
         "depth_image": None, "depth_seq": 0, "depth_content_type": "image/jpeg",
+        "depth_received_at": 0.0,
         "received_at": 0.0, "prev_received_at": 0.0,
         "camera_info": None, "timestamp": None, "first_seen": now,
         "product": None, "product_seq": 0, "product_gen": 0, "product_error": None,
@@ -257,8 +259,10 @@ def _ext_active_locked(st: dict, now: float) -> bool:
 
 
 def _prune_locked(now: float) -> None:
-    """清理超过 DEVICE_TTL 没有新帧的设备条目（选中设备也会过期，随后自动回落）。"""
-    stale = [d for d, st in _devices.items() if now - st["received_at"] > DEVICE_TTL]
+    """清理超过 DEVICE_TTL 没有新帧的设备条目（选中设备也会过期，随后自动回落）。
+    RGB 帧与 depth-only 上报任一到达都算「有新帧」续 TTL。"""
+    stale = [d for d, st in _devices.items()
+             if now - max(st["received_at"], st.get("depth_received_at", 0.0)) > DEVICE_TTL]
     for d in stale:
         del _devices[d]
 
@@ -426,7 +430,7 @@ def _target_device_locked(device: Optional[str]):
 
 @router.post("/api/frame")
 async def ingest_frame(
-    image: UploadFile = File(...),
+    image: Optional[UploadFile] = File(None),
     depth: Optional[UploadFile] = File(None),
     camera_info: Optional[str] = Form(None),
     timestamp: Optional[str] = Form(None),
@@ -436,33 +440,45 @@ async def ingest_frame(
     字段：image（二进制图片）、depth（可选，相机硬件深度图的伪彩 JPEG，随彩色帧
     一并上报）、camera_info（可选 JSON 字符串，其中 device_id 用于分桶）、
     timestamp（可选）。仅更新该设备桶的最新帧并唤醒处理线程，立即返回，不阻塞在 GPU 推理上。
+
+    depth-only 模式：深度独立帧率（depth_fps）高于 RGB 推帧率时，推流端在 RGB
+    节拍之间只带 depth 不带 image——此时仅更新深度槽与设备存活时间，不推进 RGB
+    seq/received_at（fps 统计与单目 DA3 触发键不受影响）。image 与 depth 至少给一个。
     """
-    data = await image.read()
-    if not data:
-        return JSONResponse({"ok": False, "error": "空图片"}, status_code=400)
+    data = await image.read() if image is not None else None
     depth_data = await depth.read() if depth is not None else None
+    if not data and not depth_data:
+        return JSONResponse({"ok": False, "error": "image 与 depth 至少一个非空"},
+                            status_code=400)
     dev = _parse_device_id(camera_info)
     now = time.time()
     with _cv:
         st = _devices.get(dev)
         if st is None:
             st = _devices[dev] = _new_bucket(now)
-        st["seq"] += 1
         seq = st["seq"]
-        st["image"] = data
-        st["content_type"] = image.content_type or "image/jpeg"
+        if data:
+            st["seq"] += 1
+            seq = st["seq"]
+            st["image"] = data
+            st["content_type"] = image.content_type or "image/jpeg"
+            st["prev_received_at"] = st["received_at"]
+            st["received_at"] = now
+            st["camera_info"] = camera_info
+            st["timestamp"] = timestamp
         if depth_data:
             st["depth_seq"] += 1
             st["depth_image"] = depth_data
             st["depth_content_type"] = depth.content_type or "image/jpeg"
-        st["prev_received_at"] = st["received_at"]
-        st["received_at"] = now
-        st["camera_info"] = camera_info
-        st["timestamp"] = timestamp
+            st["depth_received_at"] = now
+            # depth-only 先于任何 RGB 帧到达（罕见时序）：camera_info 也补上，
+            # 设备能力字段（stereo_supported 等）不留空窗
+            if not data and st["camera_info"] is None:
+                st["camera_info"] = camera_info
         _prune_locked(now)
         _effective_device_locked()    # 首台设备出现即自动粘性选中
         _cv.notify_all()
-    return JSONResponse({"ok": True, "seq": seq, "bytes": len(data),
+    return JSONResponse({"ok": True, "seq": seq, "bytes": len(data or b""),
                          "received_at": now, "device": dev})
 
 

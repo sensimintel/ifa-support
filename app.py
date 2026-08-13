@@ -2250,8 +2250,12 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     IntersectionObserver 决定加载，display:none 的实例永远不触发 load），用 opacity
     切换可见性；隐藏实例后台加载下一个 GLB，load 后一帧切换，消掉换图空窗闪 */
  .bgmv{position:absolute;inset:0;width:100%;height:100%;display:block;opacity:0;
-   pointer-events:none;--poster-color:transparent;transition:opacity .3s ease}
- .bgmv.on{opacity:1}
+   pointer-events:none;--poster-color:transparent;
+   /* 淡出结束后彻底 visibility:hidden：opacity:0 的 WebGL 合成层在图片类来源下
+      仍可能被动效重绘透出/抢合成（跨样式泄漏），隐藏后与图片层完全隔离；
+      visibility 延迟 .3s 切换保住双缓冲 crossfade 不闪 */
+   visibility:hidden;transition:opacity .3s ease,visibility 0s linear .3s}
+ .bgmv.on{opacity:1;visibility:visible;transition:opacity .3s ease,visibility 0s}
  /* 压暗层（Figma 653-25294）：四周暗角 radial 渐变——中心透明、边角压黑，保证两侧文案可读 */
  #shade{position:absolute;inset:0;pointer-events:none;
    background:radial-gradient(99.6% 99.6% at 50% 50%,rgba(0,0,0,0) 0%,rgba(0,0,0,.92) 100%)}
@@ -2434,14 +2438,16 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <div id="hlcfg">
  <div class="hd">展示调节 <button id="hlcfgClose" title="关闭">✕</button></div>
  <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">数据源帧率（当前设备）</div>
- <div class="fld"><label>RGB 推帧 <b id="v_push_fps">2.0</b> fps</label>
+ <div class="fld"><label>RGB 推帧 <b id="v_push_fps">2.0</b> fps · 实测到帧 <b id="v_fps_meas">--</b> fps</label>
   <input type="range" id="r_push_fps" min="0.5" max="10" step="0.5" value="2"></div>
  <div class="fld"><label>点云直传间隔 <b id="v_prod_itv">2.5</b> s</label>
   <input type="range" id="r_prod_itv" min="0.5" max="10" step="0.5" value="2.5"></div>
- <div class="hint" style="margin-top:8px">按设备生效（推流端每 2s 轮询取走）。<b>RGB 推帧</b>驱动
-  DA3/SAM3 处理链路，是高亮/SAM3 点云的帧率上限；<b>点云直传间隔</b>只对带真深度直传的
-  设备（如 macmini-astra）生效，决定单目点云来源的刷新节奏。Mac↔5090 链路仅约 8Mbps，
-  两台摄像机同推时调密任何一路都会挤占另一路，调完盯一眼画面是否跟得上。</div>
+ <div class="hint" style="margin-top:8px">按设备生效（推流端每 2s 轮询取走，调完看「实测到帧」
+  确认生效，约 2~4s 跟上）。<b>RGB 推帧</b>驱动 DA3/SAM3 处理链路，是高亮/SAM3 点云的
+  帧率上限（点云画面刷新还受 GPU 处理速度约束，不会跟满推帧率；设备深度图/原始帧则直接
+  跟满）；<b>点云直传间隔</b>只对带真深度直传的设备（如 macmini-astra）生效，决定单目
+  点云来源的刷新节奏。Mac↔5090 链路实测约 14Mbps：RGB 约 135KB/帧、深度约 40KB/帧
+  （质量 72），两台摄像机同推时调密任何一路都会挤占另一路，调完盯一眼实测值是否跟得上。</div>
  <div id="ddonly" style="display:none">
  <div class="sec">深度渲染（写回推流端，约 2~4s 生效）</div>
  <div class="fld"><label>色彩映射</label>
@@ -2508,7 +2514,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div class="fld"><label>JPEG 质量 <b id="v_dd_jq">80</b></label>
   <input type="range" id="r_dd_jq" min="30" max="95" step="5" value="80"></div>
  <div class="fld"><label>深度推帧率 <b id="v_dd_fps">0.0</b>fps（0=跟随RGB）</label>
-  <input type="range" id="r_dd_fps" min="0" max="10" step="0.5" value="0"></div>
+  <input type="range" id="r_dd_fps" min="0" max="15" step="0.5" value="0"></div>
  <div class="sec">深度显示（本页即时）</div>
  <div class="fld"><label>亮度 ×<b id="v_dc_bright">1.00</b></label>
   <input type="range" id="r_dc_bright" min="0.2" max="2.5" step="0.05" value="1"></div>
@@ -2552,9 +2558,12 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div class="hint"><b>深度渲染</b>区写 per-device 配置（/api/frame/device-config，与帧率同通道），
   推流端每 2s 轮询取走后在 mini 端重渲染，约 2~4s 生效；/panel「原设备深度图」格
   是同一张图，会同步变化。量程模式为「固定」时自动分位不生效，反之量程近/远端不生效；
-  CLAHE 强度仅均衡=CLAHE 时生效；填充半径仅孔洞填充开启时生效。<b>深度显示</b>区
-  只改本页背景的 CSS，拖动立即生效、只存本浏览器（localStorage）；旋转 90°/270° 按
-  视口比例自动放大铺满。</div>
+  CLAHE 强度仅均衡=CLAHE 时生效；填充半径仅孔洞填充开启时生效。<b>深度推帧率</b>与
+  RGB 各自独立节流：0=跟随 RGB 节拍（默认）；&gt;0 时按自己的节拍推送，可高于 RGB
+  （RGB 节拍之间单独上报深度）。链路预算：Mac↔5090 实测约 14Mbps ≈ 1.75MB/s，
+  RGB 约 135KB/帧、深度约 40KB/帧（质量 72），两路合计别把预算打满，否则整体卡顿。
+  <b>深度显示</b>区只改本页背景的 CSS，拖动立即生效、只存本浏览器（localStorage）；
+  旋转 90°/270° 按视口比例自动放大铺满。</div>
  </div>
  <div id="dotonly" style="display:none">
  <div class="sec">点云化样式（图片类背景，本页即时）</div>
@@ -2563,15 +2572,55 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <label><input type="radio" name="dton" value="0" checked> 关</label>
    <label><input type="radio" name="dton" value="1"> 开</label>
   </div></div>
+ <div class="fld"><label>模式</label>
+  <div class="radios">
+   <label><input type="radio" name="dtmode" value="0" checked> 网格点阵</label>
+   <label><input type="radio" name="dtmode" value="1"> 粒子云</label>
+  </div></div>
+ <div id="dtgrid">
  <div class="fld"><label>点距 <b id="v_dt_pitch">8</b>px</label>
   <input type="range" id="r_dt_pitch" min="3" max="16" step="1" value="8"></div>
  <div class="fld"><label>圆径占比 <b id="v_dt_r">35</b>%</label>
   <input type="range" id="r_dt_r" min="10" max="50" step="1" value="35"></div>
+ <div class="fld"><label>不规律排布 <b id="v_dt_jit">0</b>%</label>
+  <input type="range" id="r_dt_jit" min="0" max="100" step="5" value="0"></div>
+ <div class="fld"><label>运动</label>
+  <div class="radios">
+   <label><input type="radio" name="dtmo" value="0" checked> 关</label>
+   <label><input type="radio" name="dtmo" value="1"> 漂移</label>
+   <label><input type="radio" name="dtmo" value="2"> 呼吸</label>
+   <label><input type="radio" name="dtmo" value="3"> 闪烁</label>
+  </div></div>
+ </div>
+ <div id="dtcloud" style="display:none">
+ <div class="fld"><label>粒子数量 <b id="v_dt_pn">30000</b></label>
+  <input type="range" id="r_dt_pn" min="5000" max="80000" step="5000" value="30000"></div>
+ <div class="fld"><label>粒径 <b id="v_dt_psz">2</b>px</label>
+  <input type="range" id="r_dt_psz" min="1" max="4" step="0.5" value="2"></div>
+ <div class="fld"><label>密度对比 <b id="v_dt_pct">1.2</b></label>
+  <input type="range" id="r_dt_pct" min="0.5" max="3" step="0.1" value="1.2"></div>
+ <div class="fld"><label>单色模式</label>
+  <div class="radios">
+   <label><input type="radio" name="dtmono" value="0" checked> 关（取原色彩）</label>
+   <label><input type="radio" name="dtmono" value="1"> 开</label>
+   <input type="color" id="c_dt_pc" value="#fffdf7">
+  </div></div>
+ <div class="fld"><label>漂移幅度 <b id="v_dt_drift">1</b></label>
+  <input type="range" id="r_dt_drift" min="0" max="3" step="0.1" value="1"></div>
+ <div class="fld"><label>重生率 <b id="v_dt_resp">1</b></label>
+  <input type="range" id="r_dt_resp" min="0" max="3" step="0.1" value="1"></div>
+ </div>
+ <div class="fld"><label>运动速度 <b id="v_dt_spd">1</b></label>
+  <input type="range" id="r_dt_spd" min="0" max="3" step="0.1" value="1"></div>
  <div class="fld"><label>点阵背景色</label>
   <div class="radios"><input type="color" id="c_dt_bg" value="#000000"></div></div>
- <div class="hint">把图片背景离散成等距圆点（每格像素格化取近似纯色、圆点外露出背景色），
-  保留原色彩、模拟 LiDAR 点阵观感。只作用于图片类背景（设备深度图、高亮/SAM3 点云的
-  图模式）；GLB 点云背景请用上方「点渲染」区的点大小/形状。即时生效、只存本浏览器。</div>
+ <div class="hint"><b>网格点阵</b>：像素格化取色 + 等距圆点（LiDAR 点阵观感），
+  不规律排布=帧间稳定的逐点随机偏移，运动=漂移/呼吸/闪烁。<b>粒子云</b>：数万粒子
+  按画面亮度重要性采样落点——主体稠密近连片、边缘稀疏成雾、暗区零星孤点（粉尘爆散
+  观感）；粒径大小不一、伪噪声缓慢漂浮，重生率控制粒子闪换与分布跟随画面变化的速度；
+  单色模式全部粒子用同一颜色（只用画面定密度），关闭则取原色彩。两种模式只作用于
+  图片类背景（设备深度图、高亮/SAM3/单目点云的图模式）；GLB 点云背景请用上方
+  「点渲染」区。即时生效、只存本浏览器。</div>
  </div>
  <div id="hlonly">
  <div class="sec">高亮样式（只作用于高亮点云）</div>
@@ -2743,8 +2792,15 @@ function showImg(url,key){            // 双缓冲交叉淡入：新图解码完
     const showEl=bgFlip?$('bgA'):$('bgB'),hideEl=bgFlip?$('bgB'):$('bgA');
     showEl.src=url;showEl.classList.add('on');hideEl.classList.remove('on');
     hideModelLayer();lastBgUrl=url;
-    dotIm=im;   // 点云化样式开启时用解码完成的这张图重画点阵层
-    if(+dotCfg.on){dotDraw();$('bgDot').style.display='block';}
+    dotIm=im;   // 点云化样式开启时用解码完成的这张图刷新取色缓存
+    if(+dotCfg.on){
+      dotSample();
+      $('bgDot').style.display='block';
+      // 需要动画循环的模式（粒子云恒开/网格运动开）rAF 自会用新缓存重绘，
+      // 中断后此处顺手复活循环；纯静态网格则重绘一次
+      if(dotNeedLoop()){if(!dotRaf)dotRaf=requestAnimationFrame(dotLoop);}
+      else dotDraw();
+    }
   };
   im.src=url;
   return true;
@@ -2846,8 +2902,23 @@ const PT_VERT='vPtD=-mvPosition.z;vPtY=(modelMatrix*vec4(transformed,1.0)).y;'
 const PT_VERT_DECL='uniform float uPt_confsize;varying float vPtD;varying float vPtY;varying float vPtR;\\n';
 let ptMats=[],ptTimer=null;
 function applyPtStyle(mvEl){
-  const mv=mvEl||mvFront(),sc=mvScene(mv);if(!sc||!sc.traverse)return;
   const S=ptStyle;
+  // ── 动效计时器启停先于场景检查：调节作用域收敛——点渲染动效只属于 GLB 来源，
+  // 图片类来源（设备深度图）下必须停表，否则 50ms 改材质+queueRender 会持续驱动
+  // 已隐藏的 GLB 层（「双目脉冲影响点阵画面」的泄漏根源）。挪到 early-return 之前
+  // 是因为图片来源下 mvScene 可能拿不到场景、走不到原来的停表行 ──
+  const tick=((+S.pt_pulse>0)||(+S.pt_sparkle>0.001))&&bgSource!=='devdepth';
+  if(tick&&!ptTimer)ptTimer=setInterval(()=>{
+    if(!mvVisible())return;   // GLB 层不可见（图片背景顶层）时空转不驱动渲染
+    PTU.time.value=performance.now()/1000;
+    if(+ptStyle.pt_pulse===2){   // 点大小脉冲：直接调材质 size（uniform 每帧自动刷新）
+      const b=+ptStyle.pt_atten?ptStyle.pt_size*0.003:+ptStyle.pt_size;
+      const f=1.0+0.25*Math.sin(6.2832*ptStyle.pt_pulse_speed*PTU.time.value);
+      ptMats.forEach(m=>{m.size=b*f;});
+    }
+    const s2=mvScene(mvFront());s2&&s2.queueRender&&s2.queueRender();},50);
+  if(!tick&&ptTimer){clearInterval(ptTimer);ptTimer=null;}
+  const mv=mvEl||mvFront(),sc=mvScene(mv);if(!sc||!sc.traverse)return;
   // uniform 同步
   PTU.shape.value=+S.pt_shape;PTU.hue.value=+S.pt_hue;PTU.sat.value=+S.pt_sat;
   PTU.val.value=+S.pt_val;PTU.contrast.value=+S.pt_contrast;PTU.invert.value=+S.pt_invert;
@@ -2896,17 +2967,6 @@ function applyPtStyle(mvEl){
       m.needsUpdate=true;
     }
   });
-  // 动效计时器：脉冲/闪烁开启时 20fps 驱动 time uniform 并请求重绘
-  const tick=(+S.pt_pulse>0)||(+S.pt_sparkle>0.001);
-  if(tick&&!ptTimer)ptTimer=setInterval(()=>{
-    PTU.time.value=performance.now()/1000;
-    if(+ptStyle.pt_pulse===2){   // 点大小脉冲：直接调材质 size（uniform 每帧自动刷新）
-      const b=+ptStyle.pt_atten?ptStyle.pt_size*0.003:+ptStyle.pt_size;
-      const f=1.0+0.25*Math.sin(6.2832*ptStyle.pt_pulse_speed*PTU.time.value);
-      ptMats.forEach(m=>{m.size=b*f;});
-    }
-    const s2=mvScene(mvFront());s2&&s2.queueRender&&s2.queueRender();},50);
-  if(!tick&&ptTimer){clearInterval(ptTimer);ptTimer=null;}
   sc.queueRender&&sc.queueRender();
 }
 // 双缓冲切换点：back 实例 load 后，先摆视角+注材质，再一帧交换可见性——旧模型
@@ -2972,9 +3032,12 @@ Object.keys(RATE_SLIDERS).forEach(key=>{
   });
 });
 function renderRate(s){
+  const d=(s.devices||[]).find(x=>x.device_id===s.selected);
+  // 实测到帧 fps 回显：不受回填守卫影响，随每轮 status 刷新——用户调完滑杆
+  // 能直接看到推流端是否真的跟上了
+  $('v_fps_meas').textContent=(d&&d.fps)?(+d.fps).toFixed(1):'--';
   // 滑条回填选中设备已下发的值（切设备跟着换）；拖动中或刚下发 1.5s 内不回写，避免打架
   if(Date.now()-rateTouched<1500)return;
-  const d=(s.devices||[]).find(x=>x.device_id===s.selected);
   const c=(d&&d.config)||{};
   [['push_fps',c.push_fps!=null?c.push_fps:(s.config||{}).push_fps],
    ['product_interval',c.product_interval]].forEach(([key,val])=>{
@@ -3093,75 +3156,193 @@ Object.keys(DC_RADIOS).forEach(nm=>document.querySelectorAll('input[name='+nm+']
 })();
 addEventListener('resize',applyDdCss);   // 旋转补偿量随视口比例变化
 
-// ══ 点云化样式（图片类背景通用形态层）：canvas 像素格化（先缩后放、近邻插值）
-//    + mask 圆点镂空——保留原色彩、样式离散成等距圆点，模拟 LiDAR 点阵观感。
+// ══ 点云化样式（图片类背景通用形态层，两种模式）：
+//    · 网格点阵——像素格化取色 + 逐格画圆，可加逐点稳定随机抖动与动效（LiDAR 点阵观感）；
+//    · 粒子云——持久粒子池 + 按图像亮度重要性采样定位：主体处粒子稠密近连片、
+//      边缘快速稀疏成雾、低权重区留零星孤点（粉尘爆散观感，参考图语义），
+//      粒径 1~2px 大小不一、伪噪声缓慢漂移、寿命重生跟随画面内容变化。
+//    深度帧更新只刷新取色缓存，与 rAF 动画解耦互不打断。
 //    对所有走 showImg 的图片类来源统一生效；GLB 背景不适用（有自己的点渲染区）══
-let dotCfg={on:0,pitch:8,r:35,bg:'#000000'};
+let dotCfg={on:0,mode:0,pitch:8,r:35,jitter:0,motion:0,speed:1,bg:'#000000',
+  pn:30000,psize:2,pcontrast:1.2,pmono:0,pcolor:'#fffdf7',pdrift:1,prespawn:1};
 try{Object.assign(dotCfg,JSON.parse(localStorage.getItem('exp_dot')||'{}'));}catch(e){}
-let dotIm=null,dotOffCv=null;   // 最近一帧背景 Image / 离屏降采样画布
-function dotDraw(){
+let dotIm=null,dotOffCv=null;        // 最近一帧背景 Image / 离屏降采样画布（复用）
+let dotData=null,dotCols=0,dotRows=0;// 降采样取色缓存：动画重绘不重复采样
+function dotSample(){
+  // 新帧/视口/点距变化时重建取色缓存：源图按 cover 构图居中裁剪，缩到 cols×rows，
+  // getImageData 一次取回全部格子颜色。网格模式格距=点距；粒子云用固定 8px 采样格
+  //（颜色/权重查询网格，与粒子密度无关）
   const im=dotIm,cv=$('bgDot');
-  if(!im||!im.naturalWidth)return;
+  if(!im||!im.naturalWidth)return false;
   const dpr=devicePixelRatio||1;
-  cv.width=Math.round(innerWidth*dpr);cv.height=Math.round(innerHeight*dpr);
-  const P=Math.max(2,+dotCfg.pitch)*dpr;   // 物理像素点距
-  const cols=Math.max(1,Math.round(cv.width/P)),rows=Math.max(1,Math.round(cv.height/P));
+  const W=Math.round(innerWidth*dpr),H=Math.round(innerHeight*dpr);
+  if(cv.width!==W||cv.height!==H){cv.width=W;cv.height=H;}
+  const P=(+dotCfg.mode===1?8:Math.max(2,+dotCfg.pitch))*dpr;
+  dotCols=Math.max(1,Math.round(W/P));dotRows=Math.max(1,Math.round(H/P));
   if(!dotOffCv)dotOffCv=document.createElement('canvas');
-  dotOffCv.width=cols;dotOffCv.height=rows;
-  // 与 .bg 的 object-fit:cover 同构图：源图按视口长宽比居中裁剪，缩到 cols×rows
-  // （降采样后每格即近似纯色）
-  const ar=cv.width/cv.height,iar=im.naturalWidth/im.naturalHeight;
+  dotOffCv.width=dotCols;dotOffCv.height=dotRows;
+  const ar=W/H,iar=im.naturalWidth/im.naturalHeight;
   let sx,sy,sw,sh;
   if(iar>ar){sh=im.naturalHeight;sw=sh*ar;sx=(im.naturalWidth-sw)/2;sy=0;}
   else{sw=im.naturalWidth;sh=sw/ar;sx=0;sy=(im.naturalHeight-sh)/2;}
-  dotOffCv.getContext('2d').drawImage(im,sx,sy,sw,sh,0,0,cols,rows);
+  const octx=dotOffCv.getContext('2d',{willReadFrequently:true});
+  octx.drawImage(im,sx,sy,sw,sh,0,0,dotCols,dotRows);
+  dotData=octx.getImageData(0,0,dotCols,dotRows).data;
+  return true;
+}
+function dotHash(i){
+  // 逐点稳定伪随机 [0,1)：只随下标变、帧间不变——抖动排布不逐帧乱跳
+  const x=Math.sin(i*127.1+311.7)*43758.5453;
+  return x-Math.floor(x);
+}
+// ── 网格点阵模式 ──
+function dotDraw(tSec){
+  const cv=$('bgDot');
+  if(!dotData&&!dotSample())return;
   const ctx=cv.getContext('2d');
-  ctx.imageSmoothingEnabled=false;   // 近邻放大：像素格化
+  const dpr=devicePixelRatio||1,P=Math.max(2,+dotCfg.pitch)*dpr;
+  const baseR=P*(+dotCfg.r)/100,jit=P*(+dotCfg.jitter)/100*0.5;  // 抖动上限=半格
+  const mode=+dotCfg.motion,spd=+dotCfg.speed,t=tSec||0,TAU=6.28318,d=dotData;
   ctx.clearRect(0,0,cv.width,cv.height);
-  ctx.drawImage(dotOffCv,0,0,cols,rows,0,0,cv.width,cv.height);
+  for(let ry=0;ry<dotRows;ry++)for(let rx=0;rx<dotCols;rx++){
+    const idx=ry*dotCols+rx,o=idx*4;
+    const h1=dotHash(idx),h2=dotHash(idx+7919);
+    let x=(rx+0.5)*P+(h1-0.5)*2*jit,y=(ry+0.5)*P+(h2-0.5)*2*jit;
+    let r=baseR,al=1;
+    if(mode===1){        // 漂移：逐点相位的缓慢圆游（幅度约 1/4 格）
+      x+=Math.sin(t*spd+h1*TAU)*P*0.25;y+=Math.cos(t*spd*0.9+h2*TAU)*P*0.25;
+    }else if(mode===2){  // 呼吸：半径正弦，逐点相位错开
+      r*=1+0.35*Math.sin(t*spd*2+h1*TAU);
+    }else if(mode===3){  // 闪烁：透明度逐点随机相位
+      al=0.45+0.55*(0.5+0.5*Math.sin(t*spd*3+h1*TAU));
+    }
+    if(r<=0.2)continue;
+    ctx.fillStyle='rgba('+d[o]+','+d[o+1]+','+d[o+2]+','+al.toFixed(3)+')';
+    ctx.beginPath();ctx.arc(x,y,r,0,TAU);ctx.fill();
+  }
+}
+// ── 粒子云模式：持久粒子池（x,y,相位,粒径因子 ×4 float）──
+let pcPool=null,pcN=0,pcSig='';
+function pcLum(gx,gy){   // 格子亮度权重 [0,1]：亮/有效处高，黑/无效处 0
+  const o=(gy*dotCols+gx)*4;
+  return (dotData[o]*0.2126+dotData[o+1]*0.7152+dotData[o+2]*0.0722)/255;
+}
+function pcSpawn(i){
+  // 重要性采样定位：拒绝采样 10 次——亮处高概率落点（稠密近连片），全不中则
+  // 落随机位置（低权重区零星孤点，构成雾状边缘）
+  const b=i*4,cv=$('bgDot'),gamma=+dotCfg.pcontrast;
+  let x=Math.random()*cv.width,y=Math.random()*cv.height;
+  if(dotData){
+    for(let k=0;k<10;k++){
+      const gx=Math.floor(Math.random()*dotCols),gy=Math.floor(Math.random()*dotRows);
+      if(Math.random()<Math.pow(pcLum(gx,gy),gamma)){
+        x=(gx+Math.random())*cv.width/dotCols;
+        y=(gy+Math.random())*cv.height/dotRows;break;}
+    }
+  }
+  pcPool[b]=x;pcPool[b+1]=y;
+  pcPool[b+2]=Math.random()*6.28318;          // 漂移相位（逐粒子随机、恒定）
+  pcPool[b+3]=0.35+Math.random()*0.65;        // 粒径因子：大小不一
+}
+function pcEnsure(){
+  // 池分配/全量重生：数量或密度对比变化时整池重建（分布立即跟新参数）
+  const sig=Math.round(+dotCfg.pn)+'|'+(+dotCfg.pcontrast);
+  if(pcPool&&pcSig===sig)return;
+  pcSig=sig;pcN=Math.round(+dotCfg.pn);
+  pcPool=new Float32Array(pcN*4);
+  for(let i=0;i<pcN;i++)pcSpawn(i);
+}
+function pcDraw(t){
+  const cv=$('bgDot');
+  if(!dotData&&!dotSample())return;
+  pcEnsure();
+  const ctx=cv.getContext('2d'),dpr=devicePixelRatio||1;
+  ctx.clearRect(0,0,cv.width,cv.height);
+  const mono=+dotCfg.pmono===1,spd=+dotCfg.speed;
+  const amp=(+dotCfg.pdrift)*1.6*dpr,psz=(+dotCfg.psize)*dpr;
+  const gw=cv.width/dotCols,gh=cv.height/dotRows,d=dotData;
+  // 寿命重生：每帧重生一小撮（基础 0.4%×重生率）——粒子缓慢闪换，画面内容变了
+  // 分布随之迁移（重生落点按当前帧权重）
+  const re=Math.max(1,Math.round(pcN*0.004*(+dotCfg.prespawn)));
+  for(let k=0;k<re;k++)pcSpawn(Math.floor(Math.random()*pcN));
+  if(mono)ctx.fillStyle=dotCfg.pcolor;
+  for(let i=0;i<pcN;i++){
+    const b=i*4,ph=pcPool[b+2];
+    // 伪噪声漂移：两组不同频正弦叠加、逐粒子相位——悬浮微尘的缓慢无序运动
+    const x=pcPool[b]+Math.sin(t*spd*0.7+ph)*amp+Math.sin(t*spd*0.31+ph*2.7)*amp*0.6;
+    const y=pcPool[b+1]+Math.cos(t*spd*0.6+ph*1.7)*amp+Math.cos(t*spd*0.23+ph*3.1)*amp*0.5;
+    if(!mono){
+      const gx=Math.min(dotCols-1,Math.max(0,(x/gw)|0));
+      const gy=Math.min(dotRows-1,Math.max(0,(y/gh)|0));
+      const o=(gy*dotCols+gx)*4;
+      ctx.fillStyle='rgb('+d[o]+','+d[o+1]+','+d[o+2]+')';   // 保留原色彩
+    }
+    const s=Math.max(1,pcPool[b+3]*psz);
+    ctx.fillRect(x,y,s,s);
+  }
+}
+// ── rAF 动画循环（~30fps 节流）：粒子云常开（speed=0 时粒子静止但仍重生闪换）；
+//    网格模式仅运动开启时循环。深度帧到达只刷 dotSample 缓存，循环不重置 ──
+let dotRaf=0,dotLastT=0;
+function dotNeedLoop(){return +dotCfg.on&&(+dotCfg.mode===1||+dotCfg.motion>0);}
+function dotLoop(ts){
+  dotRaf=0;
+  if(!dotNeedLoop()||$('bgDot').style.display==='none')return;
+  if(ts-dotLastT>=33){dotLastT=ts;
+    if(+dotCfg.mode===1)pcDraw(ts/1000);else dotDraw(ts/1000);}
+  dotRaf=requestAnimationFrame(dotLoop);
 }
 function applyDotCfg(){
-  const on=+dotCfg.on===1,cv=$('bgDot');
+  const on=+dotCfg.on===1,cv=$('bgDot'),cloud=+dotCfg.mode===1;
   $('stage').classList.toggle('doton',on);   // 开启时 img 层隐藏、canvas 呈现
   // 仅图片类背景显示 canvas：GLB（model-viewer）背景时不遮挡
   cv.style.display=(on&&!mvVisible())?'block':'none';
+  $('dtgrid').style.display=cloud?'none':'';
+  $('dtcloud').style.display=cloud?'':'none';
   if(on){
-    // 圆点镂空：mask 每 pitch×pitch 一格，只透出中心圆盘，其余露出点阵背景色
-    const rpx=(+dotCfg.pitch)*(+dotCfg.r)/100;
-    const mk='radial-gradient(circle '+rpx.toFixed(2)+'px at 50% 50%,#000 97%,transparent 100%)';
-    cv.style.webkitMaskImage=mk;cv.style.maskImage=mk;
-    cv.style.webkitMaskSize=dotCfg.pitch+'px '+dotCfg.pitch+'px';
-    cv.style.maskSize=dotCfg.pitch+'px '+dotCfg.pitch+'px';
-    cv.style.webkitMaskRepeat='repeat';cv.style.maskRepeat='repeat';
     $('stage').style.background=dotCfg.bg;
-    dotDraw();
+    dotSample();                             // 模式/点距/视口可能变了：重建取色缓存
+    if(cloud){pcDraw(performance.now()/1000);}
+    else dotDraw(performance.now()/1000);
+    if(dotNeedLoop()&&!dotRaf)dotRaf=requestAnimationFrame(dotLoop);
   }else{
     $('stage').style.background='';   // 交还默认黑底（GLB 来源由点渲染区自设背景色）
   }
 }
 function saveDot(){localStorage.setItem('exp_dot',JSON.stringify(dotCfg));}
-document.querySelectorAll('input[name=dton]').forEach(r=>r.addEventListener('change',()=>{
-  dotCfg.on=+document.querySelector('input[name=dton]:checked').value;
-  applyDotCfg();saveDot();}));
-$('r_dt_pitch').addEventListener('input',()=>{
-  dotCfg.pitch=+$('r_dt_pitch').value;$('v_dt_pitch').textContent=dotCfg.pitch;
-  applyDotCfg();saveDot();});
-$('r_dt_r').addEventListener('input',()=>{
-  dotCfg.r=+$('r_dt_r').value;$('v_dt_r').textContent=dotCfg.r;
-  applyDotCfg();saveDot();});
-$('c_dt_bg').addEventListener('input',()=>{
-  dotCfg.bg=$('c_dt_bg').value;applyDotCfg();saveDot();});
+const DT_RADIOS={dton:'on',dtmode:'mode',dtmo:'motion',dtmono:'pmono'};
+Object.keys(DT_RADIOS).forEach(nm=>document.querySelectorAll('input[name='+nm+']').forEach(r=>
+  r.addEventListener('change',()=>{
+    dotCfg[DT_RADIOS[nm]]=+document.querySelector('input[name='+nm+']:checked').value;
+    applyDotCfg();saveDot();})));
+const DT_SLIDERS={pitch:['r_dt_pitch','v_dt_pitch'],r:['r_dt_r','v_dt_r'],
+  jitter:['r_dt_jit','v_dt_jit'],speed:['r_dt_spd','v_dt_spd'],
+  pn:['r_dt_pn','v_dt_pn'],psize:['r_dt_psz','v_dt_psz'],
+  pcontrast:['r_dt_pct','v_dt_pct'],pdrift:['r_dt_drift','v_dt_drift'],
+  prespawn:['r_dt_resp','v_dt_resp']};
+Object.keys(DT_SLIDERS).forEach(k=>{
+  const [rid,vid]=DT_SLIDERS[k];
+  $(rid).addEventListener('input',()=>{
+    dotCfg[k]=+$(rid).value;$(vid).textContent=$(rid).value;
+    applyDotCfg();saveDot();});
+});
+[['c_dt_bg','bg'],['c_dt_pc','pcolor']].forEach(([id,k])=>
+  $(id).addEventListener('input',()=>{
+    dotCfg[k]=$(id).value;applyDotCfg();saveDot();}));
 // localStorage 记忆值回填点云化控件（页面加载一次）
 (function(){
-  const el=document.querySelector('input[name=dton][value="'+(+dotCfg.on)+'"]');
-  if(el)el.checked=true;
-  $('r_dt_pitch').value=dotCfg.pitch;$('v_dt_pitch').textContent=dotCfg.pitch;
-  $('r_dt_r').value=dotCfg.r;$('v_dt_r').textContent=dotCfg.r;
-  $('c_dt_bg').value=dotCfg.bg;
+  Object.keys(DT_RADIOS).forEach(nm=>{
+    const el=document.querySelector('input[name='+nm+'][value="'+(+dotCfg[DT_RADIOS[nm]])+'"]');
+    if(el)el.checked=true;});
+  Object.keys(DT_SLIDERS).forEach(k=>{
+    const [rid,vid]=DT_SLIDERS[k];
+    $(rid).value=dotCfg[k];$(vid).textContent=''+dotCfg[k];});
+  $('c_dt_bg').value=dotCfg.bg;$('c_dt_pc').value=dotCfg.pcolor;
 })();
-addEventListener('resize',()=>{if(+dotCfg.on)dotDraw();});
+addEventListener('resize',()=>{if(+dotCfg.on)applyDotCfg();});
 
 let lastInset='';
+let bgFps=0;   // 选中设备实测入帧 fps（bgTick 每轮更新，驱动轮询自适应）
 async function bgTick(){
  if(DEMO)return;
  try{
@@ -3169,6 +3350,8 @@ async function bgTick(){
   if(s.processor&&s.config_gen===0)pushDefaultConfig();
   renderDevices(s);
   renderRate(s);
+  // 供轮询自适应排程用：选中设备的实测入帧 fps（无帧/无效时 0）
+  bgFps=(s.fps&&s.fps>0)?+s.fps:0;
   if(s.device&&s.device!==curDev){   // 切设备：清背景与卡片缓存，等新设备的帧/产物
     if(curDev!==null){lastBgKey='';lastMvUrl='';lastBgUrl='';lastInset='';curCard=null;lastCardKey='';}
     curDev=s.device;
@@ -3307,10 +3490,14 @@ function syncStyleUI(){
   // 设备深度图调节区仅该来源展示
   $('hlonly').style.display=(bgSource==='hl'||bgSource==='stereo')?'':'none';
   $('ddonly').style.display=(bgSource==='devdepth')?'':'none';
-  // 点云化样式区对可能出图片类背景的来源展示（stereo/la 基本恒为 GLB）
-  $('dotonly').style.display=(bgSource==='hl'||bgSource==='s3'||bgSource==='devdepth')?'':'none';
+  // 点云化样式区对可能出图片类背景的来源展示（stereo 恒为 GLB 不列）
+  $('dotonly').style.display=(bgSource!=='stereo')?'':'none';
   applyDdCss();   // 切来源即时挂上/摘掉深度显示的 CSS（其它来源不受深度显示参数影响）
   applyDotCfg();  // 点云化样式层随来源重估显隐（GLB 来源不遮挡）
+  // 调节作用域收敛：图片类来源下停掉 GLB 侧一切动效——脉冲/闪烁 timer（applyPtStyle
+  // 内按来源重估）与自动旋转都只属于 GLB 来源，切回时 applyPtStyle 会按配置重新挂上
+  if(bgSource==='devdepth')mvEls().forEach(el=>el.removeAttribute('auto-rotate'));
+  applyPtStyle();
 }
 $('selStyle').onchange=()=>{
   bgSource=$('selStyle').value;
@@ -3470,7 +3657,17 @@ if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布
   setState('card');
 }else{
   setState('idle');
-  setInterval(bgTick,500);bgTick();
+  // 背景轮询：串行自排程（每轮结束按 delay 排下一轮，慢请求不堆积并发，同 /panel
+  // f91e6f7 的自适应节奏）。设备深度图来源直接展示入帧，轮询按实测 fps 自适应
+  // （10fps 时 ~80ms 一轮，显示帧率不再被固定 500ms 封顶）；GLB 类来源产物本来就是
+  // 秒级一轮，维持 500ms 不空转高频轮询
+  (function bgLoop(){
+    Promise.resolve(bgTick()).catch(()=>{}).then(()=>{
+      const delay=(bgSource==='devdepth'&&bgFps>0)
+        ?Math.max(80,Math.min(500,1000/(bgFps*1.5))):500;
+      setTimeout(bgLoop,delay);
+    });
+  })();
   // 识别结果 SSE 推送：连上即收全量快照，之后有变更即刻到达（断线 EventSource 自动重连）
   new EventSource('/api/recog/events').onmessage=ev=>{try{applyRecog(JSON.parse(ev.data))}catch(e){}};
   // 成功态驻留 FRESH_MS 到期回落待机是纯本地状态，用轻量本地定时器驱动（不发请求）

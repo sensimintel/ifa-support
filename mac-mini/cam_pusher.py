@@ -524,38 +524,47 @@ def _camera_worker(pid: int, spec: dict, device_id: str):
                              cf.get_width(), cf.get_height(), cf.get_format())
                     first = False
                 now = time.time()
-                if now - last_push < get_push_interval(device_id):
+                # ── RGB 与深度两路独立节拍：RGB 按 push_fps；深度 depth_fps>0 时按
+                # 自己的节拍（可高于 RGB，RGB 节拍之间发 depth-only 上报），=0 跟随
+                # RGB（历史行为）。两路都未到节拍则跳过本帧组 ──
+                dcfg = get_depth_cfg(device_id)
+                dfps = _cfg_num(dcfg, "depth_fps", 0.0)
+                dep_itv = (1.0 / min(max(dfps, 0.2), 15.0)) if dfps > 0 else None
+                rgb_due = now - last_push >= get_push_interval(device_id)
+                dep_due = (now - depth_state.get("last_push", 0.0) >= dep_itv
+                           ) if dep_itv else rgb_due
+                if not rgb_due and not dep_due:
                     continue
-                jpeg = _to_jpeg(cf)
-                # 同帧组里带硬件深度帧则伪彩后随同上报（帧组偶尔缺深度帧属正常，
-                # 面板端保留上一张；伪彩失败只丢深度不影响彩色帧）。interleave 下
-                # 只用有散斑帧的深度（无光帧深度质量差）
-                files = {"image": ("frame.jpg", jpeg, "image/jpeg")}
+                # 深度帧可用性：同帧组里带硬件深度帧则伪彩上报（帧组偶尔缺深度帧属
+                # 正常，面板端保留上一张；伪彩失败只丢深度不影响彩色帧）。interleave
+                # 下只用有散斑帧的深度（无光帧深度质量差）
+                files = {}
+                if rgb_due:
+                    files["image"] = ("frame.jpg", _to_jpeg(cf), "image/jpeg")
                 df = fs.get_depth_frame() if "depth" in streams else None
-                if df is not None and not (spec["stereo"] and laser_mode == "interleave"
-                                           and _laser_status(df) == 0):
-                    # 深度独立推帧率（depth_fps>0 时按自己的节拍降频；0=跟随 RGB 主帧）
-                    dcfg = get_depth_cfg(device_id)
-                    dfps = _cfg_num(dcfg, "depth_fps", 0.0)
-                    if dfps > 0 and now - depth_state.get("last_push", 0.0) < 1.0 / min(dfps, 15.0):
-                        pass   # 未到深度节拍：本帧只推 RGB 不附深度
-                    else:
-                        try:
-                            files["depth"] = ("depth.jpg",
-                                              _depth_to_jpeg(df, dcfg, depth_state),
-                                              "image/jpeg")
-                            depth_state["last_push"] = now
-                            if first_depth:
-                                log.info("[%s] 首帧深度 %dx%d 默认量程 %.1f~%.1fm"
-                                         "（渲染参数按服务端 device-config 覆盖）",
-                                         device_id, df.get_width(), df.get_height(),
-                                         DEPTH_MIN_M, DEPTH_MAX_M)
-                                first_depth = False
-                        except Exception as e:
-                            depth_err += 1
-                            if depth_err == 1 or depth_err % 100 == 0:
-                                log.warning("[%s] 深度帧伪彩失败 %d 次: %s",
-                                            device_id, depth_err, e)
+                if dep_due and df is not None and not (
+                        spec["stereo"] and laser_mode == "interleave"
+                        and _laser_status(df) == 0):
+                    try:
+                        files["depth"] = ("depth.jpg",
+                                          _depth_to_jpeg(df, dcfg, depth_state),
+                                          "image/jpeg")
+                        depth_state["last_push"] = now
+                        if first_depth:
+                            log.info("[%s] 首帧深度 %dx%d 默认量程 %.1f~%.1fm"
+                                     "（渲染参数按服务端 device-config 覆盖）",
+                                     device_id, df.get_width(), df.get_height(),
+                                     DEPTH_MIN_M, DEPTH_MAX_M)
+                            first_depth = False
+                    except Exception as e:
+                        depth_err += 1
+                        if depth_err == 1 or depth_err % 100 == 0:
+                            log.warning("[%s] 深度帧伪彩失败 %d 次: %s",
+                                        device_id, depth_err, e)
+                if not files:
+                    # 深度节拍到了但本帧组无可用深度帧（interleave 无光帧等）：
+                    # 等下一帧组，不空跑请求
+                    continue
                 try:
                     resp = session.post(
                         f"{RELAY_URL}/api/frame",
@@ -569,8 +578,8 @@ def _camera_worker(pid: int, spec: dict, device_id: str):
                         timeout=(3.05, 5),
                     )
                     resp.raise_for_status()
-                    # 双目 aux 跟着主帧同一节拍推：失败只告警，不影响主链路
-                    if spec["stereo"]:
+                    # 双目 aux 跟着 RGB 主帧同一节拍推：失败只告警，不影响主链路
+                    if rgb_due and spec["stereo"]:
                         try:
                             _push_aux(session, device_id, spec, cache,
                                       baseline_mm, laser_mode, now)
@@ -580,13 +589,15 @@ def _camera_worker(pid: int, spec: dict, device_id: str):
                     if push_err:
                         log.info("[%s] 推帧恢复正常", device_id)
                         push_err = 0
-                    last_push = now
+                    if rgb_due:
+                        last_push = now
                 except requests.RequestException as e:
                     push_err += 1
                     # 目标不可达时不刷屏：首次与每 30 次记一条
                     if push_err == 1 or push_err % 30 == 0:
                         log.warning("[%s] 推帧失败 %d 次: %s", device_id, push_err, e)
-                    last_push = now  # 失败也按节奏走，避免忙等打爆目标
+                    if rgb_due:
+                        last_push = now  # 失败也按节奏走，避免忙等打爆目标
         except Exception as e:
             log.warning("[%s] 相机链路异常，5 秒后重连: %s", device_id, e)
             _stop.wait(5)
