@@ -1169,7 +1169,7 @@ _sam3hl_lock = threading.Lock()
 # splat=1 保留点间缝隙的点状质感（拉远后点自然离散）。
 _sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
                "dim": 40, "color_mode": "auto", "color": "#ff9f0a",
-               "splat": 1, "view_tilt": 10.0, "view_zoom": 1.25,
+               "splat": 1, "view_tilt": 0.0, "view_zoom": 1.0,
                "eye_lift": 0.0, "eye_back": 0.0, "out_size": 760,
                "sat": 1.0, "val": 1.0, "conf": 40,   # 饱和/明度中性：GLB 直渲本身即 model-viewer
                                                      # 观感（点云图模式可手动调 0/1.2 复刻灰白）
@@ -1641,10 +1641,10 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <div class="row">
   <div class="fld"><label>基础点大小 <span class="rngval" id="pcspv">1</span>px</label>
    <input type="range" id="pcsp" min="1" max="4" step="1" value="1"></div>
-  <div class="fld"><label>俯视角 <span class="rngval" id="pctv">10</span>°</label>
-   <input type="range" id="pct" min="0" max="45" step="1" value="10"></div>
-  <div class="fld"><label>相机距离 ×<span class="rngval" id="pczv">1.25</span></label>
-   <input type="range" id="pcz" min="0.6" max="2.0" step="0.05" value="1.25"></div>
+  <div class="fld"><label>俯视角 <span class="rngval" id="pctv">0</span>°</label>
+   <input type="range" id="pct" min="0" max="45" step="1" value="0"></div>
+  <div class="fld"><label>相机距离 ×<span class="rngval" id="pczv">1.00</span></label>
+   <input type="range" id="pcz" min="0.6" max="2.0" step="0.05" value="1"></div>
   <div class="fld"><label>附加抬升 ×<span class="rngval" id="pclv">0.00</span></label>
    <input type="range" id="pcl" min="0" max="0.5" step="0.05" value="0"></div>
   <div class="fld"><label>附加后撤 ×<span class="rngval" id="pcbv">0.00</span></label>
@@ -1701,8 +1701,8 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <div class="card" id="camcard" style="display:none">
  <div class="fld"><label>视角（二选一 · 固定）</label>
   <div style="display:flex;gap:22px;align-items:center;flex-wrap:wrap">
-   <label style="display:inline;margin:0;cursor:pointer"><input type="radio" name="viewmode" value="tuned" checked> 调优视角（抬高·拉远·俯视）</label>
-   <label style="display:inline;margin:0;cursor:pointer"><input type="radio" name="viewmode" value="raw"> 原始视角（正视 -Z · 与深度图一致）</label>
+   <label style="display:inline;margin:0;cursor:pointer"><input type="radio" name="viewmode" value="tuned"> 调优视角（抬高·拉远·俯视）</label>
+   <label style="display:inline;margin:0;cursor:pointer"><input type="radio" name="viewmode" value="raw" checked> 原始视角（正视 -Z · 与深度图一致）</label>
   </div>
  </div>
  <div class="hint">两个固定视角二选一：<b>调优视角</b>略俯视、更立体，适合演示；<b>原始视角</b>沿拍摄光轴正视、相机在原点不飘，与深度图同视角。仍可鼠标拖动临时查看，下一帧自动回到所选视角。</div>
@@ -1730,7 +1730,7 @@ function syncOpts(){const f=$('fmt').value;
 // 两预设都沿光轴、对准点云中心、FOV 用后端真实相机内参；每帧 load 后回到所选预设。
 const mv=$('mv');
 let photoFov=55;              // 后端真实相机垂直 FOV（fov_deg），拿到前用占位
-let viewMode='tuned';         // 'tuned'=调优视角(抬高·拉远·俯视) | 'raw'=原始视角(正视 -Z)
+let viewMode='raw';           // 默认原始拍摄视角(相机在原点·零offset)；'tuned'=调优视角
 let interacting=false, interactTimer;   // 鼠标拖动查看期间不被新帧 load 拉回
 function markInteract(){interacting=true;clearTimeout(interactTimer);interactTimer=setTimeout(()=>{interacting=false;},600);}
 let lastView=null;            // 上次应用的视角{orbit,target,fov}字符串，供换模型前预摆消抖
@@ -2270,10 +2270,10 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <input type="color" id="hlcolor" value="#ff9f0a">
   </div></div>
  <div class="sec">点云整体样式</div>
- <div class="fld"><label>俯视角 <b id="v_view_tilt">10</b>°</label>
-  <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="10"></div>
- <div class="fld"><label>相机距离 ×<b id="v_view_zoom">1.25</b></label>
-  <input type="range" id="r_view_zoom" min="0.6" max="2.0" step="0.05" value="1.25"></div>
+ <div class="fld"><label>俯视角 <b id="v_view_tilt">0</b>°</label>
+  <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="0"></div>
+ <div class="fld"><label>相机距离 ×<b id="v_view_zoom">1.00</b></label>
+  <input type="range" id="r_view_zoom" min="0.6" max="2.0" step="0.05" value="1"></div>
  <div class="fld"><label>附加抬升 ×<b id="v_eye_lift">0.00</b></label>
   <input type="range" id="r_eye_lift" min="0" max="0.5" step="0.05" value="0"></div>
  <div class="fld"><label>附加后撤 ×<b id="v_eye_back">0.00</b></label>
@@ -2431,7 +2431,7 @@ function showModel(url,fov){          // GLB 产物（LA 点云等）：全屏 m
 // GLB 加载完自动摆「调优视角」（同 /panel：略俯视、拉远，FOV 用真实相机内参）。
 // 高亮点云来源时视角参数可调（抽屉「点云整体样式」，与服务端渲染同语义：绕点云中心
 // 俯视 tilt、距离=|cz|×zoom、附加抬升/后撤 ×|cz|）；默认 10°/1.25/0/0 与②③取景逐位一致。
-const DEF_VIEW={view_tilt:10,view_zoom:1.25,eye_lift:0,eye_back:0};
+const DEF_VIEW={view_tilt:0,view_zoom:1.0,eye_lift:0,eye_back:0};  // 拍摄视角零offset
 function applyExpView(){const mv=$('bgmv');
   try{const c=mv.getBoundingBoxCenter();const cz=(c.z<-0.001)?c.z:-1.5;
     const v=(bgSource==='hl'||bgSource==='stereo')?hlView:DEF_VIEW;
@@ -2796,7 +2796,7 @@ const PT_RADIOS={ptshape:'pt_shape',ptatten:'pt_atten',ptblend:'pt_blend',
   ptinvert:'pt_invert',ptcm:'pt_colormode',ptrot:'pt_rotate',ptpulse:'pt_pulse'};
 const PT_COLORS={c_pt_duo_a:'pt_duo_a',c_pt_duo_b:'pt_duo_b',c_pt_bg:'pt_bg'};
 const VIEW_KEYS=['view_tilt','view_zoom','eye_lift','eye_back'];
-let hlView={view_tilt:10,view_zoom:1.25,eye_lift:0,eye_back:0};
+let hlView={view_tilt:0,view_zoom:1.0,eye_lift:0,eye_back:0};  // 拍摄视角零offset（服务端配置可调）
 let hlStyle='tint',hlPushTimer=null;
 function hlLabel(k){$('v_'+k).textContent=(HL_FMT[k]||(v=>v))($('r_'+k).value);}
 function pushHlCfg(){
