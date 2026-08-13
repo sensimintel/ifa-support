@@ -2083,6 +2083,12 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  #tlempty{font-family:'ABC Arizona Serif',Georgia,serif;font-size:.3rem;color:rgba(255,253,247,.55)}
  /* ── 右下临时工具按钮（后期调样式用，刻意低调；尺寸用物理像素不随设计稿缩放） ── */
  #tools{position:fixed;right:20px;bottom:18px;display:flex;gap:8px;z-index:9}
+ /* 右键菜单：控制台（右下调试按钮组）显隐开关 */
+ #ctxmenu{position:fixed;display:none;z-index:99;background:rgba(24,24,26,.96);
+  border:1px solid #3a3a3c;border-radius:10px;padding:5px;backdrop-filter:blur(10px)}
+ #ctxmenu .ctxitem{padding:9px 16px;border-radius:7px;cursor:pointer;font-size:13px;
+  color:#e8e8ea;white-space:nowrap;user-select:none}
+ #ctxmenu .ctxitem:hover{background:#3a3a3c}
  #tools button{background:rgba(255,253,247,.08);border:1px solid rgba(255,253,247,.22);
    color:rgba(255,253,247,.72);font:12px system-ui,sans-serif;padding:6px 14px;border-radius:99px;
    cursor:pointer;backdrop-filter:blur(6px)}
@@ -2180,6 +2186,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <button id="btnTl">流水</button>
  <button id="btnFs" title="整页铺满显示器（Esc 退出）">全屏</button>
 </div>
+
+<!-- 右键菜单：控制台显隐（右下调试按钮组默认隐藏，展台观众看不到） -->
+<div id="ctxmenu"><div class="ctxitem" id="ctxToggle">显示控制台</div></div>
 
 <div id="hlcfg">
  <div class="hd">展示调节 <button id="hlcfgClose" title="关闭">✕</button></div>
@@ -2720,6 +2729,32 @@ $('btnTl').onclick=()=>{
   $('btnTl').textContent=on?'实时':'流水';
   setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
 };
+// ══ 控制台显隐：右下调试按钮组默认隐藏（观众看不到），右键菜单「显示/隐藏控制台」
+// 切换，选择记进 localStorage（刷新保持；从未设置过=默认隐藏）══
+let consoleOn=localStorage.getItem('exp_console')==='1';
+function applyConsole(){
+  $('tools').style.display=consoleOn?'':'none';
+  if(!consoleOn)$('hlcfg').classList.remove('on');   // 隐藏控制台时顺手收起调节抽屉
+  $('ctxToggle').textContent=consoleOn?'隐藏控制台':'显示控制台';
+}
+document.addEventListener('contextmenu',e=>{
+  e.preventDefault();
+  const m=$('ctxmenu');
+  m.style.display='block';
+  // 先显示再量尺寸，钳制进视口（右/下边缘右键时菜单不出界）
+  m.style.left=Math.max(4,Math.min(e.clientX,innerWidth-m.offsetWidth-8))+'px';
+  m.style.top=Math.max(4,Math.min(e.clientY,innerHeight-m.offsetHeight-8))+'px';
+});
+document.addEventListener('click',()=>{$('ctxmenu').style.display='none';});
+$('ctxToggle').addEventListener('click',e=>{
+  e.stopPropagation();
+  consoleOn=!consoleOn;
+  localStorage.setItem('exp_console',consoleOn?'1':'0');
+  applyConsole();
+  $('ctxmenu').style.display='none';
+});
+applyConsole();
+
 // ══ 全屏：Fullscreen API 整页铺满显示器（展台演示用；须由用户点击手势触发）══
 function fsOn(){return !!(document.fullscreenElement||document.webkitFullscreenElement);}
 $('btnFs').onclick=()=>{
