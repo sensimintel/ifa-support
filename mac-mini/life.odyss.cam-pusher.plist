@@ -10,7 +10,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/odyss/cam-pusher/run-pusher.sh</string>
+        <string>/Users/odyss/ifa-support/mac-mini/run-pusher.sh</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
