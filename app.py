@@ -2630,6 +2630,8 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  </div>
  <div class="fld"><label>漂浮强度 <b id="v_dt_pf">35</b>%</label>
   <input type="range" id="r_dt_pf" min="0" max="100" step="5" value="35"></div>
+ <div class="fld"><label>空间纵深 <b id="v_dt_pdep">0</b>%</label>
+  <input type="range" id="r_dt_pdep" min="0" max="100" step="5" value="0"></div>
  <div class="fld"><label>运动速度 <b id="v_dt_spd">1</b></label>
   <input type="range" id="r_dt_spd" min="0" max="3" step="0.1" value="1"></div>
  <div class="fld"><label>点阵背景色</label>
@@ -2640,7 +2642,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   观感）；粒径大小不一、伪噪声缓慢漂浮，重生率控制粒子闪换与分布跟随画面变化的速度；
   单色模式全部粒子用同一颜色（只用画面定密度），关闭则取原色彩。<b>漂浮强度</b>：
   把不同深度区块交界处的点朝暗侧吹散——边缘点持续剥离、渐隐、回炉再飞（消散观感），
-  边界因此起雾不再生硬；两种模式都生效，0=关。两种模式只作用于
+  边界因此起雾不再生硬；两种模式都生效，0=关。<b>空间纵深</b>：把画面明暗当远近
+  （配合近亮远暗的色彩映射最准），近点放大并随缓慢镜头摆动多移、远点反向缩小微移——
+  层间视差把前后空间拉开；两种模式都生效，0=关。两种模式只作用于
   图片类背景（设备深度图、高亮/SAM3/单目点云的图模式）；GLB 点云背景请用上方
   「点渲染」区。即时生效、只存本浏览器。</div>
  </div>
@@ -3188,7 +3192,8 @@ addEventListener('resize',applyDdCss);   // 旋转补偿量随视口比例变化
 //    对所有走 showImg 的图片类来源统一生效；GLB 背景不适用（有自己的点渲染区）══
 // 展会默认（2026-08-13 现场调定）：点阵化开、点距7、圆径34%
 let dotCfg={on:1,mode:0,pitch:7,r:34,jitter:0,motion:0,speed:1,bg:'#000000',gshape:1,
-  pn:30000,psize:2,pcontrast:1.2,pmono:0,pcolor:'#fffdf7',pdrift:1,prespawn:1,pfloat:35,pshape:0};
+  pn:30000,psize:2,pcontrast:1.2,pmono:0,pcolor:'#fffdf7',pdrift:1,prespawn:1,pfloat:35,pshape:0,
+  pdepth:0};
 try{Object.assign(dotCfg,JSON.parse(localStorage.getItem('exp_dot')||'{}'));}catch(e){}
 let dotIm=null,dotOffCv=null;        // 最近一帧背景 Image / 离屏降采样画布（复用）
 let dotData=null,dotCols=0,dotRows=0;// 降采样取色缓存：动画重绘不重复采样
@@ -3266,6 +3271,9 @@ function dotDraw(tSec){
   const baseR=P*(+dotCfg.r)/100,jit=P*(+dotCfg.jitter)/100*0.5;  // 抖动上限=半格
   const mode=+dotCfg.motion,spd=+dotCfg.speed,t=tSec||0,TAU=6.28318,d=dotData;
   const pf=(+dotCfg.pfloat)/100;
+  // 空间纵深：把亮度当远近（配合近亮远暗色彩映射），缓慢镜头摆动做层间视差
+  const pd=(+dotCfg.pdepth)/100;
+  const swx=pd?Math.sin(t*0.35)*70*dpr*pd:0,swy=pd?Math.cos(t*0.22)*42*dpr*pd:0;
   ctx.clearRect(0,0,cv.width,cv.height);
   for(let ry=0;ry<dotRows;ry++)for(let rx=0;rx<dotCols;rx++){
     const idx=ry*dotCols+rx,o=idx*4;
@@ -3288,6 +3296,10 @@ function dotDraw(tSec){
         x+=dotEdge[eb+1]*fly*P;y+=dotEdge[eb+2]*fly*P;
         al*=1-Math.min(0.85,fly/F*0.9);r*=1-0.35*Math.min(1,fly/F);
       }
+    }
+    if(pd){   // 近点放大并随摆动多移、远点反向缩小微移——前后层滑开
+      const dz=(d[o]*0.2126+d[o+1]*0.7152+d[o+2]*0.0722)/255-0.45;
+      x+=dz*swx;y+=dz*swy;r*=Math.max(0.3,1+dz*1.3*pd);
     }
     if(r<=0.2)continue;
     ctx.fillStyle='rgba('+d[o]+','+d[o+1]+','+d[o+2]+','+al.toFixed(3)+')';
@@ -3392,6 +3404,9 @@ function pcDraw(t){
   const re=Math.max(1,Math.round(pcN*0.12*(+dotCfg.prespawn)*dt));
   for(let k=0;k<re;k++)pcSpawn(Math.floor(Math.random()*pcN));
   const pf=(+dotCfg.pfloat)/100;
+  // 空间纵深：亮度当远近，缓慢镜头摆动做层间视差（近多移远反向）+近大远小
+  const pd=(+dotCfg.pdepth)/100;
+  const swx=pd?Math.sin(t*0.35)*70*dpr*pd:0,swy=pd?Math.cos(t*0.22)*42*dpr*pd:0;
   let mr=255,mg=253,mb=247;
   if(mono){const c=dotCfg.pcolor;
     mr=parseInt(c.slice(1,3),16);mg=parseInt(c.slice(3,5),16);mb=parseInt(c.slice(5,7),16);}
@@ -3400,12 +3415,13 @@ function pcDraw(t){
     // 伪噪声漂移：两组不同频正弦叠加、逐粒子相位——悬浮微尘的缓慢无序运动
     const x=pcPool[b]+Math.sin(t*spd*0.7+ph)*amp+Math.sin(t*spd*0.31+ph*2.7)*amp*0.6;
     const y=pcPool[b+1]+Math.cos(t*spd*0.6+ph*1.7)*amp+Math.cos(t*spd*0.23+ph*3.1)*amp*0.5;
-    let cr=mr,cg=mg,cb=mb;
-    if(!mono){   // 保留原色彩（取飘散前位置）
+    let cr=mr,cg=mg,cb=mb,dz=0;
+    if(!mono||pd){   // 保留原色彩（取飘散前位置）；空间纵深也需取格子亮度当深度
       const gx=Math.min(dotCols-1,Math.max(0,(x/gw)|0));
       const gy=Math.min(dotRows-1,Math.max(0,(y/gh)|0));
       const o=(gy*dotCols+gx)*4;
-      cr=d[o];cg=d[o+1];cb=d[o+2];
+      if(!mono){cr=d[o];cg=d[o+1];cb=d[o+2];}
+      if(pd)dz=(d[o]*0.2126+d[o+1]*0.7152+d[o+2]*0.0722)/255-0.45;
     }
     let al=1,ex=0,ey=0;
     if(pf>0&&dotEdge){
@@ -3425,11 +3441,12 @@ function pcDraw(t){
         al=1-prog*0.9;
       }
     }
-    const s=Math.max(1,Math.round(pcPool[b+3]*psz));
-    pcStamp(x+ex,y+ey,s,cr,cg,cb,al,round,W,H);
+    const pxo=dz*swx,pyo=dz*swy;   // 视差偏移只挪位置，不当作消散（不触发拖尾）
+    const s=Math.max(1,Math.round(pcPool[b+3]*psz*(pd?Math.max(0.35,1+dz*1.3*pd):1)));
+    pcStamp(x+ex+pxo,y+ey+pyo,s,cr,cg,cb,al,round,W,H);
     if(ex||ey){   // 拖尾：沿来路补两颗渐淡渐小的点，扫出消散的流线感
-      pcStamp(x+ex*0.75,y+ey*0.75,Math.max(1,Math.round(s*0.85)),cr,cg,cb,al*0.5,round,W,H);
-      pcStamp(x+ex*0.5,y+ey*0.5,Math.max(1,Math.round(s*0.7)),cr,cg,cb,al*0.25,round,W,H);
+      pcStamp(x+ex*0.75+pxo,y+ey*0.75+pyo,Math.max(1,Math.round(s*0.85)),cr,cg,cb,al*0.5,round,W,H);
+      pcStamp(x+ex*0.5+pxo,y+ey*0.5+pyo,Math.max(1,Math.round(s*0.7)),cr,cg,cb,al*0.25,round,W,H);
     }
   }
   ctx.putImageData(pcImg,0,0);
@@ -3437,7 +3454,7 @@ function pcDraw(t){
 // ── rAF 动画循环（~30fps 节流）：粒子云常开（speed=0 时粒子静止但仍重生闪换）；
 //    网格模式仅运动开启时循环。深度帧到达只刷 dotSample 缓存，循环不重置 ──
 let dotRaf=0,dotLastT=0;
-function dotNeedLoop(){return +dotCfg.on&&(+dotCfg.mode===1||+dotCfg.motion>0||+dotCfg.pfloat>0);}
+function dotNeedLoop(){return +dotCfg.on&&(+dotCfg.mode===1||+dotCfg.motion>0||+dotCfg.pfloat>0||+dotCfg.pdepth>0);}
 function dotLoop(ts){
   dotRaf=0;
   if(!dotNeedLoop()||$('bgDot').style.display==='none')return;
@@ -3473,7 +3490,8 @@ const DT_SLIDERS={pitch:['r_dt_pitch','v_dt_pitch'],r:['r_dt_r','v_dt_r'],
   jitter:['r_dt_jit','v_dt_jit'],speed:['r_dt_spd','v_dt_spd'],
   pn:['r_dt_pn','v_dt_pn'],psize:['r_dt_psz','v_dt_psz'],
   pcontrast:['r_dt_pct','v_dt_pct'],pdrift:['r_dt_drift','v_dt_drift'],
-  prespawn:['r_dt_resp','v_dt_resp'],pfloat:['r_dt_pf','v_dt_pf']};
+  prespawn:['r_dt_resp','v_dt_resp'],pfloat:['r_dt_pf','v_dt_pf'],
+  pdepth:['r_dt_pdep','v_dt_pdep']};
 Object.keys(DT_SLIDERS).forEach(k=>{
   const [rid,vid]=DT_SLIDERS[k];
   $(rid).addEventListener('input',()=>{
