@@ -23,8 +23,11 @@
 - venv 在 mini 的 `~/cam-pusher-venv`（Python 3.11——`pyorbbecsdk==1.3.2` 的
   macOS arm64 wheel 只配 3.11）。**不需要 brew / Xcode CLT / ffmpeg**。
 - 配置走 mini 部署目录 `~/cam-pusher/.env`（gitignore，不进仓）：
-  `RELAY_URL`（默认 `http://192.168.0.50:8060`）、`PUSH_FPS`（默认 3）、
+  `RELAY_URL`（默认 `http://192.168.0.50:8060`）、`PUSH_FPS`（**兜底值**，默认 3）、
   `JPEG_QUALITY`（默认 80）。
+- **推帧频率的权威来源是 `/panel` 的「推帧 fps」滑杆**（POST `/api/frame/config`
+  的 `push_fps`，与手机 App 同一套约定）：推帧器每 2s 轮询 `/api/frame/status`
+  热生效（钳制 0.2~15fps）；8060 不可达时沿用最后值，进程刚起时用 `PUSH_FPS`。
 
 ## 部署（推送式：开发机 → mini）
 

@@ -15,8 +15,12 @@
 
 配置经环境变量（LaunchDaemon 经 run-pusher.sh source 同目录 .env）：
   RELAY_URL     推帧目标，默认 http://192.168.0.50:8060
-  PUSH_FPS      每台相机的推帧频率，默认 3
+  PUSH_FPS      推帧频率兜底值，默认 3——仅在拿不到服务端配置时生效
   JPEG_QUALITY  非 MJPG 相机转码 JPEG 质量，默认 80
+
+推帧频率的权威来源是 8060 服务端配置（/panel「推帧 fps」滑杆 POST 到
+/api/frame/config 的 push_fps 字段，与手机 App 同一套约定）：后台线程每 2s
+轮询 /api/frame/status 读取并热生效，服务端不可达时沿用最后一次的值。
 """
 import json
 import logging
@@ -47,6 +51,38 @@ log = logging.getLogger("cam-pusher")
 _stop = threading.Event()
 # SDK 设备枚举/开流不保证并发安全，统一串行化
 _sdk_lock = threading.Lock()
+
+# 当前生效的推帧频率：以服务端配置为准，PUSH_FPS 仅兜底（见模块头注释）
+_effective_fps = PUSH_FPS
+_fps_lock = threading.Lock()
+
+
+def get_push_interval() -> float:
+    """当前推帧间隔（秒）。频率钳制在 0.2~15fps：防误配 0 值忙等或打爆链路。"""
+    with _fps_lock:
+        fps = _effective_fps
+    return 1.0 / min(max(fps, 0.2), 15.0)
+
+
+def _config_poller():
+    """每 2s 从 8060 读一次服务端配置里的 push_fps 并热生效。"""
+    global _effective_fps
+    session = requests.Session()
+    while not _stop.is_set():
+        try:
+            resp = session.get(f"{RELAY_URL}/api/frame/status", timeout=(3.05, 5))
+            resp.raise_for_status()
+            raw = (resp.json().get("config") or {}).get("push_fps")
+            fps = float(raw) if raw is not None else None
+            if fps and fps > 0:
+                with _fps_lock:
+                    if abs(fps - _effective_fps) > 1e-6:
+                        log.info("推帧频率随服务端配置调整: %.1f → %.1f fps",
+                                 _effective_fps, fps)
+                        _effective_fps = fps
+        except (requests.RequestException, ValueError, TypeError):
+            pass  # 服务端不可达/字段异常时沿用当前值，推帧线程自身会报连不上
+        _stop.wait(2)
 
 
 def _find_device(ctx: Context, pid: int):
@@ -102,7 +138,6 @@ def _camera_worker(pid: int, device_id: str):
     """单相机工作线程：开流 → 节流推帧 → 出错重连，直到进程退出。"""
     ctx = None
     session = requests.Session()
-    interval = 1.0 / max(PUSH_FPS, 0.1)
     push_err = 0
     while not _stop.is_set():
         pipe = None
@@ -129,7 +164,7 @@ def _camera_worker(pid: int, device_id: str):
                              cf.get_width(), cf.get_height(), cf.get_format())
                     first = False
                 now = time.time()
-                if now - last_push < interval:
+                if now - last_push < get_push_interval():
                     continue
                 jpeg = _to_jpeg(cf)
                 try:
@@ -168,8 +203,10 @@ def _camera_worker(pid: int, device_id: str):
 def main():
     signal.signal(signal.SIGTERM, lambda *_: _stop.set())
     signal.signal(signal.SIGINT, lambda *_: _stop.set())
-    log.info("cam-pusher 启动：目标=%s 频率=%.1ffps 质量=%d",
+    log.info("cam-pusher 启动：目标=%s 兜底频率=%.1ffps 质量=%d（实际频率跟随 /panel 滑杆）",
              RELAY_URL, PUSH_FPS, JPEG_QUALITY)
+    threading.Thread(target=_config_poller, name="config-poller",
+                     daemon=True).start()
 
     # 启动时枚举一次已知相机；没插的也起线程（线程内会持续等它出现）
     with _sdk_lock:
