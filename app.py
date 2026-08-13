@@ -57,7 +57,11 @@ PROCESS_RES = 504  # DA3 默认处理分辨率
 # GLB / mesh 产物落盘目录（每次推理一个子目录，超量自动清理）
 GLB_DIR = Path("/home/odyss/da3-web/glb_out")
 GLB_DIR.mkdir(parents=True, exist_ok=True)
-GLB_KEEP = 24  # 最多保留最近多少次产物
+# 最多保留最近多少次产物。三路产物（DA3/SAM3映射/SAM3高亮）高频推流时合计可达 3~6 个/秒，
+# 客户端从拿到 url 到拉完 GLB 需数秒（远端浏览器还受 Wi-Fi 带宽限制），额度太小会让 token
+# 在被拉取前就被清掉 → 前端 404、点云格子全部冻住（2026-08-13 真实发生）。150 个 ≈ 25~50s
+# 寿命、磁盘峰值 ~350MB，5090 余量充足
+GLB_KEEP = 150
 
 app = FastAPI(title="DA3 Depth Web")
 # 局域网演示服务：放开跨域，供 superadmin(18091) 等同网页面直调秤接口

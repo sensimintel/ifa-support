@@ -23,7 +23,8 @@ import push_rgb
 
 ASTRA_PID = 0x060F
 DEPTH_MIN_M, DEPTH_MAX_M = 0.25, 4.0    # 有效深度窗（米）：Astra 标称工作距离内
-STRIDE = 2                              # 深度图降采样步长：640x480 → 320x240 ≈ 7.7 万点
+STRIDE = 3                              # 深度图降采样步长：640x480 → 213x160 ≈ 3.4 万点
+                                        # （步长 2 的 GLB ~0.7MB/次会挤占 Wi-Fi，拖慢面板拉取 GLB）
 
 
 class AstraDepth:
@@ -133,7 +134,7 @@ def main():
     ap.add_argument("--device-id", default="mac-astra")
     ap.add_argument("--fps", type=float, default=2.0, help="RGB 推帧兜底 fps")
     ap.add_argument("--quality", type=int, default=85)
-    ap.add_argument("--product-interval", type=float, default=1.5, help="点云产物上传间隔（秒）")
+    ap.add_argument("--product-interval", type=float, default=2.5, help="点云产物上传间隔（秒）")
     args = ap.parse_args()
 
     depth = AstraDepth()
