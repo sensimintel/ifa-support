@@ -702,7 +702,7 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
 def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
                                 num_max_points=800000, show_cameras=True,
                                 mask_overlays=None, outlier_mad=12.0,
-                                point_scale=None):
+                                point_scale=None, color_gamma=None):
     """双视角（左右 IR）点云 GLB：每个视角各自反投影后，经 DA3 估计的相对位姿统一
     合到「视角 0（左目）相机坐标系」，再 flip Y/Z 到 glTF 约定——与单目链路同一坐标
     语义（左目相机=原点、光轴固定），前端同一套取景逻辑直接可用。
@@ -729,6 +729,12 @@ def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
     elif rgb.dtype != np.uint8:
         # processed_images 可能是 0-1 浮点：与 _rgb_uint8 同款换算，直接转 uint8 会全黑
         rgb = np.clip(rgb * (255 if rgb.max() <= 1.0 else 1), 0, 255).astype(np.uint8)
+    if color_gamma:
+        # 顶点色伽马提亮（<1 提暗部）：IR 无环境光时后景灰度极低，点云黑底上后景点
+        # 肉眼不可见——只提显示颜色，不影响喂给 DA3 的原始输入与几何
+        lut = (np.power(np.arange(256, dtype=np.float32) / 255.0,
+                        float(color_gamma)) * 255.0).astype(np.uint8)
+        rgb = lut[rgb]
     if mask_overlays:
         # SAM3 mask 染进左目视角的点颜色（与③同款 0.5 混合）
         v0 = rgb[0].copy()
@@ -3623,8 +3629,12 @@ def _da3_stereo_processor(left_raw: bytes, right_raw: bytes, aux_info: dict,
 
     res = int(max(140, min(1120, int(float(
         config.get("stereo_process_res", config.get("process_res", PROCESS_RES)))))))
-    conf = float(config.get("conf_thresh_percentile", 40.0))
-    nmp = int(float(config.get("num_max_points", 800000)))
+    # conf 分位跟随面板滑杆但减半：40% 分位在 IR 上几乎全砍在暗背景区（散斑打不远、
+    # 后景纹理弱 → conf 低），按单目口径裁会把后景整片裁没（2026-08-13 实测）
+    conf = float(config.get("conf_thresh_percentile", 40.0)) * 0.5
+    # 点预算 = 单目预算 × 2 视角：合并点云共用一份预算会把每视角密度砍半——双目实测
+    # 恰好卡死在单目预算上限（98937/100000），后景先被随机抽稀（同日实测）
+    nmp = min(2 * int(float(config.get("num_max_points", 800000))), 2_000_000)
     show_cam = str(config.get("show_cameras", "1")) in ("1", "true", "True", "on", "显示")
 
     model = get_model()
@@ -3665,7 +3675,8 @@ def _da3_stereo_processor(left_raw: bytes, right_raw: bytes, aux_info: dict,
         glb = outdir / "scene.glb"
         K0 = build_stereo_pointcloud_glb(
             pred, str(glb), conf_thresh_percentile=conf, num_max_points=nmp,
-            show_cameras=show_cam, mask_overlays=overlays, point_scale=point_scale)
+            show_cameras=show_cam, mask_overlays=overlays, point_scale=point_scale,
+            color_gamma=0.55)   # IR 暗部提亮：无环境光的后景点在黑底上才可见
         sz = glb.stat().st_size / 1024 if glb.exists() else 0
         _prune_glb()
 
