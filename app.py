@@ -1712,7 +1712,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  <select id="devsel" style="width:auto;min-width:200px;font-size:13px;padding:5px 8px;border:1px solid #d0d0d5;border-radius:8px;background:#fff"></select>
  <span id="devinfo"></span>
  <span style="flex:none;margin-left:14px">推帧 fps：</span>
- <input type="range" id="fps" min="0.5" max="10" step="0.5" value="2" style="width:130px">
+ <input type="range" id="fps" min="0.5" max="30" step="0.5" value="2" style="width:130px">
  <b id="fpv" style="font-variant-numeric:tabular-nums">2.0</b>
 </div>
 
@@ -2074,9 +2074,9 @@ async function tick(){
  try{
   const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
   // 轮询节奏自适应到帧率：显示刷新率受轮询间隔封顶（固定 500ms 时原图最多 2fps），
-  // 按实际到帧率加密（1.5 倍过采样防节拍差拍），钳制 80~500ms——高帧率跟得上、
+  // 按实际到帧率加密（1.5 倍过采样防节拍差拍），钳制 33~500ms——30fps 也跟得上、
   // 低帧率不空转。图片均按 seq 门控换图，轮询加密不会重复拉图
-  tickDelay=s.fps?Math.max(80,Math.min(500,1000/(s.fps*1.5))):500;
+  tickDelay=s.fps?Math.max(33,Math.min(500,1000/(s.fps*1.5))):500;
   // 服务端重启后配置清零（config_gen=0 → 回落 depth 模式、识别不触发）：自动重推当前面板配置
   if(s.processor && s.config_gen===0) pushConfig();
   // 设备下拉 + 切换检测（本页或其他页面触发的切换都会在这里被发现）
@@ -2442,7 +2442,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <input type="range" id="r_card_s" min="3" max="60" step="1" value="10"></div>
  <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">数据源帧率（当前设备）</div>
  <div class="fld"><label>RGB 推帧 <b id="v_push_fps">2.0</b> fps · 实测到帧 <b id="v_fps_meas">--</b> fps</label>
-  <input type="range" id="r_push_fps" min="0.5" max="10" step="0.5" value="2"></div>
+  <input type="range" id="r_push_fps" min="0.5" max="30" step="0.5" value="2"></div>
  <div class="fld"><label>点云直传间隔 <b id="v_prod_itv">2.5</b> s</label>
   <input type="range" id="r_prod_itv" min="0.5" max="10" step="0.5" value="2.5"></div>
  <div class="hint" style="margin-top:8px">按设备生效（推流端每 2s 轮询取走，调完看「实测到帧」
@@ -2517,7 +2517,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div class="fld"><label>JPEG 质量 <b id="v_dd_jq">80</b></label>
   <input type="range" id="r_dd_jq" min="30" max="95" step="5" value="80"></div>
  <div class="fld"><label>深度推帧率 <b id="v_dd_fps">0.0</b>fps（0=跟随RGB）</label>
-  <input type="range" id="r_dd_fps" min="0" max="15" step="0.5" value="0"></div>
+  <input type="range" id="r_dd_fps" min="0" max="30" step="0.5" value="0"></div>
  <div class="sec">深度显示（本页即时）</div>
  <div class="fld"><label>亮度 ×<b id="v_dc_bright">1.00</b></label>
   <input type="range" id="r_dc_bright" min="0.2" max="2.5" step="0.05" value="1"></div>
@@ -3667,12 +3667,12 @@ if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布
   setState('idle');
   // 背景轮询：串行自排程（每轮结束按 delay 排下一轮，慢请求不堆积并发，同 /panel
   // f91e6f7 的自适应节奏）。设备深度图来源直接展示入帧，轮询按实测 fps 自适应
-  // （10fps 时 ~80ms 一轮，显示帧率不再被固定 500ms 封顶）；GLB 类来源产物本来就是
+  // （30fps 时 ~33ms 一轮，显示帧率不再被固定 500ms 封顶）；GLB 类来源产物本来就是
   // 秒级一轮，维持 500ms 不空转高频轮询
   (function bgLoop(){
     Promise.resolve(bgTick()).catch(()=>{}).then(()=>{
       const delay=(bgSource==='devdepth'&&bgFps>0)
-        ?Math.max(80,Math.min(500,1000/(bgFps*1.5))):500;
+        ?Math.max(33,Math.min(500,1000/(bgFps*1.5))):500;
       setTimeout(bgLoop,delay);
     });
   })();

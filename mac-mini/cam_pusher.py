@@ -99,10 +99,10 @@ def _valid_fps(raw) -> float:
 
 
 def get_push_interval(device_id: str) -> float:
-    """该设备当前推帧间隔（秒）。频率钳制在 0.2~15fps：防误配 0 值忙等或打爆链路。"""
+    """该设备当前推帧间隔（秒）。频率钳制在 0.2~30fps：防误配 0 值忙等或打爆链路。"""
     with _fps_lock:
         fps = _dev_fps.get(device_id) or _global_fps or PUSH_FPS
-    return 1.0 / min(max(fps, 0.2), 15.0)
+    return 1.0 / min(max(fps, 0.2), 30.0)
 
 
 def get_depth_cfg(device_id: str) -> dict:
@@ -529,7 +529,7 @@ def _camera_worker(pid: int, spec: dict, device_id: str):
                 # RGB（历史行为）。两路都未到节拍则跳过本帧组 ──
                 dcfg = get_depth_cfg(device_id)
                 dfps = _cfg_num(dcfg, "depth_fps", 0.0)
-                dep_itv = (1.0 / min(max(dfps, 0.2), 15.0)) if dfps > 0 else None
+                dep_itv = (1.0 / min(max(dfps, 0.2), 30.0)) if dfps > 0 else None
                 rgb_due = now - last_push >= get_push_interval(device_id)
                 dep_due = (now - depth_state.get("last_push", 0.0) >= dep_itv
                            ) if dep_itv else rgb_due

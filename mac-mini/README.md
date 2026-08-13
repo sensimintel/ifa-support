@@ -55,7 +55,7 @@ RGB 主链路不受影响。
 - **推帧频率的权威来源是 8060 的 per-device 配置，两台相机各调各的**：`/panel`
   设备栏滑杆与 `/experience`「调节」抽屉的「数据源帧率」区都 POST
   `/api/frame/device-config`（按 `device_id` merge-patch）；推帧器每 2s 轮询
-  `/api/frame/status` 的 `devices[].config.push_fps` 热生效（钳制 0.2~15fps），
+  `/api/frame/status` 的 `devices[].config.push_fps` 热生效（钳制 0.2~30fps），
   取值优先级 per-device ＞ 全局 `config.push_fps`（旧口径）＞ `PUSH_FPS`；
   8060 不可达时沿用最后值。
 

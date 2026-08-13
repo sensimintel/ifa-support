@@ -82,7 +82,7 @@ DEV_CONFIG_LIMITS = {
     "depth_edge": (0.0, 1.0),         # 深度边缘描边强度（0=关）
     "depth_contour_m": (0.0, 2.0),    # 等值线间隔（米，0=关）
     "depth_jpeg_q": (30.0, 95.0),     # 深度图 JPEG 编码质量
-    "depth_fps": (0.0, 15.0),         # 深度独立推帧率（0=跟随 RGB 主帧节拍）
+    "depth_fps": (0.0, 30.0),         # 深度独立推帧率（0=跟随 RGB 主帧节拍）
 }
 # 枚举键白名单（值统一小写存储）
 DEV_CONFIG_ENUMS = {
