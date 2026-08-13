@@ -2471,39 +2471,39 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   </div></div>
  <div class="fld"><label>量程模式</label>
   <div class="radios">
-   <label><input type="radio" name="ddar" value="0" checked> 固定量程</label>
-   <label><input type="radio" name="ddar" value="1"> 自动分位</label>
+   <label><input type="radio" name="ddar" value="0"> 固定量程</label>
+   <label><input type="radio" name="ddar" value="1" checked> 自动分位</label>
   </div></div>
- <div class="fld"><label>量程近端 <b id="v_dd_min">0.20</b>m</label>
-  <input type="range" id="r_dd_min" min="0.05" max="3" step="0.05" value="0.2"></div>
- <div class="fld"><label>量程远端 <b id="v_dd_max">2.0</b>m</label>
-  <input type="range" id="r_dd_max" min="0.3" max="8" step="0.1" value="2"></div>
- <div class="fld"><label>自动分位 低 <b id="v_dd_lo">2</b>%</label>
-  <input type="range" id="r_dd_lo" min="0" max="20" step="1" value="2"></div>
- <div class="fld"><label>自动分位 高 <b id="v_dd_hi">98</b>%</label>
-  <input type="range" id="r_dd_hi" min="80" max="100" step="1" value="98"></div>
- <div class="fld"><label>Gamma <b id="v_dd_gamma">1.00</b></label>
-  <input type="range" id="r_dd_gamma" min="0.2" max="3" step="0.05" value="1"></div>
+ <div class="fld"><label>量程近端 <b id="v_dd_min">0.15</b>m</label>
+  <input type="range" id="r_dd_min" min="0.05" max="3" step="0.05" value="0.15"></div>
+ <div class="fld"><label>量程远端 <b id="v_dd_max">1.6</b>m</label>
+  <input type="range" id="r_dd_max" min="0.3" max="8" step="0.1" value="1.6"></div>
+ <div class="fld"><label>自动分位 低 <b id="v_dd_lo">8</b>%</label>
+  <input type="range" id="r_dd_lo" min="0" max="20" step="1" value="8"></div>
+ <div class="fld"><label>自动分位 高 <b id="v_dd_hi">89</b>%</label>
+  <input type="range" id="r_dd_hi" min="80" max="100" step="1" value="89"></div>
+ <div class="fld"><label>Gamma <b id="v_dd_gamma">0.65</b></label>
+  <input type="range" id="r_dd_gamma" min="0.2" max="3" step="0.05" value="0.65"></div>
  <div class="fld"><label>直方图均衡</label>
   <div class="radios">
-   <label><input type="radio" name="ddeq" value="off" checked> 关</label>
-   <label><input type="radio" name="ddeq" value="global"> 全局</label>
+   <label><input type="radio" name="ddeq" value="off"> 关</label>
+   <label><input type="radio" name="ddeq" value="global" checked> 全局</label>
    <label><input type="radio" name="ddeq" value="clahe"> CLAHE</label>
   </div></div>
- <div class="fld"><label>CLAHE 强度 <b id="v_dd_clip">2.0</b></label>
-  <input type="range" id="r_dd_clip" min="0.5" max="8" step="0.5" value="2"></div>
+ <div class="fld"><label>CLAHE 强度 <b id="v_dd_clip">2.5</b></label>
+  <input type="range" id="r_dd_clip" min="0.5" max="8" step="0.5" value="2.5"></div>
  <div class="fld"><label>无效点颜色</label>
   <div class="radios"><input type="color" id="c_dd_invalid" value="#000000"></div></div>
  <div class="fld"><label>孔洞填充</label>
   <div class="radios">
-   <label><input type="radio" name="ddfill" value="off" checked> 关</label>
-   <label><input type="radio" name="ddfill" value="close"> 形态学</label>
+   <label><input type="radio" name="ddfill" value="off"> 关</label>
+   <label><input type="radio" name="ddfill" value="close" checked> 形态学</label>
    <label><input type="radio" name="ddfill" value="inpaint"> 修补</label>
   </div></div>
- <div class="fld"><label>填充半径 <b id="v_dd_fillpx">3</b>px</label>
-  <input type="range" id="r_dd_fillpx" min="1" max="15" step="1" value="3"></div>
- <div class="fld"><label>时域平滑 <b id="v_dd_ema">0.00</b></label>
-  <input type="range" id="r_dd_ema" min="0" max="0.9" step="0.05" value="0"></div>
+ <div class="fld"><label>填充半径 <b id="v_dd_fillpx">5</b>px</label>
+  <input type="range" id="r_dd_fillpx" min="1" max="15" step="1" value="5"></div>
+ <div class="fld"><label>时域平滑 <b id="v_dd_ema">0.15</b></label>
+  <input type="range" id="r_dd_ema" min="0" max="0.9" step="0.05" value="0.15"></div>
  <div class="fld"><label>空域滤波</label>
   <div class="radios">
    <label><input type="radio" name="ddsm" value="off" checked> 关</label>
@@ -2514,17 +2514,17 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <input type="range" id="r_dd_edge" min="0" max="1" step="0.05" value="0"></div>
  <div class="fld"><label>等值线间隔 <b id="v_dd_contour">0.00</b>m（0=关）</label>
   <input type="range" id="r_dd_contour" min="0" max="1" step="0.05" value="0"></div>
- <div class="fld"><label>JPEG 质量 <b id="v_dd_jq">80</b></label>
-  <input type="range" id="r_dd_jq" min="30" max="95" step="5" value="80"></div>
- <div class="fld"><label>深度推帧率 <b id="v_dd_fps">0.0</b>fps（0=跟随RGB）</label>
-  <input type="range" id="r_dd_fps" min="0" max="30" step="0.5" value="0"></div>
+ <div class="fld"><label>JPEG 质量 <b id="v_dd_jq">95</b></label>
+  <input type="range" id="r_dd_jq" min="30" max="95" step="5" value="95"></div>
+ <div class="fld"><label>深度推帧率 <b id="v_dd_fps">1.5</b>fps（0=跟随RGB）</label>
+  <input type="range" id="r_dd_fps" min="0" max="30" step="0.5" value="1.5"></div>
  <div class="sec">深度显示（本页即时）</div>
- <div class="fld"><label>亮度 ×<b id="v_dc_bright">1.00</b></label>
-  <input type="range" id="r_dc_bright" min="0.2" max="2.5" step="0.05" value="1"></div>
- <div class="fld"><label>对比度 ×<b id="v_dc_contrast">1.00</b></label>
-  <input type="range" id="r_dc_contrast" min="0.2" max="2.5" step="0.05" value="1"></div>
- <div class="fld"><label>饱和度 ×<b id="v_dc_sat">1.00</b></label>
-  <input type="range" id="r_dc_sat" min="0" max="3" step="0.05" value="1"></div>
+ <div class="fld"><label>亮度 ×<b id="v_dc_bright">0.80</b></label>
+  <input type="range" id="r_dc_bright" min="0.2" max="2.5" step="0.05" value="0.8"></div>
+ <div class="fld"><label>对比度 ×<b id="v_dc_contrast">1.30</b></label>
+  <input type="range" id="r_dc_contrast" min="0.2" max="2.5" step="0.05" value="1.3"></div>
+ <div class="fld"><label>饱和度 ×<b id="v_dc_sat">0.90</b></label>
+  <input type="range" id="r_dc_sat" min="0" max="3" step="0.05" value="0.9"></div>
  <div class="fld"><label>色相旋转 <b id="v_dc_hue">0</b>°</label>
   <input type="range" id="r_dc_hue" min="-180" max="180" step="5" value="0"></div>
  <div class="fld"><label>反色</label>
@@ -2532,8 +2532,8 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <label><input type="radio" name="dcinv" value="0" checked> 关</label>
    <label><input type="radio" name="dcinv" value="1"> 开</label>
   </div></div>
- <div class="fld"><label>模糊 <b id="v_dc_blur">0</b>px</label>
-  <input type="range" id="r_dc_blur" min="0" max="10" step="1" value="0"></div>
+ <div class="fld"><label>模糊 <b id="v_dc_blur">10</b>px</label>
+  <input type="range" id="r_dc_blur" min="0" max="10" step="1" value="10"></div>
  <div class="fld"><label>不透明度 ×<b id="v_dc_opacity">1.00</b></label>
   <input type="range" id="r_dc_opacity" min="0.2" max="1" step="0.05" value="1"></div>
  <div class="fld"><label>缩放模式</label>
@@ -2572,8 +2572,8 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div class="sec">点云化样式（图片类背景，本页即时）</div>
  <div class="fld"><label>点阵化</label>
   <div class="radios">
-   <label><input type="radio" name="dton" value="0" checked> 关</label>
-   <label><input type="radio" name="dton" value="1"> 开</label>
+   <label><input type="radio" name="dton" value="0"> 关</label>
+   <label><input type="radio" name="dton" value="1" checked> 开</label>
   </div></div>
  <div class="fld"><label>模式</label>
   <div class="radios">
@@ -2581,10 +2581,10 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <label><input type="radio" name="dtmode" value="1"> 粒子云</label>
   </div></div>
  <div id="dtgrid">
- <div class="fld"><label>点距 <b id="v_dt_pitch">8</b>px</label>
-  <input type="range" id="r_dt_pitch" min="3" max="16" step="1" value="8"></div>
- <div class="fld"><label>圆径占比 <b id="v_dt_r">35</b>%</label>
-  <input type="range" id="r_dt_r" min="10" max="50" step="1" value="35"></div>
+ <div class="fld"><label>点距 <b id="v_dt_pitch">7</b>px</label>
+  <input type="range" id="r_dt_pitch" min="3" max="16" step="1" value="7"></div>
+ <div class="fld"><label>圆径占比 <b id="v_dt_r">34</b>%</label>
+  <input type="range" id="r_dt_r" min="10" max="50" step="1" value="34"></div>
  <div class="fld"><label>不规律排布 <b id="v_dt_jit">0</b>%</label>
   <input type="range" id="r_dt_jit" min="0" max="100" step="5" value="0"></div>
  <div class="fld"><label>运动</label>
@@ -3108,7 +3108,8 @@ function renderDdCfg(s){
   if(/^#[0-9a-fA-F]{6}$/.test(c.depth_invalid_color||''))$('c_dd_invalid').value=c.depth_invalid_color;
 }
 // ── 深度显示（本页 CSS 即时层）：只在 devdepth 来源挂到背景 img，切走来源即摘除 ──
-let ddCss={br:1,ct:1,sa:1,hu:0,inv:0,bl:0,op:1,fit:'cover',mir:0,rot:0,pix:0};
+// 深度视图展会默认（2026-08-13 现场调定）：亮度0.8/对比1.3/饱和0.9/模糊10px
+let ddCss={br:0.8,ct:1.3,sa:0.9,hu:0,inv:0,bl:10,op:1,fit:'cover',mir:0,rot:0,pix:0};
 try{Object.assign(ddCss,JSON.parse(localStorage.getItem('exp_dd_css')||'{}'));}catch(e){}
 function applyDdCss(){
   const on=bgSource==='devdepth';
@@ -3166,7 +3167,8 @@ addEventListener('resize',applyDdCss);   // 旋转补偿量随视口比例变化
 //      粒径 1~2px 大小不一、伪噪声缓慢漂移、寿命重生跟随画面内容变化。
 //    深度帧更新只刷新取色缓存，与 rAF 动画解耦互不打断。
 //    对所有走 showImg 的图片类来源统一生效；GLB 背景不适用（有自己的点渲染区）══
-let dotCfg={on:0,mode:0,pitch:8,r:35,jitter:0,motion:0,speed:1,bg:'#000000',
+// 展会默认（2026-08-13 现场调定）：点阵化开、点距7、圆径34%
+let dotCfg={on:1,mode:0,pitch:7,r:34,jitter:0,motion:0,speed:1,bg:'#000000',
   pn:30000,psize:2,pcontrast:1.2,pmono:0,pcolor:'#fffdf7',pdrift:1,prespawn:1};
 try{Object.assign(dotCfg,JSON.parse(localStorage.getItem('exp_dot')||'{}'));}catch(e){}
 let dotIm=null,dotOffCv=null;        // 最近一帧背景 Image / 离屏降采样画布（复用）

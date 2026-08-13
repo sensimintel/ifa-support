@@ -61,8 +61,8 @@ JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
 LASER_MODE = os.environ.get("LASER_MODE", "interleave").strip().lower()
 # 硬件深度图伪彩的固定量程（米）：固定而非逐帧 min/max 自适应——展台上手/物进出画面
 # 时整图颜色才不会跳变闪烁。桌面演示场景默认 0.2~2m，按展台纵深经 .env 调整。
-DEPTH_MIN_M = float(os.environ.get("DEPTH_MIN_M", "0.2"))
-DEPTH_MAX_M = float(os.environ.get("DEPTH_MAX_M", "2.0"))
+DEPTH_MIN_M = float(os.environ.get("DEPTH_MIN_M", "0.15"))
+DEPTH_MAX_M = float(os.environ.get("DEPTH_MAX_M", "1.6"))
 
 # 已知相机 PID → 能力描述（新相机接入时补这张表即可）
 #   tag                 device_id 尾缀（macmini-<tag>）
@@ -211,8 +211,9 @@ def _cfg_num(cfg: dict, key: str, default: float) -> float:
 def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     """硬件深度帧（uint16，单位由 depth_scale 折算毫米）→ 伪彩 JPEG。
 
-    默认（无下发配置）与历史行为一致：固定量程归一化，近 → 亮/暖（TURBO 红端），
-    远 → 暗/冷，无效点（0 值）→ 黑。服务端可经 device-config 下发 depth_* 键逐项
+    默认（无下发配置）= 展会现场调定口径（2026-08-13）：自动分位量程（8~89%）、
+    gamma 0.65、全局直方图均衡、形态学填洞（半径 5px）、时域平滑 0.15、JPEG 95、
+    深度独立 1.5fps；色彩仍为 TURBO 近亮远暗、无效点黑。服务端可经 device-config 下发 depth_* 键逐项
     覆盖：色彩映射/方向/量程（固定或分位自适应）/gamma/直方图均衡/孔洞填充/
     时空域滤波/边缘描边/等值线/无效点颜色/JPEG 质量（/experience「调节」抽屉可视化
     调节）。state 为该相机线程私有的渲染状态（时域 EMA 上一帧等），重连后重置。"""
@@ -223,7 +224,7 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     invalid = d_mm <= 0
 
     # ── 时域平滑（EMA）：只混合两帧都有效的像素；分辨率变化即重置 ──
-    ema = min(max(_cfg_num(cfg, "depth_ema", 0.0), 0.0), 0.95)
+    ema = min(max(_cfg_num(cfg, "depth_ema", 0.15), 0.0), 0.95)
     prev = state.get("ema_prev")
     if ema > 0 and prev is not None and prev.shape == d_mm.shape:
         m = (~invalid) & (prev > 0)
@@ -231,8 +232,8 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     state["ema_prev"] = d_mm.copy() if ema > 0 else None
 
     # ── 孔洞填充（close 模式，作用于深度值本身）：形态学闭运算用邻域深度补 0 值空洞 ──
-    fill = str(cfg.get("depth_fill", "off"))
-    fill_px = max(1, int(_cfg_num(cfg, "depth_fill_px", 3)))
+    fill = str(cfg.get("depth_fill", "close"))
+    fill_px = max(1, int(_cfg_num(cfg, "depth_fill_px", 5)))
     if fill == "close" and invalid.any():
         ker = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (2 * fill_px + 1, 2 * fill_px + 1))
@@ -242,9 +243,9 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
 
     # ── 量程归一化：固定量程（默认，防手/物进出画面时整图颜色跳变）或逐帧分位自适应 ──
     valid_vals = d_mm[~invalid]
-    if _cfg_num(cfg, "depth_autorange", 0.0) >= 0.5 and valid_vals.size > 256:
-        p_hi = _cfg_num(cfg, "depth_auto_hi", 98.0)
-        p_lo = min(_cfg_num(cfg, "depth_auto_lo", 2.0), p_hi - 1.0)
+    if _cfg_num(cfg, "depth_autorange", 1.0) >= 0.5 and valid_vals.size > 256:
+        p_hi = _cfg_num(cfg, "depth_auto_hi", 89.0)
+        p_lo = min(_cfg_num(cfg, "depth_auto_lo", 8.0), p_hi - 1.0)
         lo, hi = np.percentile(valid_vals, [p_lo, p_hi])
     else:
         lo = _cfg_num(cfg, "depth_min_m", DEPTH_MIN_M) * 1000.0
@@ -252,7 +253,7 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     t = np.clip((hi - d_mm) / max(hi - lo, 1.0), 0.0, 1.0)   # 近→1（近亮远暗）
     if _cfg_num(cfg, "depth_invert", 0.0) >= 0.5:
         t = 1.0 - t
-    gamma = min(max(_cfg_num(cfg, "depth_gamma", 1.0), 0.2), 5.0)
+    gamma = min(max(_cfg_num(cfg, "depth_gamma", 0.65), 0.2), 5.0)
     if abs(gamma - 1.0) > 1e-3:
         t = np.power(t, 1.0 / gamma)
     t8 = (t * 255.0).astype(np.uint8)
@@ -264,11 +265,11 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
         invalid = np.zeros_like(invalid)
 
     # ── 直方图均衡（近似：无效像素也计入直方图统计，随后会被无效色整体覆盖） ──
-    eq = str(cfg.get("depth_eq", "off"))
+    eq = str(cfg.get("depth_eq", "global"))
     if eq == "global":
         t8 = cv2.equalizeHist(t8)
     elif eq == "clahe":
-        clip = min(max(_cfg_num(cfg, "depth_eq_clip", 2.0), 0.5), 10.0)
+        clip = min(max(_cfg_num(cfg, "depth_eq_clip", 2.5), 0.5), 10.0)
         t8 = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(t8)
 
     # ── 空域滤波 ──
@@ -308,7 +309,7 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
         bgr = (0, 0, 0)
     img[invalid] = bgr
 
-    q = int(min(max(_cfg_num(cfg, "depth_jpeg_q", JPEG_QUALITY), 30), 95))
+    q = int(min(max(_cfg_num(cfg, "depth_jpeg_q", 95), 30), 95))
     ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q])
     if not ok:
         raise ValueError("深度图 JPEG 编码失败")
@@ -528,7 +529,7 @@ def _camera_worker(pid: int, spec: dict, device_id: str):
                 # 自己的节拍（可高于 RGB，RGB 节拍之间发 depth-only 上报），=0 跟随
                 # RGB（历史行为）。两路都未到节拍则跳过本帧组 ──
                 dcfg = get_depth_cfg(device_id)
-                dfps = _cfg_num(dcfg, "depth_fps", 0.0)
+                dfps = _cfg_num(dcfg, "depth_fps", 1.5)
                 dep_itv = (1.0 / min(max(dfps, 0.2), 30.0)) if dfps > 0 else None
                 rgb_due = now - last_push >= get_push_interval(device_id)
                 dep_due = (now - depth_state.get("last_push", 0.0) >= dep_itv
