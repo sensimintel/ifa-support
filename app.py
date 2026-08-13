@@ -1010,22 +1010,22 @@ _sam3hl_lock = threading.Lock()
 # 除高亮/染色外与②③ GLB 取景一致；场景相对定距把单目逐帧深度的尺度抖动归一化，视角不跳。
 # splat=1 保留点间缝隙的点状质感（拉远后点自然离散）。
 _sam3hl_cfg = {"style": "solid", "strength": 65, "point_scale": 2.0,
-               "dim": 30, "color_mode": "auto", "color": "#ff9f0a",
+               "dim": 52, "color_mode": "custom", "color": "#fffdf7",
                "splat": 1, "view_tilt": 0.0, "view_zoom": 1.40,
                "eye_lift": 0.0, "eye_back": 0.05, "out_size": 760,
-               "sat": 2.0, "val": 1.2, "conf": 30,
-               "hue": 40.0, "outlier_mad": 10.0,
-               # 参考图粒子感：细而饱满的圆点，借近大远小形成景深层次
-               "pt_size": 0.9, "pt_shape": 1, "pt_atten": 1,
-               "pt_opacity": 1.0, "pt_blend": 0, "pt_density": 88,
-               "pt_hue": 0.0, "pt_sat": 0.9, "pt_val": 1.1,
-               "pt_contrast": 1.0, "pt_exposure": 2.2, "pt_invert": 0,
+               "sat": 0.0, "val": 1.35, "conf": 18,
+               "hue": 0.0, "outlier_mad": 10.0,
+               # 黑白银盐颗粒：极细柔边点、满密度、轻叠光，暗部仍保留噪点轮廓
+               "pt_size": 0.65, "pt_shape": 2, "pt_atten": 0,
+               "pt_opacity": 0.82, "pt_blend": 1, "pt_density": 100,
+               "pt_hue": 0.0, "pt_sat": 0.0, "pt_val": 1.18,
+               "pt_contrast": 1.35, "pt_exposure": 1.65, "pt_invert": 0,
                "pt_colormode": 0, "pt_duo_a": "#141450", "pt_duo_b": "#ffd27f",
                "pt_ramp_near": 0.5, "pt_ramp_far": 2.2, "pt_fog": 0.0,
                "pt_clip_near": 0.0, "pt_clip_far": 8.0,
                "pt_clip_ylo": 0.0, "pt_clip_yhi": 1.0,
                "pt_rotate": 0, "pt_rotate_speed": 10.0, "pt_fov_off": 0.0,
-               "pt_pulse": 1, "pt_pulse_speed": 0.45, "pt_sparkle": 0.18,
+               "pt_pulse": 1, "pt_pulse_speed": 0.35, "pt_sparkle": 0.24,
                "pt_bg": "#000000", "pt_conf_size": 0.0, "pt_conf_alpha": 0.0}
 _SAM3HL_PRESET_PATH = Path(__file__).resolve().parent / "sam3hl_preset.json"
 
