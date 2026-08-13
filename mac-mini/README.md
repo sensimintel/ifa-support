@@ -43,8 +43,9 @@ RGB 主链路不受影响。
   （libusb 直读 USB 必须 root，这也是不用用户级 LaunchAgent 的原因）、开机自启、
   崩溃自拉起。日志在 mini 的 `~/Library/Logs/cam-pusher.log`。
 - venv 在 mini 的 `~/cam-pusher-venv`（Python 3.11——`pyorbbecsdk==1.3.2` 的
-  macOS arm64 wheel 只配 3.11）。**不需要 brew / Xcode CLT / ffmpeg**。
-- 配置走 mini 部署目录 `~/cam-pusher/.env`（gitignore，不进仓）：
+  macOS arm64 wheel 只配 3.11）。不需要 brew / ffmpeg；Xcode CLT 只为 git（已装，
+  2026-08-13）。
+- 配置走 mini 部署目录 `~/ifa-support/mac-mini/.env`（gitignore，不进仓）：
   `RELAY_URL`（默认 `http://192.168.0.50:8060`）、`PUSH_FPS`（**兜底值**，默认 3）、
   `JPEG_QUALITY`（默认 80）。
 - **推帧频率的权威来源是 8060 的 per-device 配置，两台相机各调各的**：`/panel`
@@ -54,18 +55,27 @@ RGB 主链路不受影响。
   取值优先级 per-device ＞ 全局 `config.push_fps`（旧口径）＞ `PUSH_FPS`；
   8060 不可达时沿用最后值。
 
-## 部署（推送式：开发机 → mini）
+## 部署（git 部署源模式，与 5090 同款）
 
-mini 不装 git（无 Xcode CLT，macOS 26.1 的 softwareupdate 目录里无 CLT 条目、
-无法无头安装），代码由开发机 rsync 推送：
+mini 的 `~/ifa-support` 是本仓 checkout，**只 pull、不 commit/push**（GitHub 侧
+只读 deploy key `mac-mini-deploy-readonly`）。开发流程：
 
-```bash
-# 开发机上，本目录执行；MINI_SUDO_PASS 提供 mini 的 sudo 密码则全程非交互
-MINI_SUDO_PASS=... ./deploy.sh
+```
+本地改代码 → push 到 GitHub → mini 上（或开发机远程触发）执行 deploy.sh
 ```
 
-流程：rsync 代码 → `setup.sh` 装 venv 依赖（幂等）→ 装/更新 LaunchDaemon 并
-`kickstart` 重启 → 轮询 8060 `/api/frame/status` 直到出现 `macmini-*` 设备帧。
+```bash
+# mini 上：
+cd ~/ifa-support/mac-mini && MINI_SUDO_PASS=... ./deploy.sh
+# 或开发机远程触发：
+ssh mac-mini 'MINI_SUDO_PASS=... ~/ifa-support/mac-mini/deploy.sh'
+```
+
+流程：`git pull --ff-only` → `setup.sh` 装 venv 依赖（幂等）→ 装/更新 LaunchDaemon
+并 `kickstart` 重启 → 轮询 8060 `/api/frame/status` 直到出现 `macmini-*` 设备帧。
+
+> 历史：2026-08-13 前 mini 无 Xcode CLT（macOS 26.1 的 softwareupdate 目录无 CLT
+> 条目、无法无头安装），部署走开发机 rsync 推送；CLT 经 GUI 装好后已切回 git 模式。
 
 ## 展会搬迁「一步拉起」
 
