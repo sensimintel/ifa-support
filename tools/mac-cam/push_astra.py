@@ -133,7 +133,7 @@ def main():
     ap.add_argument("--index", type=int, default=None)
     ap.add_argument("--device-id", default="mac-astra")
     ap.add_argument("--fps", type=float, default=2.0, help="RGB 推帧兜底 fps")
-    ap.add_argument("--quality", type=int, default=85)
+    ap.add_argument("--quality", type=int, default=75)
     ap.add_argument("--product-interval", type=float, default=2.5, help="点云产物上传间隔（秒）")
     args = ap.parse_args()
 

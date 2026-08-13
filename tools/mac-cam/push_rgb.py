@@ -63,9 +63,9 @@ def push_loop(cap, server: str, device_id: str, fallback_fps: float, quality: in
             print("读帧失败，重试…", flush=True)
             time.sleep(1.0)
             continue
-        if frame.shape[1] > 1280:  # 限宽 1280：识别/DA3 用不到更大，省带宽
-            h = int(frame.shape[0] * 1280 / frame.shape[1])
-            frame = cv2.resize(frame, (1280, h))
+        if frame.shape[1] > 960:  # 限宽 960：识别/DA3 足够，Mac↔5090 链路仅 ~8Mbps 必须省带宽
+            h = int(frame.shape[0] * 960 / frame.shape[1])
+            frame = cv2.resize(frame, (960, h))
         ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
         if not ok:
             continue
@@ -103,7 +103,7 @@ def main():
     ap.add_argument("--index", type=int, default=None, help="直接指定相机索引（跳过名称匹配）")
     ap.add_argument("--device-id", default="mac-g335")
     ap.add_argument("--fps", type=float, default=2.0, help="服务端没下发 push_fps 时的兜底 fps")
-    ap.add_argument("--quality", type=int, default=85)
+    ap.add_argument("--quality", type=int, default=75)
     args = ap.parse_args()
 
     idx = args.index

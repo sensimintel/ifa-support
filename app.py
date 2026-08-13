@@ -1510,8 +1510,10 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   <div class="row">
    <div class="fld"><label>置信度裁剪分位 conf_thresh_percentile <span class="rngval" id="ctv">40</span>%</label>
     <input type="range" id="ct" min="0" max="90" step="5" value="40"></div>
-   <div class="fld" id="nmpwrap"><label>点云最大点数 num_max_points <span class="rngval" id="nmv">0.8</span>M</label>
-    <input type="range" id="nmp" min="0.1" max="2" step="0.1" value="0.8"></div>
+   <div class="fld" id="nmpwrap"><label>点云最大点数 num_max_points <span class="rngval" id="nmv">0.3</span>M</label>
+    <!-- 默认 0.3M：0.8M 的 GLB ~2.2MB，观看端走 Wi-Fi（实测 Mac↔5090 仅 ~8Mbps）时单个
+         产物要拉 2s+，三格并发直接看不动；0.3M ≈ 0.8MB 在慢网可用，需要更细可随时拉高 -->
+    <input type="range" id="nmp" min="0.1" max="2" step="0.1" value="0.3"></div>
    <div class="fld" id="camwrap"><label>相机线框 show_cameras</label>
     <select id="cam"><option value="1">显示</option><option value="0">隐藏</option></select></div>
   </div>
