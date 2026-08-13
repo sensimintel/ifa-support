@@ -702,7 +702,8 @@ def build_pointcloud_boxes_glb(pred, detections, out_path, conf_thresh_percentil
 def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
                                 num_max_points=800000, show_cameras=True,
                                 mask_overlays=None, outlier_mad=12.0,
-                                point_scale=None, color_gamma=None):
+                                point_scale=None, color_gamma=None,
+                                hl_cfg=None, bake_conf_alpha=False):
     """双视角（左右 IR）点云 GLB：每个视角各自反投影后，经 DA3 估计的相对位姿统一
     合到「视角 0（左目）相机坐标系」，再 flip Y/Z 到 glTF 约定——与单目链路同一坐标
     语义（左目相机=原点、光轴固定），前端同一套取景逻辑直接可用。
@@ -735,7 +736,28 @@ def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
         lut = (np.power(np.arange(256, dtype=np.float32) / 255.0,
                         float(color_gamma)) * 255.0).astype(np.uint8)
         rgb = lut[rgb]
-    if mask_overlays:
+    if hl_cfg is not None:
+        # 高亮模式（/experience「双目高亮点云」来源）：与单目④同语义——先按配置调
+        # 底色（色相/饱和/明度，逐视角），再把样式化染色/纯色/提亮/描边 + 背景压暗
+        # 写进顶点色（mask 只在左目，无框）
+        _gs = float(hl_cfg.get("sat", 1.0)); _gv = float(hl_cfg.get("val", 1.0))
+        _gh = float(hl_cfg.get("hue", 0.0))
+        if abs(_gs - 1.0) > 1e-3 or abs(_gv - 1.0) > 1e-3 or abs(_gh) > 0.5:
+            graded = []
+            for i in range(N):
+                _hsv = cv2.cvtColor(rgb[i], cv2.COLOR_RGB2HSV).astype(np.float32)
+                _hsv[..., 0] = np.mod(_hsv[..., 0] + _gh / 2.0, 180.0)  # OpenCV H 范围 [0,180)
+                _hsv[..., 1] *= _gs
+                _hsv[..., 2] *= _gv
+                _h = np.mod(_hsv[..., 0], 180.0)
+                _sv = np.clip(_hsv[..., 1:], 0, 255)
+                _hsv = np.concatenate([_h[..., None], _sv], -1)
+                graded.append(cv2.cvtColor(_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB))
+            rgb = np.stack(graded)
+        if mask_overlays:
+            v0, _ = _apply_hl_styles(rgb[0].copy(), mask_overlays, hl_cfg)
+            rgb = np.concatenate([v0[None], rgb[1:]], axis=0)
+    elif mask_overlays:
         # SAM3 mask 染进左目视角的点颜色（与③同款 0.5 混合）
         v0 = rgb[0].copy()
         for (_label, _col, _mk) in mask_overlays:
@@ -754,7 +776,7 @@ def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
     pix = np.stack([us, vs, np.ones_like(us)], -1).reshape(-1, 3).astype(np.float64)
     ext0 = ext[0]
     scale = float(point_scale) if point_scale else 1.0
-    pts_all, col_all = [], []
+    pts_all, col_all, cf_all = [], [], []
     for i in range(N):
         d = depth[i]
         valid = np.isfinite(d) & (d > 0)
@@ -773,11 +795,21 @@ def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
         X0[:, 2] *= -1.0                                    # flip Z（glTF 相机看 -Z）
         pts_all.append((X0[vmask] * scale).astype(np.float32))
         col_all.append(rgb[i].reshape(-1, 3)[vmask].astype(np.uint8))
+        if conf is not None:
+            cf_all.append(conf[i].reshape(-1)[vmask].astype(np.float32))
     if not pts_all:
         raise RuntimeError("双目点云为空（有效深度点不足）")
     pc_pts = np.concatenate(pts_all)
     pc_cols = np.concatenate(col_all)
-    alpha = np.full(pc_pts.shape[0], 255, np.uint8)
+    # 颜色带 alpha 通道：默认 255；bake_conf_alpha 时把逐点置信度（5/95 分位稳健归一，
+    # 跨两视角统一标定）烘进 alpha [40,255]——供前端「置信度→点大小/透明度」联动
+    if bake_conf_alpha and cf_all:
+        _cf = np.concatenate(cf_all)
+        _lo = float(np.percentile(_cf, 5.0)); _hi = float(np.percentile(_cf, 95.0))
+        _t = np.clip((_cf - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
+        alpha = (40.0 + _t * 215.0).astype(np.uint8)
+    else:
+        alpha = np.full(pc_pts.shape[0], 255, np.uint8)
     pc_pts, pc_cols = _glb._filter_and_downsample(
         pc_pts, np.concatenate([pc_cols, alpha[:, None]], axis=1), int(num_max_points))
     # 深度(Z)方向 MAD 稳健裁离群：理由与参数同单目链路（防深度爆点撑爆取景包围盒）
@@ -1155,6 +1187,13 @@ _sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
                "pt_pulse": 0, "pt_pulse_speed": 1.0, "pt_sparkle": 0.0,
                "pt_bg": "#000000", "pt_conf_size": 0.0, "pt_conf_alpha": 0.0}
 _sam3hl = {"kind": None, "url": None, "bytes": None, "seq": 0, "meta": None, "error": None}
+
+# 双目高亮点云槽（/experience「双目高亮点云」来源）：stereo worker 每帧同 pred 追加构建，
+# 样式读同一份 _sam3hl_cfg（高亮样式/点云整体样式滑杆对两种来源同时生效）。
+# device 字段供前端做陈旧守卫：切设备后旧 GLB 不再展示
+_stereo_hl_lock = threading.Lock()
+_stereo_hl = {"kind": "model", "url": None, "seq": 0, "meta": None, "error": None,
+              "device": None}
 
 
 def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
@@ -2193,6 +2232,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <select id="selDev" style="display:none" title="选择设备"></select>
  <select id="selStyle">
   <option value="hl">高亮点云</option>
+  <option value="stereo" title="仅 G335 等双目相机支持">双目高亮点云</option>
   <option value="la">LA点云</option>
   <option value="s3">SAM3点云</option>
  </select>
@@ -2358,7 +2398,7 @@ const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无�
 
 // ══ 背景层：四种来源下拉框选择（临时工具），默认 SAM3 高亮点云 ══
 let bgSource=localStorage.getItem('exp_bg')||'hl';
-if(!['hl','la','s3'].includes(bgSource))bgSource='hl';   // 旧版存过 raw 的自动回落高亮点云
+if(!['hl','stereo','la','s3'].includes(bgSource))bgSource='hl';   // 旧版存过 raw 的自动回落高亮点云
 const MIN_SWAP_MS=1500;               // GLB 换模型最小间隔（同 /panel：防高帧率下一直黑屏加载）
 let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
 
@@ -2394,7 +2434,7 @@ function showModel(url,fov){          // GLB 产物（LA 点云等）：全屏 m
 const DEF_VIEW={view_tilt:10,view_zoom:1.25,eye_lift:0,eye_back:0};
 function applyExpView(){const mv=$('bgmv');
   try{const c=mv.getBoundingBoxCenter();const cz=(c.z<-0.001)?c.z:-1.5;
-    const v=bgSource==='hl'?hlView:DEF_VIEW;
+    const v=(bgSource==='hl'||bgSource==='stereo')?hlView:DEF_VIEW;
     const t=v.view_tilt*Math.PI/180;
     const dy=v.view_zoom*Math.sin(t)+v.eye_lift, dz=v.view_zoom*Math.cos(t)+v.eye_back;
     mv.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
@@ -2609,9 +2649,18 @@ async function bgTick(){
   }
   // 本页任何情况都不展示设备原图：所选来源暂无产物（服务重启/切设备/首轮构建中）时
   // 保持黑场，等第一份点云产物就绪再上画
+  // 双目来源仅双目设备（G335）可用：选中设备不支持时禁用选项置灰；已选双目时保持黑场
+  const stOpt=$('selStyle').querySelector('option[value=stereo]');
+  if(stOpt)stOpt.disabled=s.stereo_supported!==true;
   if(bgSource==='la'){
     if(s.product_kind==='image')showImg('/api/frame/latest-product?t='+s.product_seq,'la:'+s.product_seq);
     else if(s.product_kind==='model'&&s.product_url)showModel(s.product_url,s.product_meta&&s.product_meta.fov_deg);
+  }else if(bgSource==='stereo'){
+    if(s.stereo_supported===true){
+      const sh=await(await fetch('/api/stereohl/status',{cache:'no-store'})).json();
+      // device 比对：切设备后旧设备的双目 GLB 不上画（保持黑场等新产物）
+      if(sh.url&&sh.device===s.selected)showModel(sh.url,sh.meta&&sh.meta.fov_deg);
+    }
   }else if(bgSource==='s3'){
     const s3=await(await fetch('/api/sam3cloud/status',{cache:'no-store'})).json();
     if(s3.kind==='image'&&s3.seq)showImg('/api/sam3cloud/latest?t='+s3.seq,'s3:'+s3.seq);
@@ -2707,8 +2756,9 @@ function applyRecog(r){
 // ══ 右下临时工具：来源下拉框 + 高亮调节抽屉开关 + 流水视图开关 ══
 function syncStyleUI(){
   $('selStyle').value=bgSource;
-  // 抽屉常驻可开（帧率区对所有来源有意义）；高亮样式区只在高亮点云来源展示
-  $('hlonly').style.display=bgSource==='hl'?'':'none';
+  // 抽屉常驻可开（帧率区对所有来源有意义）；高亮样式区在高亮/双目高亮两个来源展示
+  // （双目高亮 GLB 读同一份 /api/sam3hl/config，全部滑杆同样生效）
+  $('hlonly').style.display=(bgSource==='hl'||bgSource==='stereo')?'':'none';
 }
 $('selStyle').onchange=()=>{
   bgSource=$('selStyle').value;
@@ -3685,6 +3735,36 @@ def _da3_stereo_processor(left_raw: bytes, right_raw: bytes, aux_info: dict,
         _fov_deg = round(float(np.degrees(2 * np.arctan(_H / (2 * K0[1, 1])))), 2)
         scale_note = (f"·米制×{point_scale:.3f}(估计基线{est_mm:.0f}mm)"
                       if point_scale else "")
+
+        # 双目高亮 GLB（/experience 背景来源）：同一 pred/overlays 追加构建，样式读
+        # /api/sam3hl/config（与单目④/面板调节卡同一套配置）。独立 try 隔离——高亮
+        # 构建失败只记 _stereo_hl.error，不影响 /panel 的双目产物
+        try:
+            with _sam3hl_lock:
+                hcfg = dict(_sam3hl_cfg)
+            htoken = uuid.uuid4().hex
+            houtdir = GLB_DIR / htoken
+            houtdir.mkdir(parents=True, exist_ok=True)
+            hglb = houtdir / "scene.glb"
+            build_stereo_pointcloud_glb(
+                pred, str(hglb),
+                # conf 分位同双目主产物口径减半：40% 分位在 IR 上集中裁暗背景
+                conf_thresh_percentile=float(hcfg["conf"]) * 0.5,
+                num_max_points=nmp, show_cameras=False, mask_overlays=overlays,
+                outlier_mad=float(hcfg["outlier_mad"]), point_scale=point_scale,
+                color_gamma=0.55, hl_cfg=hcfg,
+                bake_conf_alpha=(hcfg["pt_conf_size"] > 1e-3
+                                 or hcfg["pt_conf_alpha"] > 1e-3))
+            with _stereo_hl_lock:
+                _stereo_hl.update({
+                    "url": f"/glb/{htoken}/scene.glb", "seq": _stereo_hl["seq"] + 1,
+                    "error": None, "device": device_id,
+                    "meta": {"label": "双目高亮（%s）" % (
+                                 "、".join(id_tags) if id_tags else "无目标"),
+                             "fov_deg": _fov_deg}})
+        except Exception as e:
+            with _stereo_hl_lock:
+                _stereo_hl["error"] = f"{type(e).__name__}: {e}"
         return {"kind": "model", "url": f"/glb/{token}/scene.glb",
                 "meta": {"label": "双目点云 DA3×2 + SAM3（%s）%s" % (
                              "、".join(id_tags) if id_tags else "无目标", scale_note),
@@ -4127,6 +4207,14 @@ def sam3hl_status():
         return JSONResponse({"kind": _sam3hl["kind"], "url": _sam3hl["url"],
                              "seq": _sam3hl["seq"], "meta": _sam3hl["meta"],
                              "error": _sam3hl["error"], "cfg": dict(_sam3hl_cfg)})
+
+
+@app.get("/api/stereohl/status")
+def stereohl_status():
+    """双目高亮点云状态（/experience「双目高亮点云」来源）：url 为高亮 GLB；device=
+    产出时的设备 id，前端与当前选中设备比对做陈旧守卫（切设备后旧 GLB 不上画）。"""
+    with _stereo_hl_lock:
+        return JSONResponse(dict(_stereo_hl))
 
 
 @app.get("/api/sam3hl/latest")
