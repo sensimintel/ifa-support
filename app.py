@@ -2437,6 +2437,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 
 <div id="hlcfg">
  <div class="hd">展示调节 <button id="hlcfgClose" title="关闭">✕</button></div>
+ <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">识别卡片</div>
+ <div class="fld"><label>卡片驻留时长 <b id="v_card_s">10</b> s（无新识别多久回落待机）</label>
+  <input type="range" id="r_card_s" min="3" max="60" step="1" value="10"></div>
  <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">数据源帧率（当前设备）</div>
  <div class="fld"><label>RGB 推帧 <b id="v_push_fps">2.0</b> fps · 实测到帧 <b id="v_fps_meas">--</b> fps</label>
   <input type="range" id="r_push_fps" min="0.5" max="10" step="0.5" value="2"></div>
@@ -3421,7 +3424,12 @@ async function bgTick(){
 
 // ══ 状态机：待机 ↔ 识别成功（识别失败态暂不做）══
 // 最新卡片有更新（id/rev 变化）即进入成功态并驻留 FRESH_MS；无更新则回落待机
-const FRESH_MS=10000;
+// 卡片驻留时长可调（调节抽屉「识别卡片」区）：localStorage 按展示端持久化，默认 10s
+let FRESH_MS=Math.min(60,Math.max(3,+(localStorage.getItem('exp_card_fresh_s')||10)))*1000;
+(function(){const r=$('r_card_s'),v=$('v_card_s');if(!r)return;
+  r.value=FRESH_MS/1000;v.textContent=r.value;
+  r.addEventListener('input',()=>{v.textContent=r.value;
+    FRESH_MS=(+r.value)*1000;localStorage.setItem('exp_card_fresh_s',r.value);});})();
 let lastCardKey='',cardShownAt=0,curCard=null;
 function setState(st){
   $('idle').classList.toggle('on',st==='idle'&&!$('tl').classList.contains('on'));
