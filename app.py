@@ -1220,14 +1220,21 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
             return (query, label, last or [], None, None, None)
 
         targets = [(w["word"], w.get("label") or "drink") for w in _get_score_cfg()["words"]]
+        # 食物高亮：识别词都是液体词（食物证据走 LA 框、无 mask），高亮点云因此只亮
+        # 液体。额外补一路 food 查询专供高亮/染色——只进 overlays，不进液体证据缓存、
+        # 不进 sam3tune 口径观测（那页只认配置词）。口径里已有 food 标签词则不重复补
+        n_prod = len(targets)
+        if not any(l == "food" for (_w, l) in targets):
+            targets = targets + [(SAM3_TEXT_DEFAULT, "food")]
         with ThreadPoolExecutor(max_workers=len(targets)) as ex:
             results = list(ex.map(trk_one, targets))
         track_ms = (time.time() - t0) * 1000.0
         is_stream = any(g is not None for (_q, _l, _i, g, _im, _d) in results)
         impls = {im for (_q, _l, _i, _g, im, _d) in results if im}
-        # 控制面观测写回：生产流式每帧的 presence/top-K 分数 + 定位图（忠实生产结果，非另跑）
+        # 控制面观测写回：生产流式每帧的 presence/top-K 分数 + 定位图（忠实生产结果，
+        # 非另跑）。只回配置词的结果，补跑的 food 高亮查询不进口径观测
         try:
-            _sam3tune_record_prod(frames[-1], results, track_ms)
+            _sam3tune_record_prod(frames[-1], results[:n_prod], track_ms)
         except Exception as e:
             print(f"[da3-web] sam3tune 生产观测写回失败：{type(e).__name__}: {e}", flush=True)
 
@@ -1256,8 +1263,11 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
 
         # 液体证据缓存：mask → 归一化外接框，供识别工作流（食物走 LA、液体走 SAM3）取用。
         # 深度图与原图等比无裁剪，归一化坐标可与 LA 框同系混用（偏差 <2% 可忽略）。
+        # food 高亮查询的 mask 只用于染色，绝不混进液体证据（按 tag 前缀过滤）
         drink_dets = []
         for (_tag, _col, mk) in overlays:
+            if _tag.startswith("food"):
+                continue
             ys, xs = np.where(mk)
             if xs.size == 0:
                 continue
@@ -3637,6 +3647,10 @@ def _stereo_sam3_overlays(pred):
     left = np.asarray(pred.processed_images)[0]
     H0, W0 = np.asarray(pred.depth)[0].shape
     targets = [(w["word"], w.get("label") or "drink") for w in _get_score_cfg()["words"]]
+    # 食物高亮：识别词都是液体词，补一路 food 查询让食物也染色（与单目③④同款；
+    # 双目链路本就不产证据，无污染问题）
+    if not any(l == "food" for (_w, l) in targets):
+        targets = targets + [(SAM3_TEXT_DEFAULT, "food")]
     if not targets:
         return [], []
     with ThreadPoolExecutor(max_workers=len(targets)) as ex:
