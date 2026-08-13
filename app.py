@@ -2246,7 +2246,12 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     开启时 img 层隐藏、由本 canvas 呈现（构图同 object-fit:cover） */
  #bgDot{position:absolute;inset:0;width:100%;height:100%;display:none}
  #stage.doton .bg{visibility:hidden}
- #bgmv{position:absolute;inset:0;width:100%;height:100%;display:none;--poster-color:transparent}
+ /* GLB 背景双缓冲：两个 model-viewer 常驻（display 不可为 none——model-viewer 靠
+    IntersectionObserver 决定加载，display:none 的实例永远不触发 load），用 opacity
+    切换可见性；隐藏实例后台加载下一个 GLB，load 后一帧切换，消掉换图空窗闪 */
+ .bgmv{position:absolute;inset:0;width:100%;height:100%;display:block;opacity:0;
+   pointer-events:none;--poster-color:transparent;transition:opacity .3s ease}
+ .bgmv.on{opacity:1}
  /* 压暗层（Figma 653-25294）：四周暗角 radial 渐变——中心透明、边角压黑，保证两侧文案可读 */
  #shade{position:absolute;inset:0;pointer-events:none;
    background:radial-gradient(99.6% 99.6% at 50% 50%,rgba(0,0,0,0) 0%,rgba(0,0,0,.92) 100%)}
@@ -2353,7 +2358,12 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <div id="stage">
  <img class="bg" id="bgA" alt=""><img class="bg" id="bgB" alt="">
  <canvas id="bgDot"></canvas>
- <model-viewer id="bgmv" touch-action="none" interaction-prompt="none"
+ <model-viewer id="bgmvA" class="bgmv" touch-action="none" interaction-prompt="none"
+   camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
+   min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
+   min-field-of-view="10deg" max-field-of-view="60deg"
+   shadow-intensity="0.3" exposure="1.35"></model-viewer>
+ <model-viewer id="bgmvB" class="bgmv" touch-action="none" interaction-prompt="none"
    camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
    min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
    min-field-of-view="10deg" max-field-of-view="60deg"
@@ -2714,6 +2724,14 @@ if(!['hl','stereo','la','s3','devdepth'].includes(bgSource))bgSource='hl';   // 
 const MIN_SWAP_MS=0;               // 换图节流已停用（同 /panel，2026-08-13）；"加载中不打断"守卫仍在
 let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
 
+// ── GLB 背景双缓冲：front=可见实例，back=后台加载实例；load 后一帧切换 ──
+let mvFlip=false;                              // false=bgmvA 为 front
+const mvEls=()=>[$('bgmvA'),$('bgmvB')];
+const mvFront=()=>mvFlip?$('bgmvB'):$('bgmvA');
+const mvBack=()=>mvFlip?$('bgmvA'):$('bgmvB');
+const mvVisible=()=>$('bgmvA').classList.contains('on')||$('bgmvB').classList.contains('on');
+function hideModelLayer(){mvEls().forEach(el=>el.classList.remove('on'));lastMvUrl='';}
+
 let lastBgUrl='';                     // 当前背景图 url（流水小窗镜像用）
 function showImg(url,key){            // 双缓冲交叉淡入：新图解码完成后才切换，不闪黑
   if(!url)return false;
@@ -2724,30 +2742,33 @@ function showImg(url,key){            // 双缓冲交叉淡入：新图解码完
     bgFlip=!bgFlip;
     const showEl=bgFlip?$('bgA'):$('bgB'),hideEl=bgFlip?$('bgB'):$('bgA');
     showEl.src=url;showEl.classList.add('on');hideEl.classList.remove('on');
-    $('bgmv').style.display='none';lastMvUrl='';lastBgUrl=url;
+    hideModelLayer();lastBgUrl=url;
     dotIm=im;   // 点云化样式开启时用解码完成的这张图重画点阵层
     if(+dotCfg.on){dotDraw();$('bgDot').style.display='block';}
   };
   im.src=url;
   return true;
 }
-function showModel(url,fov){          // GLB 产物（单目点云等）：全屏 model-viewer 展示
-  const mv=$('bgmv');
+function showModel(url,fov){          // GLB 产物：双缓冲——back 实例后台加载，load 后一帧切换（不闪空窗）
   if(fov)mvFov=fov;
-  if(url===lastMvUrl){mv.style.display='block';return true;}
-  // 读 src 属性判「加载中」（model-viewer 的 src 不反射到 attribute）+ 8s 卡死兜底，同 /panel
-  if(!(mv.loaded||!mv.src||Date.now()-lastMvSwap>=25000)||Date.now()-lastMvSwap<MIN_SWAP_MS)return true;
+  if(url===lastMvUrl){                // 已是当前目标：确保可见（从图片背景切回 GLB 时）
+    if(!mvVisible()&&mvFront().loaded)mvFront().classList.add('on');
+    return true;
+  }
+  const back=mvBack();
+  // back 还在加载上一个目标时不打断（dataset.pending 在 load 时清；25s 卡死兜底同旧逻辑）
+  if(back.dataset.pending&&!back.loaded&&Date.now()-lastMvSwap<25000)return true;
+  if(Date.now()-lastMvSwap<MIN_SWAP_MS)return true;
   lastMvSwap=Date.now();lastMvUrl=url;lastBgKey='';
-  mv.src=url;mv.style.display='block';
-  $('bgA').classList.remove('on');$('bgB').classList.remove('on');
-  $('bgDot').style.display='none';   // GLB 背景不适用点云化样式层，避免遮挡
+  back.dataset.pending=url;
+  back.src=url;                      // 可见性切换发生在该实例的 load 事件里
   return true;
 }
 // GLB 加载完自动摆「调优视角」（同 /panel：略俯视、拉远，FOV 用真实相机内参）。
 // 高亮点云来源时视角参数可调（抽屉「点云整体样式」，与服务端渲染同语义：绕点云中心
 // 俯视 tilt、距离=|cz|×zoom、附加抬升/后撤 ×|cz|）；默认 10°/1.25/0/0 与②③取景逐位一致。
 const DEF_VIEW={view_tilt:0,view_zoom:1.0,eye_lift:0,eye_back:0};  // 拍摄视角零offset
-function applyExpView(){const mv=$('bgmv');
+function applyExpView(mvEl){const mv=mvEl||mvFront();
   try{const c=mv.getBoundingBoxCenter();const cz=(c.z<-0.001)?c.z:-1.5;
     const v=(bgSource==='hl'||bgSource==='stereo')?hlView:DEF_VIEW;
     const t=v.view_tilt*Math.PI/180;
@@ -2824,8 +2845,8 @@ const PT_VERT='vPtD=-mvPosition.z;vPtY=(modelMatrix*vec4(transformed,1.0)).y;'
  +'#ifdef USE_COLOR_ALPHA\\ngl_PointSize*=mix(1.0,clamp(vColor.a,0.05,1.0),uPt_confsize);\\n#endif\\n';
 const PT_VERT_DECL='uniform float uPt_confsize;varying float vPtD;varying float vPtY;varying float vPtR;\\n';
 let ptMats=[],ptTimer=null;
-function applyPtStyle(){
-  const mv=$('bgmv'),sc=mvScene(mv);if(!sc||!sc.traverse)return;
+function applyPtStyle(mvEl){
+  const mv=mvEl||mvFront(),sc=mvScene(mv);if(!sc||!sc.traverse)return;
   const S=ptStyle;
   // uniform 同步
   PTU.shape.value=+S.pt_shape;PTU.hue.value=+S.pt_hue;PTU.sat.value=+S.pt_sat;
@@ -2884,11 +2905,23 @@ function applyPtStyle(){
       const f=1.0+0.25*Math.sin(6.2832*ptStyle.pt_pulse_speed*PTU.time.value);
       ptMats.forEach(m=>{m.size=b*f;});
     }
-    const s2=mvScene($('bgmv'));s2&&s2.queueRender&&s2.queueRender();},50);
+    const s2=mvScene(mvFront());s2&&s2.queueRender&&s2.queueRender();},50);
   if(!tick&&ptTimer){clearInterval(ptTimer);ptTimer=null;}
   sc.queueRender&&sc.queueRender();
 }
-$('bgmv').addEventListener('load',()=>{applyExpView();applyPtStyle();});
+// 双缓冲切换点：back 实例 load 后，先摆视角+注材质，再一帧交换可见性——旧模型
+// 显示到新模型完全就绪的瞬间，消掉"卸旧等新"的空窗闪。过期加载（期间目标已更新）丢弃。
+mvEls().forEach(el=>el.addEventListener('load',()=>{
+  const url=el.dataset.pending;
+  delete el.dataset.pending;
+  if(url!==lastMvUrl)return;
+  applyExpView(el);applyPtStyle(el);
+  const other=(el===$('bgmvA'))?$('bgmvB'):$('bgmvA');
+  el.classList.add('on');other.classList.remove('on');
+  mvFlip=(el===$('bgmvB'));
+  $('bgA').classList.remove('on');$('bgB').classList.remove('on');
+  $('bgDot').style.display='none';   // GLB 背景不适用点云化样式层，避免遮挡
+}));
 
 // 服务重启后配置清零会回落 depth 模式（识别不触发）：本页独立运行时补推默认配置（glb=识别链路）
 let lastCfgPush=0;
@@ -3091,7 +3124,7 @@ function applyDotCfg(){
   const on=+dotCfg.on===1,cv=$('bgDot');
   $('stage').classList.toggle('doton',on);   // 开启时 img 层隐藏、canvas 呈现
   // 仅图片类背景显示 canvas：GLB（model-viewer）背景时不遮挡
-  cv.style.display=(on&&$('bgmv').style.display==='none')?'block':'none';
+  cv.style.display=(on&&!mvVisible())?'block':'none';
   if(on){
     // 圆点镂空：mask 每 pitch×pitch 一格，只透出中心圆盘，其余露出点阵背景色
     const rpx=(+dotCfg.pitch)*(+dotCfg.r)/100;
@@ -3160,7 +3193,7 @@ async function bgTick(){
     }else{
       // 不支持双目的设备：主动清掉上一台设备残留的双目 GLB（该设备永远不会有新
       // 双目产物顶掉旧画面），回到黑场
-      $('bgmv').style.display='none';lastMvUrl='';
+      hideModelLayer();
       $('bgA').classList.remove('on');$('bgB').classList.remove('on');
     }
   }else if(bgSource==='devdepth'){
@@ -3171,7 +3204,7 @@ async function bgTick(){
         +'&t='+s.depth_seq,'dd:'+s.depth_seq);
     }else{
       // 无深度能力/深度未就绪：清残留画面回黑场（同双目来源的降级语义）
-      $('bgmv').style.display='none';lastMvUrl='';
+      hideModelLayer();
       $('bgA').classList.remove('on');$('bgB').classList.remove('on');
     }
   }else if(bgSource==='s3'){
@@ -3187,7 +3220,7 @@ async function bgTick(){
   // 画布（toDataURL）做镜像（不受流水态压暗影响）。GLB 换模加载中（loaded=false）
   // 保持上一帧镜像不动；镜像未就绪时留等待占位，绝不垫设备原帧（本页不展示原图）。
   if($('tl').classList.contains('on')){
-    const mv=$('bgmv'),mvOn=mv.style.display!=='none',tlr=$('tlraw');
+    const mv=mvFront(),mvOn=mvVisible(),tlr=$('tlraw');
     if(mvOn){
       if(mv.loaded&&mv.src){
         try{tlr.src=mv.toDataURL('image/jpeg',0.8);lastInset='';
