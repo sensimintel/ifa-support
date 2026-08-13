@@ -134,7 +134,8 @@ def main():
     ap.add_argument("--device-id", default="mac-astra")
     ap.add_argument("--fps", type=float, default=2.0, help="RGB 推帧兜底 fps")
     ap.add_argument("--quality", type=int, default=75)
-    ap.add_argument("--product-interval", type=float, default=2.5, help="点云产物上传间隔（秒）")
+    ap.add_argument("--product-interval", type=float, default=2.5,
+                    help="点云产物上传间隔兜底（秒）；面板/控制面下发 product_interval 后以下发值为准")
     args = ap.parse_args()
 
     depth = AstraDepth()
@@ -154,11 +155,22 @@ def main():
     session = requests.Session()
     state = {"next": 0.0, "sent": 0, "err": 0}
 
-    def push_product(now):
-        """随 RGB 主循环的周期钩子：到点就构建并上传一次点云产物。"""
+    def push_product(now, poller):
+        """随 RGB 主循环的周期钩子：到点就构建并上传一次点云产物。
+
+        上传间隔优先用面板/控制面下发的 per-device product_interval（poller 随主循环
+        轮询而来），没有下发时用 --product-interval 兜底。接管窗 hold 随间隔联动
+        （3 倍且不小于 10s）：间隔调大时窗口不过期，DA3 单目点云不会中途抢回槽位。
+        """
+        try:
+            itv = float(poller.dev_config.get("product_interval") or 0)
+        except (TypeError, ValueError):
+            itv = 0.0
+        if not 0.5 <= itv <= 30:
+            itv = args.product_interval
         if now < state["next"]:
             return
-        state["next"] = now + args.product_interval
+        state["next"] = now + itv
         glb, npts = depth.build_glb()
         if glb is None:
             return
@@ -174,7 +186,7 @@ def main():
                 f"{args.server}/api/frame/product",
                 files={"model": ("scene.glb", glb, "model/gltf-binary")},
                 data={"camera_info": json.dumps({"device_id": args.device_id}),
-                      "meta": json.dumps(meta), "hold": "10"},
+                      "meta": json.dumps(meta), "hold": str(max(10.0, 3.0 * itv))},
                 timeout=8,
             )
             r.raise_for_status()

@@ -1,13 +1,17 @@
 # mac-mini 摄像头推帧器（cam-pusher）
 
 展会拓扑里 mac mini 的唯一职责：把机身上插着的两台 Orbbec 相机的帧推给 5090 的
-da3-web。每个推帧节拍推两路（同一节拍 → 两路 fps 天然一致，都受 `/panel` 滑杆控制）：
+da3-web。每个推帧节拍推两路（同一节拍 → 同设备两路 fps 天然一致）：
 
-1. **RGB 彩色帧** → `POST /api/frame`（multipart：`image` + `camera_info` JSON 内
-   `device_id`，与手机 App 契约完全一致，8060 单目链路零改动）；
-2. **辅助帧** → `POST /api/frame/aux`（multipart：`left`/`right` 灰度 JPEG +
-   `depth` 16bit PNG，`camera_info` 带 `stereo_supported`/`baseline_mm`/
-   `depth_scale_mm`/`laser_mode`），供 8060 的双目 DA3 点云与「原设备深度图」。
+1. **RGB 彩色帧（+硬件深度）** → `POST /api/frame`（multipart：`image` +
+   `camera_info` JSON 内 `device_id`，与手机 App 契约完全一致，8060 单目链路零改动）。
+   带深度的相机同请求附可选字段 `depth`：深度帧在 mini 端做**固定量程伪彩**
+   （近亮暖/远暗冷/无效点黑，默认 0.2~2m，`DEPTH_MIN_M`/`DEPTH_MAX_M` 可调；固定
+   量程防手/物进出画面时整图颜色跳变），供 `/panel`「原设备深度图」格展示，不参与
+   DA3 处理，纯展示不做 D2C 对齐；
+2. **双目辅助帧** → `POST /api/frame/aux`（仅 G335：multipart `left`/`right` 灰度
+   JPEG，`camera_info` 带 `stereo_supported`/`baseline_mm`/`laser_mode`），供 8060
+   的双目 DA3 点云链路（DA3 双视角推理 + SAM3 左目染色）。
 
 每台相机独立成一个设备桶，`/panel` 下拉可在相机与手机 App 之间切换，手机 App 通路继续并存。
 
@@ -29,8 +33,9 @@ da3-web。每个推帧节拍推两路（同一节拍 → 两路 fps 天然一致
 > supported! propertyId: 3`），实际运行自动退回 `on`——硬件深度质量优先，双目 IR
 > 带散斑喂 DA3。SDK 标定基线实测读出 50.49mm（与规格 50mm 吻合）。
 
-默认 3fps/台（`.env` 可调兜底值）。辅助帧新增约 0.5~1MB/帧，3fps 下 LAN 带宽约
-2-3 MB/s。任一辅助流开不出来只降级该流（日志告警），RGB 主链路不受影响。
+默认 3fps/台（兜底值；实际按设备跟随 `device-config`，见下）。双目辅助帧新增约
+0.3~0.5MB/帧，LAN 带宽合计约 1-2 MB/s。任一辅助流开不出来只降级该流（日志告警），
+RGB 主链路不受影响。
 
 ## 运行形态
 
@@ -42,9 +47,12 @@ da3-web。每个推帧节拍推两路（同一节拍 → 两路 fps 天然一致
 - 配置走 mini 部署目录 `~/cam-pusher/.env`（gitignore，不进仓）：
   `RELAY_URL`（默认 `http://192.168.0.50:8060`）、`PUSH_FPS`（**兜底值**，默认 3）、
   `JPEG_QUALITY`（默认 80）。
-- **推帧频率的权威来源是 `/panel` 的「推帧 fps」滑杆**（POST `/api/frame/config`
-  的 `push_fps`，与手机 App 同一套约定）：推帧器每 2s 轮询 `/api/frame/status`
-  热生效（钳制 0.2~15fps）；8060 不可达时沿用最后值，进程刚起时用 `PUSH_FPS`。
+- **推帧频率的权威来源是 8060 的 per-device 配置，两台相机各调各的**：`/panel`
+  设备栏滑杆与 `/experience`「调节」抽屉的「数据源帧率」区都 POST
+  `/api/frame/device-config`（按 `device_id` merge-patch）；推帧器每 2s 轮询
+  `/api/frame/status` 的 `devices[].config.push_fps` 热生效（钳制 0.2~15fps），
+  取值优先级 per-device ＞ 全局 `config.push_fps`（旧口径）＞ `PUSH_FPS`；
+  8060 不可达时沿用最后值。
 
 ## 部署（推送式：开发机 → mini）
 

@@ -49,7 +49,7 @@ from depth_anything_3.app.gradio_app import DepthAnything3App  # noqa: E402
 
 from frame_relay import (  # noqa: E402
     UNKNOWN_DEVICE, get_selected_device, router as frame_router,
-    set_depth_renderer, set_processor, set_stereo_processor)
+    set_processor, set_stereo_processor)
 
 MODEL_DIR = str(DA3_ROOT / "models" / "DA3NESTED-GIANT-LARGE-1.1")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1540,10 +1540,10 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
   </div>
   <figcaption><span id="prodcap">单图点云（DA3 + SAM3）</span> <span class="m" id="prodmeta"></span></figcaption>
  </figure>
- <!-- ③ 原设备深度图：相机硬件深度（16bit PNG 服务端伪彩，越亮=越近） -->
+ <!-- ③ 原设备深度图：相机硬件深度（mini 端固定量程伪彩，随主帧 depth 字段上报） -->
  <figure>
   <div class="box"><img id="devdepth" style="display:none"><span class="wait" id="ddwait">等待设备深度帧…</span></div>
-  <figcaption>原设备深度图（硬件深度 · 越亮=越近）<span class="m" id="ddmeta"></span></figcaption>
+  <figcaption>原设备深度图（硬件深度 · 越亮越暖=越近 · 黑=无效点）<span class="m" id="ddmeta"></span></figcaption>
  </figure>
  <!-- ④ 空位（按排版设计留白） -->
  <figure aria-hidden="true"></figure>
@@ -1747,8 +1747,7 @@ function currentConfig(){return {
   stereo_process_res:+$('spr').value,
   conf_thresh_percentile:+$('ct').value,
   num_max_points:Math.round(+$('nmp').value*1e6),
-  show_cameras:$('cam').value,
-  push_fps:+$('fps').value
+  show_cameras:$('cam').value
 };}
 
 let pushTimer=null;
@@ -1759,8 +1758,9 @@ function pushConfig(){
       body:JSON.stringify(currentConfig())}).catch(()=>{});
   },300);
 }
-// 控件任意改动 → 同步显隐 + 推配置（debounce）
-['fmt','pr','spr','ct','nmp','cam','fps'].forEach(id=>{
+// 控件任意改动 → 同步显隐 + 推配置（debounce）。推帧 fps 不在其中：它是 per-device
+// 配置（/api/frame/device-config），不能塞进全量覆盖语义的 /api/frame/config
+['fmt','pr','spr','ct','nmp','cam'].forEach(id=>{
   $(id).addEventListener('change',()=>{syncOpts();pushConfig();});
   $(id).addEventListener('input',pushConfig);
 });
@@ -1813,7 +1813,7 @@ function renderLatency(s){
     +'</b> · 端到端延时 <b>'+fmtLag(e2eMs)+'</b>';
 }
 
-let lastSeq=-1,lastProdKey='',lastSwap=0,lastStKey='',lastSwapSt=0,lastAuxSeq=-1;
+let lastSeq=-1,lastDepth=-1,lastProdKey='',lastSwap=0,lastStKey='',lastSwapSt=0,lastAuxSeq=-1;
 const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显示，避免高帧率下一直卡在"加载中"(黑屏)
 
 // ── 多设备：下拉选设备（服务端只处理选中设备一路；非选中设备的帧只进各自缓存） ──
@@ -1836,10 +1836,29 @@ function renderDevices(s){
   const sel=devs.find(d=>d.device_id===s.selected);
   $('devinfo').textContent=(devs.length>1?('共 '+devs.length+' 台在传 · '):'')
     +(sel&&sel.fps?('选中 '+sel.fps.toFixed(1)+' fps'):'');
+  // 滑条回填：显示选中设备已下发的 push_fps（切设备时跟着换）。拖动中或刚下发 1.5s 内
+  // 不回写，避免回填与手上的拖动打架
+  const dc=(sel&&sel.config)||{};
+  if(dc.push_fps!=null&&document.activeElement!==$('fps')&&Date.now()-fpsTouched>1500){
+    $('fps').value=dc.push_fps;$('fpv').textContent=(+dc.push_fps).toFixed(1);}
 }
+// 推帧 fps：per-device 配置（POST /api/frame/device-config），只作用当前选中设备。
+// 与 /api/frame/config 分开——那边是全量覆盖语义且全局一份，两台摄像机没法各调各的。
+// 同一设备的双目 aux 与主帧在推帧器端同节拍，此滑杆天然同控该设备两条链路
+let fpsTimer=null,fpsTouched=0;
+$('fps').addEventListener('input',()=>{
+  fpsTouched=Date.now();
+  clearTimeout(fpsTimer);
+  fpsTimer=setTimeout(()=>{
+    const dev=devsel.value||curDev;
+    if(!dev)return;
+    fetch('/api/frame/device-config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({device_id:dev,config:{push_fps:+$('fps').value}})}).catch(()=>{});
+  },300);
+});
 function resetPanesForSwitch(){   // 切设备：清空各格显示与序号缓存，等新设备的帧/产物
   $('prodcap').textContent='单图点云（DA3 + SAM3）';
-  lastSeq=-1;lastProdKey='';lastSwap=0;lastStKey='';lastSwapSt=0;lastAuxSeq=-1;
+  lastSeq=-1;lastDepth=-1;lastProdKey='';lastSwap=0;lastStKey='';lastSwapSt=0;lastAuxSeq=-1;
   pendingE2E=null;e2eMs=null;$('rawlat').textContent='';
   $('raw').style.display='none';$('rawwait').style.display='';
   $('prodimg').style.display='none';$('mv').style.display='none';$('prodwait').style.display='';
@@ -1864,7 +1883,7 @@ async function tick(){
   $('rawmeta').textContent = s.has_frame ? ('帧 '+s.seq+(s.interval?(' · 间隔 '+s.interval.toFixed(1)+'s'):'')) : '';
   renderLatency(s);
 
-  // 右框：DA3 产物（图片=深度图；模型=GLB）
+  // ②格：DA3 产物（图片=深度图；模型=GLB）
   const prodKey=(s.product_kind||'')+':'+(s.product_url||'')+':'+s.product_seq;
   if(s.product_kind && prodKey!==lastProdKey){
     if(s.product_kind==='image'){
@@ -1941,19 +1960,18 @@ async function tick(){
         +(s.aux_info&&s.aux_info.laser_mode?(' · 激光 '+s.aux_info.laser_mode):'');
     }
   }
-  // ③ 原设备深度图：有硬件深度就显示（Astra 也有；手机 App 没有 → 提示无数据）
-  if(s.has_aux_depth){
-    if(s.aux_seq!==lastAuxSeq){
-      $('devdepth').src='/api/frame/aux-image?kind=depth&t='+s.aux_seq;
-      $('devdepth').style.display='block';$('ddwait').style.display='none';
-      $('ddmeta').textContent='辅助帧 '+s.aux_seq;
-    }
+  // ③ 原设备深度图：帧源随彩色帧一并上报的伪彩 JPEG（Astra 也有；手机 App 没有）
+  if(s.has_depth){
+    if(s.depth_seq!==lastDepth){lastDepth=s.depth_seq;
+      $('devdepth').src='/api/frame/latest-depth?t='+s.depth_seq;
+      $('devdepth').style.display='block';$('ddwait').style.display='none';}
+    $('ddmeta').textContent='帧 '+s.depth_seq;
   }else{
     $('devdepth').style.display='none';$('ddwait').style.display='';
-    $('ddwait').textContent=(s.stereo_supported===null)?'该设备无硬件深度':'等待设备深度帧…';
+    $('ddwait').textContent=(s.stereo_supported==null)?'该设备无硬件深度':'等待设备深度帧…';
     $('ddmeta').textContent='';
   }
-  if(s.aux_seq!==undefined && (s.has_aux_depth || s.has_aux_stereo)) lastAuxSeq=s.aux_seq;
+  if(s.aux_seq!==undefined && s.has_aux_stereo) lastAuxSeq=s.aux_seq;
 
   // 顶部状态行
   if(!s.processor){$('status').innerHTML='<span class="err">未接入 DA3 模型（纯中继）。</span>';}
@@ -2177,8 +2195,18 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 </div>
 
 <div id="hlcfg">
- <div class="hd">高亮点云样式调节 <button id="hlcfgClose" title="关闭">✕</button></div>
- <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">高亮样式（只作用于高亮点云）</div>
+ <div class="hd">展示调节 <button id="hlcfgClose" title="关闭">✕</button></div>
+ <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">数据源帧率（当前设备）</div>
+ <div class="fld"><label>RGB 推帧 <b id="v_push_fps">2.0</b> fps</label>
+  <input type="range" id="r_push_fps" min="0.5" max="10" step="0.5" value="2"></div>
+ <div class="fld"><label>点云直传间隔 <b id="v_prod_itv">2.5</b> s</label>
+  <input type="range" id="r_prod_itv" min="0.5" max="10" step="0.5" value="2.5"></div>
+ <div class="hint" style="margin-top:8px">按设备生效（推流端每 2s 轮询取走）。<b>RGB 推帧</b>驱动
+  DA3/SAM3 处理链路，是高亮/SAM3 点云的帧率上限；<b>点云直传间隔</b>只对带真深度直传的
+  设备（如 macmini-astra）生效，决定 LA 点云来源的刷新节奏。Mac↔5090 链路仅约 8Mbps，
+  两台摄像机同推时调密任何一路都会挤占另一路，调完盯一眼画面是否跟得上。</div>
+ <div id="hlonly">
+ <div class="sec">高亮样式（只作用于高亮点云）</div>
  <div class="seg" id="hlseg">
   <button data-s="tint" class="on">染色</button>
   <button data-s="solid">纯色</button>
@@ -2315,6 +2343,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   作用于最终画面<b>含高亮色</b>。置信度联动首次开启需等下一轮 GLB（把置信度烘进
   顶点 alpha，仅高亮/SAM3 点云有此数据），之后实时。自动旋转在每次换模时回正。
   默认值均为中性观感。</div>
+ </div>
 </div>
 
 <script>
@@ -2527,6 +2556,39 @@ $('selDev').onchange=()=>{
     body:JSON.stringify({device_id:$('selDev').value})}).catch(()=>{});
 };
 
+// ── 数据源帧率（调节抽屉顶部）：per-device 配置，POST /api/frame/device-config ──
+// push_fps=RGB 推帧频率（高亮/SAM3 点云链路的帧率上限）；product_interval=点云直传
+// 间隔（Astra 类真深度设备，LA 点云来源的刷新节奏）。只作用当前选中设备；推流端每 2s
+// 轮询 /api/frame/status 取走。与 /api/frame/config 分开——那边全量覆盖且全局一份
+const RATE_SLIDERS={push_fps:['r_push_fps','v_push_fps'],product_interval:['r_prod_itv','v_prod_itv']};
+let ratePend={},rateTimer=null,rateTouched=0;
+Object.keys(RATE_SLIDERS).forEach(key=>{
+  const [rid,vid]=RATE_SLIDERS[key];
+  $(rid).addEventListener('input',()=>{
+    $(vid).textContent=(+$(rid).value).toFixed(1);
+    if(!curDev)return;
+    rateTouched=Date.now();
+    ratePend[key]=+$(rid).value;
+    clearTimeout(rateTimer);
+    rateTimer=setTimeout(()=>{
+      const cfg=ratePend;ratePend={};
+      fetch('/api/frame/device-config',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({device_id:curDev,config:cfg})}).catch(()=>{});
+    },300);
+  });
+});
+function renderRate(s){
+  // 滑条回填选中设备已下发的值（切设备跟着换）；拖动中或刚下发 1.5s 内不回写，避免打架
+  if(Date.now()-rateTouched<1500)return;
+  const d=(s.devices||[]).find(x=>x.device_id===s.selected);
+  const c=(d&&d.config)||{};
+  [['push_fps',c.push_fps!=null?c.push_fps:(s.config||{}).push_fps],
+   ['product_interval',c.product_interval]].forEach(([key,val])=>{
+    const [rid,vid]=RATE_SLIDERS[key],el=$(rid);
+    if(val!=null&&document.activeElement!==el){el.value=val;$(vid).textContent=(+el.value).toFixed(1);}
+  });
+}
+
 let lastInset='';
 async function bgTick(){
  if(DEMO)return;
@@ -2534,6 +2596,7 @@ async function bgTick(){
   const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
   if(s.processor&&s.config_gen===0)pushDefaultConfig();
   renderDevices(s);
+  renderRate(s);
   if(s.device&&s.device!==curDev){   // 切设备：清背景与卡片缓存，等新设备的帧/产物
     if(curDev!==null){lastBgKey='';lastMvUrl='';lastBgUrl='';lastInset='';curCard=null;lastCardKey='';}
     curDev=s.device;
@@ -2638,8 +2701,8 @@ function applyRecog(r){
 // ══ 右下临时工具：来源下拉框 + 高亮调节抽屉开关 + 流水视图开关 ══
 function syncStyleUI(){
   $('selStyle').value=bgSource;
-  $('btnHlCfg').style.display=bgSource==='hl'?'':'none';   // 仅高亮点云来源可调样式
-  if(bgSource!=='hl')$('hlcfg').classList.remove('on');
+  // 抽屉常驻可开（帧率区对所有来源有意义）；高亮样式区只在高亮点云来源展示
+  $('hlonly').style.display=bgSource==='hl'?'':'none';
 }
 $('selStyle').onchange=()=>{
   bgSource=$('selStyle').value;
@@ -3623,32 +3686,9 @@ def _da3_stereo_processor(left_raw: bytes, right_raw: bytes, aux_info: dict,
         raise RuntimeError("GPU 显存不足（5090 与产线共享），请调低双目处理分辨率后重试")
 
 
-def _device_depth_renderer(png_bytes: bytes, aux_info: dict):
-    """设备硬件深度（16bit PNG，值×depth_scale_mm=毫米）→ 伪彩 JPEG。
-    与单目 DA3 深度图同语义：越亮=越近；无效点（0 值空洞）涂深灰。纯 CPU。"""
-    raw = cv2.imdecode(np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_UNCHANGED)
-    if raw is None:
-        raise RuntimeError("深度 PNG 解码失败")
-    d = raw.astype(np.float32) * float(aux_info.get("depth_scale_mm", 1.0) or 1.0)
-    valid = d > 0
-    out = np.full((*d.shape, 3), 40, np.uint8)
-    if valid.any():
-        lo = float(np.percentile(d[valid], 2))
-        hi = float(np.percentile(d[valid], 98))
-        t = np.clip((d - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-        cm = cv2.applyColorMap(((1.0 - t) * 255).astype(np.uint8),
-                               cv2.COLORMAP_TURBO)          # 反归一：近→热色/亮
-        out[valid] = cm[valid]
-    ok, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    if not ok:
-        raise RuntimeError("深度伪彩编码失败")
-    return buf.tobytes(), "image/jpeg"
-
-
 app.include_router(frame_router)
 set_processor(_da3_frame_processor)
 set_stereo_processor(_da3_stereo_processor)
-set_depth_renderer(_device_depth_renderer)
 
 
 def _recog_list_payload(dev):
