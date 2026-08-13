@@ -104,6 +104,14 @@ def get_selected_device() -> Optional[str]:
         return _effective_device_locked()
 
 
+def get_latest_frame(device_id: str) -> Optional[bytes]:
+    """取指定设备最新一帧原始图片字节（无设备/无帧返回 None）。
+    供旁路链取 RGB 用——如双目链触发 VLM 识别时，识别图要用彩色帧而非 IR。"""
+    with _cv:
+        st = _devices.get(device_id)
+        return st["image"] if st else None
+
+
 def _parse_ms(val) -> Optional[int]:
     """把 13 位毫秒级 epoch 时间戳（str/int/float）解析成 int 毫秒；无效/明显不是毫秒级返回 None。"""
     try:

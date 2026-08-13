@@ -48,7 +48,8 @@ from depth_anything_3.api import DepthAnything3  # noqa: E402
 from depth_anything_3.app.gradio_app import DepthAnything3App  # noqa: E402
 
 from frame_relay import (  # noqa: E402
-    DEFERRED, UNKNOWN_DEVICE, get_selected_device, router as frame_router,
+    DEFERRED, UNKNOWN_DEVICE, get_latest_frame, get_selected_device,
+    router as frame_router,
     set_processor, set_product, set_stereo_processor, set_stereo_product)
 
 MODEL_DIR = str(DA3_ROOT / "models" / "DA3NESTED-GIANT-LARGE-1.1")
@@ -3747,6 +3748,31 @@ def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
         color_gamma=0.55)   # IR 暗部提亮：无环境光的后景点在黑底上才可见
     sz = glb.stat().st_size / 1024 if glb.exists() else 0
     _prune_glb()
+
+    # VLM 识别触发（前置依赖挂在双目链：单目停用时识别仍然活着）：
+    # 证据 = 左目 SAM3 命中（food/drink mask → 归一化框），识别图 = 该设备最新 RGB 帧
+    # （VLM 吃彩色图；IR 灰度图识别菜品不可靠）。RGB 与左 IR 镜头有厘米级基线差，
+    # 框只作大致位置引导（VLM prompt 本就按"疑似位置"用框）。pred 不传——它的深度
+    # 是 IR 坐标系，与 RGB 帧不对齐，点云快照参考图优雅降级为无。
+    try:
+        raw_rgb = get_latest_frame(device_id)
+        if raw_rgb and overlays:
+            H0, W0 = np.asarray(pred.depth)[0].shape
+            dets = []
+            for (tag, _col, mk) in overlays:
+                ys, xs = np.where(mk)
+                if xs.size == 0:
+                    continue
+                dets.append((tag.split("#", 1)[0],
+                             xs.min() / W0, ys.min() / H0,
+                             (xs.max() + 1) / W0, (ys.max() + 1) / H0))
+            if dets:
+                rgb_img = np.array(ImageOps.exif_transpose(
+                    Image.open(io.BytesIO(raw_rgb))).convert("RGB"))
+                _maybe_recognize(rgb_img, dets, f"/glb/{token}/scene.glb",
+                                 token[:6], pred=None, conf=conf, device=device_id)
+    except Exception as e:   # 识别触发失败不影响双目产物
+        print(f"[da3-web] 双目链识别触发失败（忽略）：{type(e).__name__}: {e}", flush=True)
 
     # 真实相机垂直 FOV：与单目链路同款，前端把点云相机摆回左目光心正视 -Z
     _H = int(np.asarray(pred.depth)[0].shape[0])
