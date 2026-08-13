@@ -41,3 +41,6 @@ env/
 .vscode/
 
 sam3_score_cfg.json
+
+# Orbbec SDK 运行时日志目录（mac-cam 推流脚本运行时生成）
+tools/mac-cam/Log/

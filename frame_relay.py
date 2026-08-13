@@ -120,7 +120,15 @@ def _new_bucket(now: float) -> dict:
         "received_at": 0.0, "prev_received_at": 0.0,
         "camera_info": None, "timestamp": None, "first_seen": now,
         "product": None, "product_seq": 0, "product_gen": 0, "product_error": None,
+        # 外部产物（设备直传，如 Mac 端真深度点云）：字节存桶内经 /api/frame/product-model
+        # 提供；ext_until 内该设备跳过 DA3 处理（产物槽位交给外部方），过期自动恢复 DA3
+        "ext_model": None, "ext_until": 0.0, "ext_ver": 0,
     }
+
+
+def _ext_active_locked(st: dict, now: float) -> bool:
+    """该设备当前是否处于「外部产物接管」窗口内（是则 DA3 worker 跳过它）。"""
+    return st.get("ext_until", 0.0) > now
 
 
 def _prune_locked(now: float) -> None:
@@ -163,7 +171,8 @@ def _worker_loop() -> None:
             while True:
                 dev = _effective_device_locked()
                 st = _devices.get(dev) if dev else None
-                if _processor is not None and st is not None and st["image"] is not None:
+                if (_processor is not None and st is not None and st["image"] is not None
+                        and not _ext_active_locked(st, time.time())):
                     # 键须含 received_at：设备桶过期重建后 seq 从 1 重新计数，若只看
                     # (dev, seq, 配置版本) 会与旧桶首帧撞键 → 新帧被误判"已处理"而永久漏处理
                     key = (dev, st["seq"], st["received_at"], _config_gen)
@@ -245,6 +254,69 @@ async def select_device(body: dict = Body(...)):
         _selected = dev
         _cv.notify_all()
     return JSONResponse({"ok": True, "device": dev})
+
+
+@router.post("/api/frame/product")
+async def ingest_product(
+    model: UploadFile = File(...),
+    camera_info: Optional[str] = Form(None),
+    meta: Optional[str] = Form(None),
+    hold: Optional[str] = Form(None),
+):
+    """接收设备直传的模型类产物（GLB，如 Mac 端 Astra 真深度点云）。
+
+    字段：model（GLB 二进制）、camera_info（JSON，含 device_id，与 /api/frame 同款）、
+    meta（可选 JSON：label/fov_deg/shape 等，透传给面板展示）、hold（可选秒数，默认 10：
+    接管窗口时长，窗口内该设备跳过 DA3、产物槽位归外部方；停止上传后过期自动恢复 DA3）。
+    设备桶必须已存在（先经 /api/frame 发帧再传产物），否则 404。"""
+    data = await model.read()
+    if not data:
+        return JSONResponse({"ok": False, "error": "空产物"}, status_code=400)
+    dev = _parse_device_id(camera_info)
+    try:
+        meta_obj = dict(json.loads(meta)) if meta else {}
+    except (ValueError, TypeError):
+        meta_obj = {}
+    try:
+        hold_s = min(60.0, max(1.0, float(hold))) if hold else 10.0
+    except (ValueError, TypeError):
+        hold_s = 10.0
+    now = time.time()
+    with _cv:
+        st = _devices.get(dev)
+        if st is None:
+            return JSONResponse({"ok": False, "error": f"设备不存在（先向 /api/frame 发帧）：{dev}"},
+                                status_code=404)
+        st["ext_model"] = data
+        st["ext_until"] = now + hold_s
+        st["ext_ver"] += 1
+        ver = st["ext_ver"]
+        # url 带版本号保证每次更新都变（面板以 url+product_seq 判断是否换图）
+        st["product"] = {
+            "kind": "model",
+            "url": f"/api/frame/product-model?device={dev}&v={ver}",
+            "meta": meta_obj,
+        }
+        st["product_seq"] = st["seq"]
+        st["product_error"] = None
+        _cv.notify_all()
+    return JSONResponse({"ok": True, "device": dev, "ver": ver, "bytes": len(data),
+                         "hold": hold_s})
+
+
+@router.get("/api/frame/product-model")
+def latest_product_model(device: Optional[str] = Query(None)):
+    """返回指定设备（缺省=选中设备）最新的外部模型类产物（GLB）字节，供 model-viewer 加载。"""
+    with _cv:
+        _dev, st = _target_device_locked(device)
+        data = st["ext_model"] if st else None
+    if not data:
+        return JSONResponse({"error": "暂无外部模型产物"}, status_code=404)
+    return Response(
+        content=data,
+        media_type="model/gltf-binary",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.post("/api/frame/config")

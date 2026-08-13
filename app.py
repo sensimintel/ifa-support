@@ -1398,7 +1398,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
      interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
    <span class="wait" id="prodwait">等待产物…</span>
   </div>
-  <figcaption>DA3 产物 <span class="m" id="prodmeta"></span></figcaption>
+  <figcaption><span id="prodcap">DA3 产物</span> <span class="m" id="prodmeta"></span></figcaption>
  </figure>
  <figure>
   <div class="box">
@@ -1498,6 +1498,8 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    </select></div>
   <div class="fld"><label>处理分辨率 process_res <span class="rngval" id="prv">504</span></label>
    <input type="range" id="pr" min="196" max="1120" step="28" value="504"></div>
+  <div class="fld"><label>推帧 fps push_fps（Mac 相机推流端轮询生效）<span class="rngval" id="fpv">2.0</span></label>
+   <input type="range" id="fps" min="0.5" max="10" step="0.5" value="2"></div>
  </div>
  <div class="glbopts" id="glbopts">
   <div class="row">
@@ -1528,6 +1530,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <script>
 const $=id=>document.getElementById(id);
 $('pr').oninput=()=>$('prv').textContent=$('pr').value;
+$('fps').oninput=()=>$('fpv').textContent=(+$('fps').value).toFixed(1);
 $('ct').oninput=()=>$('ctv').textContent=$('ct').value;
 $('nmp').oninput=()=>$('nmv').textContent=(+$('nmp').value).toFixed(1);
 $('camtoggle').addEventListener('change',syncOpts);  // 开关切换即展开/收起相机视角调节卡
@@ -1615,7 +1618,8 @@ function currentConfig(){return {
   process_res:+$('pr').value,
   conf_thresh_percentile:+$('ct').value,
   num_max_points:Math.round(+$('nmp').value*1e6),
-  show_cameras:$('cam').value
+  show_cameras:$('cam').value,
+  push_fps:+$('fps').value
 };}
 
 let pushTimer=null;
@@ -1627,7 +1631,7 @@ function pushConfig(){
   },300);
 }
 // 控件任意改动 → 同步显隐 + 推配置（debounce）
-['fmt','pr','ct','nmp','cam'].forEach(id=>{
+['fmt','pr','ct','nmp','cam','fps'].forEach(id=>{
   $(id).addEventListener('change',()=>{syncOpts();pushConfig();});
   $(id).addEventListener('input',pushConfig);
 });
@@ -1705,6 +1709,7 @@ function renderDevices(s){
     +(sel&&sel.fps?('选中 '+sel.fps.toFixed(1)+' fps'):'');
 }
 function resetPanesForSwitch(){   // 切设备：清空四框显示与序号缓存，等新设备的帧/产物
+  $('prodcap').textContent='DA3 产物';
   lastSeq=-1;lastProdKey='';lastS3=-1;lastSwap=0;lastSwap3=0;lastHl=-1;lastSwapH=0;
   pendingE2E=null;e2eMs=null;$('rawlat').textContent='';
   $('raw').style.display='none';$('rawwait').style.display='';
@@ -1757,7 +1762,10 @@ async function tick(){
     // 真实相机 FOV 到手 → 更新缓存；若用户未在拖动，按真实 FOV 重摆当前所选视角
     if(m.fov_deg && m.fov_deg!==photoFov){photoFov=m.fov_deg;
       if(mv.loaded && !interacting) applyView();}}
-  if(s.has_frame && s.product_seq<s.seq && !s.product_error) pm+=' <span class="dim">（处理中…）</span>';
+  // 外部产物（meta.ext，如 Mac 直传真深度点云）不是 DA3 在算，不显示"处理中"；标题跟随 meta.cap
+  const isExt=s.product_meta&&s.product_meta.ext;
+  if(s.has_frame && s.product_seq<s.seq && !s.product_error && !isExt) pm+=' <span class="dim">（处理中…）</span>';
+  $('prodcap').textContent=(isExt&&s.product_meta.cap)?s.product_meta.cap:'DA3 产物';
   $('prodmeta').innerHTML=pm;
 
   // 第三框：DA3→SAM3→点云映射（与②同源：model=GLB 相机跟随②；image=同参 cloudimg 渲染）
