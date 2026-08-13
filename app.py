@@ -2613,6 +2613,8 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div class="fld"><label>重生率 <b id="v_dt_resp">1</b></label>
   <input type="range" id="r_dt_resp" min="0" max="3" step="0.1" value="1"></div>
  </div>
+ <div class="fld"><label>漂浮强度 <b id="v_dt_pf">35</b>%</label>
+  <input type="range" id="r_dt_pf" min="0" max="100" step="5" value="35"></div>
  <div class="fld"><label>运动速度 <b id="v_dt_spd">1</b></label>
   <input type="range" id="r_dt_spd" min="0" max="3" step="0.1" value="1"></div>
  <div class="fld"><label>点阵背景色</label>
@@ -2621,7 +2623,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   不规律排布=帧间稳定的逐点随机偏移，运动=漂移/呼吸/闪烁。<b>粒子云</b>：数万粒子
   按画面亮度重要性采样落点——主体稠密近连片、边缘稀疏成雾、暗区零星孤点（粉尘爆散
   观感）；粒径大小不一、伪噪声缓慢漂浮，重生率控制粒子闪换与分布跟随画面变化的速度；
-  单色模式全部粒子用同一颜色（只用画面定密度），关闭则取原色彩。两种模式只作用于
+  单色模式全部粒子用同一颜色（只用画面定密度），关闭则取原色彩。<b>漂浮强度</b>：
+  把不同深度区块交界处的点朝暗侧吹散——边缘点持续剥离、渐隐、回炉再飞（消散观感），
+  边界因此起雾不再生硬；两种模式都生效，0=关。两种模式只作用于
   图片类背景（设备深度图、高亮/SAM3/单目点云的图模式）；GLB 点云背景请用上方
   「点渲染」区。即时生效、只存本浏览器。</div>
  </div>
@@ -3169,7 +3173,7 @@ addEventListener('resize',applyDdCss);   // 旋转补偿量随视口比例变化
 //    对所有走 showImg 的图片类来源统一生效；GLB 背景不适用（有自己的点渲染区）══
 // 展会默认（2026-08-13 现场调定）：点阵化开、点距7、圆径34%
 let dotCfg={on:1,mode:0,pitch:7,r:34,jitter:0,motion:0,speed:1,bg:'#000000',
-  pn:30000,psize:2,pcontrast:1.2,pmono:0,pcolor:'#fffdf7',pdrift:1,prespawn:1};
+  pn:30000,psize:2,pcontrast:1.2,pmono:0,pcolor:'#fffdf7',pdrift:1,prespawn:1,pfloat:35};
 try{Object.assign(dotCfg,JSON.parse(localStorage.getItem('exp_dot')||'{}'));}catch(e){}
 let dotIm=null,dotOffCv=null;        // 最近一帧背景 Image / 离屏降采样画布（复用）
 let dotData=null,dotCols=0,dotRows=0;// 降采样取色缓存：动画重绘不重复采样
@@ -3193,7 +3197,30 @@ function dotSample(){
   const octx=dotOffCv.getContext('2d',{willReadFrequently:true});
   octx.drawImage(im,sx,sy,sw,sh,0,0,dotCols,dotRows);
   dotData=octx.getImageData(0,0,dotCols,dotRows).data;
+  dotEdge=null;
+  if(+dotCfg.pfloat>0)dotEdgeBuild();   // 漂浮强度开启时随取色缓存一并重建边缘场
   return true;
+}
+// ── 边缘场：每格 [强度, 外散方向x, 外散方向y]。强度=与四邻的色差（不同深度区块的
+//    交界处高），方向=亮度梯度反方向（朝更暗一侧；梯度太小则逐格稳定随机方向）。
+//    供「漂浮强度」把边缘的点吹散——消散观感的几何基础 ──
+let dotEdge=null;
+function dotEdgeBuild(){
+  const d=dotData;if(!d)return;
+  dotEdge=new Float32Array(dotCols*dotRows*3);
+  const lum=o=>d[o]*0.2126+d[o+1]*0.7152+d[o+2]*0.0722;
+  for(let y=1;y<dotRows-1;y++)for(let x=1;x<dotCols-1;x++){
+    const i=y*dotCols+x,o=i*4,oL=o-4,oR=o+4,oU=o-dotCols*4,oD=o+dotCols*4;
+    let diff=0;
+    for(let c=0;c<3;c++)diff+=Math.abs(d[oR+c]-d[oL+c])+Math.abs(d[oD+c]-d[oU+c]);
+    const e=Math.min(1,diff/220);
+    if(e<0.05)continue;
+    let nx=lum(oL)-lum(oR),ny=lum(oU)-lum(oD);
+    const m=Math.hypot(nx,ny);
+    if(m>6){nx/=m;ny/=m;}
+    else{const a=dotHash(i)*6.28318;nx=Math.cos(a);ny=Math.sin(a);}
+    const b=i*3;dotEdge[b]=e;dotEdge[b+1]=nx;dotEdge[b+2]=ny;
+  }
 }
 function dotHash(i){
   // 逐点稳定伪随机 [0,1)：只随下标变、帧间不变——抖动排布不逐帧乱跳
@@ -3208,6 +3235,7 @@ function dotDraw(tSec){
   const dpr=devicePixelRatio||1,P=Math.max(2,+dotCfg.pitch)*dpr;
   const baseR=P*(+dotCfg.r)/100,jit=P*(+dotCfg.jitter)/100*0.5;  // 抖动上限=半格
   const mode=+dotCfg.motion,spd=+dotCfg.speed,t=tSec||0,TAU=6.28318,d=dotData;
+  const pf=(+dotCfg.pfloat)/100;
   ctx.clearRect(0,0,cv.width,cv.height);
   for(let ry=0;ry<dotRows;ry++)for(let rx=0;rx<dotCols;rx++){
     const idx=ry*dotCols+rx,o=idx*4;
@@ -3220,6 +3248,15 @@ function dotDraw(tSec){
       r*=1+0.35*Math.sin(t*spd*2+h1*TAU);
     }else if(mode===3){  // 闪烁：透明度逐点随机相位
       al=0.45+0.55*(0.5+0.5*Math.sin(t*spd*3+h1*TAU));
+    }
+    if(pf>0&&dotEdge){   // 边缘消散：边缘格的点沿外散方向飘出，越远越淡越小（缓慢起伏）
+      const eb=idx*3,e=dotEdge[eb];
+      if(e>0.05){
+        const h3=dotHash(idx+3571);
+        const fly=e*pf*3*(0.25+0.75*h3)*(1+0.3*Math.sin(t*spd*0.8+h3*TAU));
+        x+=dotEdge[eb+1]*fly*P;y+=dotEdge[eb+2]*fly*P;
+        al*=1-Math.min(0.85,fly*0.3);r*=1-0.35*Math.min(1,fly/3);
+      }
     }
     if(r<=0.2)continue;
     ctx.fillStyle='rgba('+d[o]+','+d[o+1]+','+d[o+2]+','+al.toFixed(3)+')';
@@ -3270,7 +3307,9 @@ function pcDraw(t){
   // 分布随之迁移（重生落点按当前帧权重）
   const re=Math.max(1,Math.round(pcN*0.004*(+dotCfg.prespawn)));
   for(let k=0;k<re;k++)pcSpawn(Math.floor(Math.random()*pcN));
+  const pf=(+dotCfg.pfloat)/100;
   if(mono)ctx.fillStyle=dotCfg.pcolor;
+  let curAl=1;
   for(let i=0;i<pcN;i++){
     const b=i*4,ph=pcPool[b+2];
     // 伪噪声漂移：两组不同频正弦叠加、逐粒子相位——悬浮微尘的缓慢无序运动
@@ -3280,16 +3319,38 @@ function pcDraw(t){
       const gx=Math.min(dotCols-1,Math.max(0,(x/gw)|0));
       const gy=Math.min(dotRows-1,Math.max(0,(y/gh)|0));
       const o=(gy*dotCols+gx)*4;
-      ctx.fillStyle='rgb('+d[o]+','+d[o+1]+','+d[o+2]+')';   // 保留原色彩
+      ctx.fillStyle='rgb('+d[o]+','+d[o+1]+','+d[o+2]+')';   // 保留原色彩（取飘散前位置）
     }
+    let al=1,ex=0,ey=0;
+    if(pf>0&&dotEdge){
+      // 边缘消散：落在边缘格的粒子沿外散方向持续剥离——锯齿进度循环
+      //（飞出→渐隐→回炉再飞），带着起点颜色飘进暗侧，深度区块交界因此起雾
+      const gx0=Math.min(dotCols-1,Math.max(0,(pcPool[b]/gw)|0));
+      const gy0=Math.min(dotRows-1,Math.max(0,(pcPool[b+1]/gh)|0));
+      const eb=(gy0*dotCols+gx0)*3,e=dotEdge[eb];
+      if(e>0.05){
+        const h=ph*0.159155;   // 相位归一化 [0,1) 作逐粒子稳定随机
+        const prog=(t*spd*(0.1+0.2*h)+h*7)%1;
+        const dist=e*pf*(40+80*h)*dpr*prog;
+        ex=dotEdge[eb+1]*dist;ey=dotEdge[eb+2]*dist;
+        al=1-prog*0.9;
+      }
+    }
+    if(al!==curAl){ctx.globalAlpha=al;curAl=al;}
     const s=Math.max(1,pcPool[b+3]*psz);
-    ctx.fillRect(x,y,s,s);
+    ctx.fillRect(x+ex,y+ey,s,s);
+    if(ex||ey){   // 拖尾：沿来路补一颗更淡的小点，扫出消散的流线感
+      ctx.globalAlpha=al*0.45;
+      ctx.fillRect(x+ex*0.72,y+ey*0.72,s*0.8,s*0.8);
+      curAl=-1;
+    }
   }
+  if(curAl!==1)ctx.globalAlpha=1;
 }
 // ── rAF 动画循环（~30fps 节流）：粒子云常开（speed=0 时粒子静止但仍重生闪换）；
 //    网格模式仅运动开启时循环。深度帧到达只刷 dotSample 缓存，循环不重置 ──
 let dotRaf=0,dotLastT=0;
-function dotNeedLoop(){return +dotCfg.on&&(+dotCfg.mode===1||+dotCfg.motion>0);}
+function dotNeedLoop(){return +dotCfg.on&&(+dotCfg.mode===1||+dotCfg.motion>0||+dotCfg.pfloat>0);}
 function dotLoop(ts){
   dotRaf=0;
   if(!dotNeedLoop()||$('bgDot').style.display==='none')return;
@@ -3324,7 +3385,7 @@ const DT_SLIDERS={pitch:['r_dt_pitch','v_dt_pitch'],r:['r_dt_r','v_dt_r'],
   jitter:['r_dt_jit','v_dt_jit'],speed:['r_dt_spd','v_dt_spd'],
   pn:['r_dt_pn','v_dt_pn'],psize:['r_dt_psz','v_dt_psz'],
   pcontrast:['r_dt_pct','v_dt_pct'],pdrift:['r_dt_drift','v_dt_drift'],
-  prespawn:['r_dt_resp','v_dt_resp']};
+  prespawn:['r_dt_resp','v_dt_resp'],pfloat:['r_dt_pf','v_dt_pf']};
 Object.keys(DT_SLIDERS).forEach(k=>{
   const [rid,vid]=DT_SLIDERS[k];
   $(rid).addEventListener('input',()=>{
