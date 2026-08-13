@@ -22,6 +22,7 @@
 因此本模块在本地无 GPU、无模型的环境下也能被 include_router 起来并跑通收图 + 展示链路。
 """
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -61,8 +62,40 @@ _config_gen = 0                       # 配置版本号：变更时 +1，用于�
 # 写入走 POST /api/frame/device-config（merge-patch 语义），推流端经 /api/frame/status
 # 的 devices[].config 轮询生效；后续 18091 控制面（superadmin 经 /da3-api 反代）走同一对接口。
 _dev_config: dict = {}
-# 可写键与钳制范围：push_fps=RGB 推帧频率（fps）；product_interval=点云产物上传间隔（秒）
-DEV_CONFIG_LIMITS = {"push_fps": (0.1, 30.0), "product_interval": (0.5, 30.0)}
+# 可写键分三类：数值（按范围钳制）、枚举（白名单）、颜色（#rrggbb）。
+# 数值键：push_fps=RGB 推帧频率（fps）；product_interval=点云产物上传间隔（秒）；
+# depth_*=硬件深度伪彩渲染参数——本服务只存储与下发，渲染在推流端（mac mini
+# cam-pusher）应用：推流端每 2s 经 /api/frame/status 的 devices[].config 轮询取走，
+# 约 2~4s 生效。默认值全部留在推流端（未下发的键=历史固定量程 TURBO 行为）。
+DEV_CONFIG_LIMITS = {
+    "push_fps": (0.1, 30.0), "product_interval": (0.5, 30.0),
+    "depth_min_m": (0.05, 10.0),      # 固定量程近端（米）
+    "depth_max_m": (0.1, 20.0),       # 固定量程远端（米）
+    "depth_autorange": (0.0, 1.0),    # 1=逐帧分位自适应量程（0=固定量程）
+    "depth_auto_lo": (0.0, 49.0),     # 自适应量程低分位（%）
+    "depth_auto_hi": (51.0, 100.0),   # 自适应量程高分位（%）
+    "depth_invert": (0.0, 1.0),       # 1=近暗远亮（默认近亮远暗）
+    "depth_gamma": (0.2, 5.0),        # 归一化后 gamma（>1 提亮中间调）
+    "depth_eq_clip": (0.5, 10.0),     # CLAHE clipLimit（depth_eq=clahe 时生效）
+    "depth_fill_px": (1.0, 15.0),     # 孔洞填充核半径（像素）
+    "depth_ema": (0.0, 0.95),         # 时域平滑 EMA 系数（0=关）
+    "depth_edge": (0.0, 1.0),         # 深度边缘描边强度（0=关）
+    "depth_contour_m": (0.0, 2.0),    # 等值线间隔（米，0=关）
+    "depth_jpeg_q": (30.0, 95.0),     # 深度图 JPEG 编码质量
+    "depth_fps": (0.0, 15.0),         # 深度独立推帧率（0=跟随 RGB 主帧节拍）
+}
+# 枚举键白名单（值统一小写存储）
+DEV_CONFIG_ENUMS = {
+    "depth_colormap": {"turbo", "jet", "viridis", "plasma", "inferno", "magma",
+                       "hot", "bone", "ocean", "hsv", "parula", "cividis",
+                       "twilight_shifted", "deepgreen", "gray"},
+    "depth_eq": {"off", "global", "clahe"},          # 直方图均衡模式
+    "depth_fill": {"off", "close", "inpaint"},       # 无效点孔洞填充模式
+    "depth_smooth": {"off", "median", "bilateral"},  # 空域滤波模式
+}
+# 颜色键（#rrggbb）：无效点（深度 0 值）着色
+DEV_CONFIG_COLORS = {"depth_invalid_color"}
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 # per-device 配置落盘持久化（gitignored 本地态，学 sam3_score_cfg.json 的做法）：
 # 服务重启不再回落默认帧率——此前配置是纯内存态，每次重启都得重新下发
@@ -587,7 +620,8 @@ async def set_device_config(body: dict = Body(...)):
 
     body 形如 {"device_id": "macmini-astra", "config": {"push_fps": 5, "product_interval": 1.5}}。
     与 /api/frame/config（全局一份、全量覆盖）不同：本配置按设备分桶、只接受
-    DEV_CONFIG_LIMITS 里的键并按范围钳制；设备不必在线（先下发配置再起推流端同样生效）。
+    三张白名单表里的键（数值按范围钳制、枚举按白名单、颜色按 #rrggbb 校验）；
+    设备不必在线（先下发配置再起推流端同样生效）。
     """
     dev = str((body or {}).get("device_id") or "").strip()
     if not dev:
@@ -595,22 +629,36 @@ async def set_device_config(body: dict = Body(...)):
     patch = (body or {}).get("config")
     if not isinstance(patch, dict) or not patch:
         return JSONResponse({"ok": False, "error": "缺少 config（应为非空对象）"}, status_code=400)
-    unknown = sorted(k for k in patch if k not in DEV_CONFIG_LIMITS)
+    unknown = sorted(k for k in patch if k not in DEV_CONFIG_LIMITS
+                     and k not in DEV_CONFIG_ENUMS and k not in DEV_CONFIG_COLORS)
     if unknown:
-        return JSONResponse({"ok": False, "error": f"不支持的键：{unknown}；"
-                             f"可用：{sorted(DEV_CONFIG_LIMITS)}"}, status_code=400)
+        return JSONResponse({"ok": False, "error": f"不支持的键：{unknown}；可用："
+                             f"{sorted([*DEV_CONFIG_LIMITS, *DEV_CONFIG_ENUMS, *DEV_CONFIG_COLORS])}"},
+                            status_code=400)
     # 先在锁外完成校验与钳制，锁内只做原子合并，坏值不会留下半套配置
     norm: dict = {}
     for k, v in patch.items():
         if v is None or v == "":
             norm[k] = None
-        else:
+        elif k in DEV_CONFIG_LIMITS:
             try:
                 lo, hi = DEV_CONFIG_LIMITS[k]
                 norm[k] = min(hi, max(lo, float(v)))
             except (TypeError, ValueError):
                 return JSONResponse({"ok": False, "error": f"{k} 不是数字：{v!r}"},
                                     status_code=400)
+        elif k in DEV_CONFIG_ENUMS:
+            sv = str(v).strip().lower()
+            if sv not in DEV_CONFIG_ENUMS[k]:
+                return JSONResponse({"ok": False, "error": f"{k} 取值非法：{v!r}；"
+                                     f"可用：{sorted(DEV_CONFIG_ENUMS[k])}"}, status_code=400)
+            norm[k] = sv
+        else:  # 颜色键
+            sv = str(v).strip()
+            if not _HEX_COLOR_RE.match(sv):
+                return JSONResponse({"ok": False, "error": f"{k} 不是 #rrggbb 颜色：{v!r}"},
+                                    status_code=400)
+            norm[k] = sv.lower()
     with _cv:
         cfg = dict(_dev_config.get(dev) or {})
         for k, v in norm.items():

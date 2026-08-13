@@ -5,10 +5,14 @@ da3-web。每个推帧节拍推两路（同一节拍 → 同设备两路 fps 天
 
 1. **RGB 彩色帧（+硬件深度）** → `POST /api/frame`（multipart：`image` +
    `camera_info` JSON 内 `device_id`，与手机 App 契约完全一致，8060 单目链路零改动）。
-   带深度的相机同请求附可选字段 `depth`：深度帧在 mini 端做**固定量程伪彩**
-   （近亮暖/远暗冷/无效点黑，默认 0.2~2m，`DEPTH_MIN_M`/`DEPTH_MAX_M` 可调；固定
-   量程防手/物进出画面时整图颜色跳变），供 `/panel`「原设备深度图」格展示，不参与
-   DA3 处理，纯展示不做 D2C 对齐；
+   带深度的相机同请求附可选字段 `depth`：深度帧在 mini 端做**伪彩渲染**（默认
+   固定量程 TURBO：近亮暖/远暗冷/无效点黑，默认 0.2~2m，`DEPTH_MIN_M`/`DEPTH_MAX_M`
+   可调；固定量程防手/物进出画面时整图颜色跳变），供 `/panel`「原设备深度图」格与
+   `/experience`「设备深度图」来源展示，不参与 DA3 处理，纯展示不做 D2C 对齐。
+   渲染参数（`depth_*` 键：色彩映射/方向/量程或分位自适应/gamma/直方图均衡/孔洞
+   填充/时空域滤波/边缘描边/等值线/无效点色/JPEG 质量/深度独立帧率）由 8060 的
+   per-device `device-config` 下发，随现有 2s 配置轮询热生效（约 2~4s），未下发
+   即全默认=历史行为；
 2. **双目辅助帧** → `POST /api/frame/aux`（仅 G335：multipart `left`/`right` 灰度
    JPEG，`camera_info` 带 `stereo_supported`/`baseline_mm`/`laser_mode`），供 8060
    的双目 DA3 点云链路（DA3 双视角推理 + SAM3 左目染色）。

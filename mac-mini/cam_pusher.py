@@ -6,9 +6,12 @@ da3-web 服务。每台相机独立成一个 device_id 桶，/panel 下拉可切
 
 每个推帧节拍推两路（同一个节拍 → 同设备两路 fps 天然一致）：
   1. RGB 彩色帧 → POST /api/frame（契约与手机 App 一致，8060 单目链路零改动）；
-     带硬件深度的相机同请求附可选字段 depth——深度帧在 mini 端做固定量程伪彩
-     （近亮暖/远暗冷/无效点黑，默认 0.2~2m 防手/物进出画面时整图颜色跳变），
-     供 /panel「原设备深度图」格展示，不参与 DA3 处理；
+     带硬件深度的相机同请求附可选字段 depth——深度帧在 mini 端做伪彩渲染
+     （默认固定量程 TURBO：近亮暖/远暗冷/无效点黑，默认 0.2~2m 防手/物进出画面
+     时整图颜色跳变），供 /panel「原设备深度图」格与 /experience「设备深度图」
+     来源展示，不参与 DA3 处理。渲染参数（色彩映射/量程/gamma/均衡/填洞/滤波/
+     描边/等值线等 depth_* 键）可由服务端 per-device 配置逐项覆盖，经
+     device-config 轮询热生效（约 2~4s），未下发时全走默认=历史行为；
   2. 辅助帧    → POST /api/frame/aux（仅双目相机）：左 IR + 右 IR 灰度 JPEG，
      camera_info 带 stereo_supported / baseline_mm / laser_mode，
      供 8060 的双目 DA3 点云链路。
@@ -83,6 +86,7 @@ _sdk_lock = threading.Lock()
 _fps_lock = threading.Lock()
 _dev_fps: dict = {}                   # device_id -> per-device push_fps（服务端下发）
 _global_fps: float = 0.0              # 全局 config.push_fps（旧口径兜底；0=未下发）
+_dev_depth: dict = {}                 # device_id -> 深度伪彩渲染配置（depth_* 键，服务端下发）
 
 
 def _valid_fps(raw) -> float:
@@ -101,9 +105,17 @@ def get_push_interval(device_id: str) -> float:
     return 1.0 / min(max(fps, 0.2), 15.0)
 
 
+def get_depth_cfg(device_id: str) -> dict:
+    """该设备当前的深度伪彩渲染配置（服务端 device-config 下发的 depth_* 键；
+    未下发时空 dict=全部走默认值，即历史固定量程 TURBO 行为）。"""
+    with _fps_lock:
+        return dict(_dev_depth.get(device_id) or {})
+
+
 def _config_poller():
-    """每 2s 从 8060 读一次帧率配置并热生效：devices[].config.push_fps（per-device）
-    与全局 config.push_fps（旧口径兜底）。服务端不可达时沿用当前值。"""
+    """每 2s 从 8060 读一次配置并热生效：devices[].config 里的 push_fps（per-device
+    帧率）、depth_*（深度伪彩渲染参数），及全局 config.push_fps（旧口径兜底）。
+    服务端不可达时沿用当前值。"""
     global _global_fps
     session = requests.Session()
     last_desc = None
@@ -114,19 +126,28 @@ def _config_poller():
             st = resp.json()
             g = _valid_fps((st.get("config") or {}).get("push_fps"))
             dev = {}
+            ddep = {}
             for d in st.get("devices") or []:
-                fps = _valid_fps((d.get("config") or {}).get("push_fps"))
+                did = str(d.get("device_id") or "")
+                cfg = d.get("config") or {}
+                fps = _valid_fps(cfg.get("push_fps"))
                 if fps:
-                    dev[str(d.get("device_id") or "")] = fps
+                    dev[did] = fps
+                dcfg = {k: v for k, v in cfg.items() if str(k).startswith("depth_")}
+                if dcfg:
+                    ddep[did] = dcfg
             with _fps_lock:
                 _global_fps = g
                 _dev_fps.clear()
                 _dev_fps.update(dev)
-            desc = (g, tuple(sorted(dev.items())))
+                _dev_depth.clear()
+                _dev_depth.update(ddep)
+            desc = (g, tuple(sorted(dev.items())),
+                    tuple(sorted((k, tuple(sorted(v.items()))) for k, v in ddep.items())))
             if desc != last_desc:
-                if last_desc is not None or g or dev:   # 启动即空配置不打日志
-                    log.info("推帧频率随服务端配置调整: per-device=%s 全局兜底=%s",
-                             dev or "无", g or "无")
+                if last_desc is not None or g or dev or ddep:   # 启动即空配置不打日志
+                    log.info("推帧配置随服务端调整: per-device帧率=%s 全局兜底=%s 深度渲染=%s",
+                             dev or "无", g or "无", ddep or "默认")
                 last_desc = desc
         except (requests.RequestException, ValueError, TypeError):
             pass  # 服务端不可达/字段异常时沿用当前值，推帧线程自身会报连不上
@@ -171,18 +192,124 @@ def _to_jpeg(frame) -> bytes:
     return jpeg.tobytes()
 
 
-def _depth_to_jpeg(frame) -> bytes:
+# 深度伪彩可选色彩映射（gray 特殊处理不走 applyColorMap）；个别老版本 OpenCV
+# 缺少的映射回落 TURBO
+_DEPTH_CMAPS = {name: getattr(cv2, "COLORMAP_" + name.upper(), cv2.COLORMAP_TURBO)
+                for name in ("turbo", "jet", "viridis", "plasma", "inferno", "magma",
+                             "hot", "bone", "ocean", "hsv", "parula", "cividis",
+                             "twilight_shifted", "deepgreen")}
+
+
+def _cfg_num(cfg: dict, key: str, default: float) -> float:
+    """读数值配置项；缺失/非法一律回默认值（服务端已钳制过范围，这里只做兜底）。"""
+    try:
+        return float(cfg[key])
+    except (KeyError, TypeError, ValueError):
+        return float(default)
+
+
+def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     """硬件深度帧（uint16，单位由 depth_scale 折算毫米）→ 伪彩 JPEG。
-    固定量程归一化：近 → 亮/暖（TURBO 红端），远 → 暗/冷，无效点（0 值）→ 黑。"""
+
+    默认（无下发配置）与历史行为一致：固定量程归一化，近 → 亮/暖（TURBO 红端），
+    远 → 暗/冷，无效点（0 值）→ 黑。服务端可经 device-config 下发 depth_* 键逐项
+    覆盖：色彩映射/方向/量程（固定或分位自适应）/gamma/直方图均衡/孔洞填充/
+    时空域滤波/边缘描边/等值线/无效点颜色/JPEG 质量（/experience「调节」抽屉可视化
+    调节）。state 为该相机线程私有的渲染状态（时域 EMA 上一帧等），重连后重置。"""
     w, h = frame.get_width(), frame.get_height()
     scale = float(getattr(frame, "get_depth_scale", lambda: 1.0)() or 1.0)
     d = np.frombuffer(bytes(frame.get_data()), dtype=np.uint16).reshape(h, w)
     d_mm = d.astype(np.float32) * scale
-    lo, hi = DEPTH_MIN_M * 1000.0, DEPTH_MAX_M * 1000.0
-    t = np.clip((hi - d_mm) / max(hi - lo, 1.0), 0.0, 1.0)
-    img = cv2.applyColorMap((t * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
-    img[d == 0] = 0
-    ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    invalid = d_mm <= 0
+
+    # ── 时域平滑（EMA）：只混合两帧都有效的像素；分辨率变化即重置 ──
+    ema = min(max(_cfg_num(cfg, "depth_ema", 0.0), 0.0), 0.95)
+    prev = state.get("ema_prev")
+    if ema > 0 and prev is not None and prev.shape == d_mm.shape:
+        m = (~invalid) & (prev > 0)
+        d_mm[m] = ema * prev[m] + (1.0 - ema) * d_mm[m]
+    state["ema_prev"] = d_mm.copy() if ema > 0 else None
+
+    # ── 孔洞填充（close 模式，作用于深度值本身）：形态学闭运算用邻域深度补 0 值空洞 ──
+    fill = str(cfg.get("depth_fill", "off"))
+    fill_px = max(1, int(_cfg_num(cfg, "depth_fill_px", 3)))
+    if fill == "close" and invalid.any():
+        ker = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * fill_px + 1, 2 * fill_px + 1))
+        closed = cv2.morphologyEx(d_mm, cv2.MORPH_CLOSE, ker)
+        d_mm = np.where(invalid, closed, d_mm)
+        invalid = d_mm <= 0
+
+    # ── 量程归一化：固定量程（默认，防手/物进出画面时整图颜色跳变）或逐帧分位自适应 ──
+    valid_vals = d_mm[~invalid]
+    if _cfg_num(cfg, "depth_autorange", 0.0) >= 0.5 and valid_vals.size > 256:
+        p_hi = _cfg_num(cfg, "depth_auto_hi", 98.0)
+        p_lo = min(_cfg_num(cfg, "depth_auto_lo", 2.0), p_hi - 1.0)
+        lo, hi = np.percentile(valid_vals, [p_lo, p_hi])
+    else:
+        lo = _cfg_num(cfg, "depth_min_m", DEPTH_MIN_M) * 1000.0
+        hi = _cfg_num(cfg, "depth_max_m", DEPTH_MAX_M) * 1000.0
+    t = np.clip((hi - d_mm) / max(hi - lo, 1.0), 0.0, 1.0)   # 近→1（近亮远暗）
+    if _cfg_num(cfg, "depth_invert", 0.0) >= 0.5:
+        t = 1.0 - t
+    gamma = min(max(_cfg_num(cfg, "depth_gamma", 1.0), 0.2), 5.0)
+    if abs(gamma - 1.0) > 1e-3:
+        t = np.power(t, 1.0 / gamma)
+    t8 = (t * 255.0).astype(np.uint8)
+
+    # ── 孔洞填充（inpaint 模式，作用于归一化灰度图）：修补后不再视为无效点 ──
+    if fill == "inpaint" and invalid.any():
+        t8 = cv2.inpaint(t8, invalid.astype(np.uint8),
+                         float(min(fill_px, 10)), cv2.INPAINT_TELEA)
+        invalid = np.zeros_like(invalid)
+
+    # ── 直方图均衡（近似：无效像素也计入直方图统计，随后会被无效色整体覆盖） ──
+    eq = str(cfg.get("depth_eq", "off"))
+    if eq == "global":
+        t8 = cv2.equalizeHist(t8)
+    elif eq == "clahe":
+        clip = min(max(_cfg_num(cfg, "depth_eq_clip", 2.0), 0.5), 10.0)
+        t8 = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(t8)
+
+    # ── 空域滤波 ──
+    smooth = str(cfg.get("depth_smooth", "off"))
+    if smooth == "median":
+        t8 = cv2.medianBlur(t8, 5)
+    elif smooth == "bilateral":
+        t8 = cv2.bilateralFilter(t8, 7, 50, 50)
+
+    # ── 伪彩映射 ──
+    cmap = str(cfg.get("depth_colormap", "turbo"))
+    if cmap == "gray":
+        img = cv2.cvtColor(t8, cv2.COLOR_GRAY2BGR)
+    else:
+        img = cv2.applyColorMap(t8, _DEPTH_CMAPS.get(cmap, cv2.COLORMAP_TURBO))
+
+    # ── 等值线：按真实距离取模的提亮细带，只画有效像素 ──
+    contour_m = _cfg_num(cfg, "depth_contour_m", 0.0)
+    if contour_m > 0.01:
+        band = (np.mod(d_mm / (contour_m * 1000.0), 1.0) < 0.06) & (~invalid)
+        img[band] = (img[band].astype(np.float32) * 0.35 + 255.0 * 0.65).astype(np.uint8)
+
+    # ── 深度边缘描边：Sobel 梯度大处向白色混合，强度可调 ──
+    edge = min(max(_cfg_num(cfg, "depth_edge", 0.0), 0.0), 1.0)
+    if edge > 0.01:
+        gx = cv2.convertScaleAbs(cv2.Sobel(t8, cv2.CV_16S, 1, 0, ksize=3))
+        gy = cv2.convertScaleAbs(cv2.Sobel(t8, cv2.CV_16S, 0, 1, ksize=3))
+        em = cv2.addWeighted(gx, 0.5, gy, 0.5, 0) > 48
+        img[em] = (img[em].astype(np.float32) * (1.0 - edge)
+                   + 255.0 * edge).astype(np.uint8)
+
+    # ── 无效点上色（默认黑，与历史行为一致） ──
+    color = str(cfg.get("depth_invalid_color", "#000000"))
+    try:
+        bgr = (int(color[5:7], 16), int(color[3:5], 16), int(color[1:3], 16))
+    except (ValueError, IndexError):
+        bgr = (0, 0, 0)
+    img[invalid] = bgr
+
+    q = int(min(max(_cfg_num(cfg, "depth_jpeg_q", JPEG_QUALITY), 30), 95))
+    ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q])
     if not ok:
         raise ValueError("深度图 JPEG 编码失败")
     return jpeg.tobytes()
@@ -371,6 +498,8 @@ def _camera_worker(pid: int, spec: dict, device_id: str):
             aux_err_logged = False
             last_push = 0.0
             cache = _IRCache()
+            # 深度渲染线程私有状态（EMA 上一帧 / 上次深度推送时刻），重连即重置
+            depth_state: dict = {}
             while not _stop.is_set():
                 fs = pipe.wait_for_frames(500)
                 if fs is None:
@@ -405,18 +534,28 @@ def _camera_worker(pid: int, spec: dict, device_id: str):
                 df = fs.get_depth_frame() if "depth" in streams else None
                 if df is not None and not (spec["stereo"] and laser_mode == "interleave"
                                            and _laser_status(df) == 0):
-                    try:
-                        files["depth"] = ("depth.jpg", _depth_to_jpeg(df), "image/jpeg")
-                        if first_depth:
-                            log.info("[%s] 首帧深度 %dx%d 量程 %.1f~%.1fm", device_id,
-                                     df.get_width(), df.get_height(),
-                                     DEPTH_MIN_M, DEPTH_MAX_M)
-                            first_depth = False
-                    except Exception as e:
-                        depth_err += 1
-                        if depth_err == 1 or depth_err % 100 == 0:
-                            log.warning("[%s] 深度帧伪彩失败 %d 次: %s",
-                                        device_id, depth_err, e)
+                    # 深度独立推帧率（depth_fps>0 时按自己的节拍降频；0=跟随 RGB 主帧）
+                    dcfg = get_depth_cfg(device_id)
+                    dfps = _cfg_num(dcfg, "depth_fps", 0.0)
+                    if dfps > 0 and now - depth_state.get("last_push", 0.0) < 1.0 / min(dfps, 15.0):
+                        pass   # 未到深度节拍：本帧只推 RGB 不附深度
+                    else:
+                        try:
+                            files["depth"] = ("depth.jpg",
+                                              _depth_to_jpeg(df, dcfg, depth_state),
+                                              "image/jpeg")
+                            depth_state["last_push"] = now
+                            if first_depth:
+                                log.info("[%s] 首帧深度 %dx%d 默认量程 %.1f~%.1fm"
+                                         "（渲染参数按服务端 device-config 覆盖）",
+                                         device_id, df.get_width(), df.get_height(),
+                                         DEPTH_MIN_M, DEPTH_MAX_M)
+                                first_depth = False
+                        except Exception as e:
+                            depth_err += 1
+                            if depth_err == 1 or depth_err % 100 == 0:
+                                log.warning("[%s] 深度帧伪彩失败 %d 次: %s",
+                                            device_id, depth_err, e)
                 try:
                     resp = session.post(
                         f"{RELAY_URL}/api/frame",

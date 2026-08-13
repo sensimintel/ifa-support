@@ -2207,6 +2207,10 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  #stage{position:fixed;inset:0;background:#000}
  .bg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .45s ease}
  .bg.on{opacity:1}
+ /* 点云化样式层：图片背景像素格化后经 mask 圆点镂空（形态层，保留原色彩）。
+    开启时 img 层隐藏、由本 canvas 呈现（构图同 object-fit:cover） */
+ #bgDot{position:absolute;inset:0;width:100%;height:100%;display:none}
+ #stage.doton .bg{visibility:hidden}
  #bgmv{position:absolute;inset:0;width:100%;height:100%;display:none;--poster-color:transparent}
  /* 压暗层（Figma 653-25294）：四周暗角 radial 渐变——中心透明、边角压黑，保证两侧文案可读 */
  #shade{position:absolute;inset:0;pointer-events:none;
@@ -2307,10 +2311,13 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  #hlcfg .radios{display:flex;gap:14px;align-items:center;margin:6px 0 2px;flex-wrap:wrap}
  #hlcfg .radios label{cursor:pointer}
  #hlcfg input[type=color]{width:38px;height:24px;border:none;background:none;padding:0;cursor:pointer}
+ #hlcfg select{width:100%;background:#1c1c1e;color:#eee;border:1px solid rgba(255,253,247,.25);
+   border-radius:6px;padding:4px 6px;font:12px system-ui,sans-serif;margin:2px 0;outline:none}
  #hlcfg .hint{margin-top:12px;font-size:11px;line-height:1.5;color:rgba(255,253,247,.45)}
 </style></head><body>
 <div id="stage">
  <img class="bg" id="bgA" alt=""><img class="bg" id="bgB" alt="">
+ <canvas id="bgDot"></canvas>
  <model-viewer id="bgmv" touch-action="none" interaction-prompt="none"
    camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
    min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
@@ -2367,6 +2374,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <select id="selStyle">
   <option value="hl">高亮点云</option>
   <option value="stereo" title="仅 G335 等双目相机支持">双目高亮点云</option>
+  <option value="devdepth" title="仅 G335 等带硬件深度的相机支持">设备深度图</option>
   <option value="la">单目点云</option>
   <option value="s3">SAM3点云</option>
  </select>
@@ -2389,6 +2397,137 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   DA3/SAM3 处理链路，是高亮/SAM3 点云的帧率上限；<b>点云直传间隔</b>只对带真深度直传的
   设备（如 macmini-astra）生效，决定单目点云来源的刷新节奏。Mac↔5090 链路仅约 8Mbps，
   两台摄像机同推时调密任何一路都会挤占另一路，调完盯一眼画面是否跟得上。</div>
+ <div id="ddonly" style="display:none">
+ <div class="sec">深度渲染（写回推流端，约 2~4s 生效）</div>
+ <div class="fld"><label>色彩映射</label>
+  <select id="dd_cmap">
+   <option value="turbo">TURBO（默认）</option><option value="jet">JET</option>
+   <option value="viridis">VIRIDIS</option><option value="plasma">PLASMA</option>
+   <option value="inferno">INFERNO</option><option value="magma">MAGMA</option>
+   <option value="hot">HOT</option><option value="bone">BONE</option>
+   <option value="ocean">OCEAN</option><option value="hsv">HSV</option>
+   <option value="parula">PARULA</option><option value="cividis">CIVIDIS</option>
+   <option value="twilight_shifted">TWILIGHT</option><option value="deepgreen">DEEPGREEN</option>
+   <option value="gray">灰度</option>
+  </select></div>
+ <div class="fld"><label>映射方向</label>
+  <div class="radios">
+   <label><input type="radio" name="ddinv" value="0" checked> 近亮远暗</label>
+   <label><input type="radio" name="ddinv" value="1"> 近暗远亮</label>
+  </div></div>
+ <div class="fld"><label>量程模式</label>
+  <div class="radios">
+   <label><input type="radio" name="ddar" value="0" checked> 固定量程</label>
+   <label><input type="radio" name="ddar" value="1"> 自动分位</label>
+  </div></div>
+ <div class="fld"><label>量程近端 <b id="v_dd_min">0.20</b>m</label>
+  <input type="range" id="r_dd_min" min="0.05" max="3" step="0.05" value="0.2"></div>
+ <div class="fld"><label>量程远端 <b id="v_dd_max">2.0</b>m</label>
+  <input type="range" id="r_dd_max" min="0.3" max="8" step="0.1" value="2"></div>
+ <div class="fld"><label>自动分位 低 <b id="v_dd_lo">2</b>%</label>
+  <input type="range" id="r_dd_lo" min="0" max="20" step="1" value="2"></div>
+ <div class="fld"><label>自动分位 高 <b id="v_dd_hi">98</b>%</label>
+  <input type="range" id="r_dd_hi" min="80" max="100" step="1" value="98"></div>
+ <div class="fld"><label>Gamma <b id="v_dd_gamma">1.00</b></label>
+  <input type="range" id="r_dd_gamma" min="0.2" max="3" step="0.05" value="1"></div>
+ <div class="fld"><label>直方图均衡</label>
+  <div class="radios">
+   <label><input type="radio" name="ddeq" value="off" checked> 关</label>
+   <label><input type="radio" name="ddeq" value="global"> 全局</label>
+   <label><input type="radio" name="ddeq" value="clahe"> CLAHE</label>
+  </div></div>
+ <div class="fld"><label>CLAHE 强度 <b id="v_dd_clip">2.0</b></label>
+  <input type="range" id="r_dd_clip" min="0.5" max="8" step="0.5" value="2"></div>
+ <div class="fld"><label>无效点颜色</label>
+  <div class="radios"><input type="color" id="c_dd_invalid" value="#000000"></div></div>
+ <div class="fld"><label>孔洞填充</label>
+  <div class="radios">
+   <label><input type="radio" name="ddfill" value="off" checked> 关</label>
+   <label><input type="radio" name="ddfill" value="close"> 形态学</label>
+   <label><input type="radio" name="ddfill" value="inpaint"> 修补</label>
+  </div></div>
+ <div class="fld"><label>填充半径 <b id="v_dd_fillpx">3</b>px</label>
+  <input type="range" id="r_dd_fillpx" min="1" max="15" step="1" value="3"></div>
+ <div class="fld"><label>时域平滑 <b id="v_dd_ema">0.00</b></label>
+  <input type="range" id="r_dd_ema" min="0" max="0.9" step="0.05" value="0"></div>
+ <div class="fld"><label>空域滤波</label>
+  <div class="radios">
+   <label><input type="radio" name="ddsm" value="off" checked> 关</label>
+   <label><input type="radio" name="ddsm" value="median"> 中值</label>
+   <label><input type="radio" name="ddsm" value="bilateral"> 双边</label>
+  </div></div>
+ <div class="fld"><label>边缘描边 <b id="v_dd_edge">0.00</b></label>
+  <input type="range" id="r_dd_edge" min="0" max="1" step="0.05" value="0"></div>
+ <div class="fld"><label>等值线间隔 <b id="v_dd_contour">0.00</b>m（0=关）</label>
+  <input type="range" id="r_dd_contour" min="0" max="1" step="0.05" value="0"></div>
+ <div class="fld"><label>JPEG 质量 <b id="v_dd_jq">80</b></label>
+  <input type="range" id="r_dd_jq" min="30" max="95" step="5" value="80"></div>
+ <div class="fld"><label>深度推帧率 <b id="v_dd_fps">0.0</b>fps（0=跟随RGB）</label>
+  <input type="range" id="r_dd_fps" min="0" max="10" step="0.5" value="0"></div>
+ <div class="sec">深度显示（本页即时）</div>
+ <div class="fld"><label>亮度 ×<b id="v_dc_bright">1.00</b></label>
+  <input type="range" id="r_dc_bright" min="0.2" max="2.5" step="0.05" value="1"></div>
+ <div class="fld"><label>对比度 ×<b id="v_dc_contrast">1.00</b></label>
+  <input type="range" id="r_dc_contrast" min="0.2" max="2.5" step="0.05" value="1"></div>
+ <div class="fld"><label>饱和度 ×<b id="v_dc_sat">1.00</b></label>
+  <input type="range" id="r_dc_sat" min="0" max="3" step="0.05" value="1"></div>
+ <div class="fld"><label>色相旋转 <b id="v_dc_hue">0</b>°</label>
+  <input type="range" id="r_dc_hue" min="-180" max="180" step="5" value="0"></div>
+ <div class="fld"><label>反色</label>
+  <div class="radios">
+   <label><input type="radio" name="dcinv" value="0" checked> 关</label>
+   <label><input type="radio" name="dcinv" value="1"> 开</label>
+  </div></div>
+ <div class="fld"><label>模糊 <b id="v_dc_blur">0</b>px</label>
+  <input type="range" id="r_dc_blur" min="0" max="10" step="1" value="0"></div>
+ <div class="fld"><label>不透明度 ×<b id="v_dc_opacity">1.00</b></label>
+  <input type="range" id="r_dc_opacity" min="0.2" max="1" step="0.05" value="1"></div>
+ <div class="fld"><label>缩放模式</label>
+  <div class="radios">
+   <label><input type="radio" name="dcfit" value="cover" checked> 铺满裁边</label>
+   <label><input type="radio" name="dcfit" value="contain"> 完整适配</label>
+  </div></div>
+ <div class="fld"><label>水平镜像</label>
+  <div class="radios">
+   <label><input type="radio" name="dcmir" value="0" checked> 关</label>
+   <label><input type="radio" name="dcmir" value="1"> 开</label>
+  </div></div>
+ <div class="fld"><label>旋转</label>
+  <div class="radios">
+   <label><input type="radio" name="dcrot" value="0" checked> 0°</label>
+   <label><input type="radio" name="dcrot" value="90"> 90°</label>
+   <label><input type="radio" name="dcrot" value="180"> 180°</label>
+   <label><input type="radio" name="dcrot" value="270"> 270°</label>
+  </div></div>
+ <div class="fld"><label>像素化</label>
+  <div class="radios">
+   <label><input type="radio" name="dcpix" value="0" checked> 关</label>
+   <label><input type="radio" name="dcpix" value="1"> 开</label>
+  </div></div>
+ <div class="hint"><b>深度渲染</b>区写 per-device 配置（/api/frame/device-config，与帧率同通道），
+  推流端每 2s 轮询取走后在 mini 端重渲染，约 2~4s 生效；/panel「原设备深度图」格
+  是同一张图，会同步变化。量程模式为「固定」时自动分位不生效，反之量程近/远端不生效；
+  CLAHE 强度仅均衡=CLAHE 时生效；填充半径仅孔洞填充开启时生效。<b>深度显示</b>区
+  只改本页背景的 CSS，拖动立即生效、只存本浏览器（localStorage）；旋转 90°/270° 按
+  视口比例自动放大铺满。</div>
+ </div>
+ <div id="dotonly" style="display:none">
+ <div class="sec">点云化样式（图片类背景，本页即时）</div>
+ <div class="fld"><label>点阵化</label>
+  <div class="radios">
+   <label><input type="radio" name="dton" value="0" checked> 关</label>
+   <label><input type="radio" name="dton" value="1"> 开</label>
+  </div></div>
+ <div class="fld"><label>点距 <b id="v_dt_pitch">8</b>px</label>
+  <input type="range" id="r_dt_pitch" min="3" max="16" step="1" value="8"></div>
+ <div class="fld"><label>圆径占比 <b id="v_dt_r">35</b>%</label>
+  <input type="range" id="r_dt_r" min="10" max="50" step="1" value="35"></div>
+ <div class="fld"><label>点阵背景色</label>
+  <div class="radios"><input type="color" id="c_dt_bg" value="#000000"></div></div>
+ <div class="hint">把图片背景离散成等距圆点（每格像素格化取近似纯色、圆点外露出背景色），
+  保留原色彩、模拟 LiDAR 点阵观感。只作用于图片类背景（设备深度图、高亮/SAM3 点云的
+  图模式）；GLB 点云背景请用上方「点渲染」区的点大小/形状。即时生效、只存本浏览器。</div>
+ </div>
  <div id="hlonly">
  <div class="sec">高亮样式（只作用于高亮点云）</div>
  <div class="seg" id="hlseg">
@@ -2534,9 +2673,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 const $=id=>document.getElementById(id);
 const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无后端时目检布局用
 
-// ══ 背景层：四种来源下拉框选择（临时工具），默认 SAM3 高亮点云 ══
+// ══ 背景层：五种来源下拉框选择（临时工具），默认 SAM3 高亮点云 ══
 let bgSource=localStorage.getItem('exp_bg')||'hl';
-if(!['hl','stereo','la','s3'].includes(bgSource))bgSource='hl';   // 旧版存过 raw 的自动回落高亮点云
+if(!['hl','stereo','la','s3','devdepth'].includes(bgSource))bgSource='hl';   // 旧版存过 raw 的自动回落高亮点云
 const MIN_SWAP_MS=0;               // 换图节流已停用（同 /panel，2026-08-13）；"加载中不打断"守卫仍在
 let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
 
@@ -2551,6 +2690,8 @@ function showImg(url,key){            // 双缓冲交叉淡入：新图解码完
     const showEl=bgFlip?$('bgA'):$('bgB'),hideEl=bgFlip?$('bgB'):$('bgA');
     showEl.src=url;showEl.classList.add('on');hideEl.classList.remove('on');
     $('bgmv').style.display='none';lastMvUrl='';lastBgUrl=url;
+    dotIm=im;   // 点云化样式开启时用解码完成的这张图重画点阵层
+    if(+dotCfg.on){dotDraw();$('bgDot').style.display='block';}
   };
   im.src=url;
   return true;
@@ -2564,6 +2705,7 @@ function showModel(url,fov){          // GLB 产物（单目点云等）：全�
   lastMvSwap=Date.now();lastMvUrl=url;lastBgKey='';
   mv.src=url;mv.style.display='block';
   $('bgA').classList.remove('on');$('bgB').classList.remove('on');
+  $('bgDot').style.display='none';   // GLB 背景不适用点云化样式层，避免遮挡
   return true;
 }
 // GLB 加载完自动摆「调优视角」（同 /panel：略俯视、拉远，FOV 用真实相机内参）。
@@ -2773,6 +2915,184 @@ function renderRate(s){
   });
 }
 
+// ══ 设备深度图调节：深度渲染参数（device-config 下发到 mini 端，~2-4s 生效）
+//    + 深度显示参数（本页 CSS，即时生效、localStorage 记忆） ══
+// 滑条表：配置键 -> [range id, 数值显示 id, 小数位数]
+const DD_SLIDERS={depth_min_m:['r_dd_min','v_dd_min',2],depth_max_m:['r_dd_max','v_dd_max',1],
+  depth_auto_lo:['r_dd_lo','v_dd_lo',0],depth_auto_hi:['r_dd_hi','v_dd_hi',0],
+  depth_gamma:['r_dd_gamma','v_dd_gamma',2],depth_eq_clip:['r_dd_clip','v_dd_clip',1],
+  depth_fill_px:['r_dd_fillpx','v_dd_fillpx',0],depth_ema:['r_dd_ema','v_dd_ema',2],
+  depth_edge:['r_dd_edge','v_dd_edge',2],depth_contour_m:['r_dd_contour','v_dd_contour',2],
+  depth_jpeg_q:['r_dd_jq','v_dd_jq',0],depth_fps:['r_dd_fps','v_dd_fps',1]};
+// radio 组：name -> 配置键（数值型 radio 下发数字，枚举型下发字符串）
+const DD_RADIOS={ddinv:'depth_invert',ddar:'depth_autorange',ddeq:'depth_eq',
+  ddfill:'depth_fill',ddsm:'depth_smooth'};
+let ddPend={},ddTimer=null,ddTouched=0;
+function ddPush(k,v){
+  if(!curDev)return;
+  ddTouched=Date.now();
+  ddPend[k]=v;
+  clearTimeout(ddTimer);
+  ddTimer=setTimeout(()=>{
+    const cfg=ddPend;ddPend={};
+    fetch('/api/frame/device-config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({device_id:curDev,config:cfg})}).catch(()=>{});
+  },300);
+}
+Object.keys(DD_SLIDERS).forEach(k=>{
+  const [rid,vid,dp]=DD_SLIDERS[k];
+  $(rid).addEventListener('input',()=>{
+    $(vid).textContent=(+$(rid).value).toFixed(dp);
+    ddPush(k,+$(rid).value);
+  });
+});
+Object.keys(DD_RADIOS).forEach(nm=>document.querySelectorAll('input[name='+nm+']').forEach(r=>
+  r.addEventListener('change',()=>{
+    const v=document.querySelector('input[name='+nm+']:checked').value;
+    ddPush(DD_RADIOS[nm],isNaN(+v)?v:+v);   // 枚举值传字符串，0/1 开关传数字
+  })));
+$('dd_cmap').addEventListener('change',()=>ddPush('depth_colormap',$('dd_cmap').value));
+$('c_dd_invalid').addEventListener('input',()=>ddPush('depth_invalid_color',$('c_dd_invalid').value));
+function renderDdCfg(s){
+  // 从 status 回填选中设备已下发的深度渲染配置（切设备跟着换）；
+  // 拖动中或刚下发 1.5s 内不回写，避免打架（同帧率滑条的守卫逻辑）
+  if(Date.now()-ddTouched<1500)return;
+  const d=(s.devices||[]).find(x=>x.device_id===s.selected);
+  const c=(d&&d.config)||{};
+  Object.keys(DD_SLIDERS).forEach(k=>{
+    const [rid,vid,dp]=DD_SLIDERS[k],el=$(rid);
+    if(c[k]!=null&&document.activeElement!==el){el.value=c[k];$(vid).textContent=(+el.value).toFixed(dp);}
+  });
+  Object.keys(DD_RADIOS).forEach(nm=>{
+    const k=DD_RADIOS[nm];
+    if(c[k]!=null){
+      const el=document.querySelector('input[name='+nm+'][value="'+c[k]+'"]');
+      if(el&&!el.checked)el.checked=true;
+    }
+  });
+  if(c.depth_colormap&&document.activeElement!==$('dd_cmap'))$('dd_cmap').value=c.depth_colormap;
+  if(/^#[0-9a-fA-F]{6}$/.test(c.depth_invalid_color||''))$('c_dd_invalid').value=c.depth_invalid_color;
+}
+// ── 深度显示（本页 CSS 即时层）：只在 devdepth 来源挂到背景 img，切走来源即摘除 ──
+let ddCss={br:1,ct:1,sa:1,hu:0,inv:0,bl:0,op:1,fit:'cover',mir:0,rot:0,pix:0};
+try{Object.assign(ddCss,JSON.parse(localStorage.getItem('exp_dd_css')||'{}'));}catch(e){}
+function applyDdCss(){
+  const on=bgSource==='devdepth';
+  // 点云化 canvas 层也套同一组显示参数：devdepth+点阵组合时调节仍可见
+  [$('bgA'),$('bgB'),$('bgDot')].forEach(el=>{
+    if(!on){el.style.filter='';el.style.objectFit='';el.style.transform='';el.style.imageRendering='';return;}
+    // 不透明度用 filter 的 opacity()：inline opacity 会盖掉 .bg.on 的交叉淡入
+    el.style.filter='brightness('+ddCss.br+') contrast('+ddCss.ct+') saturate('+ddCss.sa
+      +') hue-rotate('+ddCss.hu+'deg)'+(+ddCss.inv?' invert(1)':'')
+      +(+ddCss.bl?' blur('+ddCss.bl+'px)':'')+' opacity('+ddCss.op+')';
+    el.style.objectFit=ddCss.fit;
+    // 旋转 90°/270° 宽高互换：按视口长宽比放大补偿，保证铺满不露黑边
+    const r=+ddCss.rot;
+    const sc=(r===90||r===270)?Math.max(innerWidth/innerHeight,innerHeight/innerWidth):1;
+    el.style.transform=(r?'rotate('+r+'deg)':'')+(+ddCss.mir?' scaleX(-1)':'')
+      +(sc!==1?' scale('+sc.toFixed(3)+')':'');
+    el.style.imageRendering=+ddCss.pix?'pixelated':'';
+  });
+}
+const DC_SLIDERS={br:['r_dc_bright','v_dc_bright',2],ct:['r_dc_contrast','v_dc_contrast',2],
+  sa:['r_dc_sat','v_dc_sat',2],hu:['r_dc_hue','v_dc_hue',0],bl:['r_dc_blur','v_dc_blur',0],
+  op:['r_dc_opacity','v_dc_opacity',2]};
+const DC_RADIOS={dcinv:'inv',dcfit:'fit',dcmir:'mir',dcrot:'rot',dcpix:'pix'};
+function saveDdCss(){localStorage.setItem('exp_dd_css',JSON.stringify(ddCss));}
+Object.keys(DC_SLIDERS).forEach(k=>{
+  const [rid,vid,dp]=DC_SLIDERS[k];
+  $(rid).addEventListener('input',()=>{
+    ddCss[k]=+$(rid).value;$(vid).textContent=(+$(rid).value).toFixed(dp);
+    applyDdCss();saveDdCss();
+  });
+});
+Object.keys(DC_RADIOS).forEach(nm=>document.querySelectorAll('input[name='+nm+']').forEach(r=>
+  r.addEventListener('change',()=>{
+    const v=document.querySelector('input[name='+nm+']:checked').value;
+    ddCss[DC_RADIOS[nm]]=(nm==='dcfit')?v:+v;
+    applyDdCss();saveDdCss();
+  })));
+// localStorage 记忆值回填显示层控件（页面加载一次）
+(function(){
+  Object.keys(DC_SLIDERS).forEach(k=>{
+    const [rid,vid,dp]=DC_SLIDERS[k];
+    $(rid).value=ddCss[k];$(vid).textContent=(+ddCss[k]).toFixed(dp);
+  });
+  Object.keys(DC_RADIOS).forEach(nm=>{
+    const el=document.querySelector('input[name='+nm+'][value="'+ddCss[DC_RADIOS[nm]]+'"]');
+    if(el)el.checked=true;
+  });
+})();
+addEventListener('resize',applyDdCss);   // 旋转补偿量随视口比例变化
+
+// ══ 点云化样式（图片类背景通用形态层）：canvas 像素格化（先缩后放、近邻插值）
+//    + mask 圆点镂空——保留原色彩、样式离散成等距圆点，模拟 LiDAR 点阵观感。
+//    对所有走 showImg 的图片类来源统一生效；GLB 背景不适用（有自己的点渲染区）══
+let dotCfg={on:0,pitch:8,r:35,bg:'#000000'};
+try{Object.assign(dotCfg,JSON.parse(localStorage.getItem('exp_dot')||'{}'));}catch(e){}
+let dotIm=null,dotOffCv=null;   // 最近一帧背景 Image / 离屏降采样画布
+function dotDraw(){
+  const im=dotIm,cv=$('bgDot');
+  if(!im||!im.naturalWidth)return;
+  const dpr=devicePixelRatio||1;
+  cv.width=Math.round(innerWidth*dpr);cv.height=Math.round(innerHeight*dpr);
+  const P=Math.max(2,+dotCfg.pitch)*dpr;   // 物理像素点距
+  const cols=Math.max(1,Math.round(cv.width/P)),rows=Math.max(1,Math.round(cv.height/P));
+  if(!dotOffCv)dotOffCv=document.createElement('canvas');
+  dotOffCv.width=cols;dotOffCv.height=rows;
+  // 与 .bg 的 object-fit:cover 同构图：源图按视口长宽比居中裁剪，缩到 cols×rows
+  // （降采样后每格即近似纯色）
+  const ar=cv.width/cv.height,iar=im.naturalWidth/im.naturalHeight;
+  let sx,sy,sw,sh;
+  if(iar>ar){sh=im.naturalHeight;sw=sh*ar;sx=(im.naturalWidth-sw)/2;sy=0;}
+  else{sw=im.naturalWidth;sh=sw/ar;sx=0;sy=(im.naturalHeight-sh)/2;}
+  dotOffCv.getContext('2d').drawImage(im,sx,sy,sw,sh,0,0,cols,rows);
+  const ctx=cv.getContext('2d');
+  ctx.imageSmoothingEnabled=false;   // 近邻放大：像素格化
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.drawImage(dotOffCv,0,0,cols,rows,0,0,cv.width,cv.height);
+}
+function applyDotCfg(){
+  const on=+dotCfg.on===1,cv=$('bgDot');
+  $('stage').classList.toggle('doton',on);   // 开启时 img 层隐藏、canvas 呈现
+  // 仅图片类背景显示 canvas：GLB（model-viewer）背景时不遮挡
+  cv.style.display=(on&&$('bgmv').style.display==='none')?'block':'none';
+  if(on){
+    // 圆点镂空：mask 每 pitch×pitch 一格，只透出中心圆盘，其余露出点阵背景色
+    const rpx=(+dotCfg.pitch)*(+dotCfg.r)/100;
+    const mk='radial-gradient(circle '+rpx.toFixed(2)+'px at 50% 50%,#000 97%,transparent 100%)';
+    cv.style.webkitMaskImage=mk;cv.style.maskImage=mk;
+    cv.style.webkitMaskSize=dotCfg.pitch+'px '+dotCfg.pitch+'px';
+    cv.style.maskSize=dotCfg.pitch+'px '+dotCfg.pitch+'px';
+    cv.style.webkitMaskRepeat='repeat';cv.style.maskRepeat='repeat';
+    $('stage').style.background=dotCfg.bg;
+    dotDraw();
+  }else{
+    $('stage').style.background='';   // 交还默认黑底（GLB 来源由点渲染区自设背景色）
+  }
+}
+function saveDot(){localStorage.setItem('exp_dot',JSON.stringify(dotCfg));}
+document.querySelectorAll('input[name=dton]').forEach(r=>r.addEventListener('change',()=>{
+  dotCfg.on=+document.querySelector('input[name=dton]:checked').value;
+  applyDotCfg();saveDot();}));
+$('r_dt_pitch').addEventListener('input',()=>{
+  dotCfg.pitch=+$('r_dt_pitch').value;$('v_dt_pitch').textContent=dotCfg.pitch;
+  applyDotCfg();saveDot();});
+$('r_dt_r').addEventListener('input',()=>{
+  dotCfg.r=+$('r_dt_r').value;$('v_dt_r').textContent=dotCfg.r;
+  applyDotCfg();saveDot();});
+$('c_dt_bg').addEventListener('input',()=>{
+  dotCfg.bg=$('c_dt_bg').value;applyDotCfg();saveDot();});
+// localStorage 记忆值回填点云化控件（页面加载一次）
+(function(){
+  const el=document.querySelector('input[name=dton][value="'+(+dotCfg.on)+'"]');
+  if(el)el.checked=true;
+  $('r_dt_pitch').value=dotCfg.pitch;$('v_dt_pitch').textContent=dotCfg.pitch;
+  $('r_dt_r').value=dotCfg.r;$('v_dt_r').textContent=dotCfg.r;
+  $('c_dt_bg').value=dotCfg.bg;
+})();
+addEventListener('resize',()=>{if(+dotCfg.on)dotDraw();});
+
 let lastInset='';
 async function bgTick(){
  if(DEMO)return;
@@ -2790,6 +3110,10 @@ async function bgTick(){
   // 双目来源仅双目设备（G335）可用：选中设备不支持时禁用选项置灰；已选双目时保持黑场
   const stOpt=$('selStyle').querySelector('option[value=stereo]');
   if(stOpt)stOpt.disabled=s.stereo_supported!==true;
+  // 设备深度图来源仅带硬件深度的相机（G335 等）可用：无深度能力的设备置灰
+  const ddOpt=$('selStyle').querySelector('option[value=devdepth]');
+  if(ddOpt)ddOpt.disabled=s.has_depth!==true;
+  renderDdCfg(s);
   if(bgSource==='la'){
     if(s.product_kind==='image')showImg('/api/frame/latest-product?t='+s.product_seq,'la:'+s.product_seq);
     else if(s.product_kind==='model'&&s.product_url)showModel(s.product_url,s.product_meta&&s.product_meta.fov_deg);
@@ -2801,6 +3125,17 @@ async function bgTick(){
     }else{
       // 不支持双目的设备：主动清掉上一台设备残留的双目 GLB（该设备永远不会有新
       // 双目产物顶掉旧画面），回到黑场
+      $('bgmv').style.display='none';lastMvUrl='';
+      $('bgA').classList.remove('on');$('bgB').classList.remove('on');
+    }
+  }else if(bgSource==='devdepth'){
+    // 设备深度图（仅 G335 等带硬件深度的相机）：直接展示 mini 端伪彩深度帧。
+    // 深度是相机产物不是设备 RGB 原图，不违反「本页不展示设备原图」的产品红线
+    if(s.has_depth&&s.depth_seq){
+      showImg('/api/frame/latest-depth?device='+encodeURIComponent(s.device||'')
+        +'&t='+s.depth_seq,'dd:'+s.depth_seq);
+    }else{
+      // 无深度能力/深度未就绪：清残留画面回黑场（同双目来源的降级语义）
       $('bgmv').style.display='none';lastMvUrl='';
       $('bgA').classList.remove('on');$('bgB').classList.remove('on');
     }
@@ -2900,8 +3235,14 @@ function applyRecog(r){
 function syncStyleUI(){
   $('selStyle').value=bgSource;
   // 抽屉常驻可开（帧率区对所有来源有意义）；高亮样式区在高亮/双目高亮两个来源展示
-  // （双目高亮 GLB 读同一份 /api/sam3hl/config，全部滑杆同样生效）
+  // （双目高亮 GLB 读同一份 /api/sam3hl/config，全部滑杆同样生效）；
+  // 设备深度图调节区仅该来源展示
   $('hlonly').style.display=(bgSource==='hl'||bgSource==='stereo')?'':'none';
+  $('ddonly').style.display=(bgSource==='devdepth')?'':'none';
+  // 点云化样式区对可能出图片类背景的来源展示（stereo/la 基本恒为 GLB）
+  $('dotonly').style.display=(bgSource==='hl'||bgSource==='s3'||bgSource==='devdepth')?'':'none';
+  applyDdCss();   // 切来源即时挂上/摘掉深度显示的 CSS（其它来源不受深度显示参数影响）
+  applyDotCfg();  // 点云化样式层随来源重估显隐（GLB 来源不遮挡）
 }
 $('selStyle').onchange=()=>{
   bgSource=$('selStyle').value;
