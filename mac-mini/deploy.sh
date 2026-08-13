@@ -29,8 +29,10 @@ bash ./setup.sh
 echo "==> 安装/更新 LaunchDaemon 并重启"
 run_sudo cp "$PLIST" "/Library/LaunchDaemons/$PLIST"
 run_sudo chown root:wheel "/Library/LaunchDaemons/$PLIST"
-run_sudo launchctl bootstrap system "/Library/LaunchDaemons/$PLIST" 2>/dev/null || true
-run_sudo launchctl kickstart -k "system/$LABEL"
+# 必须 bootout 再 bootstrap：kickstart -k 只重启进程、不重读 plist，改过
+# ProgramArguments 等定义不 bootout 就不生效（2026-08-13 实锤：进程仍跑在旧路径）
+run_sudo launchctl bootout "system/$LABEL" 2>/dev/null || true
+run_sudo launchctl bootstrap system "/Library/LaunchDaemons/$PLIST"
 
 echo "==> 健康检查：等 8060 出现 macmini-* 设备帧（至多 30s）"
 RELAY_URL="${RELAY_URL:-http://192.168.0.50:8060}"
