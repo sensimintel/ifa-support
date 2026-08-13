@@ -32,7 +32,19 @@ run_sudo chown root:wheel "/Library/LaunchDaemons/$PLIST"
 # 必须 bootout 再 bootstrap：kickstart -k 只重启进程、不重读 plist，改过
 # ProgramArguments 等定义不 bootout 就不生效（2026-08-13 实锤：进程仍跑在旧路径）
 run_sudo launchctl bootout "system/$LABEL" 2>/dev/null || true
-run_sudo launchctl bootstrap system "/Library/LaunchDaemons/$PLIST"
+# bootout 是异步 teardown：立刻 bootstrap 会撞上「Bootstrap failed: 5: Input/output
+# error」（2026-08-13 两次实锤）。等一拍再试，失败按 2s 间隔重试至多 5 次
+for i in 1 2 3 4 5; do
+  sleep 2
+  if run_sudo launchctl bootstrap system "/Library/LaunchDaemons/$PLIST" 2>/dev/null; then
+    break
+  fi
+  if [ "$i" = 5 ]; then
+    echo "!! launchctl bootstrap 重试 5 次仍失败" >&2
+    exit 1
+  fi
+  echo "    bootstrap 未就绪（bootout teardown 中），重试 $i/5"
+done
 
 echo "==> 健康检查：等 8060 出现 macmini-* 设备帧（至多 30s）"
 RELAY_URL="${RELAY_URL:-http://192.168.0.50:8060}"
