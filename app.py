@@ -1746,10 +1746,14 @@ async function tick(){
       $('prodimg').style.display='block';$('mv').style.display='none';$('prodwait').style.display='none';
     }else if(s.product_kind==='model' && s.product_url){
       // 点云 GLB 较大、加载/解析慢。两道防护：
-      //  (1) 上一个没加载完(mv.loaded=false)就别换 src，否则高帧率下不断打断加载→loaded 永远 false→黑；
+      //  (1) 上一个没加载完(mv.loaded=false)就别换 src，否则高帧率下不断打断加载→loaded 永远 false→黑。
+      //      注意判「已有 src」必须读 mv.src 属性——model-viewer 的 src 属性不反射到 attribute，
+      //      读 getAttribute 恒为 null，守卫形同虚设，慢网(单个 GLB 加载>MIN_SWAP_MS)下加载被
+      //      无限打断、格子永冻（2026-08-13 真实发生）；
       //  (2) 换一次后至少停留 MIN_SWAP_MS 再换，让加载完的点云停住显示——否则高帧率(如 10fps)下
-      //      刚 loaded 就立刻换最新，几乎一直卡在"加载中"(黑)。跳过时不更新 lastProdKey，下周期重试。
-      if((mv.loaded || !mv.getAttribute('src')) && Date.now()-lastSwap>=MIN_SWAP_MS){
+      //      刚 loaded 就立刻换最新，几乎一直卡在"加载中"(黑)。跳过时不更新 lastProdKey，下周期重试；
+      //  (3) 兜底：某个 GLB 加载卡死/404 时 loaded 永远 false，超 8s 强制放行换新的，避免永锁。
+      if((mv.loaded || !mv.src || Date.now()-lastSwap>=8000) && Date.now()-lastSwap>=MIN_SWAP_MS){
         lastSwap=Date.now();
         lastProdKey=prodKey;
         preApplyView();   // 换模型前先摆好视角，让新点云加载首帧就在锁定视角，消除抖动
@@ -1778,8 +1782,8 @@ async function tick(){
     const s3=await(await fetch('/api/sam3cloud/status',{cache:'no-store'})).json();
     if(s3.seq && s3.seq!==lastS3){
       if(s3.kind==='model' && s3.url){
-        // 与②同款换模型节流：上一个没加载完不换、加载完至少停 MIN_SWAP_MS
-        if((mv2.loaded || !mv2.getAttribute('src')) && Date.now()-lastSwap3>=MIN_SWAP_MS){
+        // 与②同款换模型节流：上一个没加载完不换、加载完至少停 MIN_SWAP_MS（读 src 属性 + 8s 兜底，同②）
+        if((mv2.loaded || !mv2.src || Date.now()-lastSwap3>=8000) && Date.now()-lastSwap3>=MIN_SWAP_MS){
           lastSwap3=Date.now(); lastS3=s3.seq;
           mv2.src=s3.url;
           mv2.style.display='block';$('s3img').style.display='none';$('s3wait').style.display='none';
@@ -1805,7 +1809,7 @@ async function tick(){
     const hl=await(await fetch('/api/sam3hl/status',{cache:'no-store'})).json();
     if(hl.seq && hl.seq!==lastHl){
       if(hl.kind==='model' && hl.url){
-        if((mv3.loaded || !mv3.getAttribute('src')) && Date.now()-lastSwapH>=MIN_SWAP_MS){
+        if((mv3.loaded || !mv3.src || Date.now()-lastSwapH>=8000) && Date.now()-lastSwapH>=MIN_SWAP_MS){
           lastSwapH=Date.now(); lastHl=hl.seq;
           mv3.src=hl.url;
           mv3.style.display='block';$('hlimg').style.display='none';$('hlwait').style.display='none';
@@ -2210,7 +2214,8 @@ function showModel(url,fov){          // GLB 产物（LA 点云等）：全屏 m
   const mv=$('bgmv');
   if(fov)mvFov=fov;
   if(url===lastMvUrl){mv.style.display='block';return true;}
-  if(!(mv.loaded||!mv.getAttribute('src'))||Date.now()-lastMvSwap<MIN_SWAP_MS)return true;
+  // 读 src 属性判「加载中」（model-viewer 的 src 不反射到 attribute）+ 8s 卡死兜底，同 /panel
+  if(!(mv.loaded||!mv.src||Date.now()-lastMvSwap>=8000)||Date.now()-lastMvSwap<MIN_SWAP_MS)return true;
   lastMvSwap=Date.now();lastMvUrl=url;lastBgKey='';
   mv.src=url;mv.style.display='block';
   $('bgA').classList.remove('on');$('bgB').classList.remove('on');
