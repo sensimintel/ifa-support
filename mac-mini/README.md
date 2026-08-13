@@ -1,19 +1,36 @@
 # mac-mini 摄像头推帧器（cam-pusher）
 
-展会拓扑里 mac mini 的唯一职责：把机身上插着的两台 Orbbec 相机的彩色流，按 8060
-现有入帧契约推给 5090 的 da3-web（`POST /api/frame`，multipart：`image` +
-`camera_info` JSON 内 `device_id`）。每台相机独立成一个设备桶，`/panel` 下拉可在
-相机与手机 App 之间切换，**8060 侧零改动**，手机 App 通路继续并存。
+展会拓扑里 mac mini 的唯一职责：把机身上插着的两台 Orbbec 相机的帧推给 5090 的
+da3-web。每个推帧节拍推两路（同一节拍 → 两路 fps 天然一致，都受 `/panel` 滑杆控制）：
+
+1. **RGB 彩色帧** → `POST /api/frame`（multipart：`image` + `camera_info` JSON 内
+   `device_id`，与手机 App 契约完全一致，8060 单目链路零改动）；
+2. **辅助帧** → `POST /api/frame/aux`（multipart：`left`/`right` 灰度 JPEG +
+   `depth` 16bit PNG，`camera_info` 带 `stereo_supported`/`baseline_mm`/
+   `depth_scale_mm`/`laser_mode`），供 8060 的双目 DA3 点云与「原设备深度图」。
+
+每台相机独立成一个设备桶，`/panel` 下拉可在相机与手机 App 之间切换，手机 App 通路继续并存。
 
 ## 硬件与设备号
 
-| 相机 | PID | device_id | 彩色流 |
+| 相机 | PID | device_id | 推送流 |
 |---|---|---|---|
-| Orbbec Gemini 335 | `0x0800` | `macmini-g335` | 1280×720 MJPG（JPEG 直传不转码） |
-| Astra Pro Plus | `0x060F` | `macmini-astra` | 默认 profile，非 MJPG 时 cv2 转码 |
+| Orbbec Gemini 335 | `0x0800` | `macmini-g335` | 彩色 1280×720 MJPG 直传 + 左/右 IR + 硬件深度 |
+| Astra Pro Plus | `0x060F` | `macmini-astra` | 彩色（默认 profile，非 MJPG 转码）+ 硬件深度；无双目（`stereo_supported=false`） |
 
-只开彩色流不开深度（8060 只吃 RGB，深度由 DA3 自己算）。默认 3fps/台（`.env`
-可调），LAN 带宽占用约几百 KB/s。
+### G335 激光策略（`.env` 的 `LASER_MODE`）
+
+喂 DA3 的双目 IR 要**无散斑**，硬件深度要**有散斑**，两者冲突。默认
+`interleave`：用 `OB_PROP_LASER_ON_OFF_PATTERN_INT` 让投射器逐帧交替开关，按帧
+元数据 `LASER_STATUS` 分拣——无光帧取 IR、有光帧取深度；属性设置失败自动退回
+`on`（散斑 IR 直喂 DA3）。可显式设 `on` / `off` 做对比实验。
+
+> 2026-08-13 实测：pyorbbecsdk 1.3.2 + G335 固件不支持该属性（`Property is not
+> supported! propertyId: 3`），实际运行自动退回 `on`——硬件深度质量优先，双目 IR
+> 带散斑喂 DA3。SDK 标定基线实测读出 50.49mm（与规格 50mm 吻合）。
+
+默认 3fps/台（`.env` 可调兜底值）。辅助帧新增约 0.5~1MB/帧，3fps 下 LAN 带宽约
+2-3 MB/s。任一辅助流开不出来只降级该流（日志告警），RGB 主链路不受影响。
 
 ## 运行形态
 
