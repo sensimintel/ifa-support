@@ -294,19 +294,45 @@ _DEPTH_CMAPS = {name: getattr(cv2, "COLORMAP_" + name.upper(), cv2.COLORMAP_TURB
                              "twilight_shifted", "deepgreen")}
 
 
-def _lidar_lut() -> np.ndarray:
-    """自建「激光雷达蓝青」色表（256x3 BGR，索引 0=远、255=近）：远端深藏青、
-    中程蔚蓝、近端亮青白——单一蓝青色系靠明度/色温拉开前后空间，不像 turbo/jet
-    满屏红绿蓝混杂（对齐经典 LiDAR 点云可视化观感）。"""
-    stops_i = np.array([0.0, 90.0, 170.0, 225.0, 255.0], dtype=np.float32)
-    stops_rgb = np.array([(3, 10, 40), (0, 60, 180), (0, 140, 255),
-                          (0, 220, 220), (170, 255, 225)], dtype=np.float32)
+# 自建色表档位表：{名字: (索引档位, RGB 档位)}，索引 0=远、255=近。
+# 对齐用户给的参考图观感，单/双色系靠明度与色温拉开前后空间：
+#   lidar    激光雷达蓝青——远深藏青、中蔚蓝、近亮青白
+#   radar    雷达蓝绿·暖尖——蓝青为底，最近处绿→黄→橙红点睛（经典扫描仪配色）
+#   indigo   靛蓝冰晶——黑→暗靛→长春花蓝→近处白（巨石阵扫描风）
+#   moss     苔原绿——墨绿黑→苔绿→草绿→近处浅卡其（森林苔原风）
+#   lavender 薰衣草雾——暗灰绿→灰蓝→长春花→近处雾白（柔和低对比）
+_CUSTOM_CMAP_STOPS = {
+    "lidar": ([0, 90, 170, 225, 255],
+              [(3, 10, 40), (0, 60, 180), (0, 140, 255),
+               (0, 220, 220), (170, 255, 225)]),
+    "radar": ([0, 110, 170, 210, 235, 255],
+              [(2, 8, 45), (0, 90, 220), (60, 190, 235),
+               (80, 220, 120), (235, 220, 70), (250, 120, 40)]),
+    "indigo": ([0, 90, 170, 225, 255],
+               [(8, 8, 25), (60, 60, 140), (125, 125, 225),
+                (200, 200, 245), (255, 255, 255)]),
+    "moss": ([0, 90, 170, 220, 255],
+             [(5, 12, 8), (30, 70, 40), (90, 150, 80),
+              (150, 190, 110), (225, 220, 170)]),
+    "lavender": ([0, 80, 150, 210, 255],
+                 [(40, 50, 45), (90, 100, 120), (130, 140, 200),
+                  (170, 175, 225), (245, 245, 250)]),
+}
+
+
+def _build_custom_luts() -> dict:
+    """按档位表插值生成 256x3 BGR 查表（numpy 查表着色，不依赖 OpenCV 自定义色表接口）。"""
     idx = np.arange(256, dtype=np.float32)
-    rgb = np.stack([np.interp(idx, stops_i, stops_rgb[:, c]) for c in range(3)], axis=1)
-    return np.ascontiguousarray(rgb[:, ::-1]).astype(np.uint8)   # RGB→BGR
+    luts = {}
+    for name, (stops_i, stops_rgb) in _CUSTOM_CMAP_STOPS.items():
+        si = np.array(stops_i, dtype=np.float32)
+        sc = np.array(stops_rgb, dtype=np.float32)
+        rgb = np.stack([np.interp(idx, si, sc[:, c]) for c in range(3)], axis=1)
+        luts[name] = np.ascontiguousarray(rgb[:, ::-1]).astype(np.uint8)   # RGB→BGR
+    return luts
 
 
-_LIDAR_LUT = _lidar_lut()
+_CUSTOM_LUTS = _build_custom_luts()
 
 
 def _cfg_num(cfg: dict, key: str, default: float) -> float:
@@ -392,8 +418,8 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     cmap = str(cfg.get("depth_colormap", "turbo"))
     if cmap == "gray":
         img = cv2.cvtColor(t8, cv2.COLOR_GRAY2BGR)
-    elif cmap == "lidar":
-        img = _LIDAR_LUT[t8]   # numpy 查表（不依赖 OpenCV 自定义色表接口）
+    elif cmap in _CUSTOM_LUTS:
+        img = _CUSTOM_LUTS[cmap][t8]   # numpy 查表着色
     else:
         img = cv2.applyColorMap(t8, _DEPTH_CMAPS.get(cmap, cv2.COLORMAP_TURBO))
 

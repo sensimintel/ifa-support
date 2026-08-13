@@ -88,7 +88,8 @@ DEV_CONFIG_LIMITS = {
 DEV_CONFIG_ENUMS = {
     "depth_colormap": {"turbo", "jet", "viridis", "plasma", "inferno", "magma",
                        "hot", "bone", "ocean", "hsv", "parula", "cividis",
-                       "twilight_shifted", "deepgreen", "gray", "lidar"},
+                       "twilight_shifted", "deepgreen", "gray", "lidar",
+                       "radar", "indigo", "moss", "lavender"},
     "depth_eq": {"off", "global", "clahe"},          # 直方图均衡模式
     "depth_fill": {"off", "close", "inpaint"},       # 无效点孔洞填充模式
     "depth_smooth": {"off", "median", "bilateral"},  # 空域滤波模式

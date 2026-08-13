@@ -2456,6 +2456,10 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div class="fld"><label>色彩映射</label>
   <select id="dd_cmap">
    <option value="lidar">LIDAR 蓝青（近亮青远深蓝）</option>
+   <option value="radar">雷达蓝绿·暖尖（近端绿黄橙点睛）</option>
+   <option value="indigo">靛蓝冰晶（近白远靛黑）</option>
+   <option value="moss">苔原绿（近卡其远墨绿）</option>
+   <option value="lavender">薰衣草雾（柔和低对比）</option>
    <option value="turbo">TURBO（默认）</option><option value="jet">JET</option>
    <option value="viridis">VIRIDIS</option><option value="plasma">PLASMA</option>
    <option value="inferno">INFERNO</option><option value="magma">MAGMA</option>
