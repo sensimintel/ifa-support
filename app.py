@@ -2245,8 +2245,6 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  /* 点云化样式层：图片背景像素格化后经 mask 圆点镂空（形态层，保留原色彩）。
     开启时 img 层隐藏、由本 canvas 呈现（构图同 object-fit:cover） */
  #bgDot{position:absolute;inset:0;width:100%;height:100%;display:none}
- #ovlImg{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;
-  pointer-events:none;display:none;mix-blend-mode:screen}
  #stage.doton .bg{visibility:hidden}
  /* GLB 背景双缓冲：两个 model-viewer 常驻（display 不可为 none——model-viewer 靠
     IntersectionObserver 决定加载，display:none 的实例永远不触发 load），用 opacity
@@ -2375,7 +2373,6 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    min-field-of-view="10deg" max-field-of-view="60deg"
    shadow-intensity="0.3" exposure="1.35"></model-viewer>
  <div id="shade"></div>
- <img id="ovlImg" src="/static/overlay-halo.png" alt="">
 
  <svg id="logo" viewBox="0 0 132 16" fill="none" xmlns="http://www.w3.org/2000/svg">
   <path fill-rule="evenodd" clip-rule="evenodd" fill="#FFFDF7" d="M7.89492 0C10.0744 0.000214409 11.9432 0.773049 13.48 2.30987C15.0165 3.84677 15.788 5.71539 15.788 7.89492C15.7878 10.0741 15.0163 11.9415 13.48 13.4782C11.9432 15.015 10.0744 15.7878 7.89492 15.788C5.71553 15.7879 3.8485 15.0146 2.31168 13.4782C0.774843 11.9413 0.000194423 10.0744 0 7.89492C0 5.71506 0.77465 3.8469 2.31168 2.30987C3.84849 0.773434 5.71557 7.90328e-05 7.89492 0ZM7.89492 1.90342C6.8145 1.90347 5.81496 2.1734 4.89191 2.71269L4.8901 2.7145C3.96745 3.24172 3.23472 3.96349 2.69454 4.88647L2.69636 4.88828C2.16858 5.81194 1.90523 6.81279 1.90523 7.89492C1.90537 8.97584 2.16777 9.97514 2.69454 10.8979L2.90684 11.2354C3.42094 12.0013 4.08036 12.6207 4.88828 13.0935C5.81146 13.6207 6.81346 13.8846 7.89492 13.8846C8.97675 13.8845 9.97812 13.6212 10.9016 13.0935C11.8246 12.5533 12.5481 11.8224 13.0753 10.8997L13.0771 10.8979C13.6165 9.97494 13.8863 8.97526 13.8864 7.89492C13.8864 6.81426 13.6166 5.81332 13.0771 4.8901L13.0753 4.88828C12.548 3.96546 11.8242 3.24198 10.9016 2.7145L10.8979 2.71269C9.97497 2.1734 8.97522 1.90357 7.89492 1.90342Z"/>
@@ -2632,25 +2629,6 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <input type="range" id="r_dt_spd" min="0" max="3" step="0.1" value="1"></div>
  <div class="fld"><label>点阵背景色</label>
   <div class="radios"><input type="color" id="c_dt_bg" value="#000000"></div></div>
- <div class="sec">叠加图层（点云层之上）</div>
- <div class="fld"><label>光环叠加</label>
-  <div class="radios">
-   <label><input type="radio" name="ovon" value="0"> 关</label>
-   <label><input type="radio" name="ovon" value="1" checked> 开</label>
-  </div></div>
- <div class="fld"><label>叠加透明度 <b id="v_ov_op">100</b>%</label>
-  <input type="range" id="r_ov_op" min="0" max="100" step="5" value="100"></div>
- <div class="fld"><label>混合方式</label>
-  <div class="radios">
-   <label><input type="radio" name="ovbl" value="screen" checked> 滤色（黑透光叠）</label>
-   <label><input type="radio" name="ovbl" value="normal"> 正常（原图盖底）</label>
-  </div></div>
- <div class="fld"><label>画面适配</label>
-  <div class="radios">
-   <label><input type="radio" name="ovfit" value="cover" checked> 裁满</label>
-   <label><input type="radio" name="ovfit" value="contain"> 完整</label>
-   <label><input type="radio" name="ovfit" value="fill"> 拉伸</label>
-  </div></div>
  <div class="hint"><b>网格点阵</b>：像素格化取色 + 等距圆点（LiDAR 点阵观感），
   不规律排布=帧间稳定的逐点随机偏移，运动=漂移/呼吸/闪烁。<b>粒子云</b>：数万粒子
   按画面亮度重要性采样落点——主体稠密近连片、边缘稀疏成雾、暗区零星孤点（粉尘爆散
@@ -3509,34 +3487,6 @@ Object.keys(DT_SLIDERS).forEach(k=>{
     const [rid,vid]=DT_SLIDERS[k];
     $(rid).value=dotCfg[k];$(vid).textContent=''+dotCfg[k];});
   $('c_dt_bg').value=dotCfg.bg;$('c_dt_pc').value=dotCfg.pcolor;
-})();
-// ── 叠加图层：光环图压在点云层之上（本页 CSS 即时生效、只存本浏览器）──
-let ovlCfg={on:1,opacity:100,blend:'screen',fit:'cover'};
-try{Object.assign(ovlCfg,JSON.parse(localStorage.getItem('exp_ovl')||'{}'));}catch(e){}
-function saveOvl(){localStorage.setItem('exp_ovl',JSON.stringify(ovlCfg));}
-function applyOvl(){
-  const el=$('ovlImg');
-  el.style.display=+ovlCfg.on?'block':'none';
-  el.style.opacity=(+ovlCfg.opacity)/100;
-  el.style.mixBlendMode=ovlCfg.blend;
-  el.style.objectFit=ovlCfg.fit;
-}
-[['ovon','on'],['ovbl','blend'],['ovfit','fit']].forEach(([nm,k])=>
-  document.querySelectorAll('input[name='+nm+']').forEach(r=>
-    r.addEventListener('change',()=>{
-      const v=document.querySelector('input[name='+nm+']:checked').value;
-      ovlCfg[k]=(nm==='ovon')?+v:v;
-      applyOvl();saveOvl();})));
-$('r_ov_op').addEventListener('input',()=>{
-  ovlCfg.opacity=+$('r_ov_op').value;$('v_ov_op').textContent=$('r_ov_op').value;
-  applyOvl();saveOvl();});
-// localStorage 记忆值回填叠加图层控件（页面加载一次）
-(function(){
-  const on=document.querySelector('input[name=ovon][value="'+(+ovlCfg.on)+'"]');if(on)on.checked=true;
-  const bl=document.querySelector('input[name=ovbl][value="'+ovlCfg.blend+'"]');if(bl)bl.checked=true;
-  const ft=document.querySelector('input[name=ovfit][value="'+ovlCfg.fit+'"]');if(ft)ft.checked=true;
-  $('r_ov_op').value=ovlCfg.opacity;$('v_ov_op').textContent=''+ovlCfg.opacity;
-  applyOvl();
 })();
 addEventListener('resize',()=>{if(+dotCfg.on)applyDotCfg();});
 
