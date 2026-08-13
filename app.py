@@ -2585,6 +2585,11 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <input type="range" id="r_dt_pitch" min="3" max="16" step="1" value="7"></div>
  <div class="fld"><label>圆径占比 <b id="v_dt_r">34</b>%</label>
   <input type="range" id="r_dt_r" min="10" max="50" step="1" value="34"></div>
+ <div class="fld"><label>点形状</label>
+  <div class="radios">
+   <label><input type="radio" name="dtgsh" value="1" checked> 圆</label>
+   <label><input type="radio" name="dtgsh" value="0"> 方</label>
+  </div></div>
  <div class="fld"><label>不规律排布 <b id="v_dt_jit">0</b>%</label>
   <input type="range" id="r_dt_jit" min="0" max="100" step="5" value="0"></div>
  <div class="fld"><label>运动</label>
@@ -2600,6 +2605,11 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <input type="range" id="r_dt_pn" min="5000" max="80000" step="5000" value="30000"></div>
  <div class="fld"><label>粒径 <b id="v_dt_psz">2</b>px</label>
   <input type="range" id="r_dt_psz" min="1" max="4" step="0.5" value="2"></div>
+ <div class="fld"><label>粒子形状</label>
+  <div class="radios">
+   <label><input type="radio" name="dtpsh" value="0" checked> 方</label>
+   <label><input type="radio" name="dtpsh" value="1"> 圆</label>
+  </div></div>
  <div class="fld"><label>密度对比 <b id="v_dt_pct">1.2</b></label>
   <input type="range" id="r_dt_pct" min="0.5" max="3" step="0.1" value="1.2"></div>
  <div class="fld"><label>单色模式</label>
@@ -3172,8 +3182,8 @@ addEventListener('resize',applyDdCss);   // 旋转补偿量随视口比例变化
 //    深度帧更新只刷新取色缓存，与 rAF 动画解耦互不打断。
 //    对所有走 showImg 的图片类来源统一生效；GLB 背景不适用（有自己的点渲染区）══
 // 展会默认（2026-08-13 现场调定）：点阵化开、点距7、圆径34%
-let dotCfg={on:1,mode:0,pitch:7,r:34,jitter:0,motion:0,speed:1,bg:'#000000',
-  pn:30000,psize:2,pcontrast:1.2,pmono:0,pcolor:'#fffdf7',pdrift:1,prespawn:1,pfloat:35};
+let dotCfg={on:1,mode:0,pitch:7,r:34,jitter:0,motion:0,speed:1,bg:'#000000',gshape:1,
+  pn:30000,psize:2,pcontrast:1.2,pmono:0,pcolor:'#fffdf7',pdrift:1,prespawn:1,pfloat:35,pshape:0};
 try{Object.assign(dotCfg,JSON.parse(localStorage.getItem('exp_dot')||'{}'));}catch(e){}
 let dotIm=null,dotOffCv=null;        // 最近一帧背景 Image / 离屏降采样画布（复用）
 let dotData=null,dotCols=0,dotRows=0;// 降采样取色缓存：动画重绘不重复采样
@@ -3276,7 +3286,8 @@ function dotDraw(tSec){
     }
     if(r<=0.2)continue;
     ctx.fillStyle='rgba('+d[o]+','+d[o+1]+','+d[o+2]+','+al.toFixed(3)+')';
-    ctx.beginPath();ctx.arc(x,y,r,0,TAU);ctx.fill();
+    if(+dotCfg.gshape===1){ctx.beginPath();ctx.arc(x,y,r,0,TAU);ctx.fill();}
+    else ctx.fillRect(x-r,y-r,r*2,r*2);
   }
 }
 // ── 粒子云模式：持久粒子池（x,y,相位,粒径因子 ×4 float）──
@@ -3310,32 +3321,86 @@ function pcEnsure(){
   pcPool=new Float32Array(pcN*4);
   for(let i=0;i<pcN;i++)pcSpawn(i);
 }
+// ── 粒子云 ImageData 直写渲染：逐粒子 fillStyle 字符串解析+fillRect（外加拖尾三倍
+//    过绘）在粒子数拉高后一帧要十几万次 Canvas 状态切换，主线程被打满、帧率崩塌，
+//    深度帧轮询/取色缓存全被饿死——画面整体"卡住"。改成 typed array 手写像素、
+//    整帧一次 putImageData，粒子数拉满也稳住帧率 ──
+let pcImg=null,pcBuf=null,pcMaskCache={},pcPrevT=0;
+function pcMask(s){
+  // 圆形蒙版偏移缓存（整数粒径 s → 圆内像素 [dx,dy] 扁平表）；s<3 时圆=方不走蒙版
+  let m=pcMaskCache[s];if(m)return m;
+  m=[];const c=(s-1)/2,r2=(s/2+0.1)*(s/2+0.1);
+  for(let dy=0;dy<s;dy++)for(let dx=0;dx<s;dx++){
+    const ax=dx-c,ay=dy-c;
+    if(ax*ax+ay*ay<=r2){m.push(dx);m.push(dy);}
+  }
+  pcMaskCache[s]=m;return m;
+}
+function pcPx(idx,cr,cg,cb,a){
+  // 单像素 src-over：不透明或落在空像素直接写；半透明叠加时按通道混合
+  const dst=pcBuf[idx];
+  if(a===255||dst===0){pcBuf[idx]=(a<<24)|(cb<<16)|(cg<<8)|cr;return;}
+  const da=dst>>>24,ia=255-a;
+  const dr=dst&255,dg=(dst>>>8)&255,db=(dst>>>16)&255;
+  pcBuf[idx]=(Math.max(da,a)<<24)|(((cb*a+db*ia)/255|0)<<16)|(((cg*a+dg*ia)/255|0)<<8)|((cr*a+dr*ia)/255|0);
+}
+function pcStamp(x,y,s,cr,cg,cb,al,round,W,H){
+  // 以 (x,y) 为中心盖一颗 s×s 的粒子章（方/圆），越界部分逐像素裁剪
+  const x0=Math.round(x-s/2),y0=Math.round(y-s/2);
+  if(x0+s<=0||y0+s<=0||x0>=W||y0>=H)return;
+  const a=al>=1?255:(al<=0?0:(al*255)|0);
+  if(!a)return;
+  if(round&&s>=3){
+    const m=pcMask(s);
+    for(let k=0;k<m.length;k+=2){
+      const px=x0+m[k],py=y0+m[k+1];
+      if(px>=0&&px<W&&py>=0&&py<H)pcPx(py*W+px,cr,cg,cb,a);
+    }
+  }else{
+    for(let dy=0;dy<s;dy++){
+      const py=y0+dy;if(py<0||py>=H)continue;
+      const row=py*W;
+      for(let dx=0;dx<s;dx++){
+        const px=x0+dx;if(px>=0&&px<W)pcPx(row+px,cr,cg,cb,a);
+      }
+    }
+  }
+}
 function pcDraw(t){
   const cv=$('bgDot');
   if(!dotData&&!dotSample())return;
   pcEnsure();
   const ctx=cv.getContext('2d'),dpr=devicePixelRatio||1;
-  ctx.clearRect(0,0,cv.width,cv.height);
+  const W=cv.width,H=cv.height;
+  if(!pcImg||pcImg.width!==W||pcImg.height!==H){
+    pcImg=ctx.createImageData(W,H);
+    pcBuf=new Uint32Array(pcImg.data.buffer);
+  }
+  pcBuf.fill(0);
   const mono=+dotCfg.pmono===1,spd=+dotCfg.speed;
   const amp=(+dotCfg.pdrift)*1.6*dpr,psz=(+dotCfg.psize)*dpr;
-  const gw=cv.width/dotCols,gh=cv.height/dotRows,d=dotData;
-  // 寿命重生：每帧重生一小撮（基础 0.4%×重生率）——粒子缓慢闪换，画面内容变了
-  // 分布随之迁移（重生落点按当前帧权重）
-  const re=Math.max(1,Math.round(pcN*0.004*(+dotCfg.prespawn)));
+  const round=+dotCfg.pshape===1;
+  const gw=W/dotCols,gh=H/dotRows,d=dotData;
+  // 寿命重生按真实时间走（基础 12%/秒×重生率）：旧实现按帧固定 0.4%，帧率一低
+  // 每秒重生数等比暴跌，画面内容变了粒子还赖在旧位置——"部分点停在原地"的根源
+  const dt=Math.min(0.25,Math.max(0.001,t-pcPrevT));pcPrevT=t;
+  const re=Math.max(1,Math.round(pcN*0.12*(+dotCfg.prespawn)*dt));
   for(let k=0;k<re;k++)pcSpawn(Math.floor(Math.random()*pcN));
   const pf=(+dotCfg.pfloat)/100;
-  if(mono)ctx.fillStyle=dotCfg.pcolor;
-  let curAl=1;
+  let mr=255,mg=253,mb=247;
+  if(mono){const c=dotCfg.pcolor;
+    mr=parseInt(c.slice(1,3),16);mg=parseInt(c.slice(3,5),16);mb=parseInt(c.slice(5,7),16);}
   for(let i=0;i<pcN;i++){
     const b=i*4,ph=pcPool[b+2];
     // 伪噪声漂移：两组不同频正弦叠加、逐粒子相位——悬浮微尘的缓慢无序运动
     const x=pcPool[b]+Math.sin(t*spd*0.7+ph)*amp+Math.sin(t*spd*0.31+ph*2.7)*amp*0.6;
     const y=pcPool[b+1]+Math.cos(t*spd*0.6+ph*1.7)*amp+Math.cos(t*spd*0.23+ph*3.1)*amp*0.5;
-    if(!mono){
+    let cr=mr,cg=mg,cb=mb;
+    if(!mono){   // 保留原色彩（取飘散前位置）
       const gx=Math.min(dotCols-1,Math.max(0,(x/gw)|0));
       const gy=Math.min(dotRows-1,Math.max(0,(y/gh)|0));
       const o=(gy*dotCols+gx)*4;
-      ctx.fillStyle='rgb('+d[o]+','+d[o+1]+','+d[o+2]+')';   // 保留原色彩（取飘散前位置）
+      cr=d[o];cg=d[o+1];cb=d[o+2];
     }
     let al=1,ex=0,ey=0;
     if(pf>0&&dotEdge){
@@ -3355,18 +3420,14 @@ function pcDraw(t){
         al=1-prog*0.9;
       }
     }
-    if(al!==curAl){ctx.globalAlpha=al;curAl=al;}
-    const s=Math.max(1,pcPool[b+3]*psz);
-    ctx.fillRect(x+ex,y+ey,s,s);
+    const s=Math.max(1,Math.round(pcPool[b+3]*psz));
+    pcStamp(x+ex,y+ey,s,cr,cg,cb,al,round,W,H);
     if(ex||ey){   // 拖尾：沿来路补两颗渐淡渐小的点，扫出消散的流线感
-      ctx.globalAlpha=al*0.5;
-      ctx.fillRect(x+ex*0.75,y+ey*0.75,s*0.85,s*0.85);
-      ctx.globalAlpha=al*0.25;
-      ctx.fillRect(x+ex*0.5,y+ey*0.5,s*0.7,s*0.7);
-      curAl=-1;
+      pcStamp(x+ex*0.75,y+ey*0.75,Math.max(1,Math.round(s*0.85)),cr,cg,cb,al*0.5,round,W,H);
+      pcStamp(x+ex*0.5,y+ey*0.5,Math.max(1,Math.round(s*0.7)),cr,cg,cb,al*0.25,round,W,H);
     }
   }
-  if(curAl!==1)ctx.globalAlpha=1;
+  ctx.putImageData(pcImg,0,0);
 }
 // ── rAF 动画循环（~30fps 节流）：粒子云常开（speed=0 时粒子静止但仍重生闪换）；
 //    网格模式仅运动开启时循环。深度帧到达只刷 dotSample 缓存，循环不重置 ──
@@ -3397,7 +3458,8 @@ function applyDotCfg(){
   }
 }
 function saveDot(){localStorage.setItem('exp_dot',JSON.stringify(dotCfg));}
-const DT_RADIOS={dton:'on',dtmode:'mode',dtmo:'motion',dtmono:'pmono'};
+const DT_RADIOS={dton:'on',dtmode:'mode',dtmo:'motion',dtmono:'pmono',
+  dtgsh:'gshape',dtpsh:'pshape'};
 Object.keys(DT_RADIOS).forEach(nm=>document.querySelectorAll('input[name='+nm+']').forEach(r=>
   r.addEventListener('change',()=>{
     dotCfg[DT_RADIOS[nm]]=+document.querySelector('input[name='+nm+']:checked').value;
