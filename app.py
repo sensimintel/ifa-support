@@ -1754,8 +1754,8 @@ async function tick(){
       //      无限打断、格子永冻（2026-08-13 真实发生）；
       //  (2) 换一次后至少停留 MIN_SWAP_MS 再换，让加载完的点云停住显示——否则高帧率(如 10fps)下
       //      刚 loaded 就立刻换最新，几乎一直卡在"加载中"(黑)。跳过时不更新 lastProdKey，下周期重试；
-      //  (3) 兜底：某个 GLB 加载卡死/404 时 loaded 永远 false，超 8s 强制放行换新的，避免永锁。
-      if((mv.loaded || !mv.src || Date.now()-lastSwap>=8000) && Date.now()-lastSwap>=MIN_SWAP_MS){
+      //  (3) 兜底：某个 GLB 加载卡死/404 时 loaded 永远 false，超 25s 强制放行换新的，避免永锁（阈值须大于慢网拉一个大 GLB 的时间，否则会打断将完成的加载）。
+      if((mv.loaded || !mv.src || Date.now()-lastSwap>=25000) && Date.now()-lastSwap>=MIN_SWAP_MS){
         lastSwap=Date.now();
         lastProdKey=prodKey;
         preApplyView();   // 换模型前先摆好视角，让新点云加载首帧就在锁定视角，消除抖动
@@ -1785,7 +1785,7 @@ async function tick(){
     if(s3.seq && s3.seq!==lastS3){
       if(s3.kind==='model' && s3.url){
         // 与②同款换模型节流：上一个没加载完不换、加载完至少停 MIN_SWAP_MS（读 src 属性 + 8s 兜底，同②）
-        if((mv2.loaded || !mv2.src || Date.now()-lastSwap3>=8000) && Date.now()-lastSwap3>=MIN_SWAP_MS){
+        if((mv2.loaded || !mv2.src || Date.now()-lastSwap3>=25000) && Date.now()-lastSwap3>=MIN_SWAP_MS){
           lastSwap3=Date.now(); lastS3=s3.seq;
           mv2.src=s3.url;
           mv2.style.display='block';$('s3img').style.display='none';$('s3wait').style.display='none';
@@ -1811,7 +1811,7 @@ async function tick(){
     const hl=await(await fetch('/api/sam3hl/status',{cache:'no-store'})).json();
     if(hl.seq && hl.seq!==lastHl){
       if(hl.kind==='model' && hl.url){
-        if((mv3.loaded || !mv3.src || Date.now()-lastSwapH>=8000) && Date.now()-lastSwapH>=MIN_SWAP_MS){
+        if((mv3.loaded || !mv3.src || Date.now()-lastSwapH>=25000) && Date.now()-lastSwapH>=MIN_SWAP_MS){
           lastSwapH=Date.now(); lastHl=hl.seq;
           mv3.src=hl.url;
           mv3.style.display='block';$('hlimg').style.display='none';$('hlwait').style.display='none';
@@ -2217,7 +2217,7 @@ function showModel(url,fov){          // GLB 产物（LA 点云等）：全屏 m
   if(fov)mvFov=fov;
   if(url===lastMvUrl){mv.style.display='block';return true;}
   // 读 src 属性判「加载中」（model-viewer 的 src 不反射到 attribute）+ 8s 卡死兜底，同 /panel
-  if(!(mv.loaded||!mv.src||Date.now()-lastMvSwap>=8000)||Date.now()-lastMvSwap<MIN_SWAP_MS)return true;
+  if(!(mv.loaded||!mv.src||Date.now()-lastMvSwap>=25000)||Date.now()-lastMvSwap<MIN_SWAP_MS)return true;
   lastMvSwap=Date.now();lastMvUrl=url;lastBgKey='';
   mv.src=url;mv.style.display='block';
   $('bgA').classList.remove('on');$('bgB').classList.remove('on');
