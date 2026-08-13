@@ -81,6 +81,100 @@ _stop = threading.Event()
 # SDK 设备枚举/开流不保证并发安全，统一串行化
 _sdk_lock = threading.Lock()
 
+# ── 取帧僵死看门狗（2026-08-13 事故：USB 掉线后 G335 线程卡死在 SDK 取帧调用里，
+# 不进重连循环、插拔无效，只能重启进程。展台 USB 被碰掉是常态，必须自愈）──
+# 三级防线：
+#   1. 线程自检：wait_for_frames 正常返回但连续 FRAME_STALL_S 无帧（拔线后 SDK
+#      往往安静返回 None）→ 线程自己 raise 走既有 5s 重连；
+#   2. watchdog 强拆：线程连自检都没动静（卡死在 SDK 调用内）→ watchdog 线程
+#      代为 stop pipeline（尽力唤醒阻塞调用）、置代数废弃标记、起新线程重连；
+#      卡死旧线程即使醒不来也只是泄漏一条线程，好过整进程僵死；
+#   3. 进程重生：连续 WATCHDOG_REBUILD_MAX 次线程级重建仍无帧（如 SDK 全局
+#      mutex 烂掉，新线程也卡在 _sdk_lock/开流上）→ os._exit 让 LaunchDaemon
+#      （KeepAlive）拉起整个进程，代价是两台相机同断几秒。
+FRAME_STALL_S = 10.0      # 线程自检阈值：超过即主动重建取帧管线
+WATCHDOG_STALL_S = 20.0   # watchdog 判卡死阈值：自检都没触发=线程卡死在 SDK 里
+WATCHDOG_REBUILD_MAX = 3  # 连续线程级重建无效上限，超过进程自杀重生
+
+_watch_lock = threading.Lock()
+# device_id -> {"ts": 最近活跃时刻, "gen": 当前线程代数, "pipe": 当前 pipeline,
+#               "rebuilds": 连续未见帧的重建次数, "pid": USB PID, "spec": 能力描述}
+# ts 的语义是「线程最近一次证明自己活着」：取到帧 / 开流成功 / 重连循环报错都算；
+# 只有取到帧才清零 rebuilds。设备长期不在线（如 astra 未插）时线程每 5s 报
+# 「设备未找到」并 touch，不会误触发 watchdog。
+_watch: dict = {}
+
+
+def _watch_register(device_id: str, pid: int, spec: dict) -> None:
+    with _watch_lock:
+        _watch[device_id] = {"ts": time.time(), "gen": 0, "pipe": None,
+                             "rebuilds": 0, "pid": pid, "spec": spec}
+
+
+def _watch_alive(device_id: str, gen: int) -> bool:
+    """本线程是否仍是该设备的当前代（watchdog 重建后旧代应尽快退出）。"""
+    with _watch_lock:
+        return _watch[device_id]["gen"] == gen
+
+
+def _watch_touch(device_id: str, gen: int, pipe=None, frame: bool = False) -> None:
+    """线程报活。frame=True 表示真取到了帧（清零重建计数）；开流成功时传 pipe
+    供 watchdog 强拆用。过期代的报活直接忽略。"""
+    with _watch_lock:
+        w = _watch[device_id]
+        if w["gen"] != gen:
+            return
+        w["ts"] = time.time()
+        if pipe is not None:
+            w["pipe"] = pipe
+        if frame:
+            w["rebuilds"] = 0
+
+
+def _safe_stop(pipe, device_id: str) -> None:
+    """watchdog 线程里尽力 stop 卡死线程持有的 pipeline（stop 本身也可能阻塞，
+    所以由独立 daemon 线程执行，卡住就随它去）。"""
+    try:
+        pipe.stop()
+        log.info("[%s] watchdog 已停掉疑似僵死的 pipeline", device_id)
+    except Exception as e:
+        log.warning("[%s] watchdog 停 pipeline 失败（不影响新线程重建）: %s",
+                    device_id, e)
+
+
+def _watchdog_loop():
+    """每 3s 巡检各相机线程活跃时间戳，按三级防线处置（见模块头注释）。"""
+    while not _stop.wait(3):
+        now = time.time()
+        with _watch_lock:
+            snapshot = [(d, dict(w)) for d, w in _watch.items()]
+        for dev, w in snapshot:
+            if now - w["ts"] < WATCHDOG_STALL_S:
+                continue
+            if w["rebuilds"] >= WATCHDOG_REBUILD_MAX:
+                log.error("[%s] 线程级重建 %d 次仍无帧，进程自杀重生"
+                          "（由 LaunchDaemon KeepAlive 拉起）", dev, w["rebuilds"])
+                logging.shutdown()
+                os._exit(1)
+            with _watch_lock:
+                w2 = _watch[dev]
+                if w2["gen"] != w["gen"] or now - w2["ts"] < WATCHDOG_STALL_S:
+                    continue   # 巡检期间已被处理/已恢复
+                w2["gen"] += 1
+                w2["rebuilds"] += 1
+                w2["ts"] = now          # 给新线程完整的观察窗口
+                gen, n = w2["gen"], w2["rebuilds"]
+                pipe, w2["pipe"] = w2["pipe"], None
+            log.warning("[%s] %.0f 秒无任何线程活动（疑似卡死在 SDK 取帧调用），"
+                        "触发线程级重建（第 %d/%d 次）",
+                        dev, WATCHDOG_STALL_S, n, WATCHDOG_REBUILD_MAX)
+            if pipe is not None:
+                threading.Thread(target=_safe_stop, args=(pipe, dev),
+                                 name=f"{dev}-force-stop", daemon=True).start()
+            threading.Thread(target=_camera_worker,
+                             args=(w["pid"], w["spec"], dev, gen),
+                             name=f"{dev}-gen{gen}", daemon=True).start()
+
 # 当前生效的推帧频率：以服务端配置为准（per-device 优先、全局旧口径兜底），
 # 都没有时用 PUSH_FPS（见模块头注释）。dict 按 device_id 分桶，两台相机各调各的
 _fps_lock = threading.Lock()
@@ -475,12 +569,13 @@ def _push_aux(session, device_id: str, spec, cache: _IRCache,
     return True
 
 
-def _camera_worker(pid: int, spec: dict, device_id: str):
-    """单相机工作线程：开流 → 节流推帧（RGB+深度 / 双目 aux）→ 出错重连，直到进程退出。"""
+def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
+    """单相机工作线程：开流 → 节流推帧（RGB+深度 / 双目 aux）→ 出错重连，直到
+    进程退出或本线程代数被 watchdog 废弃（gen 落后即静默退出，由新代接管）。"""
     ctx = None
     session = requests.Session()
     push_err = 0
-    while not _stop.is_set():
+    while not _stop.is_set() and _watch_alive(device_id, gen):
         pipe = None
         try:
             with _sdk_lock:
@@ -493,6 +588,9 @@ def _camera_worker(pid: int, spec: dict, device_id: str):
                 laser_mode = _setup_laser(dev, device_id) if spec["stereo"] else "off"
                 baseline_mm = _read_baseline_mm(dev, spec) if spec["stereo"] else None
             log.info("[%s] 已启动，流=%s 基线=%s", device_id, sorted(streams), baseline_mm)
+            # 开流成功即报活并登记 pipe（watchdog 强拆用）；给出帧留满一个自检窗口
+            _watch_touch(device_id, gen, pipe=pipe)
+            last_fs = time.time()
             first = True
             first_depth = True
             depth_err = 0
@@ -503,8 +601,18 @@ def _camera_worker(pid: int, spec: dict, device_id: str):
             depth_state: dict = {}
             while not _stop.is_set():
                 fs = pipe.wait_for_frames(500)
+                if not _watch_alive(device_id, gen):
+                    return   # 本代已被 watchdog 废弃：新线程已接管，静默退出
                 if fs is None:
+                    # 线程自检（第一级防线）：SDK 活着但长时间不出帧——拔线后
+                    # wait_for_frames 常安静返回 None、pipeline 已失效，原地等待
+                    # 插回也收不到帧，必须重建管线
+                    if time.time() - last_fs > FRAME_STALL_S:
+                        raise RuntimeError(
+                            f"连续 {FRAME_STALL_S:.0f} 秒无帧，主动重建取帧管线")
                     continue
+                last_fs = time.time()
+                _watch_touch(device_id, gen, frame=True)
                 cf = fs.get_color_frame()
                 # 双目 IR 每个 frameset 都收进缓存（interleave 下 IR/深度交替出现，
                 # 只在推送节拍看当前帧组会漏掉一半帧源）
@@ -601,6 +709,8 @@ def _camera_worker(pid: int, spec: dict, device_id: str):
                         last_push = now  # 失败也按节奏走，避免忙等打爆目标
         except Exception as e:
             log.warning("[%s] 相机链路异常，5 秒后重连: %s", device_id, e)
+            # 重连等待也算线程活着（设备长期不在线属正常等待，不触发 watchdog）
+            _watch_touch(device_id, gen)
             _stop.wait(5)
         finally:
             if pipe is not None:
@@ -637,10 +747,14 @@ def main():
         if pid not in present:
             log.warning("[%s] 启动时未发现（pid=%#06x），线程将持续等待接入",
                         device_id, pid)
-        t = threading.Thread(target=_camera_worker, args=(pid, spec, device_id),
+        _watch_register(device_id, pid, spec)
+        t = threading.Thread(target=_camera_worker, args=(pid, spec, device_id, 0),
                              name=device_id, daemon=True)
         t.start()
         threads.append(t)
+    # 取帧僵死看门狗：巡检各相机线程活跃度，卡死即线程级重建、屡建无效即进程重生
+    threading.Thread(target=_watchdog_loop, name="frame-watchdog",
+                     daemon=True).start()
 
     while not _stop.is_set():
         _stop.wait(1)
