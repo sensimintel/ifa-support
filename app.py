@@ -1798,7 +1798,7 @@ function renderLatency(s){
 }
 
 let lastSeq=-1,lastDepth=-1,lastProdKey='',lastSwap=0,lastStKey='',lastSwapSt=0,lastAuxSeq=-1;
-const MIN_SWAP_MS=1500;   // 点云换图最小间隔：加载完让它停住显示，避免高帧率下一直卡在"加载中"(黑屏)
+const MIN_SWAP_MS=0;   // 换图节流已停用（2026-08-13 应用户要求，有线大屏跟上后端节拍）；"加载中不打断"守卫仍在，慢网表现为持续加载
 
 // ── 多设备：下拉选设备（服务端只处理选中设备一路；非选中设备的帧只进各自缓存） ──
 const devsel=$('devsel');
@@ -2339,7 +2339,7 @@ const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无�
 // ══ 背景层：四种来源下拉框选择（临时工具），默认 SAM3 高亮点云 ══
 let bgSource=localStorage.getItem('exp_bg')||'hl';
 if(!['hl','stereo','la','s3'].includes(bgSource))bgSource='hl';   // 旧版存过 raw 的自动回落高亮点云
-const MIN_SWAP_MS=1500;               // GLB 换模型最小间隔（同 /panel：防高帧率下一直黑屏加载）
+const MIN_SWAP_MS=0;               // 换图节流已停用（同 /panel，2026-08-13）；"加载中不打断"守卫仍在
 let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
 
 let lastBgUrl='';                     // 当前背景图 url（流水小窗镜像用）
