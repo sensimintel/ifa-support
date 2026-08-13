@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -3721,10 +3722,30 @@ def _da3_stereo_processor(left_raw: bytes, right_raw: bytes, aux_info: dict,
     return DEFERRED
 
 
+# ── 双目取景参数的帧间平滑（治换图缩放抖动）：DA3 逐帧估计的内参 FOV 与双目基线
+# 都有帧间噪声（实测 fov 42.8~52.2° 抖、基线估计 36~40mm 抖、场景变化时更大），
+# 逐帧直出会让前端每次换图都按新值重新取景 → 视觉上"快速缩放一下"。
+# 按设备取近 N 帧滑动中位数输出：中位数对离群帧（如手挡住画面时的离谱估计）比
+# 均值稳，收敛也够快（N=10 @1.4张/s ≈ 7 秒窗口）。──────────────────────────
+_STEREO_SMOOTH_N = 10
+_stereo_smooth: dict = {}          # device_id -> {"scale": deque, "fov": deque}
+_stereo_smooth_lock = threading.Lock()
+
+
+def _smooth_stereo_param(device_id: str, key: str, value):
+    """当帧估计值滑进该设备窗口，返回窗口中位数；value=None 时返回历史中位数（可能 None）。"""
+    with _stereo_smooth_lock:
+        dq = _stereo_smooth.setdefault(device_id, {}).setdefault(
+            key, deque(maxlen=_STEREO_SMOOTH_N))
+        if value is not None:
+            dq.append(float(value))
+        return float(np.median(dq)) if dq else None
+
+
 def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
                           device_id, t0, infer_ms) -> dict:
     """双目产物构建级：SAM3 左目分割 + 米制缩放 + 合并点云 GLB（在 _stereo_builder
-    线程串行执行）。"""
+    线程串行执行）。取景相关的逐帧估计量（point_scale/fov）经滑动中位数平滑输出。"""
     # SAM3 一次性分割左目（网络调用，不占 GPU 锁）
     _ts = time.time()
     try:
@@ -3748,6 +3769,8 @@ def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
         if est > 1e-6:
             est_mm = est * 1000.0
             point_scale = (float(baseline_mm) / 1000.0) / est
+    # 帧间平滑：尺度进滑动中位数（本帧估不出时沿用历史中位数），点云整体大小不再逐帧呼吸
+    point_scale = _smooth_stereo_param(device_id, "scale", point_scale)
 
     token = uuid.uuid4().hex
     outdir = GLB_DIR / token
@@ -3787,8 +3810,10 @@ def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
 
     # 真实相机垂直 FOV：与单目链路同款，前端把点云相机摆回左目光心正视 -Z
     _H = int(np.asarray(pred.depth)[0].shape[0])
-    _fov_deg = round(float(np.degrees(2 * np.arctan(_H / (2 * K0[1, 1])))), 2)
-    scale_note = (f"·米制×{point_scale:.3f}(估计基线{est_mm:.0f}mm)"
+    _fov_raw = float(np.degrees(2 * np.arctan(_H / (2 * K0[1, 1]))))
+    # 帧间平滑：FOV 逐帧估计噪声 ±10° 是换图缩放抖动的主凶，中位数稳住取景
+    _fov_deg = round(_smooth_stereo_param(device_id, "fov", _fov_raw) or _fov_raw, 2)
+    scale_note = (f"·米制×{point_scale:.3f}(估计基线{est_mm:.0f}mm·已平滑)"
                   if point_scale else "")
 
     # 双目高亮 GLB（/experience 背景来源）：同一 pred/overlays 追加构建，样式读
