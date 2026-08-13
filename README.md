@@ -33,6 +33,7 @@
 | `da3-web.service` | 可选 systemd 单元（正规化开机自启/重启） |
 | `requirements.txt` | pip 依赖（不含 `depth_anything_3`，见下） |
 | `model/` | **三个模型服务（DA3 / LocateAnything / SAM3）的一键拉起脚本与部署信息**，含 SAM3 推理服务源码（流式长记忆版）与 systemd 单元，见 `model/README.md` |
+| `mac-mini/` | **mac mini 摄像头推帧器（cam-pusher）**：把 mini 上两台 Orbbec 相机（Gemini 335 / Astra Pro Plus）的彩色流按 `/api/frame` 契约推给 8060，LaunchDaemon 常驻、开发机 rsync 推送部署，见 `mac-mini/README.md` |
 
 ## 运行
 
