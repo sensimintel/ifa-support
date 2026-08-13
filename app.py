@@ -1009,25 +1009,60 @@ _sam3hl_lock = threading.Lock()
 # 默认=②③前端 model-viewer 调优视角的等价参数（俯视10°、距离1.25×场景深度、真实FOV）：
 # 除高亮/染色外与②③ GLB 取景一致；场景相对定距把单目逐帧深度的尺度抖动归一化，视角不跳。
 # splat=1 保留点间缝隙的点状质感（拉远后点自然离散）。
-_sam3hl_cfg = {"style": "tint", "strength": 65, "point_scale": 2.0,
-               "dim": 40, "color_mode": "auto", "color": "#ff9f0a",
-               "splat": 1, "view_tilt": 10.0, "view_zoom": 1.25,
-               "eye_lift": 0.0, "eye_back": 0.0, "out_size": 760,
-               "sat": 1.0, "val": 1.0, "conf": 40,   # 饱和/明度中性：GLB 直渲本身即 model-viewer
-                                                     # 观感（点云图模式可手动调 0/1.2 复刻灰白）
-               "hue": 0.0, "outlier_mad": 12.0,
-               # 点渲染默认全中性 = three 原生观感（1px 方点、不调色、无动效）
-               "pt_size": 1.0, "pt_shape": 0, "pt_atten": 0,
-               "pt_opacity": 1.0, "pt_blend": 0, "pt_density": 100,
-               "pt_hue": 0.0, "pt_sat": 1.0, "pt_val": 1.0,
-               "pt_contrast": 1.0, "pt_exposure": 1.35, "pt_invert": 0,
+_sam3hl_cfg = {"style": "solid", "strength": 65, "point_scale": 2.0,
+               "dim": 30, "color_mode": "auto", "color": "#ff9f0a",
+               "splat": 1, "view_tilt": 0.0, "view_zoom": 1.40,
+               "eye_lift": 0.0, "eye_back": 0.05, "out_size": 760,
+               "sat": 2.0, "val": 1.2, "conf": 30,
+               "hue": 40.0, "outlier_mad": 10.0,
+               # 参考图粒子感：细而饱满的圆点，借近大远小形成景深层次
+               "pt_size": 0.9, "pt_shape": 1, "pt_atten": 1,
+               "pt_opacity": 1.0, "pt_blend": 0, "pt_density": 88,
+               "pt_hue": 0.0, "pt_sat": 0.9, "pt_val": 1.1,
+               "pt_contrast": 1.0, "pt_exposure": 2.2, "pt_invert": 0,
                "pt_colormode": 0, "pt_duo_a": "#141450", "pt_duo_b": "#ffd27f",
                "pt_ramp_near": 0.5, "pt_ramp_far": 2.2, "pt_fog": 0.0,
                "pt_clip_near": 0.0, "pt_clip_far": 8.0,
                "pt_clip_ylo": 0.0, "pt_clip_yhi": 1.0,
                "pt_rotate": 0, "pt_rotate_speed": 10.0, "pt_fov_off": 0.0,
-               "pt_pulse": 0, "pt_pulse_speed": 1.0, "pt_sparkle": 0.0,
+               "pt_pulse": 1, "pt_pulse_speed": 0.45, "pt_sparkle": 0.18,
                "pt_bg": "#000000", "pt_conf_size": 0.0, "pt_conf_alpha": 0.0}
+_SAM3HL_PRESET_PATH = Path(__file__).resolve().parent / "sam3hl_preset.json"
+
+
+def _load_sam3hl_preset():
+    """服务启动时读取上次从网页保存的高亮点云预设。"""
+    if not _SAM3HL_PRESET_PATH.is_file():
+        return
+    try:
+        saved = json.loads(_SAM3HL_PRESET_PATH.read_text(encoding="utf-8"))
+        if not isinstance(saved, dict):
+            raise ValueError("preset must be an object")
+        for key, (lo, hi, value_type) in _HL_NUM_FIELDS.items():
+            if key in saved:
+                _sam3hl_cfg[key] = value_type(min(hi, max(lo, float(saved[key]))))
+        if saved.get("style") in _HL_STYLE_CN:
+            _sam3hl_cfg["style"] = saved["style"]
+        if saved.get("color_mode") in ("auto", "custom"):
+            _sam3hl_cfg["color_mode"] = saved["color_mode"]
+        for key in _HL_HEX_FIELDS:
+            value = str(saved.get(key, "")).strip()
+            if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+                _sam3hl_cfg[key] = value
+        print(f"[da3-web] 已加载高亮点云预设：{_SAM3HL_PRESET_PATH}", flush=True)
+    except Exception as exc:
+        print(f"[da3-web] 高亮点云预设读取失败：{type(exc).__name__}: {exc}", flush=True)
+
+
+def _save_sam3hl_preset():
+    """原子写入当前高亮点云配置，避免服务中断时留下半个 JSON 文件。"""
+    temp_path = _SAM3HL_PRESET_PATH.with_suffix(".json.tmp")
+    temp_path.write_text(json.dumps(_sam3hl_cfg, ensure_ascii=False, indent=2) + "\n",
+                         encoding="utf-8")
+    temp_path.replace(_SAM3HL_PRESET_PATH)
+
+
+_load_sam3hl_preset()
 _sam3hl = {"kind": None, "url": None, "bytes": None, "seq": 0, "meta": None, "error": None}
 
 
@@ -1893,8 +1928,8 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    background:radial-gradient(99.6% 99.6% at 50% 50%,rgba(0,0,0,0) 0%,rgba(0,0,0,.92) 100%)}
  /* ── 左侧 ODYSS logo（Figma：左边距 26px、宽 210px、垂直居中） ── */
  #logo{position:absolute;left:.26rem;top:50%;transform:translateY(-50%);width:2.1rem;height:auto;opacity:.95}
- /* ── 右侧状态区（两态叠放，淡入淡出切换；Figma：右边距 26px、宽 532px、垂直居中） ── */
- #panel{position:absolute;right:.26rem;top:50%;transform:translateY(-50%);width:5.32rem;display:grid}
+ /* ── 右侧状态区（两态叠放，淡入淡出切换；Figma：右边距 43px、宽 515px、垂直居中） ── */
+ #panel{position:absolute;right:.43rem;top:50%;transform:translateY(-50%);width:5.15rem;display:grid}
  /* 两态同格叠放；状态盒在面板高度内纵向居中（待机态只有一行标题，Figma 上为垂直居中） */
  #panel .state{grid-area:1/1;opacity:0;transition:opacity .5s ease;pointer-events:none;
    display:flex;flex-direction:column;justify-content:center}
@@ -3839,6 +3874,11 @@ def sam3hl_config(body: dict = Body(default=None)):
             c = str(body.get(hk, "")).strip()
             if re.fullmatch(r"#[0-9a-fA-F]{6}", c):
                 _sam3hl_cfg[hk] = c
+        try:
+            _save_sam3hl_preset()
+        except OSError as exc:
+            return JSONResponse({"ok": False, "error": f"预设保存失败：{exc}",
+                                 "cfg": dict(_sam3hl_cfg)}, status_code=500)
         return JSONResponse({"ok": True, "cfg": dict(_sam3hl_cfg)})
 
 
