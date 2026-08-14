@@ -618,6 +618,7 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
     ctx = None
     session = requests.Session()
     push_err = 0
+    conn_err = 0   # 连续开流失败计数（成功开流即清零），触发 Context 级重建
     while not _stop.is_set() and _watch_alive(device_id, gen):
         pipe = None
         try:
@@ -631,6 +632,7 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                 laser_mode = _setup_laser(dev, device_id) if spec["stereo"] else "off"
                 baseline_mm = _read_baseline_mm(dev, spec) if spec["stereo"] else None
             log.info("[%s] 已启动，流=%s 基线=%s", device_id, sorted(streams), baseline_mm)
+            conn_err = 0
             # 开流成功即报活并登记 pipe（watchdog 强拆用）；给出帧留满一个自检窗口
             _watch_touch(device_id, gen, pipe=pipe)
             last_fs = time.time()
@@ -761,7 +763,16 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                     if rgb_due:
                         last_push = now  # 失败也按节奏走，避免忙等打爆目标
         except Exception as e:
+            conn_err += 1
             log.warning("[%s] 相机链路异常，5 秒后重连: %s", device_id, e)
+            if conn_err % 6 == 0:
+                # 连续 ~30s 连不上：丢弃旧 Context 整个重建。重插 USB 后设备以
+                # 新身份重新枚举，旧 Context 认不到新设备、会永远报
+                # 「Create vendor command failed」（2026-08-14 真实发生），
+                # 只有换全新 Context 才能接上重插后的相机
+                log.warning("[%s] 连续 %d 次链路异常，重建 SDK Context",
+                            device_id, conn_err)
+                ctx = None
             # 重连等待也算线程活着（设备长期不在线属正常等待，不触发 watchdog）
             _watch_touch(device_id, gen)
             _stop.wait(5)
