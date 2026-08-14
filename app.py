@@ -3222,6 +3222,7 @@ let dotCfg={on:1,mode:0,pitch:7,r:34,jitter:0,motion:0,speed:1,bg:'#000000',gsha
 try{Object.assign(dotCfg,JSON.parse(localStorage.getItem('exp_dot')||'{}'));}catch(e){}
 let dotIm=null,dotOffCv=null;        // 最近一帧背景 Image / 离屏降采样画布（复用）
 let dotData=null,dotCols=0,dotRows=0;// 降采样取色缓存：动画重绘不重复采样
+let inkT=0,inkMass=0,inkN=0;         // 诊断记账：每绘制 tick 的墨量(Σ粒径²×α)与粒/点数
 function dotSample(){
   // 新帧/视口/点距变化时重建取色缓存：源图按 cover 构图居中裁剪，缩到 cols×rows，
   // getImageData 一次取回全部格子颜色。网格模式格距=点距；粒子云用固定 8px 采样格
@@ -3299,6 +3300,7 @@ function dotDraw(tSec){
   // 空间纵深：把亮度当远近（配合近亮远暗色彩映射），缓慢镜头摆动做层间视差
   const pd=(+dotCfg.pdepth)/100;
   const swx=pd?Math.sin(t*0.35)*70*dpr*pd:0,swy=pd?Math.cos(t*0.22)*42*dpr*pd:0;
+  let ink=0,inkn=0;
   ctx.clearRect(0,0,cv.width,cv.height);
   for(let ry=0;ry<dotRows;ry++)for(let rx=0;rx<dotCols;rx++){
     const idx=ry*dotCols+rx,o=idx*4;
@@ -3327,10 +3329,12 @@ function dotDraw(tSec){
       x+=dz*swx;y+=dz*swy;r*=Math.max(0.3,1+dz*1.3*pd);
     }
     if(r<=0.2)continue;
+    ink+=r*r*al;inkn++;   // 诊断记账：亮度不计入——只量"画了多少"
     ctx.fillStyle='rgba('+d[o]+','+d[o+1]+','+d[o+2]+','+al.toFixed(3)+')';
     if(+dotCfg.gshape===1){ctx.beginPath();ctx.arc(x,y,r,0,TAU);ctx.fill();}
     else ctx.fillRect(x-r,y-r,r*2,r*2);
   }
+  inkT=performance.now();inkMass=ink;inkN=inkn;
 }
 // ── 粒子云模式：持久粒子池（x,y,相位,粒径因子 ×4 float）──
 let pcPool=null,pcN=0,pcSig='';
@@ -3419,6 +3423,7 @@ function pcDraw(t){
     pcBuf=new Uint32Array(pcImg.data.buffer);
   }
   pcBuf.fill(0);
+  let ink=0,inkn=0;
   const mono=+dotCfg.pmono===1,spd=+dotCfg.speed;
   const amp=(+dotCfg.pdrift)*1.6*dpr,psz=(+dotCfg.psize)*dpr;
   const round=+dotCfg.pshape===1;
@@ -3468,12 +3473,14 @@ function pcDraw(t){
     }
     const pxo=dz*swx,pyo=dz*swy;   // 视差偏移只挪位置，不当作消散（不触发拖尾）
     const s=Math.max(1,Math.round(pcPool[b+3]*psz*(pd?Math.max(0.35,1+dz*1.3*pd):1)));
+    ink+=s*s*al;inkn++;   // 诊断记账
     pcStamp(x+ex+pxo,y+ey+pyo,s,cr,cg,cb,al,round,W,H);
     if(ex||ey){   // 拖尾：沿来路补两颗渐淡渐小的点，扫出消散的流线感
       pcStamp(x+ex*0.75+pxo,y+ey*0.75+pyo,Math.max(1,Math.round(s*0.85)),cr,cg,cb,al*0.5,round,W,H);
       pcStamp(x+ex*0.5+pxo,y+ey*0.5+pyo,Math.max(1,Math.round(s*0.7)),cr,cg,cb,al*0.25,round,W,H);
     }
   }
+  inkT=performance.now();inkMass=ink;inkN=inkn;
   ctx.putImageData(pcImg,0,0);
 }
 // ── rAF 动画循环（~30fps 节流）：粒子云常开（speed=0 时粒子静止但仍重生闪换）；
@@ -3957,35 +3964,21 @@ if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布
 //    逐像素平均亮度（无缩放无插值，规避极限缩小的采样混叠），连同当前帧 key 与
 //    点云化配置回传 /api/flicker-report。诊断结束整段可移除 ══
 if(new URLSearchParams(location.search).get('trace')==='1'){
+  // v3：零扰动——不读 canvas 像素，每个动画帧只记录绘制函数自己记的账
+  //（墨量 inkMass=Σ粒径²×α、粒点数 inkN、上次绘制时刻 inkT）+ 当前帧 key。
+  // 墨量恒定而肉眼仍闪 ⇒ 闪在 canvas 之后（合成/显示）；墨量骤降 ⇒ 绘制逻辑
   const tbuf=[];
-  const PS=48;
-  function patchLuma(ctx,x,y){
-    const d=ctx.getImageData(x,y,PS,PS).data;let s=0;
-    for(let i=0;i<d.length;i+=4)s+=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
-    return Math.round(s/(d.length/4)*10)/10;
-  }
   (function tSample(){
-    try{
-      const cv=$('bgDot');
-      const dotShown=$('stage').classList.contains('doton')&&cv.style.display!=='none';
-      let p=null;
-      if(dotShown&&cv.width>=PS*3&&cv.height>=PS*3){
-        const ctx=cv.getContext('2d',{willReadFrequently:true});
-        const W=cv.width,H=cv.height,cx=(W-PS)>>1,cy=(H-PS)>>1;
-        p=[patchLuma(ctx,(W>>2),(H>>2)),patchLuma(ctx,W-(W>>2)-PS,(H>>2)),
-           patchLuma(ctx,cx,cy),
-           patchLuma(ctx,(W>>2),H-(H>>2)-PS),patchLuma(ctx,W-(W>>2)-PS,H-(H>>2)-PS)];
-      }
-      tbuf.push({t:Math.round(performance.now()),p:p,k:lastBgKey});
-      if(tbuf.length>1200)tbuf.shift();
-    }catch(e){}
+    tbuf.push({t:Math.round(performance.now()),k:lastBgKey,
+      it:Math.round(inkT),im:Math.round(inkMass),n:inkN});
+    if(tbuf.length>2400)tbuf.shift();
     requestAnimationFrame(tSample);
   })();
   setInterval(()=>{
     fetch('/api/flicker-report',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({page_ts:Date.now(),total:tbuf.length,
+      body:JSON.stringify({page_ts:Date.now(),total:tbuf.length,v:3,
         cfg:Object.assign({},dotCfg),dd:Object.assign({},ddCss),
-        samples:tbuf.slice(-450)})
+        samples:tbuf.slice(-900)})
     }).catch(()=>{});
   },5000);
 }
