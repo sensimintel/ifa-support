@@ -3992,8 +3992,9 @@ if(new URLSearchParams(location.search).get('trace')==='1'){
   })();
   setInterval(()=>{
     fetch('/api/flicker-report',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({page_ts:Date.now(),total:tbuf.length,v:3,
+      body:JSON.stringify({page_ts:Date.now(),total:tbuf.length,v:3,bld:'bake1',
         cfg:Object.assign({},dotCfg),dd:Object.assign({},ddCss),
+        fdot:getComputedStyle($('bgDot')).filter,
         samples:tbuf.slice(-900)})
     }).catch(()=>{});
   },5000);
@@ -4010,8 +4011,8 @@ def home():
 
 @app.get("/experience", response_class=HTMLResponse)
 def experience():
-    """IFA 浅体验区展示页：品牌化全屏实时识别 UI。"""
-    return EXPERIENCE_PAGE
+    """IFA 浅体验区展示页：品牌化全屏实时识别 UI。no-store 防止排障期拿到缓存旧页。"""
+    return HTMLResponse(EXPERIENCE_PAGE, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/panel", response_class=HTMLResponse)
