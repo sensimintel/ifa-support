@@ -3390,7 +3390,7 @@ function dotDraw(tSec){
   inkT=performance.now();inkMass=ink;inkN=inkn;
 }
 // ── 粒子云模式：持久粒子池（x,y,相位,粒径因子 ×4 float）──
-let pcPool=null,pcN=0,pcSig='';
+let pcPool=null,pcN=0,pcSig='',pcW=0,pcH=0;
 function pcLum(gx,gy){   // 格子亮度权重 [0,1]：亮/有效处高，黑/无效处 0
   const o=(gy*dotCols+gx)*4;
   return (dotData[o]*0.2126+dotData[o+1]*0.7152+dotData[o+2]*0.0722)/255;
@@ -3414,11 +3414,22 @@ function pcSpawn(i){
 }
 function pcEnsure(){
   // 池分配/全量重生：数量或密度对比变化时整池重建（分布立即跟新参数）
+  const cv=$('bgDot');
   const sig=Math.round(+dotCfg.pn)+'|'+(+dotCfg.pcontrast);
-  if(pcPool&&pcSig===sig)return;
+  if(pcPool&&pcSig===sig){
+    // 画布尺寸变化（进出全屏/改窗口）：粒子位置等比缩放到新尺寸立即铺满。
+    // 不能指望寿命重生补位——重生率可调到 0，粒子会永远留在旧窗口区域
+    if(cv.width!==pcW||cv.height!==pcH){
+      const kx=cv.width/(pcW||cv.width),ky=cv.height/(pcH||cv.height);
+      for(let i=0;i<pcN;i++){pcPool[i*4]*=kx;pcPool[i*4+1]*=ky;}
+      pcW=cv.width;pcH=cv.height;
+    }
+    return;
+  }
   pcSig=sig;pcN=Math.round(+dotCfg.pn);
   pcPool=new Float32Array(pcN*4);
   for(let i=0;i<pcN;i++)pcSpawn(i);
+  pcW=cv.width;pcH=cv.height;
 }
 // ── 粒子云 ImageData 直写渲染：逐粒子 fillStyle 字符串解析+fillRect（外加拖尾三倍
 //    过绘）在粒子数拉高后一帧要十几万次 Canvas 状态切换，主线程被打满、帧率崩塌，
