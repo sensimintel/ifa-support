@@ -3160,11 +3160,16 @@ let ddCss={br:0.8,ct:1.3,sa:0.9,hu:0,inv:0,bl:10,op:1,fit:'cover',mir:0,rot:0,pi
 try{Object.assign(ddCss,JSON.parse(localStorage.getItem('exp_dd_css')||'{}'));}catch(e){}
 function applyDdCss(){
   const on=bgSource==='devdepth';
-  // 点云化 canvas 层也套同一组显示参数：devdepth+点阵组合时调节仍可见
+  // 点云化 canvas 层也套同一组显示参数：devdepth+点阵组合时调节仍可见。
+  // 例外——亮度：canvas 层不走 CSS brightness 滤镜，而是烘进取色缓存（dotSample）。
+  // 原因（2026-08-14 屏闪根因）：大 canvas 每帧全量上传 + CSS 滤镜的 GPU 合成
+  // 在高负载下偶发"漏套滤镜"的帧直接上屏，brightness≠1 时该帧亮度骤变=全屏暗闪；
+  // 烘进像素后滤镜恒为 1，漏帧不可见
   [$('bgA'),$('bgB'),$('bgDot')].forEach(el=>{
     if(!on){el.style.filter='';el.style.objectFit='';el.style.transform='';el.style.imageRendering='';return;}
+    const br=(el.id==='bgDot')?1:ddCss.br;
     // 不透明度用 filter 的 opacity()：inline opacity 会盖掉 .bg.on 的交叉淡入
-    el.style.filter='brightness('+ddCss.br+') contrast('+ddCss.ct+') saturate('+ddCss.sa
+    el.style.filter='brightness('+br+') contrast('+ddCss.ct+') saturate('+ddCss.sa
       +') hue-rotate('+ddCss.hu+'deg)'+(+ddCss.inv?' invert(1)':'')
       +(+ddCss.bl?' blur('+ddCss.bl+'px)':'')+' opacity('+ddCss.op+')';
     el.style.objectFit=ddCss.fit;
@@ -3175,6 +3180,12 @@ function applyDdCss(){
       +(sc!==1?' scale('+sc.toFixed(3)+')':'');
     el.style.imageRendering=+ddCss.pix?'pixelated':'';
   });
+  // 亮度增益烘焙进取色缓存：换亮度后立即重建缓存并重绘（页面初始化时 dotIm 尚无则跳过）
+  if(+dotCfg.on&&on&&dotIm){
+    dotSample();
+    if(dotNeedLoop()){if(!dotRaf)dotRaf=requestAnimationFrame(dotLoop);}
+    else dotDraw(performance.now()/1000);
+  }
 }
 const DC_SLIDERS={br:['r_dc_bright','v_dc_bright',2],ct:['r_dc_contrast','v_dc_contrast',2],
   sa:['r_dc_sat','v_dc_sat',2],hu:['r_dc_hue','v_dc_hue',0],bl:['r_dc_blur','v_dc_blur',0],
@@ -3243,6 +3254,11 @@ function dotSample(){
   const octx=dotOffCv.getContext('2d',{willReadFrequently:true});
   octx.drawImage(im,sx,sy,sw,sh,0,0,dotCols,dotRows);
   dotData=octx.getImageData(0,0,dotCols,dotRows).data;
+  // 深度来源的亮度增益烘进像素（Uint8ClampedArray 自动截断到 255）：
+  // 替代 canvas 层的 CSS brightness 滤镜，规避合成漏帧导致的全屏暗闪
+  const g=(bgSource==='devdepth')?Math.max(0,+ddCss.br||1):1;
+  if(g!==1){const d=dotData;
+    for(let i=0;i<d.length;i+=4){d[i]*=g;d[i+1]*=g;d[i+2]*=g;}}
   dotEdge=null;
   if(+dotCfg.pfloat>0)dotEdgeBuild();   // 漂浮强度开启时随取色缓存一并重建边缘场
   return true;
