@@ -83,6 +83,11 @@ DEV_CONFIG_LIMITS = {
     "depth_contour_m": (0.0, 2.0),    # 等值线间隔（米，0=关）
     "depth_jpeg_q": (30.0, 95.0),     # 深度图 JPEG 编码质量
     "depth_fps": (0.0, 30.0),         # 深度独立推帧率（0=跟随 RGB 主帧节拍）
+    # pc_*=设备点云（原始深度+RGB → /api/devpc/frame）推流参数：推流端仅在
+    # devices[].pc_want=true（/experience 选中「设备点云」来源）时才推，
+    # 未下发时用推流端默认值（1.5fps / stride 自适应到 ~424 列）
+    "pc_fps": (0.2, 10.0),            # 设备点云推帧率
+    "pc_stride": (1.0, 8.0),          # 深度降采样步长（0/未下发=自适应）
 }
 # 枚举键白名单（值统一小写存储）
 DEV_CONFIG_ENUMS = {
@@ -207,6 +212,27 @@ _worker_started = False
 # （硬件深度不走 aux——深度伪彩随主帧 /api/frame 的可选 depth 字段上报，见 ingest_frame）
 _stereo_processor: Optional[Callable[[bytes, bytes, dict, dict, str], dict]] = None
 _stereo_worker_started = False
+
+# 设备点云按需推流标志的提供方：fn(device_id) -> bool（True=页面正选中「设备点云」
+# 来源，推流端应推原始深度）。由 app.py 注入（demand 状态由 /api/devpc/status 的
+# 轮询续期）；未注入时 /api/frame/status 恒报 False，推流端不推，链路零开销
+_pc_want_provider: Optional[Callable[[str], bool]] = None
+
+
+def set_pc_want_provider(fn: Callable[[str], bool]) -> None:
+    """注入设备点云按需推流标志（见上方注释）。"""
+    global _pc_want_provider
+    _pc_want_provider = fn
+
+
+def _pc_want(device_id: str) -> bool:
+    """该设备当前是否需要推原始深度（provider 未注入/异常一律 False，不影响状态接口）。"""
+    if _pc_want_provider is None:
+        return False
+    try:
+        return bool(_pc_want_provider(device_id))
+    except Exception:
+        return False
 
 
 def set_processor(fn: Callable[[bytes, dict, str], dict]) -> None:
@@ -883,6 +909,8 @@ def frame_status(device: Optional[str] = Query(None)):
                 "selected": d == selected,
                 # 该设备已下发的帧率类配置（/api/frame/device-config），推流端与控制面都从这读
                 "config": dict(_dev_config.get(d) or {}),
+                # 设备点云按需推流标志（app.py 注入；True=推流端应推原始深度）
+                "pc_want": _pc_want(d),
             })
         if st is None:
             return JSONResponse({

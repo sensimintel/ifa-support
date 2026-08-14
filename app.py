@@ -49,10 +49,12 @@ sys.path.append(str(DA3_ROOT / "src"))
 from depth_anything_3.api import DepthAnything3  # noqa: E402
 from depth_anything_3.app.gradio_app import DepthAnything3App  # noqa: E402
 
+import devpc  # noqa: E402
 from frame_relay import (  # noqa: E402
     DEFERRED, UNKNOWN_DEVICE, get_latest_frame, get_selected_device,
     router as frame_router,
-    set_processor, set_product, set_stereo_processor, set_stereo_product)
+    set_pc_want_provider, set_processor, set_product, set_stereo_processor,
+    set_stereo_product)
 
 MODEL_DIR = str(DA3_ROOT / "models" / "DA3NESTED-GIANT-LARGE-1.1")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -2438,6 +2440,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <option value="hl">高亮点云</option>
   <option value="stereo" title="仅 G335 等双目相机支持">双目高亮点云</option>
   <option value="devdepth" title="仅 G335 等带硬件深度的相机支持">设备深度图</option>
+  <option value="devpc" title="硬件真深度反投影彩色点云，仅 G335 等带硬件深度的相机支持">设备点云</option>
   <option value="la">单目点云</option>
   <option value="s3">SAM3点云</option>
  </select>
@@ -2814,9 +2817,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 const $=id=>document.getElementById(id);
 const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无后端时目检布局用
 
-// ══ 背景层：五种来源下拉框选择（临时工具），默认 SAM3 高亮点云 ══
+// ══ 背景层：六种来源下拉框选择（临时工具），默认 SAM3 高亮点云 ══
 let bgSource=localStorage.getItem('exp_bg')||'hl';
-if(!['hl','stereo','la','s3','devdepth'].includes(bgSource))bgSource='hl';   // 旧版存过 raw 的自动回落高亮点云
+if(!['hl','stereo','la','s3','devdepth','devpc'].includes(bgSource))bgSource='hl';   // 旧版存过 raw 的自动回落高亮点云
 const MIN_SWAP_MS=0;               // 换图节流已停用（同 /panel，2026-08-13）；"加载中不打断"守卫仍在
 let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
 
@@ -3705,9 +3708,11 @@ async function bgTick(){
   // 双目来源仅双目设备（G335）可用：选中设备不支持时禁用选项置灰；已选双目时保持黑场
   const stOpt=$('selStyle').querySelector('option[value=stereo]');
   if(stOpt)stOpt.disabled=s.stereo_supported!==true;
-  // 设备深度图来源仅带硬件深度的相机（G335 等）可用：无深度能力的设备置灰
+  // 设备深度图/设备点云来源仅带硬件深度的相机（G335 等）可用：无深度能力的设备置灰
   const ddOpt=$('selStyle').querySelector('option[value=devdepth]');
   if(ddOpt)ddOpt.disabled=s.has_depth!==true;
+  const pcOpt=$('selStyle').querySelector('option[value=devpc]');
+  if(pcOpt)pcOpt.disabled=s.has_depth!==true;
   renderDdCfg(s);
   if(bgSource==='la'){
     if(s.product_kind==='image')showImg('/api/frame/latest-product?t='+s.product_seq,'la:'+s.product_seq);
@@ -3731,6 +3736,19 @@ async function bgTick(){
         +'&t='+s.depth_seq,'dd:'+s.depth_seq);
     }else{
       // 无深度能力/深度未就绪：清残留画面回黑场（同双目来源的降级语义）
+      hideModelLayer();
+      $('bgA').classList.remove('on');$('bgB').classList.remove('on');
+    }
+  }else if(bgSource==='devpc'){
+    // 设备点云（硬件真深度反投影彩色点云 GLB）：轮询即点播——status 请求按 10s TTL
+    // 续期服务端 demand，推流端 ~2-4s 内开始推原料、切走后自动停推
+    if(s.has_depth){
+      const pc=await(await fetch('/api/devpc/status?device='
+        +encodeURIComponent(s.device||''),{cache:'no-store'})).json();
+      // device 比对：切设备后旧设备的点云 GLB 不上画（保持黑场等新产物）
+      if(pc.url&&pc.device===s.device)showModel(pc.url,pc.meta&&pc.meta.fov_deg);
+    }else{
+      // 无硬件深度能力的设备：清残留画面回黑场（同双目来源的降级语义）
       hideModelLayer();
       $('bgA').classList.remove('on');$('bgB').classList.remove('on');
     }
@@ -3839,8 +3857,8 @@ function syncStyleUI(){
   // 设备深度图调节区仅该来源展示
   $('hlonly').style.display=(bgSource==='hl'||bgSource==='stereo')?'':'none';
   $('ddonly').style.display=(bgSource==='devdepth')?'':'none';
-  // 点云化样式区对可能出图片类背景的来源展示（stereo 恒为 GLB 不列）
-  $('dotonly').style.display=(bgSource!=='stereo')?'':'none';
+  // 点云化样式区对可能出图片类背景的来源展示（stereo/devpc 恒为 GLB 不列）
+  $('dotonly').style.display=(bgSource!=='stereo'&&bgSource!=='devpc')?'':'none';
   applyDdCss();   // 切来源即时挂上/摘掉深度显示的 CSS（其它来源不受深度显示参数影响）
   applyDotCfg();  // 点云化样式层随来源重估显隐（GLB 来源不遮挡）
   // 调节作用域收敛：图片类来源下停掉 GLB 侧一切动效——脉冲/闪烁 timer（applyPtStyle
@@ -5082,6 +5100,106 @@ def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
                      "sam3_ms": round(sam3_ms, 1),
                      "stat": f"GLB {sz:.0f}KB · res {res} · 2视角",
                      "fov_deg": _fov_deg}}
+
+
+# ══ 设备点云（/experience「设备点云」来源）：硬件真深度 + RGB → 彩色点云 GLB ══
+# 与 DA3 点云平行的独立链路：mini 端仅在页面选中该来源时才推原料（demand 由本处
+# 以 10s TTL 维护，经 frame_relay 状态接口的 devices[].pc_want 下发给推流端），
+# 构建纯 CPU（devpc.build_points 反投影 + 手写 GLB 导出，毫秒级），不占 GPU、
+# 不碰单目/双目产物槽与伪彩深度链路。
+_devpc_lock = threading.Lock()
+_devpc = {"seq": 0, "url": None, "device": None, "meta": None, "error": None}
+_devpc_demand: dict = {}          # device_id -> demand 过期时刻（time.time() 秒）
+_DEVPC_DEMAND_TTL = 10.0
+# 构建串行化：推流快于构建时直接丢新帧（latest 语义，不排队不积压）
+_devpc_build_lock = threading.Lock()
+
+
+def _devpc_wanted(device_id: str) -> bool:
+    """frame_relay 状态接口的按需标志回调：该设备是否有页面正在看设备点云。"""
+    with _devpc_lock:
+        return _devpc_demand.get(device_id, 0.0) > time.time()
+
+
+set_pc_want_provider(_devpc_wanted)
+
+
+@app.get("/api/devpc/status")
+def devpc_status(device: Optional[str] = None):
+    """设备点云状态（/experience 轮询）：url 为最新 GLB；device 供前端做陈旧守卫
+    （切设备后旧点云不上画）。轮询本身就是「点播」信号——按 device 续期 demand
+    （10s TTL），推流端经 /api/frame/status 的 devices[].pc_want 在 ~2-4s 内跟上，
+    页面切走后 demand 过期即自动停推，链路零常驻带宽。"""
+    dev = (device or "").strip() or get_selected_device()
+    now = time.time()
+    with _devpc_lock:
+        if dev:
+            _devpc_demand[dev] = now + _DEVPC_DEMAND_TTL
+            # 顺手清过期 demand 条目（设备下线/改名不留垃圾）
+            for d in [d for d, t in _devpc_demand.items() if t <= now]:
+                _devpc_demand.pop(d, None)
+        return JSONResponse(dict(_devpc))
+
+
+@app.post("/api/devpc/frame")
+def devpc_ingest(depth: UploadFile = File(...), rgb: UploadFile = File(...),
+                 meta: str = Form(...)):
+    """接收 mini 端设备点云原料（对齐 uint16 深度 PNG + 同帧 RGB JPEG + 内参 meta），
+    同步反投影构建彩色点云 GLB（sync 端点跑在 FastAPI 线程池，纯 CPU 毫秒级）。
+    构建被占用（推流快于构建）时直接丢本帧返回 busy，保持 latest 语义。"""
+    try:
+        mj = json.loads(meta) or {}
+        m = devpc.parse_meta(mj)
+    except (ValueError, TypeError) as e:
+        return JSONResponse({"ok": False, "error": f"meta 非法：{e}"}, status_code=400)
+    dev = str(mj.get("device_id") or "").strip() or UNKNOWN_DEVICE
+    depth_b = depth.file.read()
+    rgb_b = rgb.file.read()
+    if not depth_b or not rgb_b:
+        return JSONResponse({"ok": False, "error": "depth 与 rgb 必须非空"},
+                            status_code=400)
+    if not _devpc_build_lock.acquire(blocking=False):
+        return JSONResponse({"ok": True, "busy": True})
+    t0 = time.time()
+    try:
+        d16 = cv2.imdecode(np.frombuffer(depth_b, np.uint8), cv2.IMREAD_UNCHANGED)
+        if d16 is None or d16.ndim != 2 or d16.dtype != np.uint16:
+            raise ValueError("depth 不是 16 位单通道 PNG")
+        bgr = cv2.imdecode(np.frombuffer(rgb_b, np.uint8), cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError("rgb 解码失败")
+        # RGB 分辨率与 meta 标称（=对齐深度的全分辨率）不一致时缩放对齐取色坐标
+        if bgr.shape[0] != m["height"] or bgr.shape[1] != m["width"]:
+            bgr = cv2.resize(bgr, (m["width"], m["height"]),
+                             interpolation=cv2.INTER_AREA)
+        pts, cols = devpc.build_points(d16, cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), m)
+        if pts.shape[0] == 0:
+            raise ValueError("有效深度点为空（画面全在量程外/全是空洞）")
+        token = uuid.uuid4().hex
+        outdir = GLB_DIR / token
+        outdir.mkdir(parents=True, exist_ok=True)
+        glb = outdir / "scene.glb"
+        _write_pointcloud_glb(str(glb), pts, cols, None, quantize=GLB_QUANTIZE)
+        _prune_glb()
+        with _devpc_lock:
+            _devpc["seq"] += 1
+            _devpc["url"] = f"/glb/{token}/scene.glb"
+            _devpc["device"] = dev
+            _devpc["meta"] = {"fov_deg": devpc.fov_y_deg(m),
+                              "points": int(pts.shape[0]),
+                              "build_ms": round((time.time() - t0) * 1000, 1),
+                              "shape": [m["width"], m["height"]],
+                              "stride": m["stride"]}
+            _devpc["error"] = None
+            seq = _devpc["seq"]
+        return JSONResponse({"ok": True, "seq": seq, "points": int(pts.shape[0])})
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+        with _devpc_lock:
+            _devpc["error"] = err
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    finally:
+        _devpc_build_lock.release()
 
 
 app.include_router(frame_router)

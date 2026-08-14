@@ -16,6 +16,12 @@ da3-web 服务。每台相机独立成一个 device_id 桶，/panel 下拉可切
      camera_info 带 stereo_supported / baseline_mm / laser_mode，
      供 8060 的双目 DA3 点云链路。
 
+另有一路按需推流（独立节拍，默认关）：
+  3. 设备点云原料 → POST /api/devpc/frame：D2C 对齐后的原始 uint16 深度（PNG
+     无损、按 stride 降采样）+ 同帧 RGB JPEG + 彩色内参。仅当 /experience 选中
+     「设备点云」来源（服务端 devices[].pc_want 亮起，10s TTL 按需续期）才推，
+     供 8060 反投影成硬件真深度彩色点云 GLB；不推时链路零带宽开销。
+
 要点：
   · 帧全部来自同一 pipeline 的同一 frameset，硬件同步，无配对逻辑；
   · G335 激光策略（LASER_MODE）：喂 DA3 的双目 IR 要"无散斑"，硬件深度要"有散斑"，
@@ -52,8 +58,9 @@ import time
 import cv2
 import numpy as np
 import requests
-from pyorbbecsdk import (Config, Context, OBFormat, OBFrameMetadataType,
-                         OBFrameType, OBPropertyID, OBSensorType, Pipeline)
+from pyorbbecsdk import (AlignFilter, Config, Context, OBFormat,
+                         OBFrameMetadataType, OBFrameType, OBPropertyID,
+                         OBSensorType, OBStreamType, Pipeline)
 
 RELAY_URL = os.environ.get("RELAY_URL", "http://192.168.0.50:8060").rstrip("/")
 PUSH_FPS = float(os.environ.get("PUSH_FPS", "3"))
@@ -181,6 +188,9 @@ _fps_lock = threading.Lock()
 _dev_fps: dict = {}                   # device_id -> per-device push_fps（服务端下发）
 _global_fps: float = 0.0              # 全局 config.push_fps（旧口径兜底；0=未下发）
 _dev_depth: dict = {}                 # device_id -> 深度伪彩渲染配置（depth_* 键，服务端下发）
+# device_id -> 设备点云推流状态：{"want": /experience 是否正选中该来源（服务端
+# 按 10s TTL 续期的按需标志）, 以及可选的 pc_fps / pc_stride 覆盖值}
+_dev_pc: dict = {}
 
 
 def _valid_fps(raw) -> float:
@@ -206,6 +216,13 @@ def get_depth_cfg(device_id: str) -> dict:
         return dict(_dev_depth.get(device_id) or {})
 
 
+def get_pc_cfg(device_id: str) -> dict:
+    """该设备当前的设备点云推流状态（want 按需标志 + 可选 pc_* 覆盖值；
+    空 dict=不推）。"""
+    with _fps_lock:
+        return dict(_dev_pc.get(device_id) or {})
+
+
 def _config_poller():
     """每 2s 从 8060 读一次配置并热生效：devices[].config 里的 push_fps（per-device
     帧率）、depth_*（深度伪彩渲染参数），及全局 config.push_fps（旧口径兜底）。
@@ -221,6 +238,7 @@ def _config_poller():
             g = _valid_fps((st.get("config") or {}).get("push_fps"))
             dev = {}
             ddep = {}
+            dpc = {}
             for d in st.get("devices") or []:
                 did = str(d.get("device_id") or "")
                 cfg = d.get("config") or {}
@@ -230,18 +248,31 @@ def _config_poller():
                 dcfg = {k: v for k, v in cfg.items() if str(k).startswith("depth_")}
                 if dcfg:
                     ddep[did] = dcfg
+                pcc = {k: v for k, v in cfg.items() if str(k).startswith("pc_")}
+                if d.get("pc_want"):
+                    pcc["want"] = True
+                if pcc:
+                    dpc[did] = pcc
             with _fps_lock:
                 _global_fps = g
                 _dev_fps.clear()
                 _dev_fps.update(dev)
                 _dev_depth.clear()
                 _dev_depth.update(ddep)
+                _dev_pc.clear()
+                _dev_pc.update(dpc)
+            # 设备点云的按需标志只按「哪些设备在推」进 desc：want 翻转要打日志，
+            # 但 pc_* 数值抖动不至于刷屏
+            pc_on = tuple(sorted(d for d, c in dpc.items() if c.get("want")))
             desc = (g, tuple(sorted(dev.items())),
-                    tuple(sorted((k, tuple(sorted(v.items()))) for k, v in ddep.items())))
+                    tuple(sorted((k, tuple(sorted(v.items()))) for k, v in ddep.items())),
+                    pc_on)
             if desc != last_desc:
-                if last_desc is not None or g or dev or ddep:   # 启动即空配置不打日志
-                    log.info("推帧配置随服务端调整: per-device帧率=%s 全局兜底=%s 深度渲染=%s",
-                             dev or "无", g or "无", ddep or "默认")
+                if last_desc is not None or g or dev or ddep or pc_on:   # 启动即空配置不打日志
+                    log.info("推帧配置随服务端调整: per-device帧率=%s 全局兜底=%s 深度渲染=%s"
+                             " 设备点云=%s",
+                             dev or "无", g or "无", ddep or "默认",
+                             list(pc_on) or "关")
                 last_desc = desc
         except (requests.RequestException, ValueError, TypeError):
             pass  # 服务端不可达/字段异常时沿用当前值，推帧线程自身会报连不上
@@ -650,6 +681,71 @@ def _push_aux(session, device_id: str, spec, cache: _IRCache,
     return True
 
 
+def _open_pc_context(pipe, streams, device_id: str):
+    """创建设备点云推流上下文：D2C 对齐滤镜 + 彩色相机内参。
+
+    仅同时开出彩色与深度流的相机可用；标定/滤镜拿不到时返回 None（该设备
+    不推点云，其余链路不受影响）。对齐用软件 AlignFilter 而非硬件 D2C 模式：
+    硬件模式会改动整条深度流的几何，影响现有伪彩深度链路，软件滤镜只在
+    点云节拍上对单个帧组做一次对齐，原始深度帧原样保留。"""
+    if not ("color" in streams and "depth" in streams):
+        return None
+    try:
+        intr = pipe.get_camera_param().rgb_intrinsic
+        if not (intr.fx > 0 and intr.fy > 0):
+            raise RuntimeError(f"彩色内参非法：fx={intr.fx} fy={intr.fy}")
+        align = AlignFilter(align_to_stream=OBStreamType.COLOR_STREAM)
+        return {"align": align, "intr": intr, "err": 0, "logged": False}
+    except Exception as e:
+        log.warning("[%s] 设备点云上下文创建失败（该设备不推点云）: %s", device_id, e)
+        return None
+
+
+def _push_devpc(session, device_id: str, pc_ctx: dict, fs, cf, pcc: dict,
+                now: float) -> None:
+    """推一帧设备点云原料到 /api/devpc/frame：帧组过 D2C 对齐取「彩色相机坐标系
+    的 uint16 深度」，按 stride 降采样后无损 PNG 上报，同帧 RGB JPEG + 内参随行。
+    5090 端（app.py）反投影成彩色点云 GLB 供 /experience「设备点云」背景。"""
+    out = pc_ctx["align"].process(fs)
+    if out is None:
+        raise RuntimeError("D2C 对齐输出为空")
+    # SDK 版本差异：process 可能返回 Frame（需转 frameset）或直接返回 FrameSet
+    afs = out.as_frame_set() if hasattr(out, "as_frame_set") else out
+    adf = afs.get_depth_frame()
+    if adf is None:
+        raise RuntimeError("对齐后帧组无深度帧")
+    w, h = adf.get_width(), adf.get_height()
+    scale = float(getattr(adf, "get_depth_scale", lambda: 1.0)() or 1.0)
+    d16 = np.frombuffer(bytes(adf.get_data()), dtype=np.uint16).reshape(h, w)
+    stride = int(_cfg_num(pcc, "pc_stride", 0))
+    if stride < 1:
+        # 自适应步长：降到 ~424 列（G335 1280 宽 → stride 3 → 427x240 ≈ 10 万点），
+        # 点数够背景观感、PNG 体积与 5090 端构建耗时都可控
+        stride = max(1, round(w / 424))
+    ok, png = cv2.imencode(".png", np.ascontiguousarray(d16[::stride, ::stride]))
+    if not ok:
+        raise RuntimeError("深度 PNG 编码失败")
+    intr = pc_ctx["intr"]
+    # 内参标定分辨率与实际流分辨率不一致时按比例缩放（对齐后深度=彩色流分辨率）
+    sx = (w / intr.width) if intr.width else 1.0
+    sy = (h / intr.height) if intr.height else 1.0
+    meta = {"device_id": device_id, "width": w, "height": h, "stride": stride,
+            "depth_scale": scale, "fx": intr.fx * sx, "fy": intr.fy * sy,
+            "cx": intr.cx * sx, "cy": intr.cy * sy}
+    resp = session.post(
+        f"{RELAY_URL}/api/devpc/frame",
+        files={"depth": ("depth.png", png.tobytes(), "image/png"),
+               "rgb": ("rgb.jpg", _to_jpeg(cf), "image/jpeg")},
+        data={"meta": json.dumps(meta)},
+        timeout=(3.05, 8),
+    )
+    resp.raise_for_status()
+    if not pc_ctx["logged"]:
+        log.info("[%s] 设备点云开始推流：对齐深度 %dx%d stride=%d fx=%.1f fy=%.1f",
+                 device_id, w, h, stride, meta["fx"], meta["fy"])
+        pc_ctx["logged"] = True
+
+
 def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
     """单相机工作线程：开流 → 节流推帧（RGB+深度 / 双目 aux）→ 出错重连，直到
     进程退出或本线程代数被 watchdog 废弃（gen 落后即静默退出，由新代接管）。"""
@@ -669,6 +765,8 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                 pipe, streams = _open_pipeline(dev, spec, device_id)
                 laser_mode = _setup_laser(dev, device_id) if spec["stereo"] else "off"
                 baseline_mm = _read_baseline_mm(dev, spec) if spec["stereo"] else None
+                # 设备点云上下文（D2C 对齐 + 彩色内参）：拿不到只关本路，不影响其余链路
+                pc_ctx = _open_pc_context(pipe, streams, device_id)
             log.info("[%s] 已启动，流=%s 基线=%s", device_id, sorted(streams), baseline_mm)
             conn_err = 0
             # 开流成功即报活并登记 pipe（watchdog 强拆用）；给出帧留满一个自检窗口
@@ -685,6 +783,8 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
             cache = _IRCache()
             # 深度渲染线程私有状态（EMA 上一帧 / 上次深度推送时刻），重连即重置
             depth_state: dict = {}
+            # 设备点云线程私有状态（上次推送时刻），重连即重置
+            pc_state: dict = {}
             while not _stop.is_set():
                 fs = pipe.wait_for_frames(500)
                 if not _watch_alive(device_id, gen):
@@ -737,7 +837,12 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                 rgb_due = now - last_push >= get_push_interval(device_id)
                 dep_due = (now - depth_state.get("last_push", 0.0) >= dep_itv
                            ) if dep_itv else rgb_due
-                if not rgb_due and not dep_due:
+                # 设备点云独立节拍：仅在服务端按需标志（want）亮着时推
+                pcc = get_pc_cfg(device_id)
+                pc_itv = 1.0 / min(max(_cfg_num(pcc, "pc_fps", 1.5), 0.2), 10.0)
+                pc_due = (pc_ctx is not None and bool(pcc.get("want"))
+                          and now - pc_state.get("last_push", 0.0) >= pc_itv)
+                if not rgb_due and not dep_due and not pc_due:
                     continue
                 # 深度帧可用性：同帧组里带硬件深度帧则伪彩上报（帧组偶尔缺深度帧属
                 # 正常，面板端保留上一张；伪彩失败只丢深度不影响彩色帧）。interleave
@@ -750,22 +855,25 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                 # 深度帧；无光帧（0）与元数据缺失帧（-1）一律丢弃——宁可僵住上一帧
                 # 也不上垃圾帧（全屏暗闪嫌疑）。例外：本次连接从未读到过该元数据
                 # （固件不支持，读永远是 -1）时放行，避免深度整路断流
-                depth_use = dep_due and df is not None
-                if depth_use and spec["stereo"] and laser_mode == "interleave":
+                # 激光门控结论对伪彩深度与设备点云两路共用：interleave 下只认
+                # 明确有散斑（LASER_STATUS==1）的深度帧
+                laser_ok = df is not None
+                if laser_ok and spec["stereo"] and laser_mode == "interleave":
                     ls = _laser_status(df)
                     if ls >= 0:
                         laser_seen_meta = True
                     if ls == 0:
-                        depth_use = False   # 无光帧：interleave 正常另一半，静默跳过
+                        laser_ok = False   # 无光帧：interleave 正常另一半，静默跳过
                     elif ls != 1 and laser_seen_meta:
                         # 元数据缺失(-1)但该固件明明支持——旧口径会把这种帧当好帧
                         # 放行（疑似全屏暗闪来源），现整帧跳过（僵住上一帧）并留证据。
                         # 固件完全不支持该元数据（从未读到过）时仍放行，避免深度断流
-                        depth_use = False
+                        laser_ok = False
                         laser_skip += 1
                         if laser_skip == 1 or laser_skip % 20 == 0:
                             log.warning("[%s] 深度垃圾帧整帧跳过（激光状态=%d）累计 %d",
                                         device_id, ls, laser_skip)
+                depth_use = dep_due and laser_ok
                 if depth_use:
                     try:
                         files["depth"] = ("depth.jpg",
@@ -783,6 +891,19 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                         if depth_err == 1 or depth_err % 100 == 0:
                             log.warning("[%s] 深度帧伪彩失败 %d 次: %s",
                                         device_id, depth_err, e)
+                # ── 设备点云按需推流（独立请求，失败只降级本路不影响主链路）：
+                # 需散斑深度帧；无光/垃圾帧不更新节拍时刻，下一帧组即重试 ──
+                if pc_due and laser_ok:
+                    try:
+                        _push_devpc(session, device_id, pc_ctx, fs, cf, pcc, now)
+                        pc_ctx["err"] = 0
+                        pc_state["last_push"] = now
+                    except Exception as e:
+                        pc_ctx["err"] += 1
+                        pc_state["last_push"] = now  # 失败也按节奏走，避免忙等打爆链路
+                        if pc_ctx["err"] == 1 or pc_ctx["err"] % 30 == 0:
+                            log.warning("[%s] 设备点云推送失败 %d 次: %s",
+                                        device_id, pc_ctx["err"], e)
                 if not files:
                     # 深度节拍到了但本帧组无可用深度帧（interleave 无光帧等）：
                     # 等下一帧组，不空跑请求
