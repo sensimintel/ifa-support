@@ -3158,20 +3158,51 @@ function fillDdControls(c){
 // 深度视图展会默认（2026-08-13 现场调定）：亮度0.8/对比1.3/饱和0.9/模糊10px
 let ddCss={br:0.8,ct:1.3,sa:0.9,hu:0,inv:0,bl:10,op:1,fit:'cover',mir:0,rot:0,pix:0};
 try{Object.assign(ddCss,JSON.parse(localStorage.getItem('exp_dd_css')||'{}'));}catch(e){}
+// 深度显示颜色链（亮度→对比→饱和→色相→反相，与 CSS filter 同序同义）合成为
+// 一个 3×3 颜色矩阵+偏移，供 dotSample 烘进取色缓存。canvas 层因此不挂颜色类
+// CSS 滤镜——合成器偶发漏套滤镜的帧不再产生可见亮度跳变（全屏暗闪根因）。
+// 恒等变换返回 null（零开销）
+function ddColorMatrix(){
+  if(bgSource!=='devdepth')return null;
+  const br=Math.max(0,+ddCss.br||1),ct=Math.max(0,+ddCss.ct||1),sa=Math.max(0,+ddCss.sa||1);
+  const hu=(+ddCss.hu||0)*Math.PI/180,inv=+ddCss.inv?1:0;
+  let M=[br,0,0,0,br,0,0,0,br],off=[0,0,0];
+  function mul(A,ao){
+    const R=new Array(9),ro=new Array(3);
+    for(let r=0;r<3;r++){
+      for(let c=0;c<3;c++)R[r*3+c]=A[r*3]*M[c]+A[r*3+1]*M[3+c]+A[r*3+2]*M[6+c];
+      ro[r]=A[r*3]*off[0]+A[r*3+1]*off[1]+A[r*3+2]*off[2]+ao[r];
+    }
+    M=R;off=ro;
+  }
+  if(ct!==1){const o=255*(0.5-ct/2);mul([ct,0,0,0,ct,0,0,0,ct],[o,o,o]);}
+  if(sa!==1)mul([0.213+0.787*sa,0.715-0.715*sa,0.072-0.072*sa,
+                 0.213-0.213*sa,0.715+0.285*sa,0.072-0.072*sa,
+                 0.213-0.213*sa,0.715-0.715*sa,0.072+0.928*sa],[0,0,0]);
+  if(hu){const c=Math.cos(hu),s=Math.sin(hu);
+    mul([0.213+c*0.787-s*0.213,0.715-c*0.715-s*0.715,0.072-c*0.072+s*0.928,
+         0.213-c*0.213+s*0.143,0.715+c*0.285+s*0.140,0.072-c*0.072-s*0.283,
+         0.213-c*0.213-s*0.787,0.715-c*0.715+s*0.715,0.072+c*0.928+s*0.072],[0,0,0]);}
+  if(inv)mul([-1,0,0,0,-1,0,0,0,-1],[255,255,255]);
+  const ident=M[0]===1&&M[4]===1&&M[8]===1&&!M[1]&&!M[2]&&!M[3]&&!M[5]&&!M[6]&&!M[7]
+    &&!off[0]&&!off[1]&&!off[2];
+  return ident?null:[M,off];
+}
 function applyDdCss(){
   const on=bgSource==='devdepth';
   // 点云化 canvas 层也套同一组显示参数：devdepth+点阵组合时调节仍可见。
-  // 例外——亮度：canvas 层不走 CSS brightness 滤镜，而是烘进取色缓存（dotSample）。
-  // 原因（2026-08-14 屏闪根因）：大 canvas 每帧全量上传 + CSS 滤镜的 GPU 合成
-  // 在高负载下偶发"漏套滤镜"的帧直接上屏，brightness≠1 时该帧亮度骤变=全屏暗闪；
-  // 烘进像素后滤镜恒为 1，漏帧不可见
+  // 例外——颜色类滤镜（亮度/对比/饱和/色相/反相）对 canvas 走像素烘焙（见
+  // ddColorMatrix/dotSample），canvas 的 CSS filter 只留模糊与不透明度
   [$('bgA'),$('bgB'),$('bgDot')].forEach(el=>{
     if(!on){el.style.filter='';el.style.objectFit='';el.style.transform='';el.style.imageRendering='';return;}
-    const br=(el.id==='bgDot')?1:ddCss.br;
     // 不透明度用 filter 的 opacity()：inline opacity 会盖掉 .bg.on 的交叉淡入
-    el.style.filter='brightness('+br+') contrast('+ddCss.ct+') saturate('+ddCss.sa
-      +') hue-rotate('+ddCss.hu+'deg)'+(+ddCss.inv?' invert(1)':'')
-      +(+ddCss.bl?' blur('+ddCss.bl+'px)':'')+' opacity('+ddCss.op+')';
+    if(el.id==='bgDot')
+      el.style.filter=((+ddCss.bl?'blur('+ddCss.bl+'px) ':'')
+        +(+ddCss.op!==1?'opacity('+ddCss.op+')':'')).trim();
+    else
+      el.style.filter='brightness('+ddCss.br+') contrast('+ddCss.ct+') saturate('+ddCss.sa
+        +') hue-rotate('+ddCss.hu+'deg)'+(+ddCss.inv?' invert(1)':'')
+        +(+ddCss.bl?' blur('+ddCss.bl+'px)':'')+' opacity('+ddCss.op+')';
     el.style.objectFit=ddCss.fit;
     // 旋转 90°/270° 宽高互换：按视口长宽比放大补偿，保证铺满不露黑边
     const r=+ddCss.rot;
@@ -3254,11 +3285,17 @@ function dotSample(){
   const octx=dotOffCv.getContext('2d',{willReadFrequently:true});
   octx.drawImage(im,sx,sy,sw,sh,0,0,dotCols,dotRows);
   dotData=octx.getImageData(0,0,dotCols,dotRows).data;
-  // 深度来源的亮度增益烘进像素（Uint8ClampedArray 自动截断到 255）：
-  // 替代 canvas 层的 CSS brightness 滤镜，规避合成漏帧导致的全屏暗闪
-  const g=(bgSource==='devdepth')?Math.max(0,+ddCss.br||1):1;
-  if(g!==1){const d=dotData;
-    for(let i=0;i<d.length;i+=4){d[i]*=g;d[i+1]*=g;d[i+2]*=g;}}
+  // 深度显示的整条颜色滤镜链（亮度/对比/饱和/色相/反相）烘进像素
+  //（Uint8ClampedArray 自动截断），canvas 层不再挂颜色类 CSS 滤镜——
+  // 合成器偶发"漏套滤镜"的帧从此与正常帧无差别（全屏暗闪根因，2026-08-14）
+  const cm=ddColorMatrix();
+  if(cm){const d=dotData,M=cm[0],off=cm[1];
+    for(let i=0;i<d.length;i+=4){
+      const r=d[i],g=d[i+1],b=d[i+2];
+      d[i]  =M[0]*r+M[1]*g+M[2]*b+off[0];
+      d[i+1]=M[3]*r+M[4]*g+M[5]*b+off[1];
+      d[i+2]=M[6]*r+M[7]*g+M[8]*b+off[2];
+    }}
   dotEdge=null;
   if(+dotCfg.pfloat>0)dotEdgeBuild();   // 漂浮强度开启时随取色缓存一并重建边缘场
   return true;
@@ -3992,7 +4029,7 @@ if(new URLSearchParams(location.search).get('trace')==='1'){
   })();
   setInterval(()=>{
     fetch('/api/flicker-report',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({page_ts:Date.now(),total:tbuf.length,v:3,bld:'bake1',
+      body:JSON.stringify({page_ts:Date.now(),total:tbuf.length,v:3,bld:'bake2',
         cfg:Object.assign({},dotCfg),dd:Object.assign({},ddCss),
         fdot:getComputedStyle($('bgDot')).filter,
         samples:tbuf.slice(-900)})
