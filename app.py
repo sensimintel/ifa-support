@@ -3222,6 +3222,9 @@ let dotCfg={on:1,mode:0,pitch:7,r:34,jitter:0,motion:0,speed:1,bg:'#000000',gsha
 try{Object.assign(dotCfg,JSON.parse(localStorage.getItem('exp_dot')||'{}'));}catch(e){}
 let dotIm=null,dotOffCv=null;        // 最近一帧背景 Image / 离屏降采样画布（复用）
 let dotData=null,dotCols=0,dotRows=0;// 降采样取色缓存：动画重绘不重复采样
+// 帧间取色过渡：新帧到达后从旧缓存 lerp 到新缓存（时长自适应实测帧间隔），
+// 换帧不再整图瞬跳——低 fps 下的"整图换色"与高 fps 下的闪烁同源同治
+let dotBlendTo=null,dotBlendFrom=null,dotBlendT0=0,dotBlendDur=300,dotLastSample=0;
 function dotSample(){
   // 新帧/视口/点距变化时重建取色缓存：源图按 cover 构图居中裁剪，缩到 cols×rows，
   // getImageData 一次取回全部格子颜色。网格模式格距=点距；粒子云用固定 8px 采样格
@@ -3241,17 +3244,35 @@ function dotSample(){
   else{sw=im.naturalWidth;sh=sw/ar;sx=0;sy=(im.naturalHeight-sh)/2;}
   const octx=dotOffCv.getContext('2d',{willReadFrequently:true});
   octx.drawImage(im,sx,sy,sw,sh,0,0,dotCols,dotRows);
-  dotData=octx.getImageData(0,0,dotCols,dotRows).data;
+  const nd=octx.getImageData(0,0,dotCols,dotRows).data;
+  const nowMs=performance.now();
+  if(dotData&&dotData.length===nd.length&&dotLastSample>0){
+    // 同尺寸新帧：起一段 lerp 过渡（时长=实测帧间隔的 60%，80~700ms 封顶），
+    // dotData 先复制旧帧作混合缓冲；尺寸变化（视口/点距/模式切换）则立即切换
+    dotBlendDur=Math.min(700,Math.max(80,(nowMs-dotLastSample)*0.6));
+    dotBlendFrom=new Uint8ClampedArray(dotData);
+    dotBlendTo=nd;dotBlendT0=nowMs;
+    dotData=new Uint8ClampedArray(dotBlendFrom);
+  }else{dotData=nd;dotBlendTo=null;dotBlendFrom=null;}
+  dotLastSample=nowMs;
   dotEdge=null;
-  if(+dotCfg.pfloat>0)dotEdgeBuild();   // 漂浮强度开启时随取色缓存一并重建边缘场
+  if(+dotCfg.pfloat>0)dotEdgeBuild(nd);   // 漂浮强度开启时随取色缓存一并重建边缘场（几何按最新帧）
   return true;
+}
+function dotBlendStep(){
+  // 过渡推进：按进度把混合缓冲逐通道推向新帧；到位后直接引用新帧数组、释放过渡态
+  if(!dotBlendTo)return;
+  const a=Math.min(1,(performance.now()-dotBlendT0)/dotBlendDur);
+  const f=dotBlendFrom,t=dotBlendTo,d=dotData,n=d.length;
+  for(let i=0;i<n;i++)d[i]=f[i]+(t[i]-f[i])*a;
+  if(a>=1){dotData=dotBlendTo;dotBlendTo=null;dotBlendFrom=null;}
 }
 // ── 边缘场：每格 [强度, 外散方向x, 外散方向y]。强度=与四邻的色差（不同深度区块的
 //    交界处高），方向=亮度梯度反方向（朝更暗一侧；梯度太小则逐格稳定随机方向）。
 //    供「漂浮强度」把边缘的点吹散——消散观感的几何基础 ──
 let dotEdge=null;
-function dotEdgeBuild(){
-  const d=dotData;if(!d)return;
+function dotEdgeBuild(src){
+  const d=src||dotData;if(!d)return;
   dotEdge=new Float32Array(dotCols*dotRows*3);
   const lum=o=>d[o]*0.2126+d[o+1]*0.7152+d[o+2]*0.0722;
   for(let y=1;y<dotRows-1;y++)for(let x=1;x<dotCols-1;x++){
@@ -3479,11 +3500,12 @@ function pcDraw(t){
 // ── rAF 动画循环（~30fps 节流）：粒子云常开（speed=0 时粒子静止但仍重生闪换）；
 //    网格模式仅运动开启时循环。深度帧到达只刷 dotSample 缓存，循环不重置 ──
 let dotRaf=0,dotLastT=0;
-function dotNeedLoop(){return +dotCfg.on&&(+dotCfg.mode===1||+dotCfg.motion>0||+dotCfg.pfloat>0||+dotCfg.pdepth>0);}
+function dotNeedLoop(){return +dotCfg.on&&(+dotCfg.mode===1||+dotCfg.motion>0||+dotCfg.pfloat>0||+dotCfg.pdepth>0||!!dotBlendTo);}
 function dotLoop(ts){
   dotRaf=0;
   if(!dotNeedLoop()||$('bgDot').style.display==='none')return;
   if(ts-dotLastT>=33){dotLastT=ts;
+    dotBlendStep();   // 帧间取色过渡先推进，再按混合后的缓存重绘
     if(+dotCfg.mode===1)pcDraw(ts/1000);else dotDraw(ts/1000);}
   dotRaf=requestAnimationFrame(dotLoop);
 }

@@ -351,12 +351,28 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     深度独立 1.5fps；色彩仍为 TURBO 近亮远暗、无效点黑。服务端可经 device-config 下发 depth_* 键逐项
     覆盖：色彩映射/方向/量程（固定或分位自适应）/gamma/直方图均衡/孔洞填充/
     时空域滤波/边缘描边/等值线/无效点颜色/JPEG 质量（/experience「调节」抽屉可视化
-    调节）。state 为该相机线程私有的渲染状态（时域 EMA 上一帧等），重连后重置。"""
+    调节）。state 为该相机线程私有的渲染状态（时域 EMA 上一帧等），重连后重置。
+
+    时域稳频（2026-08-14，治高帧率闪烁/低帧率换帧整图变色）：空洞用上一帧有效值
+    垫底（一帧记忆）、自适应量程 lo/hi 跨帧 EMA、global 均衡只统计有效像素且
+    查表跨帧 EMA——三处逐帧统计量全部带时域惯性，色彩映射不再逐帧漂移。"""
     w, h = frame.get_width(), frame.get_height()
     scale = float(getattr(frame, "get_depth_scale", lambda: 1.0)() or 1.0)
     d = np.frombuffer(bytes(frame.get_data()), dtype=np.uint16).reshape(h, w)
     d_mm = d.astype(np.float32) * scale
     invalid = d_mm <= 0
+
+    # ── 时域空洞垫底（一帧记忆）：散斑空洞逐帧闪变（像素有效↔无效来回翻转）是
+    #    高帧率下画面闪烁的主源之一——用上一帧真实有效的值垫住本帧空洞。只记
+    #    一帧、只存真实观测值（不存垫底后的结果），避免长记忆造成运动拖影 ──
+    fill = str(cfg.get("depth_fill", "close"))
+    hole_src = np.where(invalid, np.float32(0.0), d_mm)
+    prev_hole = state.get("hole_prev")
+    if fill != "off" and prev_hole is not None and prev_hole.shape == d_mm.shape:
+        m = invalid & (prev_hole > 0)
+        d_mm[m] = prev_hole[m]
+        invalid = d_mm <= 0
+    state["hole_prev"] = hole_src
 
     # ── 时域平滑（EMA）：只混合两帧都有效的像素；分辨率变化即重置 ──
     ema = min(max(_cfg_num(cfg, "depth_ema", 0.15), 0.0), 0.95)
@@ -367,7 +383,6 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     state["ema_prev"] = d_mm.copy() if ema > 0 else None
 
     # ── 孔洞填充（close 模式，作用于深度值本身）：形态学闭运算用邻域深度补 0 值空洞 ──
-    fill = str(cfg.get("depth_fill", "close"))
     fill_px = max(1, int(_cfg_num(cfg, "depth_fill_px", 5)))
     if fill == "close" and invalid.any():
         ker = cv2.getStructuringElement(
@@ -382,6 +397,13 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
         p_hi = _cfg_num(cfg, "depth_auto_hi", 89.0)
         p_lo = min(_cfg_num(cfg, "depth_auto_lo", 8.0), p_hi - 1.0)
         lo, hi = np.percentile(valid_vals, [p_lo, p_hi])
+        # 量程时域平滑：分位数随手部进出/空洞波动逐帧小幅漂移，直接用会让整图
+        # 颜色映射逐帧平移（高帧率=闪、低帧率=换帧整图变色），lo/hi 跨帧 EMA 压住
+        prev_rng = state.get("rng_prev")
+        if prev_rng is not None:
+            lo = 0.85 * prev_rng[0] + 0.15 * lo
+            hi = 0.85 * prev_rng[1] + 0.15 * hi
+        state["rng_prev"] = (float(lo), float(hi))
     else:
         lo = _cfg_num(cfg, "depth_min_m", DEPTH_MIN_M) * 1000.0
         hi = _cfg_num(cfg, "depth_max_m", DEPTH_MAX_M) * 1000.0
@@ -399,10 +421,21 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
                          float(min(fill_px, 10)), cv2.INPAINT_TELEA)
         invalid = np.zeros_like(invalid)
 
-    # ── 直方图均衡（近似：无效像素也计入直方图统计，随后会被无效色整体覆盖） ──
+    # ── 直方图均衡：global 模式只统计有效像素并对均衡查表做跨帧 EMA——无效散斑
+    #    占比逐帧波动会推移整条 CDF，是逐帧统计操作里最大的闪烁贡献者 ──
     eq = str(cfg.get("depth_eq", "global"))
     if eq == "global":
-        t8 = cv2.equalizeHist(t8)
+        vals = t8[~invalid]
+        if vals.size:
+            cdf = np.bincount(vals.ravel(), minlength=256).astype(np.float64).cumsum()
+            lut = np.clip(cdf * (255.0 / cdf[-1]), 0.0, 255.0)
+        else:
+            lut = np.arange(256, dtype=np.float64)
+        prev_lut = state.get("eq_lut")
+        if prev_lut is not None:
+            lut = 0.85 * prev_lut + 0.15 * lut
+        state["eq_lut"] = lut
+        t8 = lut.astype(np.uint8)[t8]
     elif eq == "clahe":
         clip = min(max(_cfg_num(cfg, "depth_eq_clip", 2.5), 0.5), 10.0)
         t8 = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8)).apply(t8)
