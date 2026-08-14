@@ -16,6 +16,9 @@ infra:
     log_timezone: Asia/Shanghai
     service_tokens:
       device_image_uri_upload: local-image-uri-service-token
+      # ifa 深体验区演示状态机：dx-backend（8070）代理控制面调 services 的固定 token。
+      # 闭环内网使用，与 dx_backend.py 的 IFA_DEMO_CONTROL_TOKEN 保持一致即可。
+      ifa_demo_control: local-ifa-demo-control-token
   database:
     url: postgres://odyss:odyssadmin@postgres:5432/odyss_services?sslmode=disable
   redis:

@@ -75,6 +75,16 @@ NECKLACE_SOURCE_TIMEOUT = 2.0
 # 多设备下拉、/panel 的选中设备回落都依赖它，调小会让那些页面在短暂停传时就丢设备。
 # 这里只在本接口按更严的阈值过滤，影响面收在深体验区内。
 NECKLACE_ONLINE_MAX_AGE = float(os.environ.get("NECKLACE_ONLINE_MAX_AGE", "15"))
+# ifa 演示状态机（项链 ready / meal_in_progress / meal_complete）：状态机本体在
+# local-stack 的 odyss-services（宿主 18090），这里只做控制面代理——控制面依旧
+# 免认证走 /dx-api/，由本服务补上 services 的 service token（X-Odyss-Service-Token）。
+# token 必须与 local-stack runtime-config 的 infra.http.service_tokens.ifa_demo_control 一致。
+IFA_SERVICES_BASE_URL = os.environ.get(
+    "IFA_SERVICES_BASE_URL", "http://127.0.0.1:18090")
+IFA_DEMO_CONTROL_TOKEN = os.environ.get(
+    "IFA_DEMO_CONTROL_TOKEN", "local-ifa-demo-control-token")
+IFA_SERVICES_TIMEOUT = 5.0
+
 # 帧中继对「camera_info 缺失或其中没有 device_id」的兜底桶名。
 # 它不是真实身份：多个未识别设备的帧会混进同一个桶，绑定它毫无意义，故不进候选。
 # 但它出现本身是个运维信号——说明有项链的蓝牙名没被 App 侧的 BleDeviceIdentityCache
@@ -511,6 +521,58 @@ def api_necklace_frame(device: str = ""):
     # no-store：帧是一直在变的，缓存住就成了静态图
     return Response(content=data, media_type=content_type,
                     headers={"Cache-Control": "no-store", "X-Frame-Seq": seq})
+
+
+def _ifa_meal_state_request(method, device_id, body=None):
+    """调 services 的 ifa 演示状态机端点，统一补 service token 与错误封装。
+
+    返回 (payload, status)：payload 是 services 响应 data 段（或错误说明），
+    status 是要透传给控制面的 HTTP 状态码。services 不可达按 502 报出。
+    """
+    url = "%s/api/v1/ifa/devices/%s/meal-state" % (
+        IFA_SERVICES_BASE_URL, urllib.parse.quote(device_id))
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "X-Odyss-Service-Token": IFA_DEMO_CONTROL_TOKEN,
+        "Content-Type": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=IFA_SERVICES_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8")) or {}
+            return payload.get("data") or {}, resp.status
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("msg") or str(exc)
+        except (ValueError, OSError):
+            detail = str(exc)
+        return {"error": detail}, exc.code
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return {"error": "services（%s）不可达：%s" % (IFA_SERVICES_BASE_URL, exc)}, 502
+
+
+@app.get("/api/necklaces/{device_id}/meal-state")
+def api_necklace_meal_state_get(device_id: str):
+    """查询某条项链的演示状态机状态（tracked=false 表示未参与演示）。"""
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    data, status = _ifa_meal_state_request("GET", device_id)
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
+@app.put("/api/necklaces/{device_id}/meal-state")
+def api_necklace_meal_state_set(device_id: str, body: dict = Body(...)):
+    """设置某条项链的演示状态（控制面用：设 ready 与 reset 都是 state=ready）。"""
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    state = str((body or {}).get("state") or "").strip()
+    if not state:
+        return JSONResponse({"ok": False, "error": "需要 state"}, status_code=400)
+    data, status = _ifa_meal_state_request("PUT", device_id, {"state": state})
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
 
 
 @app.get("/api/pairing-log")
