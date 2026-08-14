@@ -364,15 +364,20 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
 
     # ── 时域空洞垫底（一帧记忆）：散斑空洞逐帧闪变（像素有效↔无效来回翻转）是
     #    高帧率下画面闪烁的主源之一——用上一帧真实有效的值垫住本帧空洞。只记
-    #    一帧、只存真实观测值（不存垫底后的结果），避免长记忆造成运动拖影 ──
+    #    一帧、只存真实观测值（不存垫底后的结果）；且仅在帧间隔 ≤0.6s 时生效——
+    #    低帧率下上一帧太陈旧，拿来填运动物体轮廓洞会出彩色镶边（重影） ──
     fill = str(cfg.get("depth_fill", "close"))
+    now_ts = time.time()
     hole_src = np.where(invalid, np.float32(0.0), d_mm)
     prev_hole = state.get("hole_prev")
-    if fill != "off" and prev_hole is not None and prev_hole.shape == d_mm.shape:
+    prev_ts = state.get("hole_ts", 0.0)
+    if (fill != "off" and prev_hole is not None
+            and prev_hole.shape == d_mm.shape and now_ts - prev_ts <= 0.6):
         m = invalid & (prev_hole > 0)
         d_mm[m] = prev_hole[m]
         invalid = d_mm <= 0
     state["hole_prev"] = hole_src
+    state["hole_ts"] = now_ts
 
     # ── 时域平滑（EMA）：只混合两帧都有效的像素；分辨率变化即重置 ──
     ema = min(max(_cfg_num(cfg, "depth_ema", 0.15), 0.0), 0.95)
@@ -673,6 +678,8 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
             first = True
             first_depth = True
             depth_err = 0
+            laser_seen_meta = False   # 本次连接内是否成功读到过 LASER_STATUS 元数据
+            laser_skip = 0            # 垃圾深度帧（无光/元数据缺失）整帧跳过累计
             aux_err_logged = False
             last_push = 0.0
             cache = _IRCache()
@@ -739,9 +746,27 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                 if rgb_due:
                     files["image"] = ("frame.jpg", _to_jpeg(cf), "image/jpeg")
                 df = fs.get_depth_frame() if "depth" in streams else None
-                if dep_due and df is not None and not (
-                        spec["stereo"] and laser_mode == "interleave"
-                        and _laser_status(df) == 0):
+                # interleave 垃圾帧整帧跳过：只收明确有散斑（LASER_STATUS==1）的
+                # 深度帧；无光帧（0）与元数据缺失帧（-1）一律丢弃——宁可僵住上一帧
+                # 也不上垃圾帧（全屏暗闪嫌疑）。例外：本次连接从未读到过该元数据
+                # （固件不支持，读永远是 -1）时放行，避免深度整路断流
+                depth_use = dep_due and df is not None
+                if depth_use and spec["stereo"] and laser_mode == "interleave":
+                    ls = _laser_status(df)
+                    if ls >= 0:
+                        laser_seen_meta = True
+                    if ls == 0:
+                        depth_use = False   # 无光帧：interleave 正常另一半，静默跳过
+                    elif ls != 1 and laser_seen_meta:
+                        # 元数据缺失(-1)但该固件明明支持——旧口径会把这种帧当好帧
+                        # 放行（疑似全屏暗闪来源），现整帧跳过（僵住上一帧）并留证据。
+                        # 固件完全不支持该元数据（从未读到过）时仍放行，避免深度断流
+                        depth_use = False
+                        laser_skip += 1
+                        if laser_skip == 1 or laser_skip % 20 == 0:
+                            log.warning("[%s] 深度垃圾帧整帧跳过（激光状态=%d）累计 %d",
+                                        device_id, ls, laser_skip)
+                if depth_use:
                     try:
                         files["depth"] = ("depth.jpg",
                                           _depth_to_jpeg(df, dcfg, depth_state),
