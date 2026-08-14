@@ -2358,6 +2358,20 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  #hlcfg select{width:100%;background:#1c1c1e;color:#eee;border:1px solid rgba(255,253,247,.25);
    border-radius:6px;padding:4px 6px;font:12px system-ui,sans-serif;margin:2px 0;outline:none}
  #hlcfg .hint{margin-top:12px;font-size:11px;line-height:1.5;color:rgba(255,253,247,.45)}
+ /* 配置预设区：保存输入行 + 预设列表行 */
+ #hlcfg .prow{display:flex;align-items:center;gap:6px;margin:6px 0 2px}
+ #hlcfg .prow input[type=text]{flex:1;min-width:0;background:#1c1c1e;color:#eee;
+   border:1px solid rgba(255,253,247,.25);border-radius:6px;padding:4px 6px;
+   font:12px system-ui,sans-serif;outline:none}
+ #hlcfg .prow button{font-size:12px;padding:4px 10px;border-radius:6px;cursor:pointer;
+   border:1px solid rgba(255,253,247,.25);background:transparent;color:rgba(255,253,247,.75);
+   white-space:nowrap}
+ #hlcfg .prow button:hover{background:rgba(255,253,247,.12)}
+ #hlcfg .prow button.confirm{border-color:#ff7a6b;color:#ff7a6b}
+ #hlcfg .prow .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+   white-space:nowrap;color:rgba(255,253,247,.85)}
+ #hlcfg .prow .ts{font-size:10px;color:rgba(255,253,247,.4);white-space:nowrap;
+   font-variant-numeric:tabular-nums}
 </style></head><body>
 <div id="stage">
  <img class="bg" id="bgA" alt=""><img class="bg" id="bgB" alt="">
@@ -2572,6 +2586,13 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   RGB 约 135KB/帧、深度约 40KB/帧（质量 72），两路合计别把预算打满，否则整体卡顿。
   <b>深度显示</b>区只改本页背景的 CSS，拖动立即生效、只存本浏览器（localStorage）；
   旋转 90°/270° 按视口比例自动放大铺满。</div>
+ <div class="sec">配置预设（存服务器）</div>
+ <div class="prow"><input type="text" id="ddp_name" maxlength="40" placeholder="预设名（重名覆盖）">
+  <button id="ddp_save">保存</button></div>
+ <div id="ddp_list"></div>
+ <div class="hint">把当前「深度渲染 + 深度显示 + 点云化」整套参数以命名快照存到服务器
+  （数量不限、重名覆盖、服务重启不丢，换浏览器/展示端也能恢复）。恢复：深度渲染整套
+  写回推流端（约 2~4s 生效），深度显示与点云化立即生效并记入本浏览器；删除需再点一次确认。</div>
  </div>
  <div id="dotonly" style="display:none">
  <div class="sec">点云化样式（图片类背景，本页即时）</div>
@@ -3115,7 +3136,10 @@ function renderDdCfg(s){
   // 拖动中或刚下发 1.5s 内不回写，避免打架（同帧率滑条的守卫逻辑）
   if(Date.now()-ddTouched<1500)return;
   const d=(s.devices||[]).find(x=>x.device_id===s.selected);
-  const c=(d&&d.config)||{};
+  fillDdControls((d&&d.config)||{});
+}
+// 深度渲染控件回填（status 轮询与预设恢复两处复用）：只填传入的键，跳过正被操作的控件
+function fillDdControls(c){
   Object.keys(DD_SLIDERS).forEach(k=>{
     const [rid,vid,dp]=DD_SLIDERS[k],el=$(rid);
     if(c[k]!=null&&document.activeElement!==el){el.value=c[k];$(vid).textContent=(+el.value).toFixed(dp);}
@@ -3170,8 +3194,8 @@ Object.keys(DC_RADIOS).forEach(nm=>document.querySelectorAll('input[name='+nm+']
     ddCss[DC_RADIOS[nm]]=(nm==='dcfit')?v:+v;
     applyDdCss();saveDdCss();
   })));
-// localStorage 记忆值回填显示层控件（页面加载一次）
-(function(){
+// ddCss 当前值回填显示层控件（页面加载与预设恢复两处复用）
+function fillDcControls(){
   Object.keys(DC_SLIDERS).forEach(k=>{
     const [rid,vid,dp]=DC_SLIDERS[k];
     $(rid).value=ddCss[k];$(vid).textContent=(+ddCss[k]).toFixed(dp);
@@ -3180,7 +3204,8 @@ Object.keys(DC_RADIOS).forEach(nm=>document.querySelectorAll('input[name='+nm+']
     const el=document.querySelector('input[name='+nm+'][value="'+ddCss[DC_RADIOS[nm]]+'"]');
     if(el)el.checked=true;
   });
-})();
+}
+fillDcControls();   // localStorage 记忆值回填（页面加载一次）
 addEventListener('resize',applyDdCss);   // 旋转补偿量随视口比例变化
 
 // ══ 点云化样式（图片类背景通用形态层，两种模式）：
@@ -3501,8 +3526,8 @@ Object.keys(DT_SLIDERS).forEach(k=>{
 [['c_dt_bg','bg'],['c_dt_pc','pcolor']].forEach(([id,k])=>
   $(id).addEventListener('input',()=>{
     dotCfg[k]=$(id).value;applyDotCfg();saveDot();}));
-// localStorage 记忆值回填点云化控件（页面加载一次）
-(function(){
+// dotCfg 当前值回填点云化控件（页面加载与预设恢复两处复用）
+function fillDtControls(){
   Object.keys(DT_RADIOS).forEach(nm=>{
     const el=document.querySelector('input[name='+nm+'][value="'+(+dotCfg[DT_RADIOS[nm]])+'"]');
     if(el)el.checked=true;});
@@ -3510,8 +3535,84 @@ Object.keys(DT_SLIDERS).forEach(k=>{
     const [rid,vid]=DT_SLIDERS[k];
     $(rid).value=dotCfg[k];$(vid).textContent=''+dotCfg[k];});
   $('c_dt_bg').value=dotCfg.bg;$('c_dt_pc').value=dotCfg.pcolor;
-})();
+}
+fillDtControls();   // localStorage 记忆值回填（页面加载一次）
 addEventListener('resize',()=>{if(+dotCfg.on)applyDotCfg();});
+
+// ══ 配置预设（存服务器）：深度渲染 + 深度显示 + 点云化 整套参数的命名快照 ══
+// 保存：从控件当前值收集完整参数 POST 到 /api/frame/depth-presets（重名覆盖、数量不限，
+// 服务端落盘 depth_presets.json 重启不丢）；恢复：深度渲染整套写回当前选中设备
+// （device-config 通道，~2-4s 生效），深度显示/点云化本页即时生效并记入 localStorage
+function ddpCollect(){
+  const cfg={};
+  Object.keys(DD_SLIDERS).forEach(k=>{cfg[k]=+$(DD_SLIDERS[k][0]).value;});
+  Object.keys(DD_RADIOS).forEach(nm=>{
+    const el=document.querySelector('input[name='+nm+']:checked');
+    if(el)cfg[DD_RADIOS[nm]]=isNaN(+el.value)?el.value:+el.value;});
+  cfg.depth_colormap=$('dd_cmap').value;
+  cfg.depth_invalid_color=$('c_dd_invalid').value;
+  return {config:cfg,display:Object.assign({},ddCss),dot:Object.assign({},dotCfg)};
+}
+async function ddpLoad(){
+  try{
+    const r=await(await fetch('/api/frame/depth-presets',{cache:'no-store'})).json();
+    ddpRender(r.presets||[]);
+  }catch(e){/* 列表加载失败保持现状，下次打开抽屉重试 */}
+}
+function ddpRender(list){
+  const box=$('ddp_list');box.textContent='';
+  if(!list.length){
+    const d=document.createElement('div');d.className='hint';d.style.marginTop='4px';
+    d.textContent='（暂无预设）';box.appendChild(d);return;
+  }
+  list.forEach(p=>{
+    const row=document.createElement('div');row.className='prow';
+    const nm=document.createElement('span');nm.className='nm';nm.textContent=p.name;nm.title=p.name;
+    const ts=document.createElement('span');ts.className='ts';
+    if(p.saved_at){
+      const d=new Date(p.saved_at*1000);
+      ts.textContent=(d.getMonth()+1)+'/'+d.getDate()+' '
+        +String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');
+    }
+    const bR=document.createElement('button');bR.textContent='恢复';
+    bR.addEventListener('click',()=>ddpApply(p));
+    const bD=document.createElement('button');bD.textContent='删除';
+    bD.addEventListener('click',()=>{
+      // 两次点击确认（不用 confirm() 弹窗：展台全屏页不弹系统对话框）
+      if(!bD.classList.contains('confirm')){
+        bD.classList.add('confirm');bD.textContent='确认删除';
+        setTimeout(()=>{bD.classList.remove('confirm');bD.textContent='删除';},3000);
+        return;
+      }
+      fetch('/api/frame/depth-presets/delete',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({name:p.name})})
+        .then(()=>ddpLoad()).catch(()=>{});
+    });
+    row.appendChild(nm);row.appendChild(ts);row.appendChild(bR);row.appendChild(bD);
+    box.appendChild(row);
+  });
+}
+function ddpApply(p){
+  // 深度渲染：整套写回推流端（预设是完整快照，所有可控键全量覆盖），并即时回填控件
+  //（ddTouched 守卫 1.5s，防 status 轮询用旧值回写打架）
+  if(p.config&&Object.keys(p.config).length&&curDev){
+    ddTouched=Date.now();
+    fetch('/api/frame/device-config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({device_id:curDev,config:p.config})}).catch(()=>{});
+    fillDdControls(p.config);
+  }
+  // 深度显示 + 点云化：与手动拖滑杆同一条路径（应用 + localStorage + 控件回填）
+  if(p.display){Object.assign(ddCss,p.display);saveDdCss();applyDdCss();fillDcControls();}
+  if(p.dot){Object.assign(dotCfg,p.dot);saveDot();applyDotCfg();fillDtControls();}
+}
+$('ddp_save').addEventListener('click',()=>{
+  const name=$('ddp_name').value.trim();
+  if(!name)return;
+  fetch('/api/frame/depth-presets',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(Object.assign({name:name},ddpCollect()))})
+    .then(r=>r.json()).then(r=>{if(r&&r.ok){$('ddp_name').value='';ddpLoad();}}).catch(()=>{});
+});
+ddpLoad();
 
 let lastInset='';
 let bgFps=0;   // 选中设备实测入帧 fps（bgTick 每轮更新，驱动轮询自适应）
@@ -3809,7 +3910,7 @@ $('hlcolor').addEventListener('input',()=>{
 $('btnHlCfg').onclick=()=>{
   const on=!$('hlcfg').classList.contains('on');
   $('hlcfg').classList.toggle('on',on);
-  if(on)loadHlCfg();   // 每次打开都回填服务端当前值
+  if(on){loadHlCfg();ddpLoad();}   // 每次打开都回填服务端当前值 + 刷新配置预设列表
 };
 loadHlCfg();   // 启动即回填持久化配置：点渲染/视角参数在首个 GLB 加载前就绪，刷新页面不丢样式
 $('hlcfgClose').onclick=()=>$('hlcfg').classList.remove('on');

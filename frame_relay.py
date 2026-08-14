@@ -124,6 +124,75 @@ def _save_dev_config_locked() -> None:
         print(f"[frame-relay] per-device 配置落盘失败（忽略）：{type(e).__name__}: {e}",
               flush=True)
 
+
+def _normalize_dev_patch(patch: dict):
+    """校验并钳制一份 device-config patch，返回 (norm, 错误文案)。
+
+    norm 里键值为 None 表示「删除该键恢复兜底」（原值传 null/空串）；出错时 norm=None。
+    供 /api/frame/device-config 与深度配置预设保存两处复用，保证同一套白名单与钳制规则。
+    """
+    unknown = sorted(k for k in patch if k not in DEV_CONFIG_LIMITS
+                     and k not in DEV_CONFIG_ENUMS and k not in DEV_CONFIG_COLORS)
+    if unknown:
+        return None, (f"不支持的键：{unknown}；可用："
+                      f"{sorted([*DEV_CONFIG_LIMITS, *DEV_CONFIG_ENUMS, *DEV_CONFIG_COLORS])}")
+    norm: dict = {}
+    for k, v in patch.items():
+        if v is None or v == "":
+            norm[k] = None
+        elif k in DEV_CONFIG_LIMITS:
+            try:
+                lo, hi = DEV_CONFIG_LIMITS[k]
+                norm[k] = min(hi, max(lo, float(v)))
+            except (TypeError, ValueError):
+                return None, f"{k} 不是数字：{v!r}"
+        elif k in DEV_CONFIG_ENUMS:
+            sv = str(v).strip().lower()
+            if sv not in DEV_CONFIG_ENUMS[k]:
+                return None, f"{k} 取值非法：{v!r}；可用：{sorted(DEV_CONFIG_ENUMS[k])}"
+            norm[k] = sv
+        else:  # 颜色键
+            sv = str(v).strip()
+            if not _HEX_COLOR_RE.match(sv):
+                return None, f"{k} 不是 #rrggbb 颜色：{v!r}"
+            norm[k] = sv.lower()
+    return norm, None
+
+
+# ── 深度视图配置预设（/experience 深度图抽屉「配置预设」区，命名多预设、数量不限）──
+# name -> {"saved_at": 秒级时间戳, "config": 深度渲染 per-device 键（白名单校验后存储）,
+#          "display": 页面「深度显示」层参数, "dot": 点云化参数}
+# display/dot 对本模块不透明：它们是页面本地（localStorage）参数，恢复时由页面自行应用；
+# config 恢复时由页面 POST /api/frame/device-config 写回当前选中设备。
+# 落盘持久化（gitignored 本地态，与 dev_config.json 同款原子写），服务重启不丢。
+_depth_presets: dict = {}
+_depth_presets_lock = threading.Lock()
+_DEPTH_PRESETS_PATH = Path(__file__).resolve().parent / "depth_presets.json"
+_DEPTH_PRESET_NAME_MAX = 40          # 预设名长度上限（字符）
+_DEPTH_PRESET_BODY_MAX = 32 * 1024   # 单预设 JSON 体积上限（防异常客户端灌爆落盘文件）
+try:
+    _depth_presets.update({str(n): dict(p) for n, p in
+                           json.loads(_DEPTH_PRESETS_PATH.read_text()).items()
+                           if isinstance(p, dict)})
+    print(f"[frame-relay] 已回读深度配置预设 {len(_depth_presets)} 个", flush=True)
+except FileNotFoundError:
+    pass
+except Exception as e:
+    print(f"[frame-relay] 深度配置预设回读失败（忽略）：{type(e).__name__}: {e}",
+          flush=True)
+
+
+def _save_depth_presets_locked() -> None:
+    """持锁快照后落盘（写临时文件再原子替换，防写一半被杀留坏文件）。"""
+    snap = json.dumps(_depth_presets, ensure_ascii=False, indent=1)
+    try:
+        tmp = _DEPTH_PRESETS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(snap)
+        tmp.replace(_DEPTH_PRESETS_PATH)
+    except Exception as e:
+        print(f"[frame-relay] 深度配置预设落盘失败（忽略）：{type(e).__name__}: {e}",
+              flush=True)
+
 # DA3 处理回调：fn(image_bytes, config, device_id, seq, gen) -> 产物描述字典，
 # 或返回 DEFERRED（流水线模式：产物由构建级稍后经 set_product(device_id, seq, gen, …)
 # 异步写回）；由 app.py 在有模型时注入
@@ -646,36 +715,9 @@ async def set_device_config(body: dict = Body(...)):
     patch = (body or {}).get("config")
     if not isinstance(patch, dict) or not patch:
         return JSONResponse({"ok": False, "error": "缺少 config（应为非空对象）"}, status_code=400)
-    unknown = sorted(k for k in patch if k not in DEV_CONFIG_LIMITS
-                     and k not in DEV_CONFIG_ENUMS and k not in DEV_CONFIG_COLORS)
-    if unknown:
-        return JSONResponse({"ok": False, "error": f"不支持的键：{unknown}；可用："
-                             f"{sorted([*DEV_CONFIG_LIMITS, *DEV_CONFIG_ENUMS, *DEV_CONFIG_COLORS])}"},
-                            status_code=400)
-    # 先在锁外完成校验与钳制，锁内只做原子合并，坏值不会留下半套配置
-    norm: dict = {}
-    for k, v in patch.items():
-        if v is None or v == "":
-            norm[k] = None
-        elif k in DEV_CONFIG_LIMITS:
-            try:
-                lo, hi = DEV_CONFIG_LIMITS[k]
-                norm[k] = min(hi, max(lo, float(v)))
-            except (TypeError, ValueError):
-                return JSONResponse({"ok": False, "error": f"{k} 不是数字：{v!r}"},
-                                    status_code=400)
-        elif k in DEV_CONFIG_ENUMS:
-            sv = str(v).strip().lower()
-            if sv not in DEV_CONFIG_ENUMS[k]:
-                return JSONResponse({"ok": False, "error": f"{k} 取值非法：{v!r}；"
-                                     f"可用：{sorted(DEV_CONFIG_ENUMS[k])}"}, status_code=400)
-            norm[k] = sv
-        else:  # 颜色键
-            sv = str(v).strip()
-            if not _HEX_COLOR_RE.match(sv):
-                return JSONResponse({"ok": False, "error": f"{k} 不是 #rrggbb 颜色：{v!r}"},
-                                    status_code=400)
-            norm[k] = sv.lower()
+    norm, err = _normalize_dev_patch(patch)
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
     with _cv:
         cfg = dict(_dev_config.get(dev) or {})
         for k, v in norm.items():
@@ -690,6 +732,69 @@ async def set_device_config(body: dict = Body(...)):
         _save_dev_config_locked()
         _cv.notify_all()
     return JSONResponse({"ok": True, "device": dev, "config": cfg})
+
+
+@router.get("/api/frame/depth-presets")
+async def list_depth_presets():
+    """列出全部深度视图配置预设（含完整参数，页面恢复时直接取用，最新保存在前）。"""
+    with _depth_presets_lock:
+        items = [{"name": n, **p} for n, p in _depth_presets.items()]
+    items.sort(key=lambda x: x.get("saved_at") or 0, reverse=True)
+    return JSONResponse({"ok": True, "presets": items})
+
+
+@router.post("/api/frame/depth-presets")
+async def save_depth_preset(body: dict = Body(...)):
+    """保存一份深度视图配置预设（重名覆盖，数量不设上限）。
+
+    body 形如 {"name": "展会白天", "config": {深度渲染键…}, "display": {…}, "dot": {…}}。
+    config 走 device-config 同一套白名单校验/钳制（预设是完整快照，不含删除语义，
+    传 null/空串的键直接剔除）；display/dot 为页面本地参数，按不透明对象存储。
+    """
+    name = str((body or {}).get("name") or "").strip()
+    if not name:
+        return JSONResponse({"ok": False, "error": "缺少预设名"}, status_code=400)
+    if len(name) > _DEPTH_PRESET_NAME_MAX:
+        return JSONResponse({"ok": False, "error": f"预设名过长（≤{_DEPTH_PRESET_NAME_MAX} 字符）"},
+                            status_code=400)
+    config = (body or {}).get("config") or {}
+    display = (body or {}).get("display") or {}
+    dot = (body or {}).get("dot") or {}
+    if not all(isinstance(x, dict) for x in (config, display, dot)):
+        return JSONResponse({"ok": False, "error": "config/display/dot 应为对象"},
+                            status_code=400)
+    norm, err = _normalize_dev_patch(config)
+    if err:
+        return JSONResponse({"ok": False, "error": err}, status_code=400)
+    norm = {k: v for k, v in norm.items() if v is not None}
+    preset = {"saved_at": int(time.time()), "config": norm,
+              "display": display, "dot": dot}
+    try:
+        if len(json.dumps(preset, ensure_ascii=False)) > _DEPTH_PRESET_BODY_MAX:
+            return JSONResponse({"ok": False, "error": "预设内容过大"}, status_code=400)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "预设内容不可序列化"}, status_code=400)
+    with _depth_presets_lock:
+        _depth_presets[name] = preset
+        _save_depth_presets_locked()
+        count = len(_depth_presets)
+    return JSONResponse({"ok": True, "name": name, "count": count})
+
+
+@router.post("/api/frame/depth-presets/delete")
+async def delete_depth_preset(body: dict = Body(...)):
+    """删除一份深度视图配置预设。走 POST+body 而非 DELETE+路径参数：
+    预设名允许中文/空格/斜杠等任意字符，塞 URL 路径会被编码规则坑到。"""
+    name = str((body or {}).get("name") or "").strip()
+    if not name:
+        return JSONResponse({"ok": False, "error": "缺少预设名"}, status_code=400)
+    with _depth_presets_lock:
+        if name not in _depth_presets:
+            return JSONResponse({"ok": False, "error": f"预设不存在：{name}"}, status_code=404)
+        _depth_presets.pop(name)
+        _save_depth_presets_locked()
+        count = len(_depth_presets)
+    return JSONResponse({"ok": True, "name": name, "count": count})
 
 
 @router.post("/api/frame/config")

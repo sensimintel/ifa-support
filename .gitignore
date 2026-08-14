@@ -47,5 +47,8 @@ sam3hl_preset.json.tmp
 # per-device 帧率配置（frame_relay 落盘持久化，运行时生成）
 dev_config.json
 
+# 深度视图配置预设（frame_relay 落盘持久化，运行时生成）
+depth_presets.json
+
 # Orbbec SDK 运行时日志目录（mac-cam 推流脚本运行时生成）
 tools/mac-cam/Log/
