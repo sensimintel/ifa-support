@@ -3951,6 +3951,38 @@ if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布
   // 成功态驻留 FRESH_MS 到期回落待机是纯本地状态，用轻量本地定时器驱动（不发请求）
   setInterval(()=>setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle'),1000);
 }
+
+// ══ 临时诊断（屏闪排障）：URL 加 ?trace=1 开启逐帧采样——每个动画帧记录
+//    点云 canvas 降采样平均亮度 + 两张背景 img 的实时合成透明度 + 当前帧 key，
+//    每 5s 把最近 15s 样本回传 /api/flicker-report。诊断结束整段可移除 ══
+if(new URLSearchParams(location.search).get('trace')==='1'){
+  const tcv=document.createElement('canvas');tcv.width=24;tcv.height=14;
+  const tctx=tcv.getContext('2d',{willReadFrequently:true});
+  const tbuf=[];
+  (function tSample(){
+    try{
+      const cv=$('bgDot');
+      const dotShown=$('stage').classList.contains('doton')&&cv.style.display!=='none';
+      let luma=-1;
+      if(dotShown&&cv.width){
+        tctx.clearRect(0,0,24,14);tctx.drawImage(cv,0,0,24,14);
+        const d=tctx.getImageData(0,0,24,14).data;let s=0;
+        for(let i=0;i<d.length;i+=4)s+=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
+        luma=Math.round(s/(d.length/4)*10)/10;
+      }
+      tbuf.push({t:Math.round(performance.now()),l:luma,
+        a:+getComputedStyle($('bgA')).opacity,b:+getComputedStyle($('bgB')).opacity,
+        k:lastBgKey});
+      if(tbuf.length>1200)tbuf.shift();
+    }catch(e){}
+    requestAnimationFrame(tSample);
+  })();
+  setInterval(()=>{
+    fetch('/api/flicker-report',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({page_ts:Date.now(),total:tbuf.length,samples:tbuf.slice(-450)})
+    }).catch(()=>{});
+  },5000);
+}
 </script>
 </body></html>"""
 
@@ -3971,6 +4003,25 @@ def experience():
 def panel():
     """扩展面板：调参 + 深度图/点云/网格。"""
     return PANEL_PAGE
+
+
+# ── 临时诊断（屏闪排障）：/experience 页加 ?trace=1 开启逐帧亮度采样并回传，
+#    这里内存单槽存最近一份报文供拉取分析；诊断结束整段可移除 ──
+_flicker_trace: dict = {}
+
+
+@app.post("/api/flicker-report")
+async def flicker_report_post(body: dict = Body(...)):
+    """存展示端回传的逐帧采样报文（新报覆盖旧报）。"""
+    _flicker_trace["received_at"] = time.time()
+    _flicker_trace["report"] = body
+    return {"ok": True}
+
+
+@app.get("/api/flicker-report")
+def flicker_report_get():
+    """读最近一份采样报文（含服务器收到时刻）。"""
+    return _flicker_trace or {"report": None}
 
 
 @app.post("/api/infer")
