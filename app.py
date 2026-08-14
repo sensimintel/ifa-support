@@ -3952,34 +3952,40 @@ if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布
   setInterval(()=>setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle'),1000);
 }
 
-// ══ 临时诊断（屏闪排障）：URL 加 ?trace=1 开启逐帧采样——每个动画帧记录
-//    点云 canvas 降采样平均亮度 + 两张背景 img 的实时合成透明度 + 当前帧 key，
-//    每 5s 把最近 15s 样本回传 /api/flicker-report。诊断结束整段可移除 ══
+// ══ 临时诊断（屏闪排障）v2：URL 加 ?trace=1 开启逐帧采样——每个动画帧在
+//    点云 canvas 的 5 个固定补丁（四角+中心，各 48×48 物理像素）直接 getImageData
+//    逐像素平均亮度（无缩放无插值，规避极限缩小的采样混叠），连同当前帧 key 与
+//    点云化配置回传 /api/flicker-report。诊断结束整段可移除 ══
 if(new URLSearchParams(location.search).get('trace')==='1'){
-  const tcv=document.createElement('canvas');tcv.width=24;tcv.height=14;
-  const tctx=tcv.getContext('2d',{willReadFrequently:true});
   const tbuf=[];
+  const PS=48;
+  function patchLuma(ctx,x,y){
+    const d=ctx.getImageData(x,y,PS,PS).data;let s=0;
+    for(let i=0;i<d.length;i+=4)s+=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
+    return Math.round(s/(d.length/4)*10)/10;
+  }
   (function tSample(){
     try{
       const cv=$('bgDot');
       const dotShown=$('stage').classList.contains('doton')&&cv.style.display!=='none';
-      let luma=-1;
-      if(dotShown&&cv.width){
-        tctx.clearRect(0,0,24,14);tctx.drawImage(cv,0,0,24,14);
-        const d=tctx.getImageData(0,0,24,14).data;let s=0;
-        for(let i=0;i<d.length;i+=4)s+=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
-        luma=Math.round(s/(d.length/4)*10)/10;
+      let p=null;
+      if(dotShown&&cv.width>=PS*3&&cv.height>=PS*3){
+        const ctx=cv.getContext('2d',{willReadFrequently:true});
+        const W=cv.width,H=cv.height,cx=(W-PS)>>1,cy=(H-PS)>>1;
+        p=[patchLuma(ctx,(W>>2),(H>>2)),patchLuma(ctx,W-(W>>2)-PS,(H>>2)),
+           patchLuma(ctx,cx,cy),
+           patchLuma(ctx,(W>>2),H-(H>>2)-PS),patchLuma(ctx,W-(W>>2)-PS,H-(H>>2)-PS)];
       }
-      tbuf.push({t:Math.round(performance.now()),l:luma,
-        a:+getComputedStyle($('bgA')).opacity,b:+getComputedStyle($('bgB')).opacity,
-        k:lastBgKey});
+      tbuf.push({t:Math.round(performance.now()),p:p,k:lastBgKey});
       if(tbuf.length>1200)tbuf.shift();
     }catch(e){}
     requestAnimationFrame(tSample);
   })();
   setInterval(()=>{
     fetch('/api/flicker-report',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({page_ts:Date.now(),total:tbuf.length,samples:tbuf.slice(-450)})
+      body:JSON.stringify({page_ts:Date.now(),total:tbuf.length,
+        cfg:Object.assign({},dotCfg),dd:Object.assign({},ddCss),
+        samples:tbuf.slice(-450)})
     }).catch(()=>{});
   },5000);
 }
