@@ -93,6 +93,9 @@ domain:
     realtime_chunk_concurrency: 3
     media_read_timeout_seconds: 15
   user:
+    report_display:
+      # main 合流后的必填项：report_ready 最短可见时长（秒），缺省/0 会直接启动失败
+      report_ready_activity_grace_seconds: 30
     auth:
       token_secret: __TOKEN_SECRET__
       access_token_ttl_seconds: 14400
