@@ -3,6 +3,8 @@
 职责：
 1. 四通道食物秤（一台 SJ101T2_CH4_ETH 模块，通道 1..4 → 寄存器 addr 0/2/4/6）：
    后台线程轮询缓存实时读数；「清空」= 软件去皮（记当前 raw 为皮重）。
+   注意 ok 只表示模块可达（四通道整组同生共死）；通道是否真插了称重传感器
+   硬件报不出来（空通道浮空输入照样出稳定读数），靠人工标注 connected 区分。
 2. 桌边分组绑定配置：每条桌边一组「手机 / 项链 / 秤通道」，可查可改、落盘持久化。
    这份绑定信息是深体验区的编排事实源——services 按项链 device_id 反查所在组，
    即可得知要读哪个秤通道、以及把通知推给哪台手机（见 GET /api/groups/resolve）。
@@ -116,6 +118,10 @@ def _default_state():
         "groups": [_default_group(e) for e in EDGES],
         # 皮重按通道存 raw 值（与读数同分度），服务重启不丢
         "tare_raw": {str(ch): 0 for ch in EDGES},
+        # 每通道「已接秤」人工标注：模块上没插称重传感器的通道，浮空输入照样出
+        # 像模像样的读数，硬件层报不出断线（实测扫遍寄存器区无每通道状态标志），
+        # 只能靠现场接线的人标注。默认 True 保持旧行为（全部当已接）。
+        "scale_connected": {str(ch): True for ch in EDGES},
     }
 
 
@@ -333,11 +339,15 @@ def _channel_reading(ch):
         st = dict(_scale_latest[ch])
     with _state_lock:
         tare = _state["tare_raw"].get(str(ch), 0)
+        connected = bool(_state["scale_connected"].get(str(ch), True))
     raw = st["raw"]
     read_at = st.get("read_at")
     return {
         "channel": ch,
+        # ok 只表示「秤模块可达」——一台模块四个通道整组同生共死；
+        # 该通道是否真插了秤看 connected（人工标注，见 _default_state 注释）
         "ok": st["ok"],
+        "connected": connected,
         "net": round((raw - tare) * SCALE_DIVISION, 1) if raw is not None else None,
         "gross": round(raw * SCALE_DIVISION, 1) if raw is not None else None,
         "tare_g": round(tare * SCALE_DIVISION, 1),
@@ -353,8 +363,13 @@ def _channel_reading(ch):
 # ══════════════════════════════════════════════════════════════════════
 @app.get("/api/health")
 def api_health():
+    with _state_lock:
+        connected = {ch: bool(_state["scale_connected"].get(str(ch), True))
+                     for ch in SCALE_CHANNELS}
     with _scale_lock:
-        online = sum(1 for ch in SCALE_CHANNELS if _scale_latest[ch]["ok"])
+        # 只数「已接秤且模块可达」的通道——未接秤的空通道不算在线
+        online = sum(1 for ch in SCALE_CHANNELS
+                     if connected[ch] and _scale_latest[ch]["ok"])
     return {"ok": True, "scales_online": online, "ts": time.time()}
 
 
@@ -527,6 +542,20 @@ def api_food_scales():
     """四通道实时读数。"""
     return JSONResponse({"scales": [_channel_reading(ch) for ch in SCALE_CHANNELS],
                          "ts": time.time()})
+
+
+@app.put("/api/food-scales/{channel}/connected")
+def api_food_scale_connected(channel: int, patch: dict = Body(...)):
+    """标注某通道是否真插了称重传感器（现场接线事实，硬件报不出来只能人标）。"""
+    if channel not in SCALE_CHANNELS:
+        return JSONResponse({"ok": False, "error": f"通道 {channel} 不存在（合法 1~4）"},
+                            status_code=404)
+    if not isinstance(patch.get("connected"), bool):
+        return JSONResponse({"ok": False, "error": "connected 必须是布尔值"}, status_code=400)
+    with _state_lock:
+        _state["scale_connected"][str(channel)] = patch["connected"]
+        _save_state(_state)
+    return JSONResponse({"ok": True, "channel": channel, "connected": patch["connected"]})
 
 
 @app.post("/api/food-scales/{channel}/tare")
