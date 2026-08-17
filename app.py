@@ -2461,7 +2461,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <label><input type="radio" name="rdon" value="1" checked> 开（定时直传，不等 SAM3）</label>
    <label><input type="radio" name="rdon" value="0"> 关（回到 SAM3 命中才识别）</label>
   </div></div>
- <div class="fld"><label>直传间隔 <b id="v_rd_itv">0.5</b> s</label>
+ <div class="fld"><label>识别间隔 <b id="v_rd_itv">0.5</b> s（多久直传一帧去识别）</label>
   <input type="range" id="r_rd_itv" min="0.2" max="10" step="0.1" value="0.5"></div>
  <div class="fld"><label>并发上限 <b id="v_rd_conc">1</b> 路</label>
   <input type="range" id="r_rd_conc" min="1" max="6" step="1" value="1"></div>
