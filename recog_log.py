@@ -18,7 +18,9 @@ import threading
 _HEAD_KEYS = ("id", "ts", "device", "trigger", "img_orig", "img_boxed",
               "n_food", "n_drink", "outcome")
 _REQ_KEYS = ("label", "model", "endpoint", "direct", "n_images",
-             "max_tokens", "temperature")
+             "max_tokens", "temperature", "img_full_px")
+# 详情才给的大字段：送 VLM 的原尺寸图（列表态给不起）
+_REQ_DETAIL_KEYS = ("prompt", "img_full", "img_boxed_full")
 _RESP_KEYS = ("ok", "error", "llm_ms", "wait_ms", "n_items")
 
 
@@ -29,9 +31,12 @@ class RecogLog:
     → 逐项判定 append 进 `entry["outcome"]` → `commit()`。失败轮同样 commit，
     「这一轮压根没调通」正是最该被看见的日志。"""
 
-    def __init__(self, max_items=30, raw_max=20000):
+    def __init__(self, max_items=30, raw_max=20000, full_keep=8):
         self.max_items = int(max_items)
         self.raw_max = int(raw_max)
+        # 只有最近 full_keep 条留「送 VLM 的原尺寸图」（每条两张、每张几百 KB）：
+        # 全留会把缓冲撑到十几 MB，而翻到很旧的日志时通常只关心判定不关心原图
+        self.full_keep = int(full_keep)
         self._items = []
         self._lock = threading.Lock()
         self._seq = 0
@@ -66,6 +71,11 @@ class RecogLog:
         with self._lock:
             self._items.insert(0, entry)
             del self._items[self.max_items:]
+            for old in self._items[self.full_keep:]:      # 滑出窗口的条目丢掉原尺寸图
+                req = old.get("req")
+                if req:
+                    req.pop("img_full", None)
+                    req.pop("img_boxed_full", None)
 
     def list(self, device=None, limit=12):
         """返回 (投影后的列表, 过滤后的总条数)。limit 钳制在 [1, max_items]。"""
@@ -106,7 +116,8 @@ def project(entry, detail=False) -> dict:
     out["resp"]["truncated"] = bool(resp.get("truncated"))
     out["n_candidates"] = len(entry.get("candidates") or [])
     if detail:
-        out["req"]["prompt"] = req.get("prompt") or ""
+        for k in _REQ_DETAIL_KEYS:
+            out["req"][k] = req.get(k) or ("" if k == "prompt" else None)
         out["resp"]["raw"] = resp.get("raw") or ""
         out["resp"]["items"] = resp.get("items") or []
         out["candidates"] = entry.get("candidates") or []
