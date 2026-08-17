@@ -1,0 +1,171 @@
+# -*- coding: utf-8 -*-
+"""VLM 识别观测日志：环形缓冲 / 响应截断 / 列表与详情投影 + app.py 侧接线断言。
+
+缓冲与投影是纯逻辑模块（recog_log.py，零 cv2/torch 依赖）直接测；
+app.py 与页面那侧只做接线断言（正则抽源码），与 test_recog_direct 同款做法。
+"""
+import re
+import unittest
+from pathlib import Path
+
+import recog_log
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _entry(log, name="可乐", raw="RAW", items=None, device="dev-a", trigger="direct"):
+    e = log.begin(device, trigger,
+                  [{"id": 7, "name": "拿铁", "type": "液体", "ref_img": "data:image/jpeg;base64,AAA"}],
+                  n_food=1, n_drink=2, img_orig="data:orig", img_boxed=None)
+    e["ts"] = 1786900000.0
+    e["req"] = {"label": "Qwen", "model": "m", "endpoint": "http://x/v1/chat",
+                "direct": True, "n_images": 2, "prompt": "P" * 50,
+                "max_tokens": 1536, "temperature": 0}
+    log.set_response(e, True, raw=raw, items=items if items is not None else [{"name": name}])
+    e["outcome"] = [{"name": name, "action": "new", "card_id": 3, "gate": ""}]
+    log.commit(e)
+    return e
+
+
+class BufferTest(unittest.TestCase):
+    def test_ids_increment_and_newest_first(self):
+        log = recog_log.RecogLog(max_items=5)
+        _entry(log, "A")
+        _entry(log, "B")
+        items, total = log.list()
+        self.assertEqual(total, 2)
+        self.assertEqual([it["id"] for it in items], [2, 1])   # 最新在前
+
+    def test_ring_drops_oldest(self):
+        log = recog_log.RecogLog(max_items=3)
+        for i in range(6):
+            _entry(log, f"食物{i}")
+        self.assertEqual(len(log), 3)
+        items, total = log.list(limit=10)
+        self.assertEqual([it["id"] for it in items], [6, 5, 4])
+        self.assertEqual(total, 3)
+
+    def test_filter_by_device_and_limit_clamped(self):
+        log = recog_log.RecogLog(max_items=10)
+        _entry(log, device="dev-a")
+        _entry(log, device="dev-b")
+        _entry(log, device="dev-a")
+        items, total = log.list(device="dev-a")
+        self.assertEqual(total, 2)
+        self.assertTrue(all(it["device"] == "dev-a" for it in items))
+        # limit 钳制在 [1, max_items]，非法值退回默认
+        self.assertEqual(len(log.list(limit=0)[0]), 1)
+        self.assertEqual(len(log.list(limit=999)[0]), 3)
+        self.assertEqual(len(log.list(limit="x")[0]), 3)
+
+    def test_clear(self):
+        log = recog_log.RecogLog()
+        _entry(log)
+        log.clear()
+        self.assertEqual(log.list()[1], 0)
+
+
+class ResponseTest(unittest.TestCase):
+    def test_raw_truncated_with_flag(self):
+        log = recog_log.RecogLog(raw_max=10)
+        e = _entry(log, raw="x" * 50)
+        self.assertEqual(len(e["resp"]["raw"]), 10)
+        self.assertTrue(e["resp"]["truncated"])
+
+    def test_short_raw_not_flagged(self):
+        log = recog_log.RecogLog(raw_max=100)
+        e = _entry(log, raw="x" * 50)
+        self.assertFalse(e["resp"]["truncated"])
+
+    def test_failed_round_is_logged(self):
+        """失败轮同样进日志——"这一轮压根没调通"正是最该被看见的。"""
+        log = recog_log.RecogLog()
+        e = log.begin("dev", "direct", [], img_orig="data:orig")
+        log.set_response(e, False, error="URLError: timed out")
+        log.commit(e)
+        got = log.list()[0][0]
+        self.assertFalse(got["resp"]["ok"])
+        self.assertIn("timed out", got["resp"]["error"])
+        self.assertEqual(got["resp"]["n_items"], 0)
+
+    def test_set_response_on_none_entry_is_noop(self):
+        recog_log.RecogLog().set_response(None, True, raw="x")   # 不抛即可
+
+
+class ProjectionTest(unittest.TestCase):
+    def test_list_strips_heavy_fields(self):
+        log = recog_log.RecogLog()
+        _entry(log, raw="MODEL RAW OUTPUT")
+        got = log.list()[0][0]
+        self.assertNotIn("prompt", got["req"])
+        self.assertNotIn("raw", got["resp"])
+        self.assertNotIn("items", got["resp"])
+        self.assertEqual(got["req"]["prompt_len"], 50)      # 只给长度
+        self.assertEqual(got["n_candidates"], 1)
+        self.assertNotIn("ref_img", got["candidates"][0])   # 参考图留给详情
+        self.assertEqual(got["candidates"][0]["name"], "拿铁")
+        self.assertEqual(got["img_orig"], "data:orig")      # 请求图列表里就要能看
+
+    def test_detail_carries_full_text(self):
+        log = recog_log.RecogLog()
+        e = _entry(log, raw="MODEL RAW OUTPUT")
+        got = log.get(e["id"])
+        self.assertEqual(got["req"]["prompt"], "P" * 50)
+        self.assertEqual(got["resp"]["raw"], "MODEL RAW OUTPUT")
+        self.assertEqual(got["resp"]["items"], [{"name": "可乐"}])
+        self.assertTrue(got["candidates"][0]["ref_img"].startswith("data:image/jpeg"))
+
+    def test_detail_missing_returns_none(self):
+        self.assertIsNone(recog_log.RecogLog().get(404))
+
+    def test_outcome_survives_projection(self):
+        log = recog_log.RecogLog()
+        _entry(log, "薯条")
+        for got in (log.list()[0][0], log.get(1)):
+            self.assertEqual(got["outcome"][0]["name"], "薯条")
+            self.assertEqual(got["outcome"][0]["action"], "new")
+
+
+class AppWiringTest(unittest.TestCase):
+    """app.py 侧接线：日志真的被写、双目链真的写观测、接口真的挂上。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = (ROOT / "app.py").read_text(encoding="utf-8")
+
+    def test_worker_opens_and_commits_log(self):
+        self.assertIn("vlog = _vlmlog_begin(dev, \"direct\" if boxed is None else \"sam3\"",
+                      self.src)
+        self.assertIn("_vlmlog.commit(vlog)", self.src)
+        self.assertIn("_recognize_dedup(orig, boxed, candidates, n_food, n_drink, tgt, log=vlog)",
+                      self.src)
+
+    def test_every_gate_writes_reason(self):
+        # 五道闸门都要把拒合并原因写进日志，否则控制面只能看到"又建了一张新卡"
+        for needle in ("回显不一致：", "类型不一致：", "证据矛盾：", "低置信：", "名称零重叠："):
+            self.assertRegex(self.src, r'gate = "%s' % needle)
+
+    def test_routes_registered(self):
+        for route in ('@app.get("/api/recoglog/list")',
+                      '@app.get("/api/recoglog/{entry_id}")',
+                      '@app.post("/api/recoglog/clear")'):
+            self.assertIn(route, self.src)
+
+    def test_stereo_chain_records_sam3_observation(self):
+        # 现网单目链停用，双目链是唯一在跑的 SAM3 生产链路——不写回控制面日志就是空的
+        self.assertRegex(self.src, r'_sam3tune_record_prod\(left, .*src="stereo"'
+                                   r'|src="stereo", device=device_id')
+        self.assertIn('"debug": True, "topk": 10,', self.src)
+
+    def test_ir_stream_returns_debug(self):
+        m = re.search(r"def _sam3_ir_stream_frame\(word, rgb\):(.*?)\ndef ", self.src, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("return (r.get(\"instances\") or []), r.get(\"debug\")", m.group(1))
+
+    def test_history_sampling_guard(self):
+        # 双目每帧都写历史会把 30 条缓冲在 20 秒内冲掉
+        self.assertIn("SAM3TUNE_HIST_MIN_GAP", self.src)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -51,6 +51,7 @@ from depth_anything_3.app.gradio_app import DepthAnything3App  # noqa: E402
 
 import devpc  # noqa: E402
 import recog_direct  # noqa: E402
+import recog_log  # noqa: E402
 from frame_relay import (  # noqa: E402
     DEFERRED, UNKNOWN_DEVICE, get_latest_frame, get_latest_frame_seq,
     get_selected_device, router as frame_router,
@@ -369,10 +370,12 @@ _sam3_ir_lock = threading.Lock()
 def _sam3_ir_stream_frame(word, rgb):
     """左目 IR 帧对单个词做流式增量步进（与 _sam3_stream_frame 同构、独立 session 表）。
     增量步进比每帧无状态整图分割便宜，且 obj_id 跨帧稳定（同物同色不闪）。
-    返回 instances 列表；失败/流式不可用返回 []。"""
+    每步带 debug 捕获（presence + top-K query 原始分）供控制面日志观测——SAM3 server 的
+    debug 是前向 hook 读已有输出，不多跑一次推理，逐帧开着零算力代价。
+    返回 (instances, debug)；失败/流式不可用返回 ([], None)。"""
     b64 = _b64_jpg(rgb)
     if not b64:
-        return []
+        return [], None
     cfg = _get_score_cfg()
     with _sam3_ir_lock:
         sid = _sam3_ir_sessions.get(word)
@@ -380,16 +383,17 @@ def _sam3_ir_stream_frame(word, rgb):
         if not sid:
             sid = _sam3_stream_start(word)
             if not sid:
-                return []
+                return [], None
             with _sam3_ir_lock:
                 _sam3_ir_sessions[word] = sid
         r = _sam3_post("/v1/stream/frame", {"session_id": sid, "image_b64": b64,
+                                            "debug": True, "topk": 10,
                                             "alpha": cfg["alpha"],
                                             "det_thresh": cfg["thresh"]})
         if r is not None:
-            return r.get("instances") or []
+            return (r.get("instances") or []), r.get("debug")
         sid = None                    # session 被回收/服务重启：重建一次再试
-    return []
+    return [], None
 
 
 _SAM3_COLORS = [(222, 52, 52), (46, 120, 235), (26, 158, 95), (240, 150, 20),
@@ -1374,8 +1378,8 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
 
         targets = [(w["word"], w.get("label") or "drink") for w in _get_score_cfg()["words"]]
         # 食物高亮：识别词都是液体词，高亮点云因此默认只亮液体。
-        # 额外补一路 food 查询专供高亮/染色——只进 overlays，不进液体证据缓存、
-        # 不进 sam3tune 口径观测（那页只认配置词）。口径里已有 food 标签词则不重复补
+        # 额外补一路 food 查询专供高亮/染色——只进 overlays，不进液体证据缓存；
+        # 它进日志观测但标 role="highlight"、不计口径统计。口径里已有 food 标签词则不重复补
         n_prod = len(targets)
         if not any(l == "food" for (_w, l) in targets):
             targets = targets + [(SAM3_TEXT_DEFAULT, "food")]
@@ -1385,9 +1389,9 @@ def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
         is_stream = any(g is not None for (_q, _l, _i, g, _im, _d) in results)
         impls = {im for (_q, _l, _i, _g, im, _d) in results if im}
         # 控制面观测写回：生产流式每帧的 presence/top-K 分数 + 定位图（忠实生产结果，
-        # 非另跑）。只回配置词的结果，补跑的 food 高亮查询不进口径观测
+        # 非另跑）。全部查询都进日志，前 n_prod 个是口径词、其余标 highlight
         try:
-            _sam3tune_record_prod(frames[-1], results[:n_prod], track_ms)
+            _sam3tune_record_prod(frames[-1], results, track_ms, src="prod", n_prod=n_prod)
         except Exception as e:
             print(f"[da3-web] sam3tune 生产观测写回失败：{type(e).__name__}: {e}", flush=True)
 
@@ -4644,21 +4648,49 @@ def _parse_recog(content):
     return out
 
 
-def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, target=None):
+# ══════════════════════════════════════════════════════════════════════
+# VLM 识别观测日志：每一轮识别请求的「请求图 + prompt + 模型原始返回 + 解析结果
+# + 去重判定」整轮留痕，供浅体验区控制面（superadmin /ifa-support/experience）
+# 可视化排障。服务端内存环形缓冲，不落盘。
+#   · 与卡片流的区别：卡片是「桌上现在有什么」的结果态，日志是「这一轮发了什么图、
+#     问了什么、模型答了什么、五道闸门怎么判的」的过程态——漏识别 / 幻觉 / 错并
+#     只能在过程态里看出来，stdout 那份审计日志上了展台没人去 ssh 翻。
+# ══════════════════════════════════════════════════════════════════════
+VLMLOG_MAX = 30            # 环形条数上限（每条含请求图 dataURI，别放太大）
+VLMLOG_RAW_MAX = 20000     # 单条留存的模型原始返回上限（字符），超长截断
+# 缓冲与投影是纯逻辑，收在 recog_log.py（零 cv2/torch 依赖，可单测）；
+# 图片编码留在本文件（_thumb_uri），日志模块只搬运字符串
+_vlmlog = recog_log.RecogLog(VLMLOG_MAX, VLMLOG_RAW_MAX)
+
+
+def _vlmlog_begin(device, trigger, candidates, n_food, n_drink, orig_rgb, boxed_rgb):
+    """开一条识别日志（请求侧快照）：识别调用填 req/resp，worker 补 outcome 后 commit。"""
+    entry = _vlmlog.begin(device, trigger, candidates, n_food, n_drink,
+                          img_orig=_thumb_uri(orig_rgb),
+                          img_boxed=_thumb_uri(boxed_rgb) if boxed_rgb is not None else None)
+    entry["ts"] = time.time()
+    return entry
+
+
+def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, target=None,
+                     log=None):
     """调多模态 VLM 识别 + 去重。一次多图请求：图1原图 + 图2带框图 + 各候选参考图(带横幅标记)。
     candidates: [{"id","name","type","desc","ref_img"}...]（顺序即参考图编号）。
     n_food/n_drink：当前画面检测器命中数，作为软接地信息进 prompt。
     boxed_rgb=None → 主链路直传口径：无 SAM3 框，只发图1 + 参考图，prompt 同步换成
     直传版（参考图编号从图2起）。
     target：识别目标预设（RECOG_TARGETS 里的一项，缺省=当前选中目标）。
+    log：观测日志条目（_vlmlog_begin 建的 dict），非空则把请求与原始返回填回去。
     返回 [{name,type,description,...,match,matched_name,match_confidence}]；任何失败返回 []。"""
     cfg = target or RECOG_TARGETS[_recog_target]
     if not cfg["endpoint"]:
+        _vlmlog.set_response(log, False, error="识别服务未接入（endpoint 为空）")
         return []
     direct = boxed_rgb is None
     u1 = _img_data_uri(orig_rgb)
     u2 = None if direct else _img_data_uri(boxed_rgb)
     if not u1 or (not direct and not u2):
+        _vlmlog.set_response(log, False, error="请求图编码失败")
         return []
     content = [{"type": "image_url", "image_url": {"url": u1}}]
     if u2:
@@ -4666,8 +4698,8 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     for c in candidates:      # 其后依次是候选参考图（带 HISTORY REF 横幅，仅供对照）
         if c.get("ref_img"):
             content.append({"type": "image_url", "image_url": {"url": c["ref_img"]}})
-    content.append({"type": "text",
-                    "text": _build_recog_prompt(candidates, n_food, n_drink, direct=direct)})
+    prompt = _build_recog_prompt(candidates, n_food, n_drink, direct=direct)
+    content.append({"type": "text", "text": prompt})
     # temperature=0：判同结果下游有硬合并动作，消除轮间抖动、日志巡检可复现；
     # max_tokens 1536：每 item 的输出字段持续增多（match_evidence 对照文本、营养四数字
     # + classification），多物品帧 1024 有截断风险——截断会被 _parse_recog 的容错
@@ -4675,6 +4707,12 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     payload = {"model": cfg["model"],
                "messages": [{"role": "user", "content": content}],
                "max_tokens": 1536, "temperature": 0}
+    if log is not None:
+        log["req"] = {"label": cfg["label"], "model": cfg["model"],
+                      "endpoint": cfg["endpoint"], "direct": direct,
+                      "n_images": len(content) - 1, "prompt": prompt,
+                      "max_tokens": payload["max_tokens"],
+                      "temperature": payload["temperature"]}
     headers = {"Content-Type": "application/json"}
     if cfg["api_key"]:
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
@@ -4684,8 +4722,11 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
             out = json.loads(r.read().decode())["choices"][0]["message"]["content"]
     except Exception as e:
         print(f"[da3-web] 识别调用失败：{type(e).__name__}: {e}", flush=True)
+        _vlmlog.set_response(log, False, error=f"{type(e).__name__}: {e}")
         return []
-    return _parse_recog(out)
+    items = _parse_recog(out)
+    _vlmlog.set_response(log, True, raw=out, items=items)
+    return items
 
 
 def _name_tokens(s):
@@ -4728,13 +4769,21 @@ def _recog_worker(idx=0):
         # 直传口径没有带框图（boxed=None），退路图用原帧。
         boxed_uri = _img_data_uri(_make_ref_img(boxed if boxed is not None else orig))
         tgt = RECOG_TARGETS[_recog_target]   # 快照本轮识别目标：切换只影响后续轮次
+        # 控制面观测：整轮留痕（请求图/prompt/原始返回/解析结果/去重判定），
+        # 失败轮也要 commit——"这一轮压根没调通"正是最该被看见的一种日志
+        vlog = _vlmlog_begin(dev, "direct" if boxed is None else "sam3",
+                             candidates, n_food, n_drink, orig, boxed)
         _tq = time.time()
         try:
-            items = _recognize_dedup(orig, boxed, candidates, n_food, n_drink, tgt)
+            items = _recognize_dedup(orig, boxed, candidates, n_food, n_drink, tgt, log=vlog)
         finally:
             with _recog_lock:
                 _recog_direct_stats["in_flight"] -= 1
         llm_ms = (time.time() - _tq) * 1000.0
+        if vlog.get("resp") is not None:
+            vlog["resp"]["llm_ms"] = int(llm_ms)
+            vlog["resp"]["wait_ms"] = int(wait_ms)
+            vlog["resp"].setdefault("n_items", len(items))
         with _recog_lock:                     # 观测：抽屉里回显实测延时与轮次
             _recog_direct_stats["rounds"] += 1
             _recog_direct_stats["last_ms"] = int(llm_ms)
@@ -4748,6 +4797,7 @@ def _recog_worker(idx=0):
             cards = _recog_cards.setdefault(dev, [])   # 该设备自己的卡片流
             for it in items:
                 target = None
+                gate = ""            # 非空=被某道闸门拦下（进日志的拒合并原因）
                 m = it.get("match")   # 命中候选编号；还要过五道闸才允许合并（宁拒勿并）
                 if isinstance(m, int) and 1 <= m <= len(candidates):
                     cand = candidates[m - 1]
@@ -4755,30 +4805,39 @@ def _recog_worker(idx=0):
                             != cand["name"].strip().casefold():
                         # 闸门一·回显校验：matched_name 必须照抄候选名——只校验编号↔名称
                         # 指称对齐（抓编号幻觉/错位），零语义判断、零语义误伤
+                        gate = "回显不一致：回显『%s』≠候选『%s』" % (
+                            it.get("matched_name") or "空", cand["name"])
                         print("[da3-web] 识别拒合并（回显不一致）：『%s』match=%s 回显『%s』≠候选『%s』→ 按新卡处理" % (
                             it["name"], m, it.get("matched_name") or "空", cand["name"]), flush=True)
                     elif (cand.get("type") or "食物") != it["type"]:
                         # 闸门二·类型一致：食物↔液体跨类合并是强错并信号，确定性拦截；
                         # 误杀代价只是多一张卡（演示场景可接受的错误方向）
+                        gate = "类型不一致：本轮 %s / 候选『%s』%s" % (
+                            it["type"], cand["name"], cand.get("type") or "食物")
                         print("[da3-web] 识别拒合并（类型不一致）：『%s』(%s) match=%s 候选『%s』(%s) → 按新卡处理" % (
                             it["name"], it["type"], m, cand["name"],
                             cand.get("type") or "食物"), flush=True)
                     elif "不一致" in (it.get("match_evidence") or ""):
                         # 闸门三·证据自洽：逐项对照里已有「不一致」却仍给 match——
                         # 模型自相矛盾（prompt 明令任一项不一致禁并），确定性拦截
+                        gate = "证据矛盾：证据里已写不一致"
                         print("[da3-web] 识别拒合并（证据矛盾）：『%s』match=%s 证据『%s』含不一致 → 按新卡处理" % (
                             it["name"], m, it.get("match_evidence")), flush=True)
                     elif it.get("match_confidence") != "high":
                         # 闸门四·置信度：模型自报不确定 → 宁拒勿并（high 在 prompt 里有硬性定义）
+                        gate = "低置信：confidence=%s" % (it.get("match_confidence") or "缺省")
                         print("[da3-web] 识别拒合并（低置信）：『%s』match=%s confidence=%s → 按新卡处理" % (
                             it["name"], m, it.get("match_confidence") or "缺省"), flush=True)
                     elif not (_name_tokens(it["name"]) & _name_tokens(cand["name"])):
                         # 闸门五·名称零重叠：合并时模型被要求照抄候选名，本轮识别名与候选名
                         # 连一个词面 token 都不重叠还要合并，几乎必是错并——从 WARN 升级为拦截
+                        gate = "名称零重叠：『%s』vs 候选『%s』" % (it["name"], cand["name"])
                         print("[da3-web] 识别拒合并（名称零重叠）：『%s』→候选『%s』 → 按新卡处理" % (
                             it["name"], cand["name"]), flush=True)
                     else:
                         target = next((c for c in cards if c["id"] == cand["id"]), None)
+                        if target is None:
+                            gate = "候选卡已不在流里（被淘汰/清空）"
                 if target is not None:
                     print("[da3-web] 识别去重：『%s』match=%s(high) → 合并到卡%s『%s』｜证据：%s｜理由：%s" % (
                         it["name"], m, target["id"], target["name"],
@@ -4837,11 +4896,21 @@ def _recog_worker(idx=0):
                         "merge_history": [],
                         "latency_ms": int(llm_ms), "latency_model": tgt["label"],
                         "frame": frame, "t": t, "last_ts": now, "rev": 0})
+                # 逐项判定进观测日志：控制面据此回答"这一项为什么建了新卡/并到了哪张"
+                vlog["outcome"].append({
+                    "name": it["name"], "type": it["type"], "match": m,
+                    "action": "merge" if target is not None else "new",
+                    "card_id": target["id"] if target is not None else _recog_id,
+                    "gate": gate, "confidence": it.get("match_confidence", ""),
+                    "evidence": it.get("match_evidence", ""),
+                    "reason": it.get("match_reason", ""),
+                    "box": it.get("box")})
             if len(cards) > RECOG_MAX_CARDS:
                 del cards[:len(cards) - RECOG_MAX_CARDS]
             if items:                    # 本轮有卡片变更（新卡/合并）→ 通知 SSE 推送线程
                 _recog_gen += 1
                 _recog_evt_cv.notify_all()
+        _vlmlog.commit(vlog)
 
 
 def _recog_ensure_workers_locked():
@@ -5103,25 +5172,41 @@ def _build_mono_product(arr, pred, fmt, res, conf, nmp, show_cam,
                          "shape": [int(depth.shape[1]), int(depth.shape[0])], "res": res}}
 
 
-def _stereo_sam3_overlays(pred):
+def _stereo_sam3_overlays(pred, device_id=None):
     """双目链路的 SAM3：对左目 processed_image（与深度同一张图，坐标零错位）按生产
     识别词逐词做**流式增量步进**（_sam3_ir_stream_frame，IR 专用 session、与 RGB
     主链路的流式记忆完全隔离）——增量步进比旧的每帧无状态 /v1/segment 便宜，且
-    obj_id 跨帧稳定。返回 (overlays, 命中标签列表)。"""
+    obj_id 跨帧稳定。返回 (overlays, 命中标签列表)。
+
+    每轮结果同时写回控制面观测（_sam3tune_record_prod，src="stereo"）：现网单目链
+    已停用（DISABLE_MONO_PIPELINE=1），双目链是唯一在跑的 SAM3 生产链路，不写回
+    的话控制面日志是空的。写回只做投影（画定位图 + 存分数），不发起额外推理。"""
     left = np.asarray(pred.processed_images)[0]
+    if left.dtype != np.uint8:      # processed_images 常是 0-1 浮点，直接转 uint8 会全黑
+        left = np.clip(left * (255 if left.max() <= 1.0 else 1), 0, 255).astype(np.uint8)
     H0, W0 = np.asarray(pred.depth)[0].shape
     targets = [(w["word"], w.get("label") or "drink") for w in _get_score_cfg()["words"]]
+    n_prod = len(targets)      # 前 n_prod 个是口径词，其后是补跑的 food 高亮词
     # 食物高亮：识别词都是液体词，补一路 food 查询让食物也染色（与单目③④同款；
     # 双目链路本就不产证据，无污染问题）
     if not any(l == "food" for (_w, l) in targets):
         targets = targets + [(SAM3_TEXT_DEFAULT, "food")]
     if not targets:
         return [], []
+    _t0 = time.time()
     with ThreadPoolExecutor(max_workers=len(targets)) as ex:
-        results = list(ex.map(lambda ql: (ql[0], ql[1], _sam3_ir_stream_frame(ql[0], left)),
+        results = list(ex.map(lambda ql: (ql[0], ql[1], *_sam3_ir_stream_frame(ql[0], left)),
                               targets))
+    seg_ms = (time.time() - _t0) * 1000.0
+    # 控制面观测写回：统一成单目链的六元组 (query, label, instances, gidx, impl, debug)
+    try:
+        _sam3tune_record_prod(left, [(q, l, ins, None, "ir-stream", dbg)
+                                     for (q, l, ins, dbg) in results],
+                              seg_ms, src="stereo", device=device_id, n_prod=n_prod)
+    except Exception as e:
+        print(f"[da3-web] 双目 SAM3 观测写回失败（忽略）：{type(e).__name__}: {e}", flush=True)
     overlays, id_tags = [], []
-    for _query, label, insts in results:
+    for _query, label, insts, _dbg in results:
         col = LABEL_COLORS.get(label, (255, 200, 0))
         for ins in insts:
             rle = ins.get("mask_rle") or {}
@@ -5226,7 +5311,7 @@ def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
     # SAM3 一次性分割左目（网络调用，不占 GPU 锁）
     _ts = time.time()
     try:
-        overlays, id_tags = _stereo_sam3_overlays(pred)
+        overlays, id_tags = _stereo_sam3_overlays(pred, device_id)
     except Exception as e:
         print(f"[da3-web] 双目 SAM3 分割失败（降级无染色）：{type(e).__name__}: {e}",
               flush=True)
@@ -5559,6 +5644,35 @@ def recog_clear(device: Optional[str] = None):
     return JSONResponse({"ok": True, "device": dev})
 
 
+# ── VLM 识别观测日志接口（浅体验区控制面用）────────────────────────────────
+@app.get("/api/recoglog/list")
+def recoglog_list(device: Optional[str] = None, limit: int = 12):
+    """识别日志列表（最新在前）。列表态不含 prompt 全文 / 原始返回 / 候选参考图——
+    那三样在详情里取，避免秒级轮询把响应撑成几 MB。"""
+    items, total = _vlmlog.list(device=device, limit=limit)
+    tgt = RECOG_TARGETS[_recog_target]
+    return JSONResponse({"items": items, "total": total, "max": VLMLOG_MAX,
+                         "target": tgt["label"], "model": tgt["model"],
+                         "direct": _recog_direct.snapshot()})
+
+
+@app.get("/api/recoglog/{entry_id}")
+def recoglog_detail(entry_id: int):
+    """单条识别日志全文：prompt 原文、模型原始返回、解析出的每一项、候选参考图。"""
+    hit = _vlmlog.get(entry_id)
+    if hit is None:
+        return JSONResponse({"ok": False, "error": "日志已滚出缓冲（只保留最近 %d 条）"
+                             % VLMLOG_MAX}, status_code=404)
+    return JSONResponse({"ok": True, "item": hit})
+
+
+@app.post("/api/recoglog/clear")
+def recoglog_clear():
+    """清空识别日志缓冲。"""
+    _vlmlog.clear()
+    return JSONResponse({"ok": True})
+
+
 # ══════════════════════════════════════════════════════════════════════
 # Qwen 识别隧道监控 / 一键重建
 # 链路：5090:8011 ←反向SSH← Mac:18011 ←IAP← gpu-g4-01:8000(vllm)。
@@ -5700,42 +5814,65 @@ def sam3_health():
 # 拿到 presence 分与 top-K query 原始分做漏检归因；运行历史养在服务端（翻页/多端可见）。
 # ══════════════════════════════════════════════════════════════════════
 SAM3TUNE_HISTORY_MAX = 30      # 历史条数上限（缩略图 dataURI 常驻内存，别放太大）
+# 生产流式写历史的最小间隔（秒）：双目链每产物一帧就写一条，不采样的话 30 条历史
+# 只覆盖 20 秒、翻页还没看完就被冲掉。实时区（live）不受此限，仍每帧刷新。
+SAM3TUNE_HIST_MIN_GAP = 1.5
+# 观测写回总开关（`.env` 里 SAM3_OBS_LOG=0 关掉）：写回本身只画图+编码两张缩略图，
+# 但它跑在双目构建线程里，展台上真嫌它占帧时可以一键关（关掉后控制面 SAM3 区空）
+SAM3TUNE_OBS_ON = os.environ.get("SAM3_OBS_LOG", "1").strip() not in ("0", "false", "off")
 _sam3tune_history = []         # 最新在前；条目结构同 /api/sam3tune/run 返回（图为缩略图）
 _sam3tune_live = {}            # device -> 生产流式最近一帧的观测条目（控制面实时区数据源）
 _sam3tune_lock = threading.Lock()
 _sam3tune_seq = 0
+_sam3tune_hist_ts = 0.0        # 上一条生产观测写进历史的时刻（采样节流用）
 
 
-def _sam3tune_record_prod(rgb, results, ms):
+def _sam3tune_record_prod(rgb, results, ms, src="prod", device=None, n_prod=None):
     """生产 SAM3 流式每帧的观测写回：per-device 最新状态 + 滚动历史。
-    results 元素 = (query, label, instances, gidx, impl, debug)，来自 _sam3cloud_refresh。
-    这里只做观测投影（画定位图 + 存分数），不发起任何额外推理——忠实生产结果。"""
-    global _sam3tune_seq
+    results 元素 = (query, label, instances, gidx, impl, debug)，来自 _sam3cloud_refresh
+    （单目链 src="prod"）或 _stereo_sam3_overlays（双目 IR 链 src="stereo"）。
+    这里只做观测投影（画定位图 + 存分数），不发起任何额外推理——忠实生产结果。
+
+    n_prod=前几个词属于生产口径词（其后是补给染色的 food 高亮查询）。高亮词同样
+    进日志（控制面要看到"这一帧 SAM3 到底认出了什么"），但标 role="highlight"、
+    不计进 n_inst——口径统计只认配置词，与 keep 口径语义保持一致。
+    device=None 时取当前选中设备（单目链语义）；双目链直接传本帧设备。"""
+    global _sam3tune_seq, _sam3tune_hist_ts
+    if not SAM3TUNE_OBS_ON:
+        return
     cfg = _get_score_cfg()
-    dev = get_selected_device()
+    dev = device or get_selected_device()
+    if n_prod is None:
+        n_prod = len(results)
     img, word_infos, n_inst = rgb, [], 0
     for wi, (query, label, inst, _g, _im, dbg) in enumerate(results):
         col = _SAM3_COLORS[wi % len(_SAM3_COLORS)]
         img = _draw_instances(img, inst, color=col, label_prefix=query)
-        n_inst += len(inst)
+        if wi < n_prod:
+            n_inst += len(inst)
         word_infos.append({
             "word": query, "label": label, "color": "#%02x%02x%02x" % col, "n": len(inst),
+            "role": "cfg" if wi < n_prod else "highlight",
             "instances": [{"obj_id": it.get("obj_id"),
                            "score": round(float(it.get("score", 0)), 4)} for it in inst],
             "debug": dbg,
         })
+    now = time.time()
     with _sam3tune_lock:
         _sam3tune_seq += 1
         entry_id = _sam3tune_seq
-    entry = {"ok": True, "id": entry_id, "ts": time.time(), "src": "prod",
-             "text": ", ".join(q for (q, _l, _i, _g2, _im2, _d) in results),
+    entry = {"ok": True, "id": entry_id, "ts": now, "src": src,
+             "text": ", ".join(q for (q, _l, _i, _g2, _im2, _d) in results[:n_prod]),
              "alpha": cfg["alpha"], "thresh": cfg["thresh"] or 0.5,
              "seg_ms": round(float(ms), 1), "n_inst": n_inst, "words": word_infos,
-             "device": dev, "raw": _thumb_uri(rgb), "seg": _thumb_uri(img)}
+             "device": dev, "endpoint": SAM3_ENDPOINT,
+             "raw": _thumb_uri(rgb), "seg": _thumb_uri(img)}
     with _sam3tune_lock:
         _sam3tune_live[dev] = entry
-        _sam3tune_history.insert(0, entry)
-        del _sam3tune_history[SAM3TUNE_HISTORY_MAX:]
+        if now - _sam3tune_hist_ts >= SAM3TUNE_HIST_MIN_GAP:
+            _sam3tune_hist_ts = now
+            _sam3tune_history.insert(0, entry)
+            del _sam3tune_history[SAM3TUNE_HISTORY_MAX:]
 
 
 @app.get("/api/sam3tune/config")
@@ -5853,10 +5990,18 @@ def sam3tune_run(body: dict = Body(default=None)):
 
 
 @app.get("/api/sam3tune/history")
-def sam3tune_history():
-    """调优运行历史（最新在前，服务端缓存最近 SAM3TUNE_HISTORY_MAX 条，图为缩略图）。"""
+def sam3tune_history(device: Optional[str] = None, limit: int = 0):
+    """调优运行历史（最新在前，服务端缓存最近 SAM3TUNE_HISTORY_MAX 条，图为缩略图）。
+    device=按设备过滤（控制面单设备视图用）；limit>0=只回最新若干条——每条自带两张
+    缩略图 dataURI，控制面秒级轮询全量会几 MB 起步，按需截断。"""
     with _sam3tune_lock:
-        return JSONResponse({"items": list(_sam3tune_history), "max": SAM3TUNE_HISTORY_MAX})
+        items = list(_sam3tune_history)
+    if device:
+        items = [it for it in items if it.get("device") == device]
+    total = len(items)
+    if limit and limit > 0:
+        items = items[:limit]
+    return JSONResponse({"items": items, "total": total, "max": SAM3TUNE_HISTORY_MAX})
 
 
 @app.post("/api/sam3tune/clear")
