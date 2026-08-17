@@ -4528,9 +4528,13 @@ def _sam3_gate_dets(rgb, device=None):
     输出，不多跑推理），presence 与 top-K 原始分因此白拿。"""
     cfg = _get_score_cfg()
     targets = [(w["word"], w.get("label") or "drink") for w in cfg["words"]]
-    n_prod = len(targets)      # 前 n_prod 个是口径词，其后是补跑的 food 词（只进日志不计口径）
-    if not any(lbl == "food" for (_w, lbl) in targets):
-        targets = targets + [(SAM3_TEXT_DEFAULT, "food")]   # 食物词：口径里没有就补一路
+    n_prod = len(targets)      # 前 n_prod 个是口径词，其后是系统补跑的 food 词（不计口径统计）
+    # 补跑食物词的判据是**词面**没被覆盖，不是「没有 label=food 的词」：现网口径词表
+    # 是 food/drink 但两个都标了 label=drink，按 label 判会把 food 这个词原样再跑一遍
+    # ——同一张图、同一个词、同样的 presence，纯白跑一次 SAM3；命中时还会让同一个物体
+    # 出两个框（一次 drink 一次 food）。词面已在词表里就不补。
+    if not any(w == SAM3_TEXT_DEFAULT for (w, _lbl) in targets):
+        targets = targets + [(SAM3_TEXT_DEFAULT, "food")]
     H, W = rgb.shape[:2]
     t0 = time.time()
 
@@ -5026,6 +5030,22 @@ def recoglog_detail(entry_id: int):
     return JSONResponse({"ok": True, "item": hit})
 
 
+@app.get("/api/recoglog/{entry_id}/image/{kind}")
+def recoglog_image(entry_id: int, kind: str):
+    """这一轮**真正送进 VLM 请求体**的那张图（kind=orig 图1 / boxed 图2），原尺寸原质量。
+    只留最近若干条（见 RecogLog.full_keep），滑出后 404。"""
+    uri = _vlmlog.full_image(entry_id, kind)
+    if not uri or "," not in uri:
+        return JSONResponse({"ok": False, "error": "原图已滚出留存窗口或该轮没有这张图"},
+                            status_code=404)
+    try:
+        raw = base64.b64decode(uri.split(",", 1)[1])
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
+    return Response(content=raw, media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"})
+
+
 @app.post("/api/recoglog/clear")
 def recoglog_clear():
     """清空识别日志缓冲。"""
@@ -5128,6 +5148,10 @@ SAM3TUNE_HISTORY_MAX = 30      # 历史条数上限（缩略图 dataURI 常驻�
 # 生产观测写历史的最小间隔（秒）：识别触发线程按 interval_s（默认 0.5s）一轮一跑门控，
 # 不采样的话 30 条历史只覆盖十几秒、翻页还没看完就被冲掉。实时区（live）不受此限。
 SAM3TUNE_HIST_MIN_GAP = 1.5
+# 留原尺寸帧（供控制面点开看大图）的条数。存的是 ndarray 引用不是 JPEG：
+# 常态零编码开销（编码只在有人点开时发生），代价是每条约 5MB 内存——对 5090 无所谓，
+# 而识别触发线程的 CPU 节拍才是展台上真正稀缺的东西。
+SAM3TUNE_FULL_KEEP = 4
 # 观测写回总开关（`.env` 里 SAM3_OBS_LOG=0 关掉）：写回本身只画定位图 + 编码两张缩略图，
 # 但它跑在识别触发线程里，展台上真嫌它占节拍时可以一键关（关掉后控制面 SAM3 区空）
 SAM3TUNE_OBS_ON = os.environ.get("SAM3_OBS_LOG", "1").strip() not in ("0", "false", "off")
@@ -5136,6 +5160,20 @@ _sam3tune_live = {}            # device -> 生产流式最近一帧的观测条�
 _sam3tune_lock = threading.Lock()
 _sam3tune_seq = 0
 _sam3tune_hist_ts = 0.0        # 上一条生产观测写进历史的时刻（采样节流用）
+
+
+def _tune_drop_frames(entry):
+    """丢掉条目持有的原尺寸帧引用（滑出留存窗口后，图片端点对它降级为 404）。"""
+    entry.pop("_raw", None)
+    entry.pop("_seg", None)
+
+
+def _tune_public(entry):
+    """观测条目 → 响应体：剥掉 `_` 开头的内部字段（ndarray 不可序列化），
+    并告诉前端这条还能不能点开看原图。"""
+    out = {k: v for k, v in entry.items() if not k.startswith("_")}
+    out["has_full"] = entry.get("_raw") is not None
+    return out
 
 
 def _sam3tune_record_prod(rgb, results, ms, src="prod", device=None, n_prod=None):
@@ -5172,18 +5210,26 @@ def _sam3tune_record_prod(rgb, results, ms, src="prod", device=None, n_prod=None
     with _sam3tune_lock:
         _sam3tune_seq += 1
         entry_id = _sam3tune_seq
-    entry = {"ok": True, "id": entry_id, "ts": now, "src": src,
+    # _raw/_seg 前缀下划线=内部字段，投影时剥掉（ndarray 不可 JSON 序列化）
+    entry = {"_raw": rgb, "_seg": img,
+             "ok": True, "id": entry_id, "ts": now, "src": src,
              "text": ", ".join(q for (q, _l, _i, _g2, _im2, _d) in results[:n_prod]),
              "alpha": cfg["alpha"], "thresh": cfg["thresh"] or 0.5,
              "seg_ms": round(float(ms), 1), "n_inst": n_inst, "words": word_infos,
              "device": dev, "endpoint": SAM3_ENDPOINT,
              "raw": _thumb_uri(rgb), "seg": _thumb_uri(img)}
     with _sam3tune_lock:
+        prev = _sam3tune_live.get(dev)
         _sam3tune_live[dev] = entry
         if now - _sam3tune_hist_ts >= SAM3TUNE_HIST_MIN_GAP:
             _sam3tune_hist_ts = now
             _sam3tune_history.insert(0, entry)
             del _sam3tune_history[SAM3TUNE_HISTORY_MAX:]
+        elif prev is not None and prev not in _sam3tune_history:
+            _tune_drop_frames(prev)      # 上一条没进历史：它的原图没人能再取到，立刻释放
+        for old in _sam3tune_history[SAM3TUNE_FULL_KEEP:]:
+            if old not in _sam3tune_live.values():
+                _tune_drop_frames(old)
 
 
 @app.get("/api/sam3tune/config")
@@ -5221,7 +5267,7 @@ def sam3tune_config_set(body: dict = Body(default=None)):
 def sam3tune_state():
     """控制面实时区数据源：口径配置 + 每设备生产流式最近一帧的观测（原图/定位缩略图+分数）。"""
     with _sam3tune_lock:
-        live = dict(_sam3tune_live)
+        live = {d: _tune_public(e) for d, e in _sam3tune_live.items()}
     return JSONResponse({"cfg": _get_score_cfg(), "selected": get_selected_device(),
                          # 生产链路当前在识别的词（随口径配置可调，空=默认词表）
                          "words": _get_score_cfg()["words"],
@@ -5321,7 +5367,28 @@ def sam3tune_history(device: Optional[str] = None, limit: int = 0):
     total = len(items)
     if limit and limit > 0:
         items = items[:limit]
-    return JSONResponse({"items": items, "total": total, "max": SAM3TUNE_HISTORY_MAX})
+    return JSONResponse({"items": [_tune_public(it) for it in items],
+                         "total": total, "max": SAM3TUNE_HISTORY_MAX})
+
+
+@app.get("/api/sam3tune/image/{entry_id}/{kind}")
+def sam3tune_image(entry_id: int, kind: str):
+    """观测条目的原尺寸帧（kind=raw 原图 / seg 定位图），点开大图时才拉。
+    留存窗口只有最近 SAM3TUNE_FULL_KEEP 条 + 各设备实时条，滑出后 404。
+    编码在这里做（懒编码）：没人点开就不花这份 CPU。"""
+    with _sam3tune_lock:
+        hit = next((e for e in list(_sam3tune_history) + list(_sam3tune_live.values())
+                    if e.get("id") == entry_id), None)
+        arr = None if hit is None else hit.get("_seg" if kind == "seg" else "_raw")
+    if arr is None:
+        return JSONResponse({"ok": False, "error": "原图已滚出留存窗口（只留最近 %d 条）"
+                             % SAM3TUNE_FULL_KEEP}, status_code=404)
+    ok, buf = cv2.imencode(".jpg", cv2.cvtColor(arr, cv2.COLOR_RGB2BGR),
+                           [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    if not ok:
+        return JSONResponse({"ok": False, "error": "编码失败"}, status_code=500)
+    return Response(content=buf.tobytes(), media_type="image/jpeg",
+                    headers={"Cache-Control": "public, max-age=3600"})
 
 
 @app.post("/api/sam3tune/clear")
