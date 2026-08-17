@@ -123,5 +123,44 @@ class WiringTest(unittest.TestCase):
                          recog_direct.LIMITS["concurrency"])
 
 
+class TrimmedSurfaceTest(unittest.TestCase):
+    """去冗余(2026-08-17)后的接线断言：删掉的链路不要悄悄长回来。
+
+    每个「环节」只留一份样本：DA3+SAM3 能力样本=单目链；点云构建=单目 + devpc；
+    识别实现=产线一份；调试页=/panel + /recog + /sam3tune。"""
+
+    def setUp(self):
+        self.app = (ROOT / "app.py").read_text(encoding="utf-8")
+        self.relay = (ROOT / "frame_relay.py").read_text(encoding="utf-8")
+        self.pusher = (ROOT / "mac-mini" / "cam_pusher.py").read_text(encoding="utf-8")
+
+    def test_stereo_chain_gone(self):
+        for token in ("_stereo_sam3_overlays", "build_stereo_pointcloud_glb",
+                      "/api/stereohl/status", "_sam3_ir_stream_frame"):
+            self.assertNotIn(token, self.app, token)
+        for token in ("/api/frame/aux", "stereo_product", "set_stereo_processor"):
+            self.assertNotIn(token, self.relay, token)
+        for token in ("_push_aux", "_IRCache", "LEFT_IR_SENSOR"):
+            self.assertNotIn(token, self.pusher, token)
+
+    def test_experience_sources_are_hardware_depth_only(self):
+        i = self.app.index('<select id="selStyle">')
+        block = self.app[i:self.app.index("</select>", i)]
+        opts = re.findall(r'<option value="(\w+)"', block)
+        self.assertEqual(opts, ["devdepth", "devpc"], "背景来源应只剩两条硬件深度链路")
+
+    def test_experiment_bench_and_gradio_gone(self):
+        self.assertFalse((ROOT / "exp_app.py").exists())
+        self.assertFalse((ROOT / "run-exp.sh").exists())
+        for token in ("import gradio", "mount_gradio_app", "SPLIT_PAGE", "SAM3_PAGE"):
+            self.assertNotIn(token, self.app, token)
+
+    def test_mono_chain_kept_as_sample(self):
+        # 单目链是保留的唯一 DA3+SAM3 能力样本（现网 DISABLE_MONO_PIPELINE=1 停用中）
+        for token in ("_maybe_sam3cloud", "_sam3cloud_refresh", "_sam3_recent_drinks",
+                      "DISABLE_MONO_PIPELINE", "build_pointcloud_boxes_glb"):
+            self.assertIn(token, self.app, token)
+
+
 if __name__ == "__main__":
     unittest.main()
