@@ -91,6 +91,13 @@ domain:
       model: __CHUNK_MODEL__
       request_timeout_seconds: 120
     realtime_chunk_concurrency: 3
+    # ifa 双链架构·实时链：帧事件触发时只判定最新 4 帧滑窗（stride=2），产 eating
+    # 信号驱动演示状态机，永不回补积压。配合 services 启动参数
+    # -realtime-workflow-lane=false（停用 workflow lane 周期编排）使用。
+    latest_window_realtime:
+      enabled: true
+      window_size: 4
+      stride_frames: 2
     media_read_timeout_seconds: 15
   user:
     report_display:
