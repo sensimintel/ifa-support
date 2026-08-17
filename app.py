@@ -54,8 +54,7 @@ import recog_direct  # noqa: E402
 from frame_relay import (  # noqa: E402
     DEFERRED, UNKNOWN_DEVICE, get_latest_frame, get_latest_frame_seq,
     get_selected_device, router as frame_router,
-    set_pc_want_provider, set_processor, set_product, set_stereo_processor,
-    set_stereo_product)
+    set_pc_want_provider, set_processor, set_product)
 
 MODEL_DIR = str(DA3_ROOT / "models" / "DA3NESTED-GIANT-LARGE-1.1")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -349,38 +348,6 @@ def _sam3_stream_frame(word, rgb):
                     r.get("debug"))
         sid = None                    # 失败（session 被回收/服务重启）：重建一次再试
     return None, None, None, None
-
-
-# ── 双目 IR 专用流式 session（与 RGB 主链路的 _sam3_stream_sessions 完全隔离：
-#    IR 帧混入 RGB session 会污染其跟踪记忆，反之亦然，故各养各的）──────────────
-_sam3_ir_sessions = {}      # 词 -> session_id（左目 IR 流式）
-_sam3_ir_lock = threading.Lock()
-
-
-def _sam3_ir_stream_frame(word, rgb):
-    """左目 IR 帧对单个词做流式增量步进（与 _sam3_stream_frame 同构、独立 session 表）。
-    增量步进比每帧无状态整图分割便宜，且 obj_id 跨帧稳定（同物同色不闪）。
-    返回 instances 列表；失败/流式不可用返回 []。"""
-    b64 = _b64_jpg(rgb)
-    if not b64:
-        return []
-    cfg = _get_score_cfg()
-    with _sam3_ir_lock:
-        sid = _sam3_ir_sessions.get(word)
-    for _retry in range(2):
-        if not sid:
-            sid = _sam3_stream_start(word)
-            if not sid:
-                return []
-            with _sam3_ir_lock:
-                _sam3_ir_sessions[word] = sid
-        r = _sam3_post("/v1/stream/frame", {"session_id": sid, "image_b64": b64,
-                                            "alpha": cfg["alpha"],
-                                            "det_thresh": cfg["thresh"]})
-        if r is not None:
-            return r.get("instances") or []
-        sid = None                    # session 被回收/服务重启：重建一次再试
-    return []
 
 
 _SAM3_COLORS = [(222, 52, 52), (46, 120, 235), (26, 158, 95), (240, 150, 20),
@@ -744,225 +711,6 @@ def _write_pointcloud_glb(out_path, pc_pts, pc_cols, cam_wires=None, quantize=Fa
         f.write(b"glTF" + struct.pack("<II", 2, total)
                 + struct.pack("<I", len(jb)) + b"JSON" + jb
                 + struct.pack("<I", len(bin_padded)) + b"BIN\x00" + bin_padded)
-
-
-def _stereo_geometry(pred, conf_thresh_percentile, num_max_points, outlier_mad,
-                     point_scale):
-    """双目点云「几何阶段」：反投影/conf 分位裁剪/随机降采样/MAD 裁离群，一次算好与
-    颜色无关的全部中间结果。主产物与高亮版共享同一份几何（各自只做顶点色 bake +
-    glTF 导出），两份 GLB 不再重复算几何管线。
-
-    返回 dict：
-      pts        最终点坐标 (M,3) float32（已合到左目系/flip/缩放/降采样/裁离群）
-      vidx       各视角有效像素的扁平下标列表（上色阶段按它抽取整图颜色）
-      final_idx  最终点在「各视角有效点拼接序」里的下标（颜色/conf 与点一一对应的桥）
-      cf_concat  拼接序逐点 conf（float32；无 conf 时 None，alpha 烘焙用）
-      K/ext      相机内外参（相机线框与返回 K0 用）
-      shape      (N, H, W)
-      key        几何参数指纹（conf 分位/点预算/MAD 倍数/缩放）——不等时不得复用"""
-    from depth_anything_3.utils.export import glb as _glb  # 复用官方外参齐次化
-
-    depth = np.asarray(pred.depth).astype(np.float32)       # (N,H,W)
-    K = np.asarray(pred.intrinsics).astype(np.float64)      # (N,3,3)
-    N, H, W = depth.shape
-    ext = pred.extrinsics
-    if ext is None:
-        ext = np.tile(np.eye(4, dtype=np.float64), (N, 1, 1))
-    else:
-        ext = np.stack([_glb._as_homogeneous44(np.asarray(e).astype(np.float64))
-                        for e in ext])
-    conf = pred.conf
-    conf_thr = None
-    if conf is not None:
-        conf = np.asarray(conf).astype(np.float32)
-        # 绝对下限传 0：理由同单目链路（写死 1.05 会钉死阈值、分位滑块失效）。
-        # 与 get_conf_thresh 同语义，但两次 percentile 合成一趟算完
-        _p_lo, _p90 = np.percentile(conf, [float(conf_thresh_percentile), 90.0])
-        conf_thr = float(min(max(0.0, float(_p_lo)), float(_p90)))
-
-    ext0 = ext[0]
-    scale = float(point_scale) if point_scale else 1.0
-    pts_all, cf_all, vidx_list = [], [], []
-    for i in range(N):
-        d = depth[i]
-        valid = np.isfinite(d) & (d > 0)
-        if getattr(pred, "sky", None) is not None:
-            valid &= ~np.asarray(pred.sky)[i].astype(bool)
-        if conf is not None:
-            valid &= conf[i] >= conf_thr
-        vidx = np.flatnonzero(valid.reshape(-1))
-        vidx_list.append(vidx)
-        if vidx.size == 0:
-            continue
-        # 先按 valid 下标取像素子集再反投影（原实现整图 H*W 像素乘完才筛，白算被裁掉
-        # 的大半）；矩阵乘全程 float32——点云精度足够，比 float64 快约一倍
-        u = (vidx % W).astype(np.float32)
-        v = (vidx // W).astype(np.float32)
-        pix = np.stack([u, v, np.ones_like(u)], 0)          # (3, M) 齐次像素坐标
-        K_inv = np.linalg.inv(K[i]).astype(np.float32)
-        Xc = (K_inv @ pix).T * d.reshape(-1)[vidx][:, None]  # 视角 i 相机坐标 (M,3)
-        T = (ext0 @ np.linalg.inv(ext[i])).astype(np.float32)  # 视角 i 相机 → 视角 0 相机
-        X0 = Xc @ T[:3, :3].T + T[:3, 3]
-        X0[:, 1] *= -1.0                                    # flip Y（glTF Y 向上）
-        X0[:, 2] *= -1.0                                    # flip Z（glTF 相机看 -Z）
-        if scale != 1.0:
-            X0 *= scale
-        pts_all.append(X0)
-        if conf is not None:
-            cf_all.append(conf[i].reshape(-1)[vidx])
-    if not pts_all:
-        raise RuntimeError("双目点云为空（有效深度点不足）")
-    pc_pts = np.concatenate(pts_all)
-    cf_concat = np.concatenate(cf_all) if cf_all else None
-    # 随机降采样（与官方 _filter_and_downsample 同语义：先剔非有限值，超预算无放回抽样；
-    # default_rng 的无放回抽样比传统 np.random.choice 快约一个量级）。全程记录下标
-    # final_idx，供上色阶段对拼接序的颜色/conf 做同样抽取，点与色严格一一对应
-    idx = np.flatnonzero(np.isfinite(pc_pts).all(axis=1))
-    if idx.size > int(num_max_points):
-        idx = idx[np.random.default_rng().choice(idx.size, int(num_max_points),
-                                                 replace=False)]
-    pc_pts = pc_pts[idx]
-    # 深度(Z)方向 MAD 稳健裁离群：理由与参数同单目链路（防深度爆点撑爆取景包围盒）
-    if pc_pts.shape[0] > 200:
-        zc = -pc_pts[:, 2]
-        med = float(np.median(zc))
-        mad = float(np.median(np.abs(zc - med))) + 1e-6
-        keep = zc <= med + float(outlier_mad) * mad
-        pc_pts = pc_pts[keep]
-        idx = idx[keep]
-    return {"pts": pc_pts, "vidx": vidx_list, "final_idx": idx,
-            "cf_concat": cf_concat, "K": K, "ext": ext, "shape": (N, H, W),
-            "key": (float(conf_thresh_percentile), int(num_max_points),
-                    float(outlier_mad),
-                    None if point_scale is None else float(point_scale))}
-
-
-def _stereo_bake_colors(pred, geo, mask_overlays, color_gamma, hl_cfg,
-                        bake_conf_alpha):
-    """双目点云「上色阶段」：gamma 提亮/HSV 调色/mask 染色（或高亮样式）烘进整图颜色，
-    再按几何阶段记录的下标抽取成逐点 RGBA (M,4) uint8。调色逻辑与原实现逐行同款，
-    仅从几何循环里拆出——主产物与高亮版对同一份几何各跑一次本阶段即可。"""
-    N, H, W = geo["shape"]
-    rgb = (np.asarray(pred.processed_images)
-           if getattr(pred, "processed_images", None) is not None else None)
-    if rgb is None or rgb.shape[:3] != (N, H, W):
-        rgb = np.full((N, H, W, 3), 180, np.uint8)
-    elif rgb.dtype != np.uint8:
-        # processed_images 可能是 0-1 浮点：与 _rgb_uint8 同款换算，直接转 uint8 会全黑
-        rgb = np.clip(rgb * (255 if rgb.max() <= 1.0 else 1), 0, 255).astype(np.uint8)
-    if color_gamma:
-        # 顶点色伽马提亮（<1 提暗部）：IR 无环境光时后景灰度极低，点云黑底上后景点
-        # 肉眼不可见——只提显示颜色，不影响喂给 DA3 的原始输入与几何
-        lut = (np.power(np.arange(256, dtype=np.float32) / 255.0,
-                        float(color_gamma)) * 255.0).astype(np.uint8)
-        rgb = lut[rgb]
-    if hl_cfg is not None:
-        # 高亮模式（/experience「双目高亮点云」来源）：与单目④同语义——先按配置调
-        # 底色（色相/饱和/明度，逐视角），再把样式化染色/纯色/提亮/描边 + 背景压暗
-        # 写进顶点色（mask 只在左目，无框）
-        _gs = float(hl_cfg.get("sat", 1.0)); _gv = float(hl_cfg.get("val", 1.0))
-        _gh = float(hl_cfg.get("hue", 0.0))
-        if abs(_gs - 1.0) > 1e-3 or abs(_gv - 1.0) > 1e-3 or abs(_gh) > 0.5:
-            graded = []
-            for i in range(N):
-                _hsv = cv2.cvtColor(rgb[i], cv2.COLOR_RGB2HSV).astype(np.float32)
-                _hsv[..., 0] = np.mod(_hsv[..., 0] + _gh / 2.0, 180.0)  # OpenCV H 范围 [0,180)
-                _hsv[..., 1] *= _gs
-                _hsv[..., 2] *= _gv
-                _h = np.mod(_hsv[..., 0], 180.0)
-                _sv = np.clip(_hsv[..., 1:], 0, 255)
-                _hsv = np.concatenate([_h[..., None], _sv], -1)
-                graded.append(cv2.cvtColor(_hsv.astype(np.uint8), cv2.COLOR_HSV2RGB))
-            rgb = np.stack(graded)
-        if mask_overlays:
-            v0, _ = _apply_hl_styles(rgb[0].copy(), mask_overlays, hl_cfg)
-            rgb = np.concatenate([v0[None], rgb[1:]], axis=0)
-    elif mask_overlays:
-        # SAM3 mask 染进左目视角的点颜色（与③同款 0.5 混合）
-        v0 = rgb[0].copy()
-        for (_label, _col, _mk) in mask_overlays:
-            v0[_mk] = (v0[_mk].astype(np.float32) * 0.5
-                       + np.array(_col, np.float32) * 0.5).astype(np.uint8)
-        rgb = np.concatenate([v0[None], rgb[1:]], axis=0)
-
-    # 按几何阶段的下标抽色：先拼各视角有效点颜色，再取降采样/MAD 后的最终下标
-    cols = np.concatenate([rgb[i].reshape(-1, 3)[geo["vidx"][i]] for i in range(N)])
-    cols = cols[geo["final_idx"]].astype(np.uint8)
-    # 颜色带 alpha 通道：默认 255；bake_conf_alpha 时把逐点置信度（5/95 分位稳健归一，
-    # 跨两视角统一标定——分位按降采样前全量 conf 算，与原实现一致）烘进 alpha
-    # [40,255]——供前端「置信度→点大小/透明度」联动
-    if bake_conf_alpha and geo["cf_concat"] is not None:
-        _cf = geo["cf_concat"]
-        _lo, _hi = (float(x) for x in np.percentile(_cf, [5.0, 95.0]))
-        _t = np.clip((_cf[geo["final_idx"]] - _lo) / max(_hi - _lo, 1e-6), 0.0, 1.0)
-        alpha = (40.0 + _t * 215.0).astype(np.uint8)
-    else:
-        alpha = np.full(cols.shape[0], 255, np.uint8)
-    return np.concatenate([cols, alpha[:, None]], axis=1)
-
-
-def build_stereo_pointcloud_glb(pred, out_path, conf_thresh_percentile=40.0,
-                                num_max_points=800000, show_cameras=True,
-                                mask_overlays=None, outlier_mad=12.0,
-                                point_scale=None, color_gamma=None,
-                                hl_cfg=None, bake_conf_alpha=False, geo=None):
-    """双视角（左右 IR）点云 GLB：每个视角各自反投影后，经 DA3 估计的相对位姿统一
-    合到「视角 0（左目）相机坐标系」，再 flip Y/Z 到 glTF 约定——与单目链路同一坐标
-    语义（左目相机=原点、光轴固定），前端同一套取景逻辑直接可用。
-
-    pred.extrinsics 是 w2c（DA3 约定）：视角 i 相机点 → 视角 0 相机系的变换为
-    T_i = ext0 @ inv(ext_i)。mask_overlays 只作用于视角 0（SAM3 跑左目图）。
-    point_scale 非空则整体缩放点云与相机线框（用真实基线恢复米制尺度）。
-    返回视角 0 的相机内参 K0（前端算 FOV 用）。
-
-    实现拆成「几何阶段」（_stereo_geometry）与「上色导出阶段」（_stereo_bake_colors +
-    _write_pointcloud_glb 手写 GLB 序列化，不再走 trimesh）。geo 传入外部预算好的
-    几何结果时两份产物共享一份几何；其参数指纹与本次调用不一致（面板把主产物与
-    高亮版的 conf 分位/outlier_mad 调不等）时自动忽略、回退独立几何计算，行为与
-    共享前完全一致。"""
-    from depth_anything_3.utils.export import glb as _glb  # 复用官方相机线框几何/场景尺度
-
-    _key = (float(conf_thresh_percentile), int(num_max_points), float(outlier_mad),
-            None if point_scale is None else float(point_scale))
-    if geo is None or geo.get("key") != _key:
-        geo = _stereo_geometry(pred, conf_thresh_percentile, num_max_points,
-                               outlier_mad, point_scale)
-    pc_pts = geo["pts"]
-    pc_cols = _stereo_bake_colors(pred, geo, mask_overlays, color_gamma, hl_cfg,
-                                  bake_conf_alpha)
-    K, ext = geo["K"], geo["ext"]
-    N, H, W = geo["shape"]
-
-    cam_wires = None
-    if show_cameras:
-        try:
-            ext0 = ext[0]
-            scale = float(point_scale) if point_scale else 1.0
-
-            # 米制缩放下相机位置也要同尺度：把相对位姿的平移分量乘 scale（线框尺寸由
-            # scene_scale 决定，已含缩放，不能再二次缩放）。
-            # 相对外参：视角 0 = identity，视角 i = ext_i @ inv(ext0)
-            def _rel_ext(i):
-                pose = np.linalg.inv(ext[i] @ np.linalg.inv(ext0))
-                pose[:3, 3] *= scale
-                return np.linalg.inv(pose)
-
-            scene_scale = _glb._estimate_scene_scale(pc_pts, fallback=1.0)
-            cam_wires = []
-            for i in range(N):
-                segs = np.asarray(_glb._camera_frustum_lines(
-                    K[i], _rel_ext(i), W, H, scene_scale * 0.03), np.float64)
-                # 与点云同坐标系：仅 flip Y/Z（相机固定在原点，等价原 hf_alignment 矩阵）
-                segs[..., 1] *= -1.0
-                segs[..., 2] *= -1.0
-                cam_wires.append((segs.astype(np.float32),
-                                  _glb._index_color_rgb(i, N)))
-        except Exception:
-            cam_wires = None
-
-    _write_pointcloud_glb(out_path, pc_pts, pc_cols, cam_wires=cam_wires,
-                          quantize=GLB_QUANTIZE)
-    return K[0]
 
 
 def _hex_rgb(s, fallback=(255, 159, 10)):
@@ -1331,14 +1079,6 @@ def _save_sam3hl_preset():
 
 _load_sam3hl_preset()
 _sam3hl = {"kind": None, "url": None, "bytes": None, "seq": 0, "meta": None, "error": None}
-
-# 双目高亮点云槽（/experience「双目高亮点云」来源）：stereo worker 每帧同 pred 追加构建，
-# 样式读同一份 _sam3hl_cfg（高亮样式/点云整体样式滑杆对两种来源同时生效）。
-# device 字段供前端做陈旧守卫：切设备后旧 GLB 不再展示
-_stereo_hl_lock = threading.Lock()
-_stereo_hl = {"kind": "model", "url": None, "seq": 0, "meta": None, "error": None,
-              "device": None}
-
 
 def _sam3cloud_refresh(pred, frames, conf, fmt, nmp, show_cam, gen):
     """后台任务：SAM3 track（多词并发）→ mask 解码/缩放到深度分辨率 → 与第二图**同源**产出：
@@ -1711,18 +1451,6 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 </div>
 
 <div class="grid">
- <!-- ① 双目点云：左右 IR 喂 DA3 双视角 + SAM3 左目染色（stereo_product 槽） -->
- <figure>
-  <div class="box">
-   <model-viewer id="mvst" style="display:none" camera-controls touch-action="pan-y"
-     camera-orbit="0deg 90deg 1.5m" field-of-view="55deg" camera-target="0m 0m -1.5m"
-     min-camera-orbit="-Infinity 0deg 1%" max-camera-orbit="Infinity 180deg 2000%"
-     min-field-of-view="10deg" max-field-of-view="60deg"
-     interaction-prompt="none" shadow-intensity="0.3" exposure="1.35"></model-viewer>
-   <span class="wait" id="stwait">等待双目点云…</span>
-  </div>
-  <figcaption><span id="stcap">双目点云（DA3×2视角 + SAM3）</span> <span class="m" id="stmeta"></span></figcaption>
- </figure>
  <!-- ② 单图点云：原单目链路产物格，逻辑原样（depth/glb/cloudimg/mesh 按产物类型） -->
  <figure>
   <div class="box">
@@ -1743,15 +1471,6 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  </figure>
  <!-- ④ 空位（按排版设计留白） -->
  <figure aria-hidden="true"></figure>
- <!-- ⑤ 双目原图：左右 IR 两张并排 -->
- <figure>
-  <div class="box" style="gap:4px">
-   <img id="irleft" style="display:none;max-width:calc(50% - 2px)">
-   <img id="irright" style="display:none;max-width:calc(50% - 2px)">
-   <span class="wait" id="irwait">等待双目帧…</span>
-  </div>
-  <figcaption>双目原图（左 / 右 IR）<span class="m" id="irmeta"></span></figcaption>
- </figure>
  <!-- ⑥ 单图原图：原设备帧格，逻辑原样 -->
  <figure>
   <div class="box"><img id="raw" style="display:none"><span class="wait" id="rawwait">等待设备帧…</span></div>
@@ -1827,8 +1546,6 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
    </select></div>
   <div class="fld"><label>处理分辨率 process_res <span class="rngval" id="prv">504</span></label>
    <input type="range" id="pr" min="196" max="1120" step="28" value="504"></div>
-  <div class="fld"><label>双目处理分辨率 stereo_process_res <span class="rngval" id="sprv">504</span></label>
-   <input type="range" id="spr" min="196" max="1120" step="28" value="504"></div>
  </div>
  <div class="glbopts" id="glbopts">
   <div class="row">
@@ -1862,7 +1579,6 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <script>
 const $=id=>document.getElementById(id);
 $('pr').oninput=()=>$('prv').textContent=$('pr').value;
-$('spr').oninput=()=>$('sprv').textContent=$('spr').value;
 $('fps').oninput=()=>$('fpv').textContent=(+$('fps').value).toFixed(1);
 $('ct').oninput=()=>$('ctv').textContent=$('ct').value;
 $('nmp').oninput=()=>$('nmv').textContent=(+$('nmp').value).toFixed(1);
@@ -1919,28 +1635,9 @@ mv.addEventListener('camera-change',(e)=>{ if(e.detail && e.detail.source==='use
 mv.addEventListener('load',()=>{ if(!interacting) applyView(); });
 
 // ── 双目点云格（①）：独立 model-viewer，固定视角逻辑与②同款（用双目自己的 FOV）──
-const mvst=$('mvst');
-let stFov=55;                 // 双目左目真实垂直 FOV（stereo meta fov_deg）
-let stInteracting=false, stInteractTimer;
-mvst.addEventListener('camera-change',(e)=>{ if(e.detail && e.detail.source==='user-interaction'){
-  stInteracting=true;clearTimeout(stInteractTimer);stInteractTimer=setTimeout(()=>{stInteracting=false;},600);} });
-function stApplyView(){       // 双目格视角：与②同一套预设（调优/原始跟随单选按钮）
-  try{
-    const c=mvst.getBoundingBoxCenter();
-    const cz=(c.z<-0.001)?c.z:-1.5;
-    const phi=(viewMode==='raw')?90:VIEW_PHI, k=(viewMode==='raw')?1.0:VIEW_K;
-    mvst.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
-    mvst.cameraOrbit='0deg '+phi+'deg '+(Math.abs(cz)*k).toFixed(4)+'m';
-    mvst.fieldOfView=stFov+'deg';
-    mvst.jumpCameraToGoal&&mvst.jumpCameraToGoal();
-  }catch(e){}
-}
-mvst.addEventListener('load',()=>{ if(!stInteracting) stApplyView(); });
-
 function currentConfig(){return {
   export_format:$('fmt').value,
   process_res:+$('pr').value,
-  stereo_process_res:+$('spr').value,
   conf_thresh_percentile:+$('ct').value,
   num_max_points:Math.round(+$('nmp').value*1e6),
   show_cameras:$('cam').value
@@ -1956,7 +1653,7 @@ function pushConfig(){
 }
 // 控件任意改动 → 同步显隐 + 推配置（debounce）。推帧 fps 不在其中：它是 per-device
 // 配置（/api/frame/device-config），不能塞进全量覆盖语义的 /api/frame/config
-['fmt','pr','spr','ct','nmp','cam'].forEach(id=>{
+['fmt','pr','ct','nmp','cam'].forEach(id=>{
   $(id).addEventListener('change',()=>{syncOpts();pushConfig();});
   $(id).addEventListener('input',pushConfig);
 });
@@ -2009,7 +1706,7 @@ function renderLatency(s){
     +'</b> · 端到端延时 <b>'+fmtLag(e2eMs)+'</b>';
 }
 
-let lastSeq=-1,lastDepth=-1,lastProdKey='',lastSwap=0,lastStKey='',lastSwapSt=0,lastAuxSeq=-1;
+let lastSeq=-1,lastDepth=-1,lastProdKey='',lastSwap=0;
 const MIN_SWAP_MS=0;   // 换图节流已停用（2026-08-13 应用户要求，有线大屏跟上后端节拍）；"加载中不打断"守卫仍在，慢网表现为持续加载
 
 // ── 多设备：下拉选设备（服务端只处理选中设备一路；非选中设备的帧只进各自缓存） ──
@@ -2040,7 +1737,6 @@ function renderDevices(s){
 }
 // 推帧 fps：per-device 配置（POST /api/frame/device-config），只作用当前选中设备。
 // 与 /api/frame/config 分开——那边是全量覆盖语义且全局一份，两台摄像机没法各调各的。
-// 同一设备的双目 aux 与主帧在推帧器端同节拍，此滑杆天然同控该设备两条链路
 let fpsTimer=null,fpsTouched=0;
 $('fps').addEventListener('input',()=>{
   fpsTouched=Date.now();
@@ -2054,15 +1750,12 @@ $('fps').addEventListener('input',()=>{
 });
 function resetPanesForSwitch(){   // 切设备：清空各格显示与序号缓存，等新设备的帧/产物
   $('prodcap').textContent='单图点云（DA3 + SAM3）';
-  lastSeq=-1;lastDepth=-1;lastProdKey='';lastSwap=0;lastStKey='';lastSwapSt=0;lastAuxSeq=-1;
+  lastSeq=-1;lastDepth=-1;lastProdKey='';lastSwap=0;
   pendingE2E=null;e2eMs=null;$('rawlat').textContent='';
   $('raw').style.display='none';$('rawwait').style.display='';
   $('prodimg').style.display='none';$('mv').style.display='none';$('prodwait').style.display='';
-  $('mvst').style.display='none';$('stwait').style.display='';$('stwait').textContent='等待双目点云…';
   $('devdepth').style.display='none';$('ddwait').style.display='';$('ddwait').textContent='等待设备深度帧…';
-  $('irleft').style.display='none';$('irright').style.display='none';
-  $('irwait').style.display='';$('irwait').textContent='等待双目帧…';
-  $('stmeta').textContent='';$('ddmeta').textContent='';$('irmeta').textContent='';
+  $('ddmeta').textContent='';
 }
 async function tick(){
  try{
@@ -2123,43 +1816,6 @@ async function tick(){
   $('prodcap').textContent=(isExt&&s.product_meta.cap)?s.product_meta.cap:'单图点云（DA3 + SAM3）';
   $('prodmeta').innerHTML=pm;
 
-  // 双目三格（①点云 / ③设备深度 / ⑤左右原图）：数据全在同一个 status 里，无额外轮询。
-  // stereo_supported：true=有双目；false/null=无（Astra/手机 App）→ ①⑤ 显示不支持提示
-  const stereoOK = s.stereo_supported===true;
-  if(!stereoOK){
-    $('mvst').style.display='none';$('stwait').style.display='';
-    $('stwait').textContent='该设备不支持双目';$('stmeta').textContent='';
-    $('irleft').style.display='none';$('irright').style.display='none';
-    $('irwait').style.display='';$('irwait').textContent='该设备不支持双目';$('irmeta').textContent='';
-  }else{
-    // ① 双目点云 GLB：换模节流与②同款（未加载完不换 + 最少停 MIN_SWAP_MS + 25s 兜底）
-    const stKey=(s.stereo_product_kind||'')+':'+(s.stereo_product_url||'')+':'+s.stereo_product_seq;
-    if(s.stereo_product_kind==='model' && s.stereo_product_url && stKey!==lastStKey){
-      if((mvst.loaded || !mvst.src || Date.now()-lastSwapSt>=25000) && Date.now()-lastSwapSt>=MIN_SWAP_MS){
-        lastSwapSt=Date.now(); lastStKey=stKey;
-        mvst.src=s.stereo_product_url;
-        mvst.style.display='block';$('stwait').style.display='none';
-      }
-    }
-    let sm='';
-    if(s.stereo_product_error){sm='<span class="err">'+s.stereo_product_error+'</span>';}
-    else if(s.stereo_product_meta){const m=s.stereo_product_meta;
-      sm=(m.label||'')+(m.dt?(' · '+m.dt.toFixed(2)+'s'):'')+(m.stat?(' · '+m.stat):'');
-      if(m.fov_deg && m.fov_deg!==stFov){stFov=m.fov_deg; if(mvst.loaded && !stInteracting) stApplyView();}}
-    if(s.has_aux_stereo && s.stereo_product_seq<s.aux_seq && !s.stereo_product_error)
-      sm+=' <span class="dim">（处理中…）</span>';
-    $('stmeta').innerHTML=sm;
-    // ⑤ 双目原图：aux_seq 变了才刷新两张 IR
-    if(s.has_aux_stereo && s.aux_seq!==lastAuxSeq){
-      $('irleft').src='/api/frame/aux-image?kind=left&t='+s.aux_seq;
-      $('irright').src='/api/frame/aux-image?kind=right&t='+s.aux_seq;
-      $('irleft').style.display='block';$('irright').style.display='block';
-      $('irwait').style.display='none';
-      $('irmeta').textContent='辅助帧 '+s.aux_seq
-        +(s.aux_info&&s.aux_info.baseline_mm?(' · 基线 '+s.aux_info.baseline_mm+'mm'):'')
-        +(s.aux_info&&s.aux_info.laser_mode?(' · 激光 '+s.aux_info.laser_mode):'');
-    }
-  }
   // ③ 原设备深度图：帧源随彩色帧一并上报的伪彩 JPEG（Astra 也有；手机 App 没有）
   if(s.has_depth){
     if(s.depth_seq!==lastDepth){lastDepth=s.depth_seq;
@@ -2168,10 +1824,9 @@ async function tick(){
     $('ddmeta').textContent='帧 '+s.depth_seq;
   }else{
     $('devdepth').style.display='none';$('ddwait').style.display='';
-    $('ddwait').textContent=(s.stereo_supported==null)?'该设备无硬件深度':'等待设备深度帧…';
+    $('ddwait').textContent='等待设备深度帧…';
     $('ddmeta').textContent='';
   }
-  if(s.aux_seq!==undefined && s.has_aux_stereo) lastAuxSeq=s.aux_seq;
 
   // 顶部状态行
   if(!s.processor){$('status').innerHTML='<span class="err">未接入 DA3 模型（纯中继）。</span>';}
@@ -4898,7 +4553,6 @@ class _PipelineBuilder:
 
 
 _mono_builder = _PipelineBuilder("mono-product-builder")
-_stereo_builder = _PipelineBuilder("stereo-product-builder")
 
 
 def _da3_frame_processor(raw: bytes, config: dict, device_id: str,
@@ -5028,243 +4682,6 @@ def _build_mono_product(arr, pred, fmt, res, conf, nmp, show_cam,
                          "shape": [int(depth.shape[1]), int(depth.shape[0])], "res": res}}
 
 
-def _stereo_sam3_overlays(pred):
-    """双目链路的 SAM3：对左目 processed_image（与深度同一张图，坐标零错位）按生产
-    识别词逐词做**流式增量步进**（_sam3_ir_stream_frame，IR 专用 session、与 RGB
-    主链路的流式记忆完全隔离）——增量步进比旧的每帧无状态 /v1/segment 便宜，且
-    obj_id 跨帧稳定。返回 (overlays, 命中标签列表)。"""
-    left = np.asarray(pred.processed_images)[0]
-    H0, W0 = np.asarray(pred.depth)[0].shape
-    targets = [(w["word"], w.get("label") or "drink") for w in _get_score_cfg()["words"]]
-    # 食物高亮：识别词都是液体词，补一路 food 查询让食物也染色（与单目③④同款；
-    # 双目链路本就不产证据，无污染问题）
-    if not any(l == "food" for (_w, l) in targets):
-        targets = targets + [(SAM3_TEXT_DEFAULT, "food")]
-    if not targets:
-        return [], []
-    with ThreadPoolExecutor(max_workers=len(targets)) as ex:
-        results = list(ex.map(lambda ql: (ql[0], ql[1], _sam3_ir_stream_frame(ql[0], left)),
-                              targets))
-    overlays, id_tags = [], []
-    for _query, label, insts in results:
-        col = LABEL_COLORS.get(label, (255, 200, 0))
-        for ins in insts:
-            rle = ins.get("mask_rle") or {}
-            if not (rle.get("counts") and rle.get("size")):
-                continue
-            try:
-                mk = _rle_decode(rle["size"], rle["counts"])
-            except Exception as e:
-                print(f"[da3-web] 双目 SAM3 mask 解码失败：{type(e).__name__}: {e}",
-                      flush=True)
-                continue
-            if mk.shape != (H0, W0):
-                mk = cv2.resize(mk, (W0, H0), interpolation=cv2.INTER_NEAREST)
-            mk = mk.astype(bool)
-            if not mk.any():
-                continue
-            tag = f"{label}#{ins.get('obj_id', '?')}"
-            overlays.append((tag, col, mk))
-            id_tags.append(tag)
-    return overlays, id_tags
-
-
-def _da3_stereo_processor(left_raw: bytes, right_raw: bytes, aux_info: dict,
-                          config: dict, device_id: str, seq: int, gen: int):
-    """双目链路 GPU 级（两级流水线的第一级）：左右 IR 解码 → DA3 any-view 双视角
-    推理（GPU 锁内）→ 把构建闭包交给 _stereo_builder 后立即返回 DEFERRED。构建级
-    做 SAM3 左目分割染色（网络调用，560ms 量级——正是流水线要重叠掉的大头）+
-    合并点云 GLB，完成后经 set_stereo_product 异步写回 stereo_product 槽。
-
-    与单目链路完全平行：不碰单目产物槽、不碰跨帧时序缓存（识别/流式 SAM3/最近帧
-    都是 RGB 主链路的状态），GPU 推理与单目共用同一把 _gpu_lock 串行。
-    米制尺度：aux_info 带真实双目基线（毫米）时，用「真实基线 ÷ DA3 估计的左右
-    相机间距」整体缩放点云，恢复接近米制的尺度（单目链路做不到）。"""
-    l_gray = cv2.imdecode(np.frombuffer(left_raw, np.uint8), cv2.IMREAD_GRAYSCALE)
-    r_gray = cv2.imdecode(np.frombuffer(right_raw, np.uint8), cv2.IMREAD_GRAYSCALE)
-    if l_gray is None or r_gray is None:
-        raise RuntimeError("左右 IR 解码失败")
-    # IR 是灰度：复制成 3 通道喂 DA3（模型输入约定 RGB）
-    arrs = [np.stack([l_gray] * 3, -1), np.stack([r_gray] * 3, -1)]
-
-    res = int(max(140, min(1120, int(float(
-        config.get("stereo_process_res", config.get("process_res", PROCESS_RES)))))))
-    # conf 分位跟随面板滑杆但减半：40% 分位在 IR 上几乎全砍在暗背景区（散斑打不远、
-    # 后景纹理弱 → conf 低），按单目口径裁会把后景整片裁没（2026-08-13 实测）
-    conf = float(config.get("conf_thresh_percentile", 40.0)) * 0.5
-    # 点预算 = 单目预算 × 2 视角：合并点云共用一份预算会把每视角密度砍半——双目实测
-    # 恰好卡死在单目预算上限（98937/100000），后景先被随机抽稀（同日实测）
-    nmp = min(2 * int(float(config.get("num_max_points", 800000))), 2_000_000)
-    show_cam = str(config.get("show_cameras", "1")) in ("1", "true", "True", "on", "显示")
-
-    model = get_model()
-    t0 = time.time()
-    try:
-        with _gpu_lock:  # 与单目/Gradio 共用同一模型，串行化 GPU 推理
-            with torch.no_grad():
-                pred = model.inference(arrs, process_res=res, export_format="mini_npz")
-    except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
-        raise RuntimeError("GPU 显存不足（5090 与产线共享），请调低双目处理分辨率后重试")
-    infer_ms = (time.time() - t0) * 1000.0
-
-    def _build():
-        try:
-            product = _build_stereo_product(pred, aux_info, res, conf, nmp,
-                                            show_cam, device_id, t0, infer_ms)
-            set_stereo_product(device_id, seq, gen, product)
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            set_stereo_product(device_id, seq, gen, None,
-                               "GPU 显存不足（5090 与产线共享），请调低双目处理分辨率后重试")
-        except Exception as e:
-            set_stereo_product(device_id, seq, gen, None, f"{type(e).__name__}: {e}")
-
-    _stereo_builder.submit(_build)
-    return DEFERRED
-
-
-# ── 双目取景参数的帧间平滑（治换图缩放抖动）：DA3 逐帧估计的内参 FOV 与双目基线
-# 都有帧间噪声（实测 fov 42.8~52.2° 抖、基线估计 36~40mm 抖、场景变化时更大），
-# 逐帧直出会让前端每次换图都按新值重新取景 → 视觉上"快速缩放一下"。
-# 按设备取近 N 帧滑动中位数输出：中位数对离群帧（如手挡住画面时的离谱估计）比
-# 均值稳，收敛也够快（N=10 @1.4张/s ≈ 7 秒窗口）。──────────────────────────
-_STEREO_SMOOTH_N = 10
-_stereo_smooth: dict = {}          # device_id -> {"scale": deque, "fov": deque}
-_stereo_smooth_lock = threading.Lock()
-
-
-def _smooth_stereo_param(device_id: str, key: str, value):
-    """当帧估计值滑进该设备窗口，返回窗口中位数；value=None 时返回历史中位数（可能 None）。"""
-    with _stereo_smooth_lock:
-        dq = _stereo_smooth.setdefault(device_id, {}).setdefault(
-            key, deque(maxlen=_STEREO_SMOOTH_N))
-        if value is not None:
-            dq.append(float(value))
-        return float(np.median(dq)) if dq else None
-
-
-def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
-                          device_id, t0, infer_ms) -> dict:
-    """双目产物构建级：SAM3 左目分割 + 米制缩放 + 合并点云 GLB（在 _stereo_builder
-    线程串行执行）。取景相关的逐帧估计量（point_scale/fov）经滑动中位数平滑输出。"""
-    # SAM3 一次性分割左目（网络调用，不占 GPU 锁）
-    _ts = time.time()
-    try:
-        overlays, id_tags = _stereo_sam3_overlays(pred)
-    except Exception as e:
-        print(f"[da3-web] 双目 SAM3 分割失败（降级无染色）：{type(e).__name__}: {e}",
-              flush=True)
-        overlays, id_tags = [], []
-    sam3_ms = (time.time() - _ts) * 1000.0
-
-    # 米制尺度：真实基线 ÷ DA3 估计的左右相机光心间距
-    point_scale = None
-    est_mm = None
-    baseline_mm = aux_info.get("baseline_mm")
-    ext = pred.extrinsics
-    if baseline_mm and ext is not None and len(ext) >= 2:
-        e0, e1 = (np.asarray(x).astype(np.float64) for x in (ext[0], ext[1]))
-        c0 = -e0[:3, :3].T @ e0[:3, 3]   # w2c → 相机光心（世界系）
-        c1 = -e1[:3, :3].T @ e1[:3, 3]
-        est = float(np.linalg.norm(c0 - c1))
-        if est > 1e-6:
-            est_mm = est * 1000.0
-            point_scale = (float(baseline_mm) / 1000.0) / est
-    # 帧间平滑：尺度进滑动中位数（本帧估不出时沿用历史中位数），点云整体大小不再逐帧呼吸
-    point_scale = _smooth_stereo_param(device_id, "scale", point_scale)
-
-    token = uuid.uuid4().hex
-    outdir = GLB_DIR / token
-    outdir.mkdir(parents=True, exist_ok=True)
-    glb = outdir / "scene.glb"
-    # 几何阶段只算一次：主产物与下面的高亮版共享反投影/conf 裁剪/降采样/MAD 结果，
-    # 各自只做「顶点色 bake + GLB 导出」。高亮版参数（conf 分位、outlier_mad 来自
-    # /api/sam3hl/config）与主产物调不等时，build_stereo_pointcloud_glb 按参数指纹
-    # 自动回退独立几何计算，行为与共享前一致
-    geo = _stereo_geometry(pred, conf, nmp, 12.0, point_scale)
-    K0 = build_stereo_pointcloud_glb(
-        pred, str(glb), conf_thresh_percentile=conf, num_max_points=nmp,
-        show_cameras=show_cam, mask_overlays=overlays, point_scale=point_scale,
-        color_gamma=0.55,   # IR 暗部提亮：无环境光的后景点在黑底上才可见
-        geo=geo)
-    sz = glb.stat().st_size / 1024 if glb.exists() else 0
-    _prune_glb()
-
-    # VLM 识别触发（SAM3 触发口径；前置依赖挂在双目链：单目停用时识别仍然活着。
-    # 主链路直传开启时这条路在 _maybe_recognize 里被整体闸掉，识别只走直传）：
-    # 证据 = 左目 SAM3 命中（food/drink mask → 归一化框），识别图 = 该设备最新 RGB 帧
-    # （VLM 吃彩色图；IR 灰度图识别菜品不可靠）。RGB 与左 IR 镜头有厘米级基线差，
-    # 框只作大致位置引导（VLM prompt 本就按"疑似位置"用框）。pred 不传——它的深度
-    # 是 IR 坐标系，与 RGB 帧不对齐，点云快照参考图优雅降级为无。
-    try:
-        raw_rgb = get_latest_frame(device_id)
-        if raw_rgb and overlays:
-            H0, W0 = np.asarray(pred.depth)[0].shape
-            dets = []
-            for (tag, _col, mk) in overlays:
-                ys, xs = np.where(mk)
-                if xs.size == 0:
-                    continue
-                dets.append((tag.split("#", 1)[0],
-                             xs.min() / W0, ys.min() / H0,
-                             (xs.max() + 1) / W0, (ys.max() + 1) / H0))
-            if dets:
-                rgb_img = np.array(ImageOps.exif_transpose(
-                    Image.open(io.BytesIO(raw_rgb))).convert("RGB"))
-                _maybe_recognize(rgb_img, dets, f"/glb/{token}/scene.glb",
-                                 token[:6], pred=None, conf=conf, device=device_id)
-    except Exception as e:   # 识别触发失败不影响双目产物
-        print(f"[da3-web] 双目链识别触发失败（忽略）：{type(e).__name__}: {e}", flush=True)
-
-    # 真实相机垂直 FOV：与单目链路同款，前端把点云相机摆回左目光心正视 -Z
-    _H = int(np.asarray(pred.depth)[0].shape[0])
-    _fov_raw = float(np.degrees(2 * np.arctan(_H / (2 * K0[1, 1]))))
-    # 帧间平滑：FOV 逐帧估计噪声 ±10° 是换图缩放抖动的主凶，中位数稳住取景
-    _fov_deg = round(_smooth_stereo_param(device_id, "fov", _fov_raw) or _fov_raw, 2)
-    scale_note = (f"·米制×{point_scale:.3f}(估计基线{est_mm:.0f}mm·已平滑)"
-                  if point_scale else "")
-
-    # 双目高亮 GLB（/experience 背景来源）：同一 pred/overlays 追加构建，样式读
-    # /api/sam3hl/config（与单目④/面板调节卡同一套配置）。独立 try 隔离——高亮
-    # 构建失败只记 _stereo_hl.error，不影响 /panel 的双目产物
-    try:
-        with _sam3hl_lock:
-            hcfg = dict(_sam3hl_cfg)
-        htoken = uuid.uuid4().hex
-        houtdir = GLB_DIR / htoken
-        houtdir.mkdir(parents=True, exist_ok=True)
-        hglb = houtdir / "scene.glb"
-        build_stereo_pointcloud_glb(
-            pred, str(hglb),
-            # conf 分位同双目主产物口径减半：40% 分位在 IR 上集中裁暗背景
-            conf_thresh_percentile=float(hcfg["conf"]) * 0.5,
-            num_max_points=nmp, show_cameras=False, mask_overlays=overlays,
-            outlier_mad=float(hcfg["outlier_mad"]), point_scale=point_scale,
-            color_gamma=0.55, hl_cfg=hcfg,
-            bake_conf_alpha=(hcfg["pt_conf_size"] > 1e-3
-                             or hcfg["pt_conf_alpha"] > 1e-3),
-            # 与主产物共享几何（默认两套参数相等；被调不等时函数内自动回退独立计算）
-            geo=geo)
-        with _stereo_hl_lock:
-            _stereo_hl.update({
-                "url": f"/glb/{htoken}/scene.glb", "seq": _stereo_hl["seq"] + 1,
-                "error": None, "device": device_id,
-                "meta": {"label": "双目高亮（%s）" % (
-                             "、".join(id_tags) if id_tags else "无目标"),
-                         "fov_deg": _fov_deg}})
-    except Exception as e:
-        with _stereo_hl_lock:
-            _stereo_hl["error"] = f"{type(e).__name__}: {e}"
-    return {"kind": "model", "url": f"/glb/{token}/scene.glb",
-            "meta": {"label": "双目点云 DA3×2 + SAM3（%s）%s" % (
-                         "、".join(id_tags) if id_tags else "无目标", scale_note),
-                     "dt": time.time() - t0, "infer_ms": round(infer_ms, 1),
-                     "sam3_ms": round(sam3_ms, 1),
-                     "stat": f"GLB {sz:.0f}KB · res {res} · 2视角",
-                     "fov_deg": _fov_deg}}
-
-
 # ══ 设备点云（/experience「设备点云」来源）：硬件真深度 + RGB → 彩色点云 GLB ══
 # 与 DA3 点云平行的独立链路：mini 端仅在页面选中该来源时才推原料（demand 由本处
 # 以 10s TTL 维护，经 frame_relay 状态接口的 devices[].pc_want 下发给推流端），
@@ -5367,14 +4784,13 @@ def devpc_ingest(depth: UploadFile = File(...), rgb: UploadFile = File(...),
 
 app.include_router(frame_router)
 # 单目链路总闸：.env 设 DISABLE_MONO_PIPELINE=1 时不注册单目处理器——frame_relay 对
-# RGB 帧退化为纯中继（原图/硬件深度展示、双目 aux 入帧照常），DA3 单目产物、SAM3
+# RGB 帧退化为纯中继（原图/硬件深度展示照常），DA3 单目产物、SAM3
 # 点云映射/高亮、VLM 识别触发全停，把 GPU 与 SAM3 算力整体让给双目链路。
 # 恢复：删掉该环境变量重启即可。
 if os.environ.get("DISABLE_MONO_PIPELINE", "0") not in ("1", "true", "True"):
     set_processor(_da3_frame_processor)
 else:
     print("[da3-web] 单目链路已停用（DISABLE_MONO_PIPELINE=1）：算力让给双目", flush=True)
-set_stereo_processor(_da3_stereo_processor)
 
 
 def _recog_list_payload(dev):
@@ -5774,14 +5190,6 @@ def sam3hl_status():
         return JSONResponse({"kind": _sam3hl["kind"], "url": _sam3hl["url"],
                              "seq": _sam3hl["seq"], "meta": _sam3hl["meta"],
                              "error": _sam3hl["error"], "cfg": dict(_sam3hl_cfg)})
-
-
-@app.get("/api/stereohl/status")
-def stereohl_status():
-    """双目高亮点云状态（/experience「双目高亮点云」来源）：url 为高亮 GLB；device=
-    产出时的设备 id，前端与当前选中设备比对做陈旧守卫（切设备后旧 GLB 不上画）。"""
-    with _stereo_hl_lock:
-        return JSONResponse(dict(_stereo_hl))
 
 
 @app.get("/api/sam3hl/latest")
