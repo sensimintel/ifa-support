@@ -18,7 +18,8 @@
 
 | # | 消费方 | 调用方式 | 产出 / 去向 | 现网状态 |
 |---|---|---|---|---|
-| A | 8060 单目 RGB 链（`_maybe_sam3cloud` → `_sam3cloud_refresh`） | 每词一路并发，优先 `/v1/stream/frame`，老 server 回退 `/v1/track` | ①SAM3 点云映射 ②SAM3 高亮点云 ③液体框证据(SAM3 口径的识别触发) ④sam3tune 生产观测 | **停用**（`.env` `DISABLE_MONO_PIPELINE=1`）。保留为「DA3+SAM3+点云+高亮+触发识别」的唯一完整能力样本，停用即零成本 |
+| A | **识别触发线程的 SAM3 门控**（`_sam3_gate_dets`） | 每词一路并发，直接跑**当前设备的 RGB 彩色帧**，优先 `/v1/stream/frame`，老 server 回退 `/v1/segment` | food/drink 归一化框 → 命中即带框送 VLM 识别 | **在跑**（`/experience` 抽屉里直传开关设为「关」时；开=不调 SAM3） |
+| A' | 8060 单目 RGB 链（`_maybe_sam3cloud` → `_sam3cloud_refresh`） | 每词一路并发，优先 `/v1/stream/frame`，老 server 回退 `/v1/track` | ①SAM3 点云映射 ②SAM3 高亮点云 ③液体框证据 ④sam3tune 生产观测 | **停用**（`.env` `DISABLE_MONO_PIPELINE=1`）。保留为「DA3+SAM3+点云+高亮」的完整能力样本，停用即零成本 |
 | B | `/sam3tune` 调优页（`/api/sam3tune/*`） | `/v1/segment` 带 debug（presence/top-K） | 调参可视化 + **生产打分口径**落 `sam3_score_cfg.json`（词表/α/阈值），A 每帧读 | 在用（手动触发） |
 
 已删除的历史消费方（2026-08-17 去冗余）：双目 IR 链（`_stereo_sam3_overlays`，整条双目 DA3 链一并删）、
@@ -51,13 +52,15 @@
 | 口径 | 触发条件 | 送 VLM 的图 | 节奏 |
 |---|---|---|---|
 | **直传（默认）** | 主链路定时取选中设备最新 **RGB 帧**，不看 SAM3 | 只有图1原图（+ 去重参考图） | `/api/recog/direct/config` 的 `interval_s`（默认 0.5s）× `concurrency`（默认 1=串行·最新优先） |
-| SAM3（直传关掉时） | A 的液体框缓存命中 | 图1原图 + 图2带框图（+ 参考图） | `RECOG_MIN_INTERVAL` 节流 + worker 丢积压 |
+| **SAM3 门控（直传关掉时）** | 同一条触发线程按同样的间隔取 RGB 帧，先跑 SAM3（生产词表 + food 词），**认出食物/饮品才送 VLM** | 图1原图 + 图2带框图（+ 参考图） | 同上间隔；每轮多一次 SAM3（约 0.5~0.9s）。单目链启用时它的液体框缓存也走这条 |
 
-直传开启时 SAM3 口径**整体让位**（代码保留，闸掉即可回退）。开关在 `/experience`
-右下「调节」抽屉 →「识别触发（主链路直传 VLM）」。
+两种口径**共用同一条触发线程与帧源**，区别只在"要不要 SAM3 先筛一道"——**两边都会出识别卡**。
+开关在 `/experience` 右下「调节」抽屉 →「识别触发（主链路直传 VLM）」。
 
-历史：触发原本只在 A（单目 glb 分支）；`5bb5aec`(2026-08-13) 因 `DISABLE_MONO_PIPELINE=1`
-停单目导致识别一起停，把触发搬到双目链；2026-08-17 改为直传口径，双目链随之删除。
+历史：触发原本挂在 A'（单目 glb 分支，证据只收 drink，食物从不触发）；`5bb5aec`(2026-08-13)
+因 `DISABLE_MONO_PIPELINE=1` 停单目导致识别一起停，把触发搬到双目左目 IR；2026-08-17
+去冗余删掉双目链后，SAM3 门控改为直接跑触发线程手里的 RGB 帧——不再依赖任何 DA3 链，
+彩色图也比带散斑的 IR 灰度更适合认食物，food 与 drink 都算证据。
 
 ## 4. 开关与配置速查
 
@@ -66,11 +69,11 @@
 | `SAM3_ENDPOINT` | `.env` | SAM3 服务地址（现网 `http://127.0.0.1:8013`） |
 | `SAM3_STREAM_WINDOW` | `.env`，默认 5 | 流式服务端滚动窗口帧数 |
 | `SAM3_TEXT` | `.env`，默认 `food` | 补给染色的 food 查询词 |
-| `DISABLE_MONO_PIPELINE` | `.env`，现网 `1` | 停单目链：A 的四个下游全停（当前唯一的 SAM3 生产消费方，因此现网 SAM3 只被 sam3tune 手动调用） |
+| `DISABLE_MONO_PIPELINE` | `.env`，现网 `1` | 停单目链：A' 的四个下游全停（不影响 A 的 SAM3 门控与识别） |
 | `sam3_score_cfg.json` | 仓根（gitignored） | 生产词表 + presence α + 检测阈值，`/sam3tune` 写、A 每帧读 |
 | `sam3hl_preset.json` | 仓根（gitignored） | 高亮/点渲染样式，`/panel` 与 `/experience` 抽屉共写 |
 | `recog_direct_cfg.json` | 仓根（gitignored） | 直传识别开关/间隔/并发 |
 
-> 现网提醒：A 停用 + 双目链删除后，SAM3 服务在常规运行中已无自动调用者（只剩
-> `/sam3tune` 手动触发）。要腾 5090 显存可以停 `sam3.service`，但**必须同步改
-> `tools/health/check.sh` 的预期清单**，否则体检会把它误报成故障。
+> 现网提醒：SAM3 服务是识别「关」模式（SAM3 门控）的前置依赖，**不能停**——停了
+> 门控每轮报错、识别不出卡。只有确认长期只用「开」（直传）时才谈得上停常驻，
+> 且要同步改 `tools/health/check.sh` 的预期清单。

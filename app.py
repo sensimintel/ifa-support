@@ -2057,18 +2057,19 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">识别触发（主链路直传 VLM）</div>
  <div class="fld"><label>直传开关</label>
   <div class="radios">
-   <label><input type="radio" name="rdon" value="1" checked> 开（定时直传，不等 SAM3）</label>
-   <label><input type="radio" name="rdon" value="0"> 关（回到 SAM3 命中才识别）</label>
+   <label><input type="radio" name="rdon" value="1" checked> 开（每帧直送 VLM，不等 SAM3）</label>
+   <label><input type="radio" name="rdon" value="0"> 关（SAM3 先筛，命中食物/饮品才送 VLM）</label>
   </div></div>
  <div class="fld"><label>识别间隔 <b id="v_rd_itv">0.5</b> s（多久直传一帧去识别）</label>
   <input type="range" id="r_rd_itv" min="0.2" max="10" step="0.1" value="0.5"></div>
  <div class="fld"><label>并发上限 <b id="v_rd_conc">1</b> 路</label>
   <input type="range" id="r_rd_conc" min="1" max="6" step="1" value="1"></div>
- <div class="hint">直传=按间隔把当前设备的最新 <b>RGB 帧</b>直接送 Qwen VLM 问画面里有什么食物，
-  不再等 SAM3 定位（伪彩深度图只是背景呈现，识别始终走同设备的 RGB 帧）。开启期间
-  SAM3 那条触发（单目液体证据 / 双目左目命中）整体停用，识别卡片只有直传一个来源；
-  SAM3 本身照常跑高亮点云等背景。<b>并发=1</b> 是串行·最新优先：上一轮没回就丢旧帧用最新帧，
-  实际节奏≈VLM 延时（实测约 1.2~1.5s/轮）；调大并发才真按间隔多路齐发，代价是成本 ×N
+ <div class="hint">两种口径共用同一条触发线程与帧源（当前设备的最新 <b>RGB 帧</b>——VLM 与
+  SAM3 都吃彩色图，伪彩深度图只是背景呈现）。<b>开</b>=整帧直送 Qwen VLM 问画面里有什么食物；
+  <b>关</b>=同一帧先过 SAM3（生产词表 + food 词，直接跑彩色帧），认出食物/饮品才带框送 VLM——
+  SAM3 只当「有没有东西」的前置门，命中后照样识别。关比开省 VLM 调用（画面空时不烧），
+  代价是每轮多一次 SAM3（约 0.5~0.9s）。<b>并发=1</b> 是串行·最新优先：上一轮没回就丢旧帧用
+  最新帧，实际节奏≈VLM 延时（实测约 1.2~1.5s/轮）；调大并发才真按间隔多路齐发，代价是成本 ×N
   且并发轮次拿的是同一份去重候选、可能给同一食物重复建卡。间隔也快不过 RGB 推帧
   （下方「数据源帧率」），同一帧不会重复送。<br>实测：<b id="v_rd_stat">--</b></div>
  <div class="sec">识别卡片</div>
@@ -3428,7 +3429,11 @@ function pushRdCfg(){
 function rdStat(s){
   const el=$('v_rd_stat');if(!el||!s)return;
   const age=s.last_ts?Math.max(0,Math.round(Date.now()/1000-s.last_ts)):null;
-  el.textContent='VLM '+(s.last_ms||0)+'ms · 在飞 '+(s.in_flight||0)+' 路 · 累计 '
+  const off=document.querySelector('input[name=rdon]:checked').value==='0';
+  // 关（SAM3 门控）时把门控耗时与命中率一并回显——空轮多说明画面里确实没东西
+  const gate=off?('SAM3 门控 '+(s.gate_ms||0)+'ms · 命中 '+(s.gate_hits||0)
+    +'/'+((s.gate_hits||0)+(s.gate_misses||0))+' 轮 · '):'';
+  el.textContent=gate+'VLM '+(s.last_ms||0)+'ms · 在飞 '+(s.in_flight||0)+' 路 · 累计 '
     +(s.rounds||0)+' 轮'+(age!==null?' · 最近一轮 '+age+'s 前':'')
     +(s.last_error?' · 错误：'+s.last_error:'');
 }
@@ -3884,9 +3889,9 @@ _recog_workers = 0         # 已起的 worker 线程数（按并发配置只增�
 #   动机：识别触发历来挂 SAM3——单目链取 SAM3 流式液体框、双目链取左目 IR 的 SAM3
 #   命中，SAM3 没定位到就完全不识别。直传去掉这层前置：按固定间隔取选中设备的最新
 #   RGB 帧直接送 Qwen VLM 问「画面里可能有什么食物」。
-#   · 直传开启时，两处 SAM3 触发（单目液体证据 / 双目左目命中）一律闸掉，
-#     识别卡片只有直传一个来源，节奏干净可控；关掉直传即回到 SAM3 触发的老行为。
-#   · SAM3 本身不受影响：高亮点云/双目高亮/SAM3 点云等背景可视化照常跑。
+#   · 开=整帧直送 VLM；关=同一帧先过 SAM3 门控（_sam3_gate_dets，直接跑 RGB 彩色帧），
+#     认出食物/饮品才带框送 VLM——SAM3 只当"有没有东西"的前置门，命中后照样识别。
+#   · 两种口径共用同一条触发线程与帧源，切换即时生效、互不干扰。
 #   · 并发=1 时「串行·最新优先」（上一轮没回就丢旧帧用最新帧，实际节奏≈VLM 延时）；
 #     调大并发即真按间隔多路齐发，代价是 GPU 成本 ×N 且并发轮次拿同一份去重候选、
 #     可能给同一食物重复建卡。
@@ -3895,7 +3900,9 @@ _recog_workers = 0         # 已起的 worker 线程数（按并发配置只增�
 _recog_direct = recog_direct.DirectConfig(
     Path(__file__).resolve().parent / "recog_direct_cfg.json")
 _recog_direct_stats = {"rounds": 0, "in_flight": 0, "last_ms": 0,
-                       "last_ts": 0.0, "skipped_same_frame": 0, "last_error": ""}
+                       "last_ts": 0.0, "skipped_same_frame": 0, "last_error": "",
+                       # SAM3 门控（直传关闭时）观测：单轮耗时 + 命中/空轮计数
+                       "gate_ms": 0, "gate_hits": 0, "gate_misses": 0}
 print(f"[da3-web] 直传识别配置：{_recog_direct.snapshot()}", flush=True)
 
 # 食物健康分级的合法枚举（静态 guardrail 白名单：模型输出只保留集合内的值、其余置空）。
@@ -4400,8 +4407,8 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
 
     direct=True 是主链路直传口径：无 SAM3 检测框（detections 传空即可），节奏由
     直传触发线程按配置间隔控制，不吃 RECOG_MIN_INTERVAL 节流。
-    direct=False 是 SAM3 触发口径（单目液体证据 / 双目左目命中）——直传开启时
-    这条路整体闸掉，识别卡片只留直传一个来源。"""
+    direct=False 是 SAM3 触发口径：证据来自触发线程的 SAM3 门控（_sam3_gate_dets，
+    跑 RGB 彩色帧），单目链启用时它的液体证据也走这条——直传开启时整条闸掉。"""
     global _recog_last_ts
     if not RECOG_TARGETS[_recog_target]["endpoint"]:
         return
@@ -4433,21 +4440,65 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
         _recog_cv.notify_all()   # worker 池可能不止一个线程在等（并发>1）
 
 
-# ── 直传触发线程：按配置间隔取选中设备最新 RGB 帧 → 提交识别（不依赖 SAM3）──────
-def _recog_direct_loop():
-    """常驻线程：直传开启时按 interval_s 节拍取「当前选中设备」的最新 RGB 帧送 VLM。
+def _sam3_gate_dets(rgb):
+    """SAM3 门控（直传关闭时用）：**直接在 RGB 彩色帧上**跑生产词表，返回归一化检测框。
 
-    要点：
-      · 帧源用 frame_relay 的最新帧（RGB 彩色帧——VLM 吃彩色图，伪彩深度图识别不了
-        食物；「设备深度图」只是背景呈现，识别始终走同设备的 RGB 帧）；
-      · seq 没变说明推帧比触发间隔还慢，跳过不重复送（省一次多图请求）；
+    与历史口径的差别只在"跑在哪张图上"：以前 SAM3 挂在 DA3 链上（单目跑 RGB 但只把
+    液体当证据、双目跑左目 IR 灰度图），现在直接跑触发线程手里的这张 RGB——彩色图上
+    找食物/饮品比带散斑的 IR 灰度准，也不必先跑 DA3 才轮到 SAM3。
+    food 与 drink 都算证据（历史单目口径只收 drink，食物因此从不触发）。
+
+    返回 (dets, 耗时ms)；dets=[(food|drink, nx1, ny1, nx2, ny2)…] 归一化 0-1。
+    SAM3 整体不可用（每个词都拿不到结果）时抛异常，由调用方记 last_error。"""
+    cfg = _get_score_cfg()
+    targets = [(w["word"], w.get("label") or "drink") for w in cfg["words"]]
+    if not any(lbl == "food" for (_w, lbl) in targets):
+        targets = targets + [(SAM3_TEXT_DEFAULT, "food")]   # 食物词：口径里没有就补一路
+    H, W = rgb.shape[:2]
+    t0 = time.time()
+
+    def one(ql):
+        word, label = ql
+        insts = _sam3_stream_frame(word, rgb)[0]      # 流式优先（服务端长记忆、每步一帧）
+        if insts is None:
+            insts = _sam3_segment_debug(rgb, word, topk=1, alpha=cfg["alpha"],
+                                        det_thresh=cfg["thresh"])[0]   # 老 server 回退无状态
+        return label, insts
+
+    with ThreadPoolExecutor(max_workers=len(targets)) as ex:
+        results = list(ex.map(one, targets))
+    if all(insts is None for _lbl, insts in results):
+        raise RuntimeError(f"SAM3 无应答（{SAM3_ENDPOINT}）")
+    dets = []
+    for label, insts in results:
+        for ins in insts or []:
+            box = ins.get("box_xywh_px")
+            if not (box and len(box) == 4):
+                continue
+            x, y, bw, bh = (float(v) for v in box)
+            if bw <= 1 or bh <= 1:
+                continue
+            dets.append((label, max(0.0, x / W), max(0.0, y / H),
+                         min(1.0, (x + bw) / W), min(1.0, (y + bh) / H)))
+    return dets, (time.time() - t0) * 1000.0
+
+
+# ── 识别触发线程：按配置间隔取选中设备最新 RGB 帧 → 直传送 VLM 或 先过 SAM3 门控 ──
+def _recog_direct_loop():
+    """常驻线程：按 interval_s 节拍取「当前选中设备」的最新 RGB 帧，按开关走两条口径。
+
+      · 直传开：整帧直送 VLM，不看 SAM3；
+      · 直传关：同一帧先过 _sam3_gate_dets，认出食物/饮品才带框送 VLM（历史口径的
+        本意——SAM3 只是"有没有东西"的前置门，命中后照样识别）。
+
+    其余要点：
+      · 帧源用 frame_relay 的最新帧（RGB 彩色帧——VLM 与 SAM3 都吃彩色图，伪彩深度图
+        识别不了食物；「设备深度图」只是背景呈现，识别始终走同设备的 RGB 帧）；
+      · seq 没变说明推帧比触发间隔还慢，跳过不重复送（省一次多图/SAM3 请求）；
       · 并发=1 时队列 latest-wins 天然退化成「串行·最新优先」，实际节奏≈VLM 延时。"""
     last_seq, last_dev = 0, None
     while True:
         try:
-            if not _recog_direct.enabled():
-                time.sleep(0.5)
-                continue
             itv = _recog_direct.interval_s()
             dev = get_selected_device()
             if not dev:
@@ -4463,8 +4514,18 @@ def _recog_direct_loop():
             last_dev, last_seq = dev, seq
             arr = np.array(ImageOps.exif_transpose(
                 Image.open(io.BytesIO(raw))).convert("RGB"))
-            _maybe_recognize(arr, [], None, f"d{seq}", pred=None, conf=40.0,
-                             device=dev, direct=True)
+            if _recog_direct.enabled():
+                _maybe_recognize(arr, [], None, f"d{seq}", pred=None, conf=40.0,
+                                 device=dev, direct=True)
+            else:
+                _track_stream_device(dev)      # 切设备重置 SAM3 流式会话（幂等）
+                dets, gate_ms = _sam3_gate_dets(arr)
+                with _recog_lock:
+                    _recog_direct_stats["gate_ms"] = int(gate_ms)
+                    _recog_direct_stats["gate_hits" if dets else "gate_misses"] += 1
+                if dets:
+                    _maybe_recognize(arr, dets, None, f"g{seq}", pred=None, conf=40.0,
+                                     device=dev, direct=False)
             with _recog_lock:
                 _recog_direct_stats["last_error"] = ""
         except Exception as e:         # 触发线程必须长命：任何异常只记录不退出
@@ -4602,9 +4663,9 @@ def _build_mono_product(arr, pred, fmt, res, conf, nmp, show_cam,
             num_max_points=nmp, show_cameras=show_cam)
         sz = glb.stat().st_size / 1024 if glb.exists() else 0
         _prune_glb()
-        # 识别工作流（SAM3 触发口径）：证据=SAM3 流式液体命中（缓存框），
-        # 命中即异步送 Qwen3-VL 识别（节流、后台线程，不阻塞产线）。
-        # 主链路直传开启时这条路在 _maybe_recognize 里被整体闸掉（识别只走直传）
+        # 识别工作流（SAM3 触发口径的另一个证据源，仅单目链启用时才跑）：
+        # 证据=SAM3 流式液体命中（缓存框），命中即异步送 Qwen3-VL 识别。
+        # 直传开启时这条路在 _maybe_recognize 里被整体闸掉
         _maybe_recognize(arr, _sam3_recent_drinks(),
                          f"/glb/{token}/scene.glb", token[:6], pred=pred, conf=conf,
                          device=device_id)
