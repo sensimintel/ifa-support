@@ -50,9 +50,10 @@ from depth_anything_3.api import DepthAnything3  # noqa: E402
 from depth_anything_3.app.gradio_app import DepthAnything3App  # noqa: E402
 
 import devpc  # noqa: E402
+import recog_direct  # noqa: E402
 from frame_relay import (  # noqa: E402
-    DEFERRED, UNKNOWN_DEVICE, get_latest_frame, get_selected_device,
-    router as frame_router,
+    DEFERRED, UNKNOWN_DEVICE, get_latest_frame, get_latest_frame_seq,
+    get_selected_device, router as frame_router,
     set_pc_want_provider, set_processor, set_product, set_stereo_processor,
     set_stereo_product)
 
@@ -2454,7 +2455,24 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 
 <div id="hlcfg">
  <div class="hd">展示调节 <button id="hlcfgClose" title="关闭">✕</button></div>
- <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">识别卡片</div>
+ <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">识别触发（主链路直传 VLM）</div>
+ <div class="fld"><label>直传开关</label>
+  <div class="radios">
+   <label><input type="radio" name="rdon" value="1" checked> 开（定时直传，不等 SAM3）</label>
+   <label><input type="radio" name="rdon" value="0"> 关（回到 SAM3 命中才识别）</label>
+  </div></div>
+ <div class="fld"><label>直传间隔 <b id="v_rd_itv">0.5</b> s</label>
+  <input type="range" id="r_rd_itv" min="0.2" max="10" step="0.1" value="0.5"></div>
+ <div class="fld"><label>并发上限 <b id="v_rd_conc">1</b> 路</label>
+  <input type="range" id="r_rd_conc" min="1" max="6" step="1" value="1"></div>
+ <div class="hint">直传=按间隔把当前设备的最新 <b>RGB 帧</b>直接送 Qwen VLM 问画面里有什么食物，
+  不再等 SAM3 定位（伪彩深度图只是背景呈现，识别始终走同设备的 RGB 帧）。开启期间
+  SAM3 那条触发（单目液体证据 / 双目左目命中）整体停用，识别卡片只有直传一个来源；
+  SAM3 本身照常跑高亮点云等背景。<b>并发=1</b> 是串行·最新优先：上一轮没回就丢旧帧用最新帧，
+  实际节奏≈VLM 延时（实测约 1.2~1.5s/轮）；调大并发才真按间隔多路齐发，代价是成本 ×N
+  且并发轮次拿的是同一份去重候选、可能给同一食物重复建卡。间隔也快不过 RGB 推帧
+  （下方「数据源帧率」），同一帧不会重复送。<br>实测：<b id="v_rd_stat">--</b></div>
+ <div class="sec">识别卡片</div>
  <div class="fld"><label>卡片驻留时长 <b id="v_card_s">10</b> s（无新识别多久回落待机）</label>
   <input type="range" id="r_card_s" min="3" max="60" step="1" value="10"></div>
  <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">数据源帧率（当前设备）</div>
@@ -3834,6 +3852,46 @@ let FRESH_MS=Math.min(60,Math.max(3,+(localStorage.getItem('exp_card_fresh_s')||
   r.value=FRESH_MS/1000;v.textContent=r.value;
   r.addEventListener('input',()=>{v.textContent=r.value;
     FRESH_MS=(+r.value)*1000;localStorage.setItem('exp_card_fresh_s',r.value);});})();
+
+// ══ 识别触发（主链路直传 VLM）：读写 /api/recog/direct/config（服务端全局配置，
+//    与卡片驻留那种纯展示端 localStorage 不同——直传节奏是链路行为，所有页面共享）══
+let rdTimer=null;
+function rdLabels(){
+  $('v_rd_itv').textContent=(+$('r_rd_itv').value).toFixed(1);
+  $('v_rd_conc').textContent=$('r_rd_conc').value;
+}
+function pushRdCfg(){
+  clearTimeout(rdTimer);
+  rdTimer=setTimeout(()=>{
+    fetch('/api/recog/direct/config',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({on:document.querySelector('input[name=rdon]:checked').value==='1',
+        interval_s:+$('r_rd_itv').value,concurrency:+$('r_rd_conc').value})})
+      .then(r=>r.json()).then(j=>{if(j&&j.stats)rdStat(j.stats);}).catch(()=>{});
+  },250);
+}
+function rdStat(s){
+  const el=$('v_rd_stat');if(!el||!s)return;
+  const age=s.last_ts?Math.max(0,Math.round(Date.now()/1000-s.last_ts)):null;
+  el.textContent='VLM '+(s.last_ms||0)+'ms · 在飞 '+(s.in_flight||0)+' 路 · 累计 '
+    +(s.rounds||0)+' 轮'+(age!==null?' · 最近一轮 '+age+'s 前':'')
+    +(s.last_error?' · 错误：'+s.last_error:'');
+}
+async function loadRdCfg(){
+  try{
+    const j=await(await fetch('/api/recog/direct/config',{cache:'no-store'})).json();
+    const c=j.config||{};
+    const on=document.querySelector('input[name=rdon][value="'+(c.on?1:0)+'"]');
+    if(on)on.checked=true;
+    if(c.interval_s!==undefined)$('r_rd_itv').value=c.interval_s;
+    if(c.concurrency!==undefined)$('r_rd_conc').value=c.concurrency;
+    rdLabels();rdStat(j.stats);
+  }catch(e){/* 读取失败保持面板默认值 */}
+}
+$('r_rd_itv').addEventListener('input',()=>{rdLabels();pushRdCfg();});
+$('r_rd_conc').addEventListener('input',()=>{rdLabels();pushRdCfg();});
+document.querySelectorAll('input[name=rdon]').forEach(r=>r.addEventListener('change',pushRdCfg));
+loadRdCfg();
+setInterval(()=>{if($('hlcfg').classList.contains('on'))loadRdCfg();},3000);  // 抽屉开着才刷实测
 let lastCardKey='',cardShownAt=0,curCard=null;
 function setState(st){
   $('idle').classList.toggle('on',st==='idle'&&!$('tl').classList.contains('on'));
@@ -4044,7 +4102,7 @@ $('hlcolor').addEventListener('input',()=>{
 $('btnHlCfg').onclick=()=>{
   const on=!$('hlcfg').classList.contains('on');
   $('hlcfg').classList.toggle('on',on);
-  if(on){loadHlCfg();ddpLoad();}   // 每次打开都回填服务端当前值 + 刷新配置预设列表
+  if(on){loadHlCfg();ddpLoad();loadRdCfg();}   // 每次打开都回填服务端当前值 + 刷新配置预设列表
 };
 loadHlCfg();   // 启动即回填持久化配置：点渲染/视角参数在首个 GLB 加载前就绪，刷新页面不丢样式
 $('hlcfgClose').onclick=()=>$('hlcfg').classList.remove('on');
@@ -4230,8 +4288,10 @@ async def api_infer(
 
 # ── 设备实时帧中继：接收 mobile 直发的帧 → 缓存展示 + DA3 深度处理 ──────────
 # ══════════════════════════════════════════════════════════════════════
-# 实时识别（Qwen3-VL 多模态）：SAM3 流式液体命中某帧 → 取原图 + 带框图，送 GCP g4-01 的
-# Qwen3-VL（OpenAI 兼容）识别「具体是什么」，产出 名称 + 类型(食物/液体)。
+# 实时识别（Qwen3-VL 多模态）：把某帧送 GCP g4-01 的 Qwen3-VL（OpenAI 兼容）识别
+# 「具体是什么」，产出 名称 + 类型(食物/液体)。触发有两种口径，二选一（见下方直传区块）：
+#   · 直传（默认，主链路）：按固定间隔取选中设备最新 RGB 帧直接送，只发原图；
+#   · SAM3（直传关闭时）：SAM3 命中某帧 → 取原图 + 带框图送。
 #   · 识别是慢操作（多模态 LLM 数秒），放独立后台线程 + 节流，绝不阻塞 DA3 产线。
 #   · 结果进 _recog_cards，前端 /recog 轮询 /api/recog/list 渲染卡片、名称流式打字。
 #   · endpoint 经环境变量配置（默认空=不接入，右栏显示「识别服务未接入」）：
@@ -4272,8 +4332,27 @@ _recog_evt_cv = threading.Condition(_recog_lock)
 _recog_cards = {}
 _recog_id = 0              # 卡片自增 id（全设备共用一个计数器，保证 id 全局唯一）
 _recog_last_ts = 0.0       # 上次触发识别的时刻(节流用)
-_recog_pending = []        # 待识别任务队列(单线程消费，最新优先、丢弃积压)
-_recog_worker_started = False
+_recog_pending = []        # 待识别任务队列(worker 池消费，最新优先、丢弃积压)
+_recog_workers = 0         # 已起的 worker 线程数（按并发配置只增不减；多余线程自行退出）
+
+# ══════════════════════════════════════════════════════════════════════
+# 主链路直传 VLM 识别（/experience 的「设备深度图」链路）
+#   动机：识别触发历来挂 SAM3——单目链取 SAM3 流式液体框、双目链取左目 IR 的 SAM3
+#   命中，SAM3 没定位到就完全不识别。直传去掉这层前置：按固定间隔取选中设备的最新
+#   RGB 帧直接送 Qwen VLM 问「画面里可能有什么食物」。
+#   · 直传开启时，两处 SAM3 触发（单目液体证据 / 双目左目命中）一律闸掉，
+#     识别卡片只有直传一个来源，节奏干净可控；关掉直传即回到 SAM3 触发的老行为。
+#   · SAM3 本身不受影响：高亮点云/双目高亮/SAM3 点云等背景可视化照常跑。
+#   · 并发=1 时「串行·最新优先」（上一轮没回就丢旧帧用最新帧，实际节奏≈VLM 延时）；
+#     调大并发即真按间隔多路齐发，代价是 GPU 成本 ×N 且并发轮次拿同一份去重候选、
+#     可能给同一食物重复建卡。
+# 配置：GET/POST /api/recog/direct/config（落盘 recog_direct_cfg.json，全局一份）
+# ══════════════════════════════════════════════════════════════════════
+_recog_direct = recog_direct.DirectConfig(
+    Path(__file__).resolve().parent / "recog_direct_cfg.json")
+_recog_direct_stats = {"rounds": 0, "in_flight": 0, "last_ms": 0,
+                       "last_ts": 0.0, "skipped_same_frame": 0, "last_error": ""}
+print(f"[da3-web] 直传识别配置：{_recog_direct.snapshot()}", flush=True)
 
 # 食物健康分级的合法枚举（静态 guardrail 白名单：模型输出只保留集合内的值、其余置空）。
 FOOD_CLASSIFICATIONS = ["Good", "Neutral", "Bad"]
@@ -4292,21 +4371,36 @@ def _recog_num(v, lo, hi, as_int=False):
     f = min(hi, max(lo, f))
     return int(round(f)) if as_int else round(f, 1)
 
-def _build_recog_prompt(candidates, n_food=0, n_drink=0):
+def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False):
     """按候选动态生成「识别 + 去重」prompt。
+
+    direct=True 是主链路直传口径：没有 SAM3 检测框，也就没有图2带框图与命中计数，
+    开头改成「只有图1当前画面」的说法——保留检测器措辞会让模型去找不存在的框。
     关键防线一：历史参考图（图3起）带 HISTORY REF 横幅 + prompt 明令，防止参考图内容
     泄漏进任务一被当成当前画面的物品（实测过：画面空无一物时模型照着参考图报 Snickers）。
     关键防线二（治 over-merge）：合并不是自由心证，而是逐项对照（品牌/颜色/形状/容器）
     的 checklist，字段顺序上证据(match_evidence)先于结论(match)生成，high 有硬性定义；
     「同名≠同物」明确写死——两根不同的香蕉、两杯咖啡必须分开记录。"""
-    p = (
-        "图1=当前画面原图；图2=当前画面带检测框版本（红框=疑似食物，蓝框=疑似液体/容器）。"
-        "从图3起（若有）全部是带“HISTORY REF”横幅的历史参考图，只用于任务二对照，**不是当前画面**。\n"
-        "检测器在当前画面的命中：食物框×" + str(n_food) + "、液体框×" + str(n_drink) + ""
-        "（检测器可能漏检，但当前画面里明显不存在的东西绝不要输出）。\n"
-        "任务一·识别：只识别图1/图2 当前画面里**真实存在**的食物、以及液体/饮料"
+    if direct:
+        p = (
+            "图1=当前画面原图（没有检测框，画面里有什么全靠你自己看）。"
+            "从图2起（若有）全部是带“HISTORY REF”横幅的历史参考图，只用于任务二对照，"
+            "**不是当前画面**。\n"
+            "任务一·识别：只识别图1 当前画面里**真实存在**的食物、以及液体/饮料"
+        )
+    else:
+        p = (
+            "图1=当前画面原图；图2=当前画面带检测框版本（红框=疑似食物，蓝框=疑似液体/容器）。"
+            "从图3起（若有）全部是带“HISTORY REF”横幅的历史参考图，只用于任务二对照，**不是当前画面**。\n"
+            "检测器在当前画面的命中：食物框×" + str(n_food) + "、液体框×" + str(n_drink) + ""
+            "（检测器可能漏检，但当前画面里明显不存在的东西绝不要输出）。\n"
+            "任务一·识别：只识别图1/图2 当前画面里**真实存在**的食物、以及液体/饮料"
+        )
+    p += (
         "（咖啡/水/可乐/茶/杯装饮品等），逐一分别输出，食物和液体必须拆成不同 item；"
-        "不要局限于框，画面里明显的都要识别；但**严禁**把只出现在历史参考图里的物品当成当前物品输出——"
+        + ("画面里明显的都要识别（画面里没有食物也没有液体就直接给空数组，不要硬凑）；"
+           if direct else "不要局限于框，画面里明显的都要识别；")
+        + "但**严禁**把只出现在历史参考图里的物品当成当前物品输出——"
         "当前画面没有食物/液体时，即使参考图里有，items 也必须为空数组。每个物品输出：\n"
         "  name：具体名称（简短，优先英文）。食物可用品牌名（如 Banana、Snickers）；"
         "液体一律按**内容物**命名（如 Water、Coffee、Cola、Orange juice）——"
@@ -4331,9 +4425,12 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0):
         lines = "\n".join("  [%d] %s（%s）—— %s" % (i + 1, c.get("name", ""),
                                                     c.get("type") or "食物", c.get("desc") or "无描述")
                           for i, c in enumerate(candidates))
+        # 参考图编号起点随图2在不在变：直传口径没有带框图，参考图从图2起
+        ref0 = 2 if direct else 3
         p += (
-            "任务二·去重：以下是最近30秒已记录的物品清单（编号·名称·类型·描述），其参考图依次是图3、图4…"
-            "（图3=[1]、图4=[2]，以此类推）：\n" + lines + "\n"
+            "任务二·去重：以下是最近30秒已记录的物品清单（编号·名称·类型·描述），"
+            "其参考图依次是图%d、图%d…（图%d=[1]、图%d=[2]，以此类推）：\n" % (
+                ref0, ref0 + 1, ref0, ref0 + 1) + lines + "\n"
             "判断识别出的每个物品是否就是清单里某一项的**同一个具体物品**在持续出现。"
             "默认它是新物品（match=null）；只有走完下面的对照流程并全部通过，才允许 match。\n"
             "对每个物品，先在 match_evidence 字段里对最像的那个候选做逐项对照"
@@ -4544,20 +4641,26 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     """调多模态 VLM 识别 + 去重。一次多图请求：图1原图 + 图2带框图 + 各候选参考图(带横幅标记)。
     candidates: [{"id","name","type","desc","ref_img"}...]（顺序即参考图编号）。
     n_food/n_drink：当前画面检测器命中数，作为软接地信息进 prompt。
+    boxed_rgb=None → 主链路直传口径：无 SAM3 框，只发图1 + 参考图，prompt 同步换成
+    直传版（参考图编号从图2起）。
     target：识别目标预设（RECOG_TARGETS 里的一项，缺省=当前选中目标）。
     返回 [{name,type,description,...,match,matched_name,match_confidence}]；任何失败返回 []。"""
     cfg = target or RECOG_TARGETS[_recog_target]
     if not cfg["endpoint"]:
         return []
-    u1, u2 = _img_data_uri(orig_rgb), _img_data_uri(boxed_rgb)
-    if not u1 or not u2:
+    direct = boxed_rgb is None
+    u1 = _img_data_uri(orig_rgb)
+    u2 = None if direct else _img_data_uri(boxed_rgb)
+    if not u1 or (not direct and not u2):
         return []
-    content = [{"type": "image_url", "image_url": {"url": u1}},
-               {"type": "image_url", "image_url": {"url": u2}}]
-    for c in candidates:                       # 从图3起：候选参考图（带 HISTORY REF 横幅，仅供对照）
+    content = [{"type": "image_url", "image_url": {"url": u1}}]
+    if u2:
+        content.append({"type": "image_url", "image_url": {"url": u2}})
+    for c in candidates:      # 其后依次是候选参考图（带 HISTORY REF 横幅，仅供对照）
         if c.get("ref_img"):
             content.append({"type": "image_url", "image_url": {"url": c["ref_img"]}})
-    content.append({"type": "text", "text": _build_recog_prompt(candidates, n_food, n_drink)})
+    content.append({"type": "text",
+                    "text": _build_recog_prompt(candidates, n_food, n_drink, direct=direct)})
     # temperature=0：判同结果下游有硬合并动作，消除轮间抖动、日志巡检可复现；
     # max_tokens 1536：每 item 的输出字段持续增多（match_evidence 对照文本、营养四数字
     # + classification），多物品帧 1024 有截断风险——截断会被 _parse_recog 的容错
@@ -4589,33 +4692,50 @@ def _name_tokens(s):
     return toks
 
 
-def _recog_worker():
-    """后台单线程：取最新识别任务、丢弃积压，识别 + 去重：
+def _recog_worker(idx=0):
+    """后台 worker：取最新识别任务、丢弃积压，识别 + 去重：
       duplicate 命中且通过全部闸门 → 合并到那张卡（只追加缩略图、刷新 last_ts、rev+1，内容不改）；
       否则 → 新建卡（ref_img=按物品 box 裁剪的特写，无 box 回退整帧带框图）。
     合并闸门共五道（宁拒勿并，错并比重复建卡严重）：回显校验 → 类型一致 →
-    证据自洽 → high 置信 → 名称零重叠拦截。"""
-    global _recog_id, _recog_gen
+    证据自洽 → high 置信 → 名称零重叠拦截。
+
+    idx=本 worker 在池中的序号：直传并发上限调小后，序号越界的 worker 干完当前
+    一轮自行退出（池子只在需要时增长，不留常驻空转线程）。"""
+    global _recog_id, _recog_gen, _recog_workers
     while True:
         with _recog_cv:
             while not _recog_pending:
                 _recog_cv.wait()
+            if idx >= max(1, _recog_direct.concurrency()):
+                _recog_workers -= 1      # 并发被调小：多余 worker 退场
+                _recog_cv.notify_all()   # 把刚才领到的唤醒还回去，别把任务闷死
+                return
             orig, boxed, glb_url, frame, t, candidates, n_food, n_drink, enq_ts, pred, conf, dev = \
                 _recog_pending.pop()             # 最新优先
             _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
+            _recog_direct_stats["in_flight"] += 1
         wait_ms = (time.time() - enq_ts) * 1000.0     # 在队列里等 worker 的时长
         # 新卡代表图兜底：整帧带框图加 HISTORY REF 横幅（物品无 box/裁剪失败时用）。
         # 注意：这张图同轮所有新卡共享，正是曾经 over-merge 的第一根因——正常路径
         # 走建卡处按各自 box 裁剪的特写，这里仅作退路。
-        boxed_uri = _img_data_uri(_make_ref_img(boxed))
+        # 直传口径没有带框图（boxed=None），退路图用原帧。
+        boxed_uri = _img_data_uri(_make_ref_img(boxed if boxed is not None else orig))
         tgt = RECOG_TARGETS[_recog_target]   # 快照本轮识别目标：切换只影响后续轮次
         _tq = time.time()
-        items = _recognize_dedup(orig, boxed, candidates, n_food, n_drink, tgt)
+        try:
+            items = _recognize_dedup(orig, boxed, candidates, n_food, n_drink, tgt)
+        finally:
+            with _recog_lock:
+                _recog_direct_stats["in_flight"] -= 1
         llm_ms = (time.time() - _tq) * 1000.0
+        with _recog_lock:                     # 观测：抽屉里回显实测延时与轮次
+            _recog_direct_stats["rounds"] += 1
+            _recog_direct_stats["last_ms"] = int(llm_ms)
+            _recog_direct_stats["last_ts"] = time.time()
         # 全链路审计日志：每轮（含空返回）都落盘——耗时分段 + 原始判定，可定位慢在哪/错在哪
-        print("[da3-web] 识别一轮：排队%.0fms · %s %.0fms · 返回 %d 项（去重候选 %d 个：%s）" % (
-            wait_ms, tgt["label"], llm_ms, len(items), len(candidates),
-            "、".join(c["name"] for c in candidates) or "无"), flush=True)
+        print("[da3-web] 识别一轮（%s）：排队%.0fms · %s %.0fms · 返回 %d 项（去重候选 %d 个：%s）" % (
+            "直传" if boxed is None else "SAM3", wait_ms, tgt["label"], llm_ms, len(items),
+            len(candidates), "、".join(c["name"] for c in candidates) or "无"), flush=True)
         now = time.time()
         with _recog_lock:
             cards = _recog_cards.setdefault(dev, [])   # 该设备自己的卡片流
@@ -4717,22 +4837,38 @@ def _recog_worker():
                 _recog_evt_cv.notify_all()
 
 
+def _recog_ensure_workers_locked():
+    """按当前并发配置把 worker 池补齐（须在 _recog_lock 内调用）。
+    池子只增不减，多余线程在并发调小后自行退场（见 _recog_worker 的 idx 判断）。"""
+    global _recog_workers
+    want = max(1, _recog_direct.concurrency())
+    while _recog_workers < want:
+        threading.Thread(target=_recog_worker, args=(_recog_workers,),
+                         daemon=True, name=f"recog-worker-{_recog_workers}").start()
+        _recog_workers += 1
+
+
 def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
-                     device=UNKNOWN_DEVICE):
+                     device=UNKNOWN_DEVICE, direct=False):
     """detections 非空 + 节流通过 → 取该设备活跃卡快照作去重候选、提交异步识别。
     processor 里调用，不阻塞产线。去重候选与新卡都落在 device 自己的卡片桶里。
-    不再加 pending 占位卡（去重后归属不定），识别中用前端顶部 live 指示。"""
-    global _recog_last_ts, _recog_worker_started
-    if not detections or not RECOG_TARGETS[_recog_target]["endpoint"]:
+    不再加 pending 占位卡（去重后归属不定），识别中用前端顶部 live 指示。
+
+    direct=True 是主链路直传口径：无 SAM3 检测框（detections 传空即可），节奏由
+    直传触发线程按配置间隔控制，不吃 RECOG_MIN_INTERVAL 节流。
+    direct=False 是 SAM3 触发口径（单目液体证据 / 双目左目命中）——直传开启时
+    这条路整体闸掉，识别卡片只留直传一个来源。"""
+    global _recog_last_ts
+    if not RECOG_TARGETS[_recog_target]["endpoint"]:
         return
+    if not recog_direct.should_trigger(direct, bool(detections), _recog_direct.enabled()):
+        return                      # SAM3 触发：无证据、或已被直传接管
     now = time.time()
     with _recog_lock:
-        if now - _recog_last_ts < RECOG_MIN_INTERVAL:
+        if not direct and now - _recog_last_ts < RECOG_MIN_INTERVAL:
             return
         _recog_last_ts = now
-        if not _recog_worker_started:
-            _recog_worker_started = True
-            threading.Thread(target=_recog_worker, daemon=True).start()
+        _recog_ensure_workers_locked()
         # 该设备活跃卡快照(最后出现≤30s、有代表图)作去重候选，取最近的至多 N 张（顺序=参考图编号）
         active = [c for c in _recog_cards.get(device, [])
                   if c.get("status") == "done" and c.get("ref_img")
@@ -4743,13 +4879,61 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
                        "desc": c.get("description", ""), "ref_img": c["ref_img"]}
                       for c in active[:RECOG_MAX_CANDIDATES]]
     t = time.strftime("%H:%M:%S")
-    boxed = _draw_boxes(orig_rgb, detections)
+    # 直传口径不画框、也不发图2（boxed=None 一路透传到 _recognize_dedup）
+    boxed = None if direct else _draw_boxes(orig_rgb, detections)
     n_food = sum(1 for d in detections if d[0] == "food")
     n_drink = len(detections) - n_food
     with _recog_cv:
         _recog_pending.append((orig_rgb.copy(), boxed, glb_url, frame, t, candidates,
                                n_food, n_drink, time.time(), pred, conf, device))
-        _recog_cv.notify()
+        _recog_cv.notify_all()   # worker 池可能不止一个线程在等（并发>1）
+
+
+# ── 直传触发线程：按配置间隔取选中设备最新 RGB 帧 → 提交识别（不依赖 SAM3）──────
+def _recog_direct_loop():
+    """常驻线程：直传开启时按 interval_s 节拍取「当前选中设备」的最新 RGB 帧送 VLM。
+
+    要点：
+      · 帧源用 frame_relay 的最新帧（RGB 彩色帧——VLM 吃彩色图，伪彩深度图识别不了
+        食物；「设备深度图」只是背景呈现，识别始终走同设备的 RGB 帧）；
+      · seq 没变说明推帧比触发间隔还慢，跳过不重复送（省一次多图请求）；
+      · 并发=1 时队列 latest-wins 天然退化成「串行·最新优先」，实际节奏≈VLM 延时。"""
+    last_seq, last_dev = 0, None
+    while True:
+        try:
+            if not _recog_direct.enabled():
+                time.sleep(0.5)
+                continue
+            itv = _recog_direct.interval_s()
+            dev = get_selected_device()
+            if not dev:
+                time.sleep(min(1.0, itv))
+                continue
+            raw, seq = get_latest_frame_seq(dev)
+            if raw is None or (dev == last_dev and seq == last_seq):
+                with _recog_lock:      # 推帧比触发慢：本轮无新图，不重复送
+                    if raw is not None:
+                        _recog_direct_stats["skipped_same_frame"] += 1
+                time.sleep(min(0.2, itv))
+                continue
+            last_dev, last_seq = dev, seq
+            arr = np.array(ImageOps.exif_transpose(
+                Image.open(io.BytesIO(raw))).convert("RGB"))
+            _maybe_recognize(arr, [], None, f"d{seq}", pred=None, conf=40.0,
+                             device=dev, direct=True)
+            with _recog_lock:
+                _recog_direct_stats["last_error"] = ""
+        except Exception as e:         # 触发线程必须长命：任何异常只记录不退出
+            msg = f"{type(e).__name__}: {e}"
+            with _recog_lock:
+                _recog_direct_stats["last_error"] = msg
+            print(f"[da3-web] 直传识别触发异常（已忽略）：{msg}", flush=True)
+            time.sleep(1.0)
+            continue
+        time.sleep(max(0.05, _recog_direct.interval_s()))
+
+
+threading.Thread(target=_recog_direct_loop, daemon=True, name="recog-direct").start()
 
 
 class _PipelineBuilder:
@@ -4875,8 +5059,9 @@ def _build_mono_product(arr, pred, fmt, res, conf, nmp, show_cam,
             num_max_points=nmp, show_cameras=show_cam)
         sz = glb.stat().st_size / 1024 if glb.exists() else 0
         _prune_glb()
-        # 识别工作流：证据=SAM3 流式液体命中（缓存框），
-        # 命中即异步送 Qwen3-VL 识别（节流、后台线程，不阻塞产线）
+        # 识别工作流（SAM3 触发口径）：证据=SAM3 流式液体命中（缓存框），
+        # 命中即异步送 Qwen3-VL 识别（节流、后台线程，不阻塞产线）。
+        # 主链路直传开启时这条路在 _maybe_recognize 里被整体闸掉（识别只走直传）
         _maybe_recognize(arr, _sam3_recent_drinks(),
                          f"/glb/{token}/scene.glb", token[:6], pred=pred, conf=conf,
                          device=device_id)
@@ -5074,7 +5259,8 @@ def _build_stereo_product(pred, aux_info, res, conf, nmp, show_cam,
     sz = glb.stat().st_size / 1024 if glb.exists() else 0
     _prune_glb()
 
-    # VLM 识别触发（前置依赖挂在双目链：单目停用时识别仍然活着）：
+    # VLM 识别触发（SAM3 触发口径；前置依赖挂在双目链：单目停用时识别仍然活着。
+    # 主链路直传开启时这条路在 _maybe_recognize 里被整体闸掉，识别只走直传）：
     # 证据 = 左目 SAM3 命中（food/drink mask → 归一化框），识别图 = 该设备最新 RGB 帧
     # （VLM 吃彩色图；IR 灰度图识别菜品不可靠）。RGB 与左 IR 镜头有厘米级基线差，
     # 框只作大致位置引导（VLM prompt 本就按"疑似位置"用框）。pred 不传——它的深度
@@ -5331,6 +5517,27 @@ def recog_target_set(body: dict = Body(default=None)):
     _recog_target = want
     print(f"[da3-web] 识别目标切换 → {want}（{RECOG_TARGETS[want]['model']}）", flush=True)
     return JSONResponse({"ok": True, "target": want, "model": RECOG_TARGETS[want]["model"]})
+
+
+@app.get("/api/recog/direct/config")
+def recog_direct_config_get():
+    """直传识别配置 + 观测（抽屉回显用）。"""
+    with _recog_lock:
+        stats = dict(_recog_direct_stats)
+    return JSONResponse({"config": _recog_direct.snapshot(), "stats": stats,
+                         "limits": recog_direct.LIMITS})
+
+
+@app.post("/api/recog/direct/config")
+def recog_direct_config_set(body: dict = Body(default=None)):
+    """更新直传识别配置（merge-patch：on / interval_s / concurrency），立即生效并落盘。
+    并发调大时补齐 worker 池；调小时多余 worker 干完当前一轮自行退场。"""
+    cfg = _recog_direct.update(body or {})
+    with _recog_lock:
+        _recog_ensure_workers_locked()
+        stats = dict(_recog_direct_stats)
+    print(f"[da3-web] 直传识别配置更新：{cfg}", flush=True)
+    return JSONResponse({"ok": True, "config": cfg, "stats": stats})
 
 
 @app.post("/api/recog/clear")

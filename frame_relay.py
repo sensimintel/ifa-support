@@ -268,6 +268,17 @@ def get_latest_frame(device_id: str) -> Optional[bytes]:
         return st["image"] if st else None
 
 
+def get_latest_frame_seq(device_id: str):
+    """取最新一帧的 (字节, seq)，无设备/无帧返回 (None, 0)。
+    seq 供旁路链去重用——直传 VLM 识别的触发间隔可能快过 RGB 推帧，
+    seq 没变说明还是同一张图，重复送 VLM 纯属烧算力。"""
+    with _cv:
+        st = _devices.get(device_id)
+        if not st or st["image"] is None:
+            return None, 0
+        return st["image"], int(st["seq"])
+
+
 def _parse_ms(val) -> Optional[int]:
     """把 13 位毫秒级 epoch 时间戳（str/int/float）解析成 int 毫秒；无效/明显不是毫秒级返回 None。"""
     try:

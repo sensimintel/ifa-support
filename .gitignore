@@ -47,6 +47,10 @@ sam3hl_preset.json.tmp
 # per-device 帧率配置（frame_relay 落盘持久化，运行时生成）
 dev_config.json
 
+# 直传 VLM 识别配置（recog_direct 落盘持久化，运行时生成）
+recog_direct_cfg.json
+recog_direct_cfg.json.tmp
+
 # 深度视图配置预设（frame_relay 落盘持久化，运行时生成）
 depth_presets.json
 
