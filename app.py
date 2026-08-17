@@ -3199,19 +3199,20 @@ function ddColorMatrix(){
 }
 // 亮度软肩曲线查找表（按 max 通道索引）：v'=1-(1-v)^br。br>1 时暗区/中间调
 // 实打实抬升、顶端平滑收敛永不硬截断（保住亮部层次）；三通道按 K 等比缩放，
-// 色相/饱和不动，不再有线性乘法的截断冲白。W 为掺白权重（∝v'^2），只让最亮的
-// "亮核"随 br 增大轻微泛白（过曝辉光观感——人眼据此判定"画面很亮"），中间调
-// 颜色纹丝不动；br<=1 时 W 恒 0。br=1 恒等返回 null（零开销）。
+// 色相/饱和不动，不再有线性乘法的截断冲白。W 为掺白权重（∝v'^6——2026-08-17
+// 现场实测 v'^2 铺得太宽、饱和度掉到与线性截断相当，收窄到 ^6 后 br=2.5 时
+// 平均饱和度 0.80 vs 0.71），只让最亮的"亮核"随 br 增大轻微泛白（过曝辉光
+// 观感——人眼据此判定"画面很亮"）；br<=1 时 W 恒 0。br=1 恒等返回 null。
 function ddBrightLut(){
   if(bgSource!=='devdepth')return null;
   const br=Math.max(0.1,+ddCss.br||1);
   if(br===1)return null;
   const K=new Float32Array(256),W=new Float32Array(256);
-  const HD=0.4,g=Math.max(0,1-1/br);   // HD=辉光（高光掺白）强度常量
+  const HD=0.25,g=Math.max(0,1-1/br);   // HD=辉光（高光掺白）强度常量
   for(let m=0;m<256;m++){
     const v2=1-Math.pow(1-m/255,br);
     K[m]=m?255*v2/m:0;
-    W[m]=HD*g*v2*v2;
+    W[m]=HD*g*Math.pow(v2,6);
   }
   return [K,W];
 }
