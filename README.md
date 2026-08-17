@@ -23,6 +23,7 @@
 | `app.py` | 8060 的全部服务端逻辑（FastAPI 应用 `app:app`，深度推理 + 内嵌 HTML 页面） |
 | `static/` | 静态资源（`/experience` 用的品牌字体等），经 `/static` 路径提供 |
 | `recog_direct.py` | 主链路「直传 VLM 识别」的配置态（开关/间隔/并发 + 触发闸门，纯逻辑可单测），落盘 `recog_direct_cfg.json` |
+| `recog_log.py` | VLM 识别观测日志的环形缓冲与响应投影（纯逻辑、可单测）；接口 `/api/recoglog/*`，消费方是 superadmin 浅体验区控制面的「VLM 识别日志」页签 |
 | `docs/sam3-usage-map.md` | **SAM3 使用路径地图**：SAM3 被哪些链路消费、各自产出什么、识别触发的两种口径与开关速查 |
 | `run.sh` | 用 `da3` conda 环境在 `0.0.0.0:8060` 起服务的启动脚本 |
 | `dx_backend.py` | **深体验区后端（8070）**：四通道食物秤读数与软件去皮、桌边分组绑定，独立于 8060 |

@@ -106,14 +106,14 @@ class WiringTest(unittest.TestCase):
 
     def test_gate_mode_runs_sam3_on_rgb_and_still_recognizes(self):
         """直传关 = SAM3 先筛 + 命中照样送 VLM（不是"只跑 SAM3 不识别"）。"""
-        self.assertIn("def _sam3_gate_dets(rgb):", self.src)
+        self.assertIn("def _sam3_gate_dets(rgb, device=None):", self.src)
         loop = self.src[self.src.index("def _recog_direct_loop():"):]
         loop = loop[:loop.index("threading.Thread(target=_recog_direct_loop")]
-        self.assertIn("_sam3_gate_dets(arr)", loop)
+        self.assertIn("_sam3_gate_dets(arr, device=dev)", loop)
         # 门控命中后必须走 direct=False 的识别提交（带框 + 检测器口径 prompt）
         self.assertIn("direct=False", loop)
         # food 也算证据（历史单目口径只收 drink，食物因此从不触发）
-        gate = self.src[self.src.index("def _sam3_gate_dets(rgb):"):]
+        gate = self.src[self.src.index("def _sam3_gate_dets(rgb, device=None):"):]
         self.assertIn('lbl == "food"', gate[:gate.index("def _recog_direct_loop")])
 
     def test_direct_prompt_variant_exists(self):

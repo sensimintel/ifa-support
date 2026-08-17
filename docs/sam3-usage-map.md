@@ -1,7 +1,7 @@
 # SAM3 使用路径地图（ifa-support）
 
 > 用途：一眼看清 SAM3 在本仓被谁用、用在哪、动它会波及什么。
-> 最后核对：2026-08-17（去冗余后：双目链、8061 实验台、/sam3 页、Gradio UI 均已下线）。
+> 最后核对：2026-08-17（去冗余后：双目链、8061 实验台、/sam3 页、Gradio UI 均已下线；控制面识别日志观测已接上）。
 > 改到 SAM3 相关链路请同步更新本文。
 
 ## 0. 服务本体
@@ -18,7 +18,7 @@
 
 | # | 消费方 | 调用方式 | 产出 / 去向 | 现网状态 |
 |---|---|---|---|---|
-| A | **识别触发线程的 SAM3 门控**（`_sam3_gate_dets`） | 每词一路并发，直接跑**当前设备的 RGB 彩色帧**，优先 `/v1/stream/frame`，老 server 回退 `/v1/segment` | food/drink 归一化框 → 命中即带框送 VLM 识别 | **在跑**（`/experience` 抽屉里直传开关设为「关」时；开=不调 SAM3） |
+| A | **识别触发线程的 SAM3 门控**（`_sam3_gate_dets`） | 每词一路并发，直接跑**当前设备的 RGB 彩色帧**，优先 `/v1/stream/frame`（带 debug 捕获），老 server 回退 `/v1/segment` | ①food/drink 归一化框 → 命中即带框送 VLM 识别 ②sam3tune 生产观测（`src="gate"`）→ 浅体验区控制面 | **在跑**（`/experience` 抽屉里直传开关设为「关」时；开=不调 SAM3） |
 | A' | 8060 单目 RGB 链（`_maybe_sam3cloud` → `_sam3cloud_refresh`） | 每词一路并发，优先 `/v1/stream/frame`，老 server 回退 `/v1/track` | ①SAM3 点云映射 ②SAM3 高亮点云 ③液体框证据 ④sam3tune 生产观测 | **停用**（`.env` `DISABLE_MONO_PIPELINE=1`）。保留为「DA3+SAM3+点云+高亮」的完整能力样本，停用即零成本 |
 | B | `/sam3tune` 调优页（`/api/sam3tune/*`） | `/v1/segment` 带 debug（presence/top-K） | 调参可视化 + **生产打分口径**落 `sam3_score_cfg.json`（词表/α/阈值），A 每帧读 | 在用（手动触发） |
 
@@ -62,6 +62,28 @@
 去冗余删掉双目链后，SAM3 门控改为直接跑触发线程手里的 RGB 帧——不再依赖任何 DA3 链，
 彩色图也比带散斑的 IR 灰度更适合认食物，food 与 drink 都算证据。
 
+## 3.5 识别观测日志（2026-08-17 起）——控制面看得见的过程态
+
+浅体验区控制面（superadmin `/ifa-support/experience`，经 `/da3-api` 反代到 8060）两个页签：
+
+**SAM3 侧**：`_sam3_gate_dets` 每轮写 `_sam3tune_record_prod(src="gate")` → `/api/sam3tune/state|history`。
+去冗余前写观测的只有停用中的 A' 单目链，控制面 SAM3 区因此长期为空（实测 `state` 的 `live: {}`）。
+细节：流式步进本就带 debug 捕获（server 端是前向 hook 读已有输出，**不多跑推理**），presence 与
+top-K 原始分白拿；补跑的 food 词也进日志但标 `role="highlight"`、不计 `n_inst`（口径统计只认配置词）；
+写历史按 `SAM3TUNE_HIST_MIN_GAP`(1.5s) 采样，实时区不受限；`/api/sam3tune/history` 支持 `device`/`limit`。
+
+**VLM 侧**：每一轮识别（含失败轮）整轮留痕。
+
+| 项 | 内容 |
+|---|---|
+| 一条日志 | 请求图（原图缩略 + 门控口径下的带框图）、候选参考图、prompt 原文、模型/endpoint/max_tokens/temperature、模型原始返回（截断 `VLMLOG_RAW_MAX`=20000 字符）、解析出的每一项、五道去重闸门的逐项判定（`outcome[].gate`/`action`/`card_id`） |
+| 容量 | 内存环形 `VLMLOG_MAX`=30 条，不落盘，重启即空 |
+| 接口 | `GET /api/recoglog/list?device=&limit=`（列表态剥掉 prompt/raw/参考图，只给长度与摘要）、`GET /api/recoglog/{id}`（全文）、`POST /api/recoglog/clear` |
+| 代码 | 缓冲与投影在 `recog_log.py`（纯逻辑、可单测），图片编码在 `app.py` 的 `_thumb_uri` |
+
+与识别卡片流的区别：卡片是「桌上现在有什么」的结果态，日志是过程态——漏识别 / 幻觉 / 错并
+只能在过程态看出来，stdout 那份审计日志上了展台没人去 ssh 翻。
+
 ## 4. 开关与配置速查
 
 | 项 | 位置 | 作用 |
@@ -73,6 +95,9 @@
 | `sam3_score_cfg.json` | 仓根（gitignored） | 生产词表 + presence α + 检测阈值，`/sam3tune` 写、A 每帧读 |
 | `sam3hl_preset.json` | 仓根（gitignored） | 高亮/点渲染样式，`/panel` 与 `/experience` 抽屉共写 |
 | `recog_direct_cfg.json` | 仓根（gitignored） | 直传识别开关/间隔/并发 |
+| `SAM3_OBS_LOG` | `.env`，默认开 | =0 关掉 SAM3 观测写回（控制面 SAM3 区随之空），嫌它占识别触发线程节拍时的应急开关 |
+| `VLMLOG_MAX` / `VLMLOG_RAW_MAX` | `app.py` 常量 | 识别日志条数上限 / 单条原始返回截断长度 |
+| `SAM3TUNE_HIST_MIN_GAP` | `app.py` 常量，1.5s | 生产 SAM3 观测写历史的采样间隔（实时区不受限） |
 
 > 现网提醒：SAM3 服务是识别「关」模式（SAM3 门控）的前置依赖，**不能停**——停了
 > 门控每轮报错、识别不出卡。只有确认长期只用「开」（直传）时才谈得上停常驻，
