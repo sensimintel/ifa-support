@@ -26,8 +26,6 @@
 | `recog_direct.py` | 主链路「直传 VLM 识别」的配置态（开关/间隔/并发 + 触发闸门，纯逻辑可单测），落盘 `recog_direct_cfg.json` |
 | `docs/sam3-usage-map.md` | **SAM3 使用路径地图**：SAM3 被哪些链路消费、各自产出什么、识别触发的两种口径与开关速查 |
 | `run.sh` | 用 `da3` conda 环境在 `0.0.0.0:8060` 起服务的启动脚本 |
-| `exp_app.py` | **感知链路实验台（8061）**：与产线 8060 完全隔离的「完整识别链路」实验环境，UI 复刻 8060 主页——左栏 设备帧/实验检测标注帧/点云产物(共享 8060 产线 DA3 产物)，右栏 完整 VLM 识别卡片流（与 /recog 同款 UI，prompt/解析/五道合并闸门移植自产线、可独立魔改）。链路=SAM3+VLM：「调节」抽屉热改 采样率/SAM3 食物·液体查询词/score 阈值/presence α·检测阈值口径/识别节流，留 embedding 匹配插槽（`_embed_match()`）。帧取自 8060 只读接口，SAM3 走无状态 `/v1/segment` 不碰产线流式，不加载新模型。手动起停：`nohup ./run-exp.sh > exp.log 2>&1 &` |
-| `run-exp.sh` | 起 8061 实验台的启动脚本（复用 `da3` conda 环境与仓根 `.env`） |
 | `dx_backend.py` | **深体验区后端（8070）**：四通道食物秤读数与软件去皮、桌边分组绑定，独立于 8060 |
 | `run-dx.sh` | 起 8070 的启动脚本（复用 `da3` conda 环境） |
 | `dx-backend.service` | 8070 的 systemd 单元 |

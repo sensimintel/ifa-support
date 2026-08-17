@@ -266,15 +266,6 @@ def _sam3_post(path, payload):
         return None
 
 
-def _sam3_segment(rgb, text):
-    """单图分割 → instances 列表；失败返回 []。"""
-    b64 = _b64_jpg(rgb)
-    if not b64:
-        return []
-    r = _sam3_post("/v1/segment", {"image_b64": b64, "text": text})
-    return (r or {}).get("instances", []) or []
-
-
 def _sam3_segment_debug(rgb, text, topk=10, alpha=1.0, det_thresh=0.0):
     """单图分割（带 presence / top-K query 原始分）→ (instances, debug)；失败返回 ([], None)。
     debug 结构见 sam3_server：presence_logit/presence_score/num_queries/topk[{joint/cond}]。
@@ -5634,55 +5625,6 @@ def tunnel_keeper(body: dict = Body(default=None)):
     return JSONResponse({"rebuild": req, "up": _tunnel_probe()})
 
 
-@app.post("/api/sam3/run")
-def sam3_run(body: dict = Body(default=None)):
-    """跑一次 SAM3：当前帧单图分割 + 最近 N 帧短视频跟踪，返回三张图（原图/分割/跟踪）。
-    text 支持多词（逗号/分号分隔）：每个词并发各调一次 SAM3，合并结果、每词一色 + 词名 label。"""
-    text = str(((body or {}).get("text") or SAM3_TEXT_DEFAULT)).strip() or SAM3_TEXT_DEFAULT
-    words = [w.strip() for w in re.split(r"[,，;；\n]+", text) if w.strip()][:6] or [SAM3_TEXT_DEFAULT]
-    frames = _get_recent_frames(SAM3_TRACK_FRAMES)
-    if not frames:
-        return JSONResponse({"ok": False, "error": "还没有设备帧（等设备传帧或先在 /panel 灌一帧）"},
-                            status_code=400)
-    cur = frames[-1]
-    nlast = str(len(frames) - 1)
-
-    def seg_one(w):
-        return (w, _sam3_segment(cur, w))
-
-    def trk_one(w):
-        fr = _sam3_track(frames, w, prompt_frame_index=0)
-        last = fr.get(nlast)
-        if last is None and fr:
-            last = fr[sorted(fr.keys(), key=lambda k: int(k))[-1]]
-        return (w, last or [])
-
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=min(6, len(words))) as ex:
-        segs = list(ex.map(seg_one, words))       # 多词并发单图分割
-    seg_ms = (time.time() - t0) * 1000.0
-    t1 = time.time()
-    with ThreadPoolExecutor(max_workers=min(6, len(words))) as ex:
-        trks = list(ex.map(trk_one, words))       # 多词并发短视频跟踪
-    track_ms = (time.time() - t1) * 1000.0
-
-    img_seg, img_trk, n_seg, n_trk = cur, cur, 0, 0
-    for wi, (w, inst) in enumerate(segs):
-        img_seg = _draw_instances(img_seg, inst, color=_SAM3_COLORS[wi % len(_SAM3_COLORS)], label_prefix=w)
-        n_seg += len(inst)
-    for wi, (w, last) in enumerate(trks):
-        img_trk = _draw_instances(img_trk, last, color=_SAM3_COLORS[wi % len(_SAM3_COLORS)], label_prefix=w)
-        n_trk += len(last)
-    return JSONResponse({
-        "ok": True, "text": text, "words": len(words), "endpoint": SAM3_ENDPOINT,
-        "seg_ms": round(seg_ms, 1), "track_ms": round(track_ms, 1),
-        "n_seg": n_seg, "n_track": n_trk, "n_frames": len(frames),
-        "raw": "data:image/jpeg;base64," + (_b64_jpg(cur) or ""),
-        "seg": "data:image/jpeg;base64," + (_b64_jpg(img_seg) or ""),
-        "track": "data:image/jpeg;base64," + (_b64_jpg(img_trk) or ""),
-    })
-
-
 @app.get("/api/sam3/health")
 def sam3_health():
     """SAM3 服务健康（经隧道）。"""
@@ -6265,96 +6207,6 @@ def recog_page():
     return RECOG_PAGE
 
 
-# ══════════════════════════════════════════════════════════════════════
-# SAM3 效果页：三图并排（原图 / 单图分割 / 短视频跟踪·过去 N 帧）
-# ══════════════════════════════════════════════════════════════════════
-SAM3_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SAM3 效果</title>
-<style>
- :root{--bg:#f4f5f7;--panel:#fff;--ink:#1b1e24;--muted:#69707b;--faint:#98a0ac;--line:#e5e8ec;
-   --accent:#0071e3;--accent-soft:#e7f1fd;--ok:#1a9e5f;--err:#de3434;
-   --mono:ui-monospace,"SF Mono",Menlo,monospace;--sans:-apple-system,BlinkMacSystemFont,system-ui,"PingFang SC",sans-serif}
- @media (prefers-color-scheme:dark){:root{--bg:#0c0e11;--panel:#15181d;--ink:#e8eaed;--muted:#98a1ad;--faint:#6b7480;--line:#262b32;--accent:#3b9bff;--accent-soft:#132436}}
- *{box-sizing:border-box}
- body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5}
- .nav{display:flex;gap:16px;align-items:center;padding:10px 16px;background:var(--panel);border-bottom:1px solid var(--line);font-size:13px}
- .nav a{color:var(--muted);text-decoration:none}.nav a.active{color:var(--accent);font-weight:600}
- .wrap{padding:16px 18px 40px;max-width:1500px;margin:0 auto}
- h1{font-size:17px;margin:2px 0 4px;font-weight:650}
- .sub{font-size:12.5px;color:var(--muted);margin-bottom:14px}
- .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:14px}
- .bar label{font-size:12.5px;color:var(--muted)}
- .bar input[type=text]{font-size:13px;padding:6px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);width:220px}
- .btn{font-size:13px;font-weight:600;color:#fff;background:var(--accent);border:0;padding:7px 16px;border-radius:8px;cursor:pointer}
- .btn:disabled{opacity:.5;cursor:default}
- .btn2{background:var(--panel);color:var(--muted);border:1px solid var(--line)}
- .st{font-size:12px;font-family:var(--mono);color:var(--faint);margin-left:auto}
- .st .ok{color:var(--ok)}.st .err{color:var(--err)}
- .grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
- @media (max-width:1000px){.grid{grid-template-columns:1fr}}
- figure{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
- figure .cap{padding:9px 12px;font-size:12.5px;font-weight:600;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
- figure .cap span{font-weight:400;color:var(--faint);font-family:var(--mono);font-size:11px;margin-left:auto}
- figure .box{background:#10141a;display:flex;align-items:center;justify-content:center;min-height:260px}
- figure img{width:100%;display:block}
- .empty{color:var(--faint);font-size:13px;padding:40px 10px;text-align:center}
-</style></head><body>
-<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a href="/recog">实时识别</a><a class="active" href="/sam3">SAM3 效果</a><a href="/sam3tune">SAM3 调优</a><a href="/" style="margin-left:auto">↗ 对比首页</a></div>
-<div class="wrap">
- <h1>SAM3 效果 · 原图 / 单图分割 / 短视频跟踪</h1>
- <div class="sub">取设备最近 <b id="nf">5</b> 帧：当前帧跑 <code>/v1/segment</code> 单图分割；最近 N 帧跑 <code>/v1/track</code> 跟踪（在第 0 帧下 prompt，跨帧保持 obj_id），跟踪结果画在当前帧上。</div>
- <div class="bar">
-  <label>text（英文名词，多词用逗号分隔，每词一色）</label>
-  <input type="text" id="text" value="food, bottle" placeholder="如 food, bottle, person / bowl of rice">
-  <button class="btn" id="run">运行一次</button>
-  <button class="btn btn2" id="auto">自动（连续）</button>
-  <span class="st" id="st">就绪</span>
- </div>
- <div class="grid">
-  <figure><div class="cap">① 原图 <span id="m1"></span></div><div class="box"><div class="empty" id="e1">点「运行一次」</div><img id="i1" style="display:none"></div></figure>
-  <figure><div class="cap">② 单图分割 /v1/segment <span id="m2"></span></div><div class="box"><div class="empty" id="e2">—</div><img id="i2" style="display:none"></div></figure>
-  <figure><div class="cap">③ 短视频跟踪 /v1/track <span id="m3"></span></div><div class="box"><div class="empty" id="e3">—</div><img id="i3" style="display:none"></div></figure>
- </div>
-</div>
-<script>
-const $=id=>document.getElementById(id);
-let auto=false, busy=false;
-function show(i,uri,meta){ if(uri&&uri.length>40){ $('i'+i).src=uri; $('i'+i).style.display='block'; $('e'+i).style.display='none'; }
-  if(meta!==undefined) $('m'+i).textContent=meta; }
-async function run(){
-  if(busy)return; busy=true; $('run').disabled=true; $('st').textContent='跑 SAM3 中…';
-  try{
-    const r=await fetch('/api/sam3/run',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({text:$('text').value||'food'})});
-    const d=await r.json();
-    if(!d.ok){ $('st').innerHTML='<span class="err">'+(d.error||'失败')+'</span>'; }
-    else{
-      show(1,d.raw,'最近 '+d.n_frames+' 帧');
-      show(2,d.seg,d.n_seg+' 个实例 · '+d.seg_ms+'ms');
-      show(3,d.track,d.n_track+' 个对象 · '+d.track_ms+'ms');
-      $('nf').textContent=d.n_frames;
-      $('st').innerHTML='<span class="ok">OK</span> · '+d.words+' 词 · 分割'+d.seg_ms+'ms / 跟踪'+d.track_ms+'ms';
-    }
-  }catch(e){ $('st').innerHTML='<span class="err">请求失败：'+e+'</span>'; }
-  busy=false; $('run').disabled=false;
-  if(auto) run();   // 自动模式：跑完立刻用当前最近 5 帧再跑（背靠背，不定时）
-}
-$('run').onclick=run;
-$('auto').onclick=()=>{ auto=!auto; $('auto').textContent=auto?'停止自动':'自动（连续）'; if(auto)run(); };
-// 首次探活
-fetch('/api/sam3/health').then(r=>r.json()).then(d=>{
-  $('st').innerHTML = d.ok ? '<span class="ok">SAM3 已接通</span> · '+d.endpoint
-                           : '<span class="err">SAM3 未接通</span> · '+d.endpoint+' · '+(d.error||'');
-}).catch(()=>{});
-</script>
-</body></html>"""
-
-
-@app.get("/sam3", response_class=HTMLResponse)
-def sam3_page():
-    """SAM3 效果页：原图 / 单图分割 / 短视频跟踪 三图并排。"""
-    return SAM3_PAGE
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -6426,7 +6278,7 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .badge.hi{background:#e5f6ed;color:var(--ok)}
  @media (prefers-color-scheme:dark){.badge.lo{background:#3a1717}.badge.hi{background:#12301f}}
 </style></head><body>
-<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a href="/recog">实时识别</a><a href="/sam3">SAM3 效果</a><a class="active" href="/sam3tune">SAM3 调优</a><a href="/" style="margin-left:auto">↗ 对比首页</a></div>
+<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a href="/recog">实时识别</a><a class="active" href="/sam3tune">SAM3 调优</a><a href="/" style="margin-left:auto">↗ 对比首页</a></div>
 <div class="wrap">
  <h1>SAM3 调优 · presence 分 / top-K query 原始分</h1>
  <div class="sub">分数分解：<code>p(query匹配) = p(query匹配 | 概念在图中) × p(概念在图中·presence)</code>，presence 是全局乘性门控。
