@@ -112,9 +112,11 @@ class WiringTest(unittest.TestCase):
         self.assertIn("_sam3_gate_dets(arr, device=dev)", loop)
         # 门控命中后必须走 direct=False 的识别提交（带框 + 检测器口径 prompt）
         self.assertIn("direct=False", loop)
-        # food 也算证据（历史单目口径只收 drink，食物因此从不触发）
+        # food 也算证据（历史单目口径只收 drink，食物因此从不触发）：口径词表没覆盖
+        # food 这个词面时补一路，覆盖了就不重复跑
         gate = self.src[self.src.index("def _sam3_gate_dets(rgb, device=None):"):]
-        self.assertIn('lbl == "food"', gate[:gate.index("def _recog_direct_loop")])
+        self.assertIn('SAM3_TEXT_DEFAULT, "food"',
+                      gate[:gate.index("def _recog_direct_loop")])
 
     def test_direct_prompt_variant_exists(self):
         # 直传口径没有图2带框图，prompt 必须换成「只有图1」的说法

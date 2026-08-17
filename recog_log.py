@@ -19,8 +19,9 @@ _HEAD_KEYS = ("id", "ts", "device", "trigger", "img_orig", "img_boxed",
               "n_food", "n_drink", "outcome")
 _REQ_KEYS = ("label", "model", "endpoint", "direct", "n_images",
              "max_tokens", "temperature", "img_full_px")
-# 详情才给的大字段：送 VLM 的原尺寸图（列表态给不起）
-_REQ_DETAIL_KEYS = ("prompt", "img_full", "img_boxed_full")
+# 详情才给的大字段（原尺寸图本身不进 JSON，走 /api/recoglog/{id}/image/{kind} 端点：
+# 详情响应从几百 KB 回到几 KB，点开大图时才拉那一张）
+_REQ_DETAIL_KEYS = ("prompt",)
 _RESP_KEYS = ("ok", "error", "llm_ms", "wait_ms", "n_items")
 
 
@@ -96,6 +97,13 @@ class RecogLog:
             hit = next((it for it in self._items if it.get("id") == entry_id), None)
         return project(hit, detail=True) if hit is not None else None
 
+    def full_image(self, entry_id, kind="orig"):
+        """取送 VLM 的原尺寸图 dataURI（kind=orig|boxed）；已滚出留存窗口返回 None。"""
+        key = "img_boxed_full" if kind == "boxed" else "img_full"
+        with self._lock:
+            hit = next((it for it in self._items if it.get("id") == entry_id), None)
+        return (hit.get("req") or {}).get(key) if hit else None
+
     def clear(self) -> None:
         with self._lock:
             self._items.clear()
@@ -115,9 +123,11 @@ def project(entry, detail=False) -> dict:
     out["resp"] = {k: resp.get(k) for k in _RESP_KEYS}
     out["resp"]["truncated"] = bool(resp.get("truncated"))
     out["n_candidates"] = len(entry.get("candidates") or [])
+    out["has_full"] = bool(req.get("img_full"))          # 还能不能点开看原尺寸图
+    out["has_boxed_full"] = bool(req.get("img_boxed_full"))
     if detail:
         for k in _REQ_DETAIL_KEYS:
-            out["req"][k] = req.get(k) or ("" if k == "prompt" else None)
+            out["req"][k] = req.get(k) or ""
         out["resp"]["raw"] = resp.get("raw") or ""
         out["resp"]["items"] = resp.get("items") or []
         out["candidates"] = entry.get("candidates") or []

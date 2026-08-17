@@ -108,16 +108,18 @@ class ProjectionTest(unittest.TestCase):
         self.assertEqual(got["candidates"][0]["name"], "拿铁")
         self.assertEqual(got["img_orig"], "data:orig")      # 请求图列表里就要能看
 
-    def test_detail_carries_llm_sized_image(self):
-        """详情要给「真正送 VLM 的那张原尺寸图」——列表缩略图看不出糊不糊。"""
+    def test_full_image_served_by_endpoint_not_inlined(self):
+        """原尺寸图不塞进 JSON（几百 KB），只标「有没有」+ 尺寸，图走 full_image()。"""
         log = recog_log.RecogLog()
         e = _entry(log)
-        got = log.get(e["id"])
-        self.assertEqual(got["req"]["img_full"], "data:image/jpeg;base64,FULL")
-        self.assertEqual(got["req"]["img_full_px"], "1280x720")
-        # 列表态只给尺寸文本，不给图本身
-        self.assertNotIn("img_full", log.list()[0][0]["req"])
-        self.assertEqual(log.list()[0][0]["req"]["img_full_px"], "1280x720")
+        for got in (log.list()[0][0], log.get(e["id"])):
+            self.assertNotIn("img_full", got["req"])
+            self.assertTrue(got["has_full"])
+            self.assertFalse(got["has_boxed_full"])          # 本例直传口径没有图2
+            self.assertEqual(got["req"]["img_full_px"], "1280x720")
+        self.assertEqual(log.full_image(e["id"]), "data:image/jpeg;base64,FULL")
+        self.assertIsNone(log.full_image(e["id"], "boxed"))
+        self.assertIsNone(log.full_image(999))
 
     def test_full_images_dropped_outside_window(self):
         """原尺寸图只留最近 full_keep 条，老条目降级为「只有缩略图与判定」。"""
@@ -125,9 +127,10 @@ class ProjectionTest(unittest.TestCase):
         first = _entry(log, "A")
         for name in ("B", "C", "D"):
             _entry(log, name)
-        self.assertIsNone(log.get(first["id"])["req"]["img_full"])
+        self.assertIsNone(log.full_image(first["id"]))
+        self.assertFalse(log.get(first["id"])["has_full"])
         newest = log.list()[0][0]["id"]
-        self.assertEqual(log.get(newest)["req"]["img_full"], "data:image/jpeg;base64,FULL")
+        self.assertEqual(log.full_image(newest), "data:image/jpeg;base64,FULL")
 
     def test_detail_carries_full_text(self):
         log = recog_log.RecogLog()
@@ -186,6 +189,21 @@ class AppWiringTest(unittest.TestCase):
         # 日志里的原图必须是送进请求体的那两张（同一变量），不是另编码一份
         self.assertIn('"img_full": u1, "img_boxed_full": u2', self.src)
         self.assertIn('THUMB_W = int(os.environ.get("OBS_THUMB_W"', self.src)
+
+    def test_image_endpoints_registered(self):
+        # 两条链路的原图都要能点开看（控制面上所有图都可点开看原图）
+        self.assertIn('@app.get("/api/recoglog/{entry_id}/image/{kind}")', self.src)
+        self.assertIn('@app.get("/api/sam3tune/image/{entry_id}/{kind}")', self.src)
+
+    def test_tune_entries_strip_internal_frames(self):
+        # 观测条目持有 ndarray（懒编码用），必须在投影时剥掉，否则 JSON 序列化直接炸
+        self.assertIn('out = {k: v for k, v in entry.items() if not k.startswith("_")}', self.src)
+        self.assertIn('"live": live', self.src)
+        self.assertIn('_tune_public(it) for it in items', self.src)
+
+    def test_food_word_not_rerun_when_already_in_wordlist(self):
+        # 词面已覆盖就不补跑：现网词表 food/drink 都标 label=drink，按 label 判会白跑一次
+        self.assertIn('if not any(w == SAM3_TEXT_DEFAULT for (w, _lbl) in targets):', self.src)
 
     def test_gate_observation_is_switchable(self):
         # 观测写回跑在识别触发线程里，展台上要能一键关
