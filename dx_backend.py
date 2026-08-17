@@ -596,9 +596,11 @@ def api_necklace_meal_segment_analyze(device_id: str, segment_id: str):
     segment_id = (segment_id or "latest").strip()
     if not device_id:
         return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    # segment_id 形如 ifa-seg:<device>:<millis>，冒号必须原样透传：默认 quote 会把它
+    # 编成 %3A，services 侧路由参数拿到的就不是原始 id，查不到段。
     data, status = _ifa_services_request(
         "POST", "/api/v1/ifa/devices/%s/meal-segments/%s/analyze" % (
-            urllib.parse.quote(device_id), urllib.parse.quote(segment_id)))
+            urllib.parse.quote(device_id), urllib.parse.quote(segment_id, safe=":")))
     ok = status < 400
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 202)
 
