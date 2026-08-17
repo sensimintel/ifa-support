@@ -4249,11 +4249,16 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
                "messages": [{"role": "user", "content": content}],
                "max_tokens": 1536, "temperature": 0}
     if log is not None:
+        # img_full/img_boxed_full = 真正送进请求体的那两张图（原帧原尺寸、cv2 默认 q95），
+        # 直接引用同一个 dataURI 字符串：不重复编码、不额外占内存。详情页据此判断
+        # 「模型是不是因为图太糊/没拍到才认错」——列表里的缩略图回答不了这个问题。
         log["req"] = {"label": cfg["label"], "model": cfg["model"],
                       "endpoint": cfg["endpoint"], "direct": direct,
                       "n_images": len(content) - 1, "prompt": prompt,
                       "max_tokens": payload["max_tokens"],
-                      "temperature": payload["temperature"]}
+                      "temperature": payload["temperature"],
+                      "img_full": u1, "img_boxed_full": u2,
+                      "img_full_px": "%dx%d" % (orig_rgb.shape[1], orig_rgb.shape[0])}
     headers = {"Content-Type": "application/json"}
     if cfg["api_key"]:
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
@@ -5223,8 +5228,17 @@ def sam3tune_state():
                          "live": live, "endpoint": SAM3_ENDPOINT})
 
 
-def _thumb_uri(rgb, width=420, quality=72):
+# 观测缩略图口径（`.env` 可覆盖）：420px/q72 在控制面上肉眼可见糊，看不出食物细节；
+# 640px/q80 每张约 30KB（原 9KB），列表按 limit 截断后总体积仍在几百 KB 量级。
+# 注意这只是「日志预览图」的口径——送 VLM 的始终是设备原帧（见 _img_data_uri）。
+THUMB_W = int(os.environ.get("OBS_THUMB_W", "640"))
+THUMB_Q = int(os.environ.get("OBS_THUMB_Q", "80"))
+
+
+def _thumb_uri(rgb, width=None, quality=None):
     """RGB → 缩略图 JPEG dataURI（历史区用小图，控内存与响应体积）。"""
+    width = THUMB_W if width is None else width
+    quality = THUMB_Q if quality is None else quality
     h, w = rgb.shape[:2]
     if w > width:
         rgb = cv2.resize(rgb, (width, max(1, round(h * width / w))),

@@ -20,7 +20,9 @@ def _entry(log, name="可乐", raw="RAW", items=None, device="dev-a", trigger="d
     e["ts"] = 1786900000.0
     e["req"] = {"label": "Qwen", "model": "m", "endpoint": "http://x/v1/chat",
                 "direct": True, "n_images": 2, "prompt": "P" * 50,
-                "max_tokens": 1536, "temperature": 0}
+                "max_tokens": 1536, "temperature": 0,
+                "img_full": "data:image/jpeg;base64,FULL", "img_boxed_full": None,
+                "img_full_px": "1280x720"}
     log.set_response(e, True, raw=raw, items=items if items is not None else [{"name": name}])
     e["outcome"] = [{"name": name, "action": "new", "card_id": 3, "gate": ""}]
     log.commit(e)
@@ -106,6 +108,27 @@ class ProjectionTest(unittest.TestCase):
         self.assertEqual(got["candidates"][0]["name"], "拿铁")
         self.assertEqual(got["img_orig"], "data:orig")      # 请求图列表里就要能看
 
+    def test_detail_carries_llm_sized_image(self):
+        """详情要给「真正送 VLM 的那张原尺寸图」——列表缩略图看不出糊不糊。"""
+        log = recog_log.RecogLog()
+        e = _entry(log)
+        got = log.get(e["id"])
+        self.assertEqual(got["req"]["img_full"], "data:image/jpeg;base64,FULL")
+        self.assertEqual(got["req"]["img_full_px"], "1280x720")
+        # 列表态只给尺寸文本，不给图本身
+        self.assertNotIn("img_full", log.list()[0][0]["req"])
+        self.assertEqual(log.list()[0][0]["req"]["img_full_px"], "1280x720")
+
+    def test_full_images_dropped_outside_window(self):
+        """原尺寸图只留最近 full_keep 条，老条目降级为「只有缩略图与判定」。"""
+        log = recog_log.RecogLog(max_items=10, full_keep=2)
+        first = _entry(log, "A")
+        for name in ("B", "C", "D"):
+            _entry(log, name)
+        self.assertIsNone(log.get(first["id"])["req"]["img_full"])
+        newest = log.list()[0][0]["id"]
+        self.assertEqual(log.get(newest)["req"]["img_full"], "data:image/jpeg;base64,FULL")
+
     def test_detail_carries_full_text(self):
         log = recog_log.RecogLog()
         e = _entry(log, raw="MODEL RAW OUTPUT")
@@ -158,6 +181,11 @@ class AppWiringTest(unittest.TestCase):
         self.assertIn('src="gate", device=device, n_prod=n_prod', m.group(1))
         # 门控要把 debug 一路带出来（流式步进本就捕获，不多跑推理）
         self.assertIn("insts, _gidx, impl, dbg = _sam3_stream_frame(word, rgb)", m.group(1))
+
+    def test_full_image_is_the_request_body_image(self):
+        # 日志里的原图必须是送进请求体的那两张（同一变量），不是另编码一份
+        self.assertIn('"img_full": u1, "img_boxed_full": u2', self.src)
+        self.assertIn('THUMB_W = int(os.environ.get("OBS_THUMB_W"', self.src)
 
     def test_gate_observation_is_switchable(self):
         # 观测写回跑在识别触发线程里，展台上要能一键关
