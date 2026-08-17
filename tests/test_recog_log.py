@@ -127,7 +127,7 @@ class ProjectionTest(unittest.TestCase):
 
 
 class AppWiringTest(unittest.TestCase):
-    """app.py 侧接线：日志真的被写、双目链真的写观测、接口真的挂上。"""
+    """app.py 侧接线：日志真的被写、SAM3 门控真的写观测、接口真的挂上。"""
 
     @classmethod
     def setUpClass(cls):
@@ -151,20 +151,24 @@ class AppWiringTest(unittest.TestCase):
                       '@app.post("/api/recoglog/clear")'):
             self.assertIn(route, self.src)
 
-    def test_stereo_chain_records_sam3_observation(self):
-        # 现网单目链停用，双目链是唯一在跑的 SAM3 生产链路——不写回控制面日志就是空的
-        self.assertRegex(self.src, r'_sam3tune_record_prod\(left, .*src="stereo"'
-                                   r'|src="stereo", device=device_id')
-        self.assertIn('"debug": True, "topk": 10,', self.src)
-
-    def test_ir_stream_returns_debug(self):
-        m = re.search(r"def _sam3_ir_stream_frame\(word, rgb\):(.*?)\ndef ", self.src, re.S)
+    def test_gate_records_sam3_observation(self):
+        # 识别门控是现网唯一在跑的 SAM3 生产链路——不写回控制面日志就是空的
+        m = re.search(r"def _sam3_gate_dets\(rgb, device=None\):(.*?)\n# ──", self.src, re.S)
         self.assertIsNotNone(m)
-        self.assertIn("return (r.get(\"instances\") or []), r.get(\"debug\")", m.group(1))
+        self.assertIn('src="gate", device=device, n_prod=n_prod', m.group(1))
+        # 门控要把 debug 一路带出来（流式步进本就捕获，不多跑推理）
+        self.assertIn("insts, _gidx, impl, dbg = _sam3_stream_frame(word, rgb)", m.group(1))
 
-    def test_history_sampling_guard(self):
-        # 双目每帧都写历史会把 30 条缓冲在 20 秒内冲掉
+    def test_gate_observation_is_switchable(self):
+        # 观测写回跑在识别触发线程里，展台上要能一键关
+        self.assertIn('SAM3_OBS_LOG', self.src)
+        self.assertIn('if not SAM3TUNE_OBS_ON:', self.src)
+
+    def test_history_sampling_and_filter(self):
+        # 门控每轮都写历史会把 30 条缓冲在十几秒内冲掉；控制面还要能按设备/条数拉
         self.assertIn("SAM3TUNE_HIST_MIN_GAP", self.src)
+        self.assertIn("def sam3tune_history(device: Optional[str] = None, limit: int = 0):",
+                      self.src)
 
 
 if __name__ == "__main__":

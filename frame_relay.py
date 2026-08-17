@@ -37,7 +37,7 @@ DEVICE_TTL = 60.0        # 设备条目过期时间（秒）：超过没有新�
 UNKNOWN_DEVICE = "unknown"   # camera_info 缺失/无 device_id 时的兜底桶
 
 # 流水线契约：处理回调返回 DEFERRED 表示「GPU 级已完成、产物由构建级稍后经
-# set_product / set_stereo_product 异步写回」。worker 收到即取下一帧，不写产物槽——
+# set_product 异步写回」。worker 收到即取下一帧，不写产物槽——
 # 这样 GPU 推理与 CPU 构建/网络调用重叠流水，链路吞吐从 sum(阶段) 变 max(阶段)。
 DEFERRED = "__deferred__"
 
@@ -206,12 +206,7 @@ def _save_depth_presets_locked() -> None:
 _processor: Optional[Callable[[bytes, dict, str], dict]] = None
 _worker_started = False
 
-# 双目处理回调：fn(left_bytes, right_bytes, aux_info, config, device_id, seq, gen)
-# -> 产物描述字典，或 DEFERRED（构建级经 set_stereo_product 异步写回）
-# （形态同上）。由独立的 stereo worker 驱动，产物写 stereo_product 槽，与单目链路完全平行。
-# （硬件深度不走 aux——深度伪彩随主帧 /api/frame 的可选 depth 字段上报，见 ingest_frame）
-_stereo_processor: Optional[Callable[[bytes, bytes, dict, dict, str], dict]] = None
-_stereo_worker_started = False
+# （硬件深度伪彩随主帧 /api/frame 的可选 depth 字段上报，见 ingest_frame）
 
 # 设备点云按需推流标志的提供方：fn(device_id) -> bool（True=页面正选中「设备点云」
 # 来源，推流端应推原始深度）。由 app.py 注入（demand 状态由 /api/devpc/status 的
@@ -244,14 +239,6 @@ def set_processor(fn: Callable[[bytes, dict, str], dict]) -> None:
     with _cv:
         _processor = fn
         _start_worker_locked()
-
-
-def set_stereo_processor(fn: Callable[[bytes, bytes, dict, dict, str], dict]) -> None:
-    """注入双目 DA3 处理回调并按需启动 stereo worker（与单目 worker 完全独立）。"""
-    global _stereo_processor
-    with _cv:
-        _stereo_processor = fn
-        _start_stereo_worker_locked()
 
 
 def get_selected_device() -> Optional[str]:
@@ -308,22 +295,6 @@ def _timing_locked(st: dict) -> dict:
     }
 
 
-def _stereo_supported_locked(st: dict):
-    """该设备是否支持双目：优先 aux_info，退回主帧 camera_info 里的
-    stereo_supported 字段；两处都没有（如手机 App）返回 None=不支持/未知。"""
-    info = st.get("aux_info")
-    if info and "stereo_supported" in info:
-        return bool(info["stereo_supported"])
-    if st["camera_info"]:
-        try:
-            v = (json.loads(st["camera_info"]) or {}).get("stereo_supported")
-            if v is not None:
-                return bool(v)
-        except (ValueError, TypeError, AttributeError):
-            pass
-    return None
-
-
 def _parse_device_id(camera_info: Optional[str]) -> str:
     """从随帧上报的 camera_info JSON 字符串里取 device_id；解析失败/缺失归 unknown 桶。"""
     if camera_info:
@@ -350,13 +321,6 @@ def _new_bucket(now: float) -> dict:
         # 外部产物（设备直传，如 Mac 端真深度点云）：字节存桶内经 /api/frame/product-model
         # 提供；ext_until 内该设备跳过 DA3 处理（产物槽位交给外部方），过期自动恢复 DA3
         "ext_model": None, "ext_until": 0.0, "ext_ver": 0,
-        # 双目辅助帧（/api/frame/aux）：左右 IR JPEG + 随帧元信息。
-        # aux_info 是解析后的 camera_info 字典（stereo_supported/baseline_mm 等）
-        "aux_left": None, "aux_right": None,
-        "aux_seq": 0, "aux_received_at": 0.0, "aux_info": None,
-        # 双目产物槽（stereo worker 写入），与单目 product 槽完全平行互不干扰
-        "stereo_product": None, "stereo_product_seq": 0,
-        "stereo_product_gen": 0, "stereo_product_error": None,
     }
 
 
@@ -393,16 +357,6 @@ def _start_worker_locked() -> None:
         return
     _worker_started = True
     threading.Thread(target=_worker_loop, daemon=True, name="frame-da3-worker").start()
-
-
-def _start_stereo_worker_locked() -> None:
-    """在持有 _cv 的前提下懒启动双目处理线程（只启动一次）。"""
-    global _stereo_worker_started
-    if _stereo_worker_started or _stereo_processor is None:
-        return
-    _stereo_worker_started = True
-    threading.Thread(target=_stereo_worker_loop, daemon=True,
-                     name="frame-stereo-worker").start()
 
 
 def _worker_loop() -> None:
@@ -450,48 +404,6 @@ def _worker_loop() -> None:
         last_key = key
 
 
-def _stereo_worker_loop() -> None:
-    """双目后台处理线程：与单目 worker 同构——始终按「当前配置」处理**选中设备**的
-    最新一对左右 IR，中间帧直接丢弃。触发键为 (设备, aux_seq, aux_received_at,
-    配置版本)。GPU 串行化在处理回调内部（与单目共用同一把 GPU 锁）。"""
-    last_key = None
-    while True:
-        with _cv:
-            while True:
-                dev = _effective_device_locked()
-                st = _devices.get(dev) if dev else None
-                if (_stereo_processor is not None and st is not None
-                        and st["aux_left"] is not None
-                        and st["aux_right"] is not None):
-                    key = (dev, st["aux_seq"], st["aux_received_at"], _config_gen)
-                    if key != last_key:
-                        break
-                _cv.wait()
-            seq, gen = st["aux_seq"], _config_gen
-            left, right = st["aux_left"], st["aux_right"]
-            info = dict(st["aux_info"] or {})
-            proc = _stereo_processor
-            config = dict(_config)
-        try:
-            product = proc(left, right, info, config, dev, seq, gen)
-            err = None
-        except Exception as e:  # 处理失败不影响原图/单目链路，仅记录到双目槽
-            product, err = None, f"{type(e).__name__}: {e}"
-        if product == DEFERRED:
-            last_key = key      # 流水线模式：构建级经 set_stereo_product 异步写回
-            continue
-        with _cv:
-            st2 = _devices.get(dev)
-            if st2 is not None:
-                st2["stereo_product"] = (product if product is not None
-                                         else st2["stereo_product"])
-                st2["stereo_product_seq"] = seq
-                st2["stereo_product_gen"] = gen
-                st2["stereo_product_error"] = err
-                _cv.notify_all()
-        last_key = key
-
-
 def set_product(device_id: str, seq: int, gen: int, product, error=None) -> None:
     """流水线构建级的异步产物写回口（线程安全）。
 
@@ -508,22 +420,6 @@ def set_product(device_id: str, seq: int, gen: int, product, error=None) -> None
         st["product_seq"] = seq
         st["product_gen"] = gen
         st["product_error"] = error
-        _cv.notify_all()
-
-
-def set_stereo_product(device_id: str, seq: int, gen: int, product, error=None) -> None:
-    """流水线构建级的双目产物异步写回口（线程安全），语义同 set_product（双目槽无
-    外部接管概念）。"""
-    with _cv:
-        st = _devices.get(device_id)
-        if st is None:
-            return
-        if seq < st["stereo_product_seq"]:
-            return
-        st["stereo_product"] = product if product is not None else st["stereo_product"]
-        st["stereo_product_seq"] = seq
-        st["stereo_product_gen"] = gen
-        st["stereo_product_error"] = error
         _cv.notify_all()
 
 
@@ -579,7 +475,7 @@ async def ingest_frame(
             st["depth_content_type"] = depth.content_type or "image/jpeg"
             st["depth_received_at"] = now
             # depth-only 先于任何 RGB 帧到达（罕见时序）：camera_info 也补上，
-            # 设备能力字段（stereo_supported 等）不留空窗
+            # 设备能力字段不留空窗
             if not data and st["camera_info"] is None:
                 st["camera_info"] = camera_info
         _prune_locked(now)
@@ -587,75 +483,6 @@ async def ingest_frame(
         _cv.notify_all()
     return JSONResponse({"ok": True, "seq": seq, "bytes": len(data or b""),
                          "received_at": now, "device": dev})
-
-
-@router.post("/api/frame/aux")
-async def ingest_aux_frame(
-    left: UploadFile = File(...),
-    right: UploadFile = File(...),
-    camera_info: Optional[str] = Form(None),
-    timestamp: Optional[str] = Form(None),
-):
-    """接收双目辅助帧（cam-pusher 与主帧同节拍推送）：左/右 IR 灰度 JPEG 成对。
-    camera_info JSON 里除 device_id 外还带 stereo_supported / baseline_mm /
-    laser_mode，解析后存 aux_info 供双目处理与面板展示。
-    （硬件深度不走本端点——伪彩深度随主帧 /api/frame 的可选 depth 字段上报。）"""
-    left_b = await left.read()
-    right_b = await right.read()
-    if not left_b or not right_b:
-        return JSONResponse({"ok": False, "error": "左右 IR 必须成对非空"},
-                            status_code=400)
-    dev = _parse_device_id(camera_info)
-    try:
-        info = dict(json.loads(camera_info) or {}) if camera_info else {}
-    except (ValueError, TypeError):
-        info = {}
-    now = time.time()
-    with _cv:
-        st = _devices.get(dev)
-        if st is None:
-            st = _devices[dev] = _new_bucket(now)
-        st["aux_seq"] += 1
-        seq = st["aux_seq"]
-        st["aux_left"], st["aux_right"] = left_b, right_b
-        st["aux_received_at"] = now
-        st["aux_info"] = info
-        _cv.notify_all()
-    return JSONResponse({"ok": True, "device": dev, "aux_seq": seq})
-
-
-@router.get("/api/frame/aux-image")
-def latest_aux_image(kind: str = Query(...), device: Optional[str] = Query(None)):
-    """返回指定设备（缺省=选中设备）最新双目辅助帧图片：kind=left|right → IR 灰度 JPEG。"""
-    if kind not in ("left", "right"):
-        return JSONResponse({"error": f"未知 kind：{kind}"}, status_code=400)
-    with _cv:
-        _dev, st = _target_device_locked(device)
-        if st is None:
-            return JSONResponse({"error": "暂无设备"}, status_code=404)
-        seq = st["aux_seq"]
-        data = st[f"aux_{kind}"]
-    if data is None:
-        return JSONResponse({"error": "暂无双目帧"}, status_code=404)
-    return Response(content=data, media_type="image/jpeg",
-                    headers={"Cache-Control": "no-store", "X-Frame-Seq": str(seq)})
-
-
-@router.get("/api/frame/latest-stereo-product")
-def latest_stereo_product(device: Optional[str] = Query(None)):
-    """返回指定设备（缺省=选中设备）最新的双目图片类产物字节。模型类产物（GLB）
-    经 /glb/<token>/scene.glb 加载，url 在 /api/frame/status 的 stereo_product_url 给出。"""
-    with _cv:
-        _dev, st = _target_device_locked(device)
-        product = st["stereo_product"] if st else None
-        seq = st["stereo_product_seq"] if st else 0
-    if not product or product.get("kind") != "image" or not product.get("bytes"):
-        return JSONResponse({"error": "暂无双目图片类产物"}, status_code=404)
-    return Response(
-        content=product["bytes"],
-        media_type=product.get("content_type", "image/jpeg"),
-        headers={"Cache-Control": "no-store", "X-Frame-Seq": str(seq)},
-    )
 
 
 @router.post("/api/frame/select")
@@ -934,16 +761,9 @@ def frame_status(device: Optional[str] = Query(None)):
                 "capture_ts_ms": None, "upload_ts_ms": None, "server_ts_ms": None,
                 "product_kind": None, "product_url": None, "product_meta": None,
                 "product_seq": 0, "product_gen": 0, "product_error": None,
-                "stereo_supported": None, "aux_seq": 0, "aux_age": None,
-                "has_aux_stereo": False, "aux_info": None,
-                "stereo_processor": _stereo_processor is not None,
-                "stereo_product_kind": None, "stereo_product_url": None,
-                "stereo_product_meta": None, "stereo_product_seq": 0,
-                "stereo_product_gen": 0, "stereo_product_error": None,
             })
         interval = (st["received_at"] - st["prev_received_at"]) if st["prev_received_at"] else 0.0
         product = st["product"] or {}
-        stereo_product = st["stereo_product"] or {}
         return JSONResponse({
             "seq": st["seq"],
             "has_frame": st["image"] is not None,
@@ -970,17 +790,4 @@ def frame_status(device: Optional[str] = Query(None)):
             "product_seq": st["product_seq"],
             "product_gen": st["product_gen"],
             "product_error": st["product_error"],
-            # 双目/辅助帧状态（六宫格用）
-            "stereo_supported": _stereo_supported_locked(st),
-            "aux_seq": st["aux_seq"],
-            "aux_age": (now - st["aux_received_at"]) if st["aux_received_at"] else None,
-            "has_aux_stereo": st["aux_left"] is not None and st["aux_right"] is not None,
-            "aux_info": st["aux_info"],
-            "stereo_processor": _stereo_processor is not None,
-            "stereo_product_kind": stereo_product.get("kind"),
-            "stereo_product_url": stereo_product.get("url"),
-            "stereo_product_meta": stereo_product.get("meta"),
-            "stereo_product_seq": st["stereo_product_seq"],
-            "stereo_product_gen": st["stereo_product_gen"],
-            "stereo_product_error": st["stereo_product_error"],
         })

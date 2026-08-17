@@ -53,10 +53,10 @@ else
   echo "==> 未装 dx-backend.service，跳过 8070（首次安装见 dx-backend.service 头部注释）"
 fi
 
-echo "==> 健康检查 http://127.0.0.1:8060/（导入 torch/gradio + 构建 Gradio app 需若干秒，轮询至多 60s）"
+echo "==> 健康检查 http://127.0.0.1:8060/experience（导入 torch 需若干秒，轮询至多 60s）"
 ok8060=0
 for i in $(seq 1 20); do
-  code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8060/ 2>/dev/null || true)
+  code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8060/experience 2>/dev/null || true)
   if [ "$code" = "200" ]; then
     echo "    8060 HTTP 200（约 $((i * 3))s 就绪）"
     ok8060=1

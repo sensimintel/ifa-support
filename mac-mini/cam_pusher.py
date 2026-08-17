@@ -4,7 +4,7 @@
 用 pyorbbecsdk 抓取 mini 上插着的 Orbbec 相机，按 8060 的入帧契约推给 5090 的
 da3-web 服务。每台相机独立成一个 device_id 桶，/panel 下拉可切换。
 
-每个推帧节拍推两路（同一个节拍 → 同设备两路 fps 天然一致）：
+每个推帧节拍推一路（RGB + 可选深度同请求）：
   1. RGB 彩色帧 → POST /api/frame（契约与手机 App 一致，8060 单目链路零改动）；
      带硬件深度的相机同请求附可选字段 depth——深度帧在 mini 端做伪彩渲染
      （默认=「默认」配置预设口径（2026-08-17 起）：radar 色表、自动分位量程、
@@ -13,23 +13,18 @@ da3-web 服务。每台相机独立成一个 device_id 桶，/panel 下拉可切
      量程/gamma/均衡/填洞/滤波/
      描边/等值线等 depth_* 键）可由服务端 per-device 配置逐项覆盖，经
      device-config 轮询热生效（约 2~4s），未下发时全走默认=历史行为；
-  2. 辅助帧    → POST /api/frame/aux（仅双目相机）：左 IR + 右 IR 灰度 JPEG，
-     camera_info 带 stereo_supported / baseline_mm / laser_mode，
-     供 8060 的双目 DA3 点云链路。
 
 另有一路按需推流（独立节拍，默认关）：
-  3. 设备点云原料 → POST /api/devpc/frame：D2C 对齐后的原始 uint16 深度（PNG
+  2. 设备点云原料 → POST /api/devpc/frame：D2C 对齐后的原始 uint16 深度（PNG
      无损、按 stride 降采样）+ 同帧 RGB JPEG + 彩色内参。仅当 /experience 选中
      「设备点云」来源（服务端 devices[].pc_want 亮起，10s TTL 按需续期）才推，
      供 8060 反投影成硬件真深度彩色点云 GLB；不推时链路零带宽开销。
 
 要点：
   · 帧全部来自同一 pipeline 的同一 frameset，硬件同步，无配对逻辑；
-  · G335 激光策略（LASER_MODE）：喂 DA3 的双目 IR 要"无散斑"，硬件深度要"有散斑"，
-    两者冲突。interleave 模式用 OB_PROP_LASER_ON_OFF_PATTERN_INT 让投射器逐帧
-    交替开关，按帧元数据 LASER_STATUS 分拣：无光帧取 IR、有光帧取深度；
-    该属性设置失败则自动退回 on（散斑 IR 直喂 DA3。2026-08-13 实测 1.3.2 + G335
-    固件不支持该属性，实际运行即此退路）；
+  · G335 激光策略（LASER_MODE）：硬件深度要"有散斑"，默认 on（投射器常开）。
+    交替开关的 interleave 模式是当年喂双目 DA3 的无散斑 IR 才需要的——双目链
+    2026-08-17 已下线，仍保留该模式与 LASER_STATUS 分拣做能力样本，但不再是默认；
   · 任一辅助流开不出来只降级该流（日志告警），RGB 主链路永不受影响；
   · G335 彩色流原生 MJPG（即 JPEG 字节），直接透传不转码；其他格式用 cv2 转 JPEG；
   · 相机线程各自独立：断线/异常自动重连重开，互不影响；
@@ -40,7 +35,7 @@ da3-web 服务。每台相机独立成一个 device_id 桶，/panel 下拉可切
   RELAY_URL     推帧目标，默认 http://192.168.0.50:8060
   PUSH_FPS      推帧频率兜底值，默认 3——仅在拿不到服务端配置时生效
   JPEG_QUALITY  非 MJPG 相机转码 JPEG 质量，默认 80
-  LASER_MODE    G335 激光策略 interleave|on|off，默认 interleave（失败自动退 on）
+  LASER_MODE    G335 激光策略 on|interleave|off，默认 on（投射器常开）
   DEPTH_MIN_M / DEPTH_MAX_M  深度伪彩固定量程（米），默认 0.05~1.4
 
 推帧频率的权威来源是 8060 服务端配置，**按设备分桶、两台相机各调各的**：
@@ -60,13 +55,13 @@ import cv2
 import numpy as np
 import requests
 from pyorbbecsdk import (AlignFilter, Config, Context, OBFormat,
-                         OBFrameMetadataType, OBFrameType, OBPropertyID,
+                         OBFrameMetadataType, OBPropertyID,
                          OBSensorType, OBStreamType, Pipeline)
 
 RELAY_URL = os.environ.get("RELAY_URL", "http://192.168.0.50:8060").rstrip("/")
 PUSH_FPS = float(os.environ.get("PUSH_FPS", "3"))
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
-LASER_MODE = os.environ.get("LASER_MODE", "interleave").strip().lower()
+LASER_MODE = os.environ.get("LASER_MODE", "on").strip().lower()
 # 硬件深度图伪彩的固定量程（米）：固定而非逐帧 min/max 自适应——展台上手/物进出画面
 # 时整图颜色才不会跳变闪烁。默认 0.05~1.4m（「默认」配置预设口径），按展台纵深经 .env 调整。
 DEPTH_MIN_M = float(os.environ.get("DEPTH_MIN_M", "0.05"))
@@ -74,11 +69,10 @@ DEPTH_MAX_M = float(os.environ.get("DEPTH_MAX_M", "1.4"))
 
 # 已知相机 PID → 能力描述（新相机接入时补这张表即可）
 #   tag                 device_id 尾缀（macmini-<tag>）
-#   stereo              是否有双目 IR（决定是否推 /api/frame/aux）
-#   nominal_baseline_mm SDK 读不到基线时的规格兜底值
+#   laser               是否有可控激光投射器（决定要不要 _setup_laser）
 KNOWN_CAMERAS = {
-    0x0800: {"tag": "g335", "stereo": True, "nominal_baseline_mm": 50.0},   # Orbbec Gemini 335
-    0x060F: {"tag": "astra", "stereo": False, "nominal_baseline_mm": None},  # Astra Pro Plus
+    0x0800: {"tag": "g335", "laser": True},    # Orbbec Gemini 335
+    0x060F: {"tag": "astra", "laser": False},  # Astra Pro Plus
 }
 
 logging.basicConfig(level=logging.INFO,
@@ -524,25 +518,6 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     return jpeg.tobytes()
 
 
-def _ir_to_gray(frame) -> np.ndarray:
-    """IR 帧 → uint8 灰度矩阵。G335 左右 IR 默认 Y8；Y16 高位截取兼容。"""
-    fmt = frame.get_format()
-    w, h = frame.get_width(), frame.get_height()
-    if fmt == OBFormat.Y8:
-        return np.asarray(frame.get_data(), dtype=np.uint8).reshape(h, w)
-    if fmt == OBFormat.Y16:
-        raw = np.frombuffer(bytes(frame.get_data()), dtype=np.uint16).reshape(h, w)
-        return (raw >> 8).astype(np.uint8)
-    raise ValueError(f"暂不支持的 IR 格式: {fmt}")
-
-
-def _gray_to_jpeg(gray: np.ndarray) -> bytes:
-    ok, jpeg = cv2.imencode(".jpg", gray, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    if not ok:
-        raise ValueError("IR JPEG 编码失败")
-    return jpeg.tobytes()
-
-
 def _laser_status(frame):
     """帧元数据里的激光状态：1=有散斑 0=无散斑 None=读不到（固件/绑定不支持）。"""
     try:
@@ -580,22 +555,8 @@ def _setup_laser(dev, device_id: str) -> str:
         return mode
 
 
-def _read_baseline_mm(dev, spec) -> float:
-    """从 SDK 标定读双目基线（毫米）；读不到用规格兜底值。"""
-    try:
-        b = dev.get_baseline()
-        for attr in ("baseline", "get_baseline"):
-            v = getattr(b, attr, None)
-            v = v() if callable(v) else v
-            if v:
-                return abs(float(v))
-    except Exception:
-        pass
-    return spec.get("nominal_baseline_mm")
-
-
 def _open_pipeline(dev, spec, device_id: str):
-    """开流：彩色必开；深度尽力开；stereo 相机加开左右 IR。
+    """开流：彩色必开；深度尽力开。
 
     显式取 default profile——简写 enable_stream(sensor) 在 1.3.2 绑定上会段错误，
     勿改回。辅助流开不出来只降级该流并告警，彩色主链路不受影响。
@@ -607,9 +568,6 @@ def _open_pipeline(dev, spec, device_id: str):
     cfg.enable_stream(profiles.get_default_video_stream_profile())
     enabled = {"color"}
     wanted = [("depth", OBSensorType.DEPTH_SENSOR)]
-    if spec["stereo"]:
-        wanted = [("left", OBSensorType.LEFT_IR_SENSOR),
-                  ("right", OBSensorType.RIGHT_IR_SENSOR)] + wanted
     for name, sensor in wanted:
         try:
             pl = pipe.get_stream_profile_list(sensor)
@@ -623,64 +581,6 @@ def _open_pipeline(dev, spec, device_id: str):
     except Exception as e:
         log.warning("[%s] frame_sync 开启失败（不影响推帧）: %s", device_id, e)
     return pipe, enabled
-
-
-def _get_typed_frame(fs, frame_type):
-    """从 frameset 取指定类型帧并转 video frame；无则返回 None。"""
-    try:
-        f = fs.get_frame(frame_type)
-        return f.as_video_frame() if f is not None else None
-    except Exception:
-        return None
-
-
-class _IRCache:
-    """双目 IR 滚动缓存：留最新的"干净 IR 对"，推送节拍取用编码。
-
-    interleave 模式下无光帧才可用（按 LASER_STATUS 分拣），与深度帧交替出现，必须
-    缓存；on/off 模式退化为"总是最新帧"。元数据读不到时不做分拣（None 视同可用）。"""
-
-    def __init__(self):
-        self.left = None      # (uint8 灰度矩阵, 单调时间)
-        self.right = None
-
-    def offer(self, left_f, right_f, laser_mode: str):
-        if left_f is None or right_f is None:
-            return
-        if laser_mode == "interleave" and _laser_status(left_f) == 1:
-            return               # 有散斑的 IR 不喂 DA3
-        now = time.time()
-        self.left = (_ir_to_gray(left_f), now)
-        self.right = (_ir_to_gray(right_f), now)
-
-    def snapshot(self, max_age: float):
-        """取当前可用的 IR 对（超龄的丢弃，防拔线后推陈旧帧）。"""
-        now = time.time()
-        if self.left and self.right and now - self.left[1] <= max_age:
-            return self.left[0], self.right[0]
-        return None, None
-
-
-def _push_aux(session, device_id: str, spec, cache: _IRCache,
-              baseline_mm, laser_mode: str, now: float) -> bool:
-    """推双目辅助帧到 /api/frame/aux。当前没有可用 IR 对时跳过（返回 False）。"""
-    # 超龄阈值 = 3 个推帧周期：既容忍 interleave 半率出帧，又不至于推太陈旧的帧
-    left, right = cache.snapshot(max_age=3 * get_push_interval(device_id))
-    if left is None or right is None:
-        return False
-    info = {"device_id": device_id, "source": "mac-mini",
-            "stereo_supported": True, "laser_mode": laser_mode}
-    if baseline_mm:
-        info["baseline_mm"] = float(baseline_mm)
-    resp = session.post(
-        f"{RELAY_URL}/api/frame/aux",
-        files={"left": ("left.jpg", _gray_to_jpeg(left), "image/jpeg"),
-               "right": ("right.jpg", _gray_to_jpeg(right), "image/jpeg")},
-        data={"camera_info": json.dumps(info), "timestamp": str(int(now * 1000))},
-        timeout=(3.05, 8),
-    )
-    resp.raise_for_status()
-    return True
 
 
 def _open_pc_context(pipe, streams, device_id: str):
@@ -749,7 +649,7 @@ def _push_devpc(session, device_id: str, pc_ctx: dict, fs, cf, pcc: dict,
 
 
 def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
-    """单相机工作线程：开流 → 节流推帧（RGB+深度 / 双目 aux）→ 出错重连，直到
+    """单相机工作线程：开流 → 节流推帧（RGB+深度，按需加设备点云）→ 出错重连，直到
     进程退出或本线程代数被 watchdog 废弃（gen 落后即静默退出，由新代接管）。"""
     ctx = None
     session = requests.Session()
@@ -765,11 +665,10 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                 if dev is None:
                     raise RuntimeError("设备未找到（未插 / 被占用 / 尚未就绪）")
                 pipe, streams = _open_pipeline(dev, spec, device_id)
-                laser_mode = _setup_laser(dev, device_id) if spec["stereo"] else "off"
-                baseline_mm = _read_baseline_mm(dev, spec) if spec["stereo"] else None
+                laser_mode = _setup_laser(dev, device_id) if spec["laser"] else "off"
                 # 设备点云上下文（D2C 对齐 + 彩色内参）：拿不到只关本路，不影响其余链路
                 pc_ctx = _open_pc_context(pipe, streams, device_id)
-            log.info("[%s] 已启动，流=%s 基线=%s", device_id, sorted(streams), baseline_mm)
+            log.info("[%s] 已启动，流=%s", device_id, sorted(streams))
             conn_err = 0
             # 开流成功即报活并登记 pipe（watchdog 强拆用）；给出帧留满一个自检窗口
             _watch_touch(device_id, gen, pipe=pipe)
@@ -780,9 +679,7 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
             depth_err = 0
             laser_seen_meta = False   # 本次连接内是否成功读到过 LASER_STATUS 元数据
             laser_skip = 0            # 垃圾深度帧（无光/元数据缺失）整帧跳过累计
-            aux_err_logged = False
             last_push = 0.0
-            cache = _IRCache()
             # 深度渲染线程私有状态（EMA 上一帧 / 上次深度推送时刻），重连即重置
             depth_state: dict = {}
             # 设备点云线程私有状态（上次推送时刻），重连即重置
@@ -802,23 +699,11 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                 last_fs = time.time()
                 _watch_touch(device_id, gen, frame=True)
                 cf = fs.get_color_frame()
-                # 双目 IR 每个 frameset 都收进缓存（interleave 下 IR/深度交替出现，
-                # 只在推送节拍看当前帧组会漏掉一半帧源）
-                if "left" in streams and "right" in streams:
-                    try:
-                        cache.offer(_get_typed_frame(fs, OBFrameType.LEFT_IR_FRAME),
-                                    _get_typed_frame(fs, OBFrameType.RIGHT_IR_FRAME),
-                                    laser_mode)
-                    except Exception as e:
-                        if not aux_err_logged:
-                            log.warning("[%s] 双目帧提取异常（只降级不中断）: %s",
-                                        device_id, e)
-                            aux_err_logged = True
                 if cf is None:
                     # 看门狗盲区自检：帧组持续到达但一直没有彩色帧（如开流时
-                    # uvc_stream_open_ctrl 失败、深度/IR 仍在流动——帧组会把
+                    # uvc_stream_open_ctrl 失败、深度仍在流动——帧组会把
                     # 两级看门狗全喂活，线程却什么都不推、什么都不报）。彩色流
-                    # 属于预期流时超时即重建管线（interleave 偶发缺帧不受影响）
+                    # 属于预期流时超时即重建管线
                     if "color" in streams and time.time() - last_cf >= FRAME_STALL_S:
                         raise RuntimeError(
                             f"连续 {FRAME_STALL_S:.0f} 秒帧组无彩色帧"
@@ -860,7 +745,7 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                 # 激光门控结论对伪彩深度与设备点云两路共用：interleave 下只认
                 # 明确有散斑（LASER_STATUS==1）的深度帧
                 laser_ok = df is not None
-                if laser_ok and spec["stereo"] and laser_mode == "interleave":
+                if laser_ok and laser_mode == "interleave":
                     ls = _laser_status(df)
                     if ls >= 0:
                         laser_seen_meta = True
@@ -916,21 +801,12 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                         files=files,
                         data={
                             "camera_info": json.dumps(
-                                {"device_id": device_id, "source": "mac-mini",
-                                 "stereo_supported": bool(spec["stereo"])}),
+                                {"device_id": device_id, "source": "mac-mini"}),
                             "timestamp": str(int(now * 1000)),
                         },
                         timeout=(3.05, 5),
                     )
                     resp.raise_for_status()
-                    # 双目 aux 跟着 RGB 主帧同一节拍推：失败只告警，不影响主链路
-                    if rgb_due and spec["stereo"]:
-                        try:
-                            _push_aux(session, device_id, spec, cache,
-                                      baseline_mm, laser_mode, now)
-                        except Exception as e:
-                            log.warning("[%s] aux 推送失败（主链路不受影响）: %s",
-                                        device_id, e)
                     if push_err:
                         log.info("[%s] 推帧恢复正常", device_id)
                         push_err = 0

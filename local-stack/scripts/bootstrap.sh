@@ -70,6 +70,22 @@ else
 fi
 . config/secrets.env
 
+# 刷新令牌幂等恢复的两把密钥：单独补齐，让已有 secrets.env 的老部署也能升级上来
+# （缺任一项，带 Idempotency-Key 的刷新会一律 503）。同样只生成一次——轮换会让
+# 存量 recovery 记录失效，旧密钥至少要保留一个 recovery TTL。
+if [ -z "$REFRESH_RECOVERY_KEY_B64" ] || [ -z "$REFRESH_RECOVERY_DIGEST_KEY" ]; then
+  REFRESH_RECOVERY_KEY_ID="${REFRESH_RECOVERY_KEY_ID:-rr-$(hostname)-$(date +%Y%m%d)}"
+  REFRESH_RECOVERY_KEY_B64=$(openssl rand -base64 32)
+  REFRESH_RECOVERY_DIGEST_KEY=$(openssl rand -base64 32)
+  {
+    echo "REFRESH_RECOVERY_KEY_ID=$REFRESH_RECOVERY_KEY_ID"
+    echo "REFRESH_RECOVERY_KEY_B64=$REFRESH_RECOVERY_KEY_B64"
+    echo "REFRESH_RECOVERY_DIGEST_KEY=$REFRESH_RECOVERY_DIGEST_KEY"
+  } >> config/secrets.env
+  chmod 600 config/secrets.env
+  echo "  已补齐 refresh recovery 密钥（key_id=$REFRESH_RECOVERY_KEY_ID）"
+fi
+
 echo "== 4/7 按 LLM_MODE 渲染运行配置"
 if [ "$LLM_MODE" = "real" ]; then
   LLM_BASE_URL="http://llm-tunnel:28000/v1"
@@ -106,6 +122,9 @@ sed -e "s|__PASSWORD_KEY_B64__|$PASSWORD_KEY_B64|" \
     -e "s|__MEAL_MODEL__|$MEAL_MODEL|" \
     -e "s|__CHUNK_MODEL__|$CHUNK_MODEL|" \
     -e "s|__CHUNK_INHOUSE_ENABLED__|$CHUNK_INHOUSE_ENABLED|" \
+    -e "s|__REFRESH_RECOVERY_KEY_ID__|$REFRESH_RECOVERY_KEY_ID|g" \
+    -e "s|__REFRESH_RECOVERY_KEY_B64__|$REFRESH_RECOVERY_KEY_B64|" \
+    -e "s|__REFRESH_RECOVERY_DIGEST_KEY__|$REFRESH_RECOVERY_DIGEST_KEY|" \
     config/runtime-config.template.yaml > config/runtime-config.yaml
 chmod 600 config/runtime-config.yaml
 sed -e "s|__STACK_ID__|$STACK_ID|" \
