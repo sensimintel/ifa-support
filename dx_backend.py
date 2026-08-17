@@ -523,14 +523,13 @@ def api_necklace_frame(device: str = ""):
                     headers={"Cache-Control": "no-store", "X-Frame-Seq": seq})
 
 
-def _ifa_meal_state_request(method, device_id, body=None):
-    """调 services 的 ifa 演示状态机端点，统一补 service token 与错误封装。
+def _ifa_services_request(method, path, body=None):
+    """调 services 的 ifa 端点（演示状态机/餐段），统一补 service token 与错误封装。
 
     返回 (payload, status)：payload 是 services 响应 data 段（或错误说明），
     status 是要透传给控制面的 HTTP 状态码。services 不可达按 502 报出。
     """
-    url = "%s/api/v1/ifa/devices/%s/meal-state" % (
-        IFA_SERVICES_BASE_URL, urllib.parse.quote(device_id))
+    url = IFA_SERVICES_BASE_URL + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers={
         "X-Odyss-Service-Token": IFA_DEMO_CONTROL_TOKEN,
@@ -556,7 +555,8 @@ def api_necklace_meal_state_get(device_id: str):
     device_id = (device_id or "").strip()
     if not device_id:
         return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
-    data, status = _ifa_meal_state_request("GET", device_id)
+    data, status = _ifa_services_request(
+        "GET", "/api/v1/ifa/devices/%s/meal-state" % urllib.parse.quote(device_id))
     ok = status < 400
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
 
@@ -570,9 +570,37 @@ def api_necklace_meal_state_set(device_id: str, body: dict = Body(...)):
     state = str((body or {}).get("state") or "").strip()
     if not state:
         return JSONResponse({"ok": False, "error": "需要 state"}, status_code=400)
-    data, status = _ifa_meal_state_request("PUT", device_id, {"state": state})
+    data, status = _ifa_services_request(
+        "PUT", "/api/v1/ifa/devices/%s/meal-state" % urllib.parse.quote(device_id), {"state": state})
     ok = status < 400
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
+@app.get("/api/necklaces/{device_id}/meal-segments")
+def api_necklace_meal_segments(device_id: str, limit: int = 10):
+    """列出某条项链最近的演示餐段（meal 分析链的取帧时间窗）。"""
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    data, status = _ifa_services_request(
+        "GET", "/api/v1/ifa/devices/%s/meal-segments?limit=%d" % (urllib.parse.quote(device_id), limit))
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
+@app.post("/api/necklaces/{device_id}/meal-segments/{segment_id}/analyze")
+def api_necklace_meal_segment_analyze(device_id: str, segment_id: str):
+    """手动触发某段餐段的整餐分析（segment_id 可为 latest）。受理即返回，
+    分析在 services 后台执行，结果落 meal fact。"""
+    device_id = (device_id or "").strip()
+    segment_id = (segment_id or "latest").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    data, status = _ifa_services_request(
+        "POST", "/api/v1/ifa/devices/%s/meal-segments/%s/analyze" % (
+            urllib.parse.quote(device_id), urllib.parse.quote(segment_id)))
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 202)
 
 
 @app.get("/api/pairing-log")
