@@ -2429,12 +2429,8 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <div id="tools">
  <select id="selDev" style="display:none" title="选择设备"></select>
  <select id="selStyle">
-  <option value="hl">高亮点云</option>
-  <option value="stereo" title="仅 G335 等双目相机支持">双目高亮点云</option>
   <option value="devdepth" title="仅 G335 等带硬件深度的相机支持">设备深度图</option>
   <option value="devpc" title="硬件真深度反投影彩色点云，仅 G335 等带硬件深度的相机支持">设备点云</option>
-  <option value="la">单目点云</option>
-  <option value="s3">SAM3点云</option>
  </select>
  <button id="btnHlCfg">调节</button>
  <button id="btnTl">流水</button>
@@ -2684,23 +2680,6 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   「点渲染」区。即时生效、只存本浏览器。</div>
  </div>
  <div id="hlonly">
- <div class="sec">高亮样式（只作用于高亮点云）</div>
- <div class="seg" id="hlseg">
-  <button data-s="tint" class="on">染色</button>
-  <button data-s="solid">纯色</button>
-  <button data-s="glow">提亮</button>
-  <button data-s="outline">描边</button>
- </div>
- <div class="fld"><label>高亮强度 <b id="v_strength">65</b>%</label>
-  <input type="range" id="r_strength" min="10" max="100" step="5" value="65"></div>
- <div class="fld"><label>背景压暗 <b id="v_dim">40</b>%</label>
-  <input type="range" id="r_dim" min="0" max="90" step="5" value="40"></div>
- <div class="fld"><label>点颜色</label>
-  <div class="radios">
-   <label><input type="radio" name="hlcm" value="auto" checked> 按词自动</label>
-   <label><input type="radio" name="hlcm" value="custom"> 自选</label>
-   <input type="color" id="hlcolor" value="#ff9f0a">
-  </div></div>
  <div class="sec">点云整体样式</div>
  <div class="fld"><label>俯视角 <b id="v_view_tilt">0</b>°</label>
   <input type="range" id="r_view_tilt" min="0" max="45" step="1" value="0"></div>
@@ -2710,16 +2689,6 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <input type="range" id="r_eye_lift" min="0" max="0.5" step="0.05" value="0"></div>
  <div class="fld"><label>附加后撤 ×<b id="v_eye_back">0.00</b></label>
   <input type="range" id="r_eye_back" min="0" max="0.5" step="0.05" value="0"></div>
- <div class="fld"><label>饱和度 ×<b id="v_sat">1.0</b></label>
-  <input type="range" id="r_sat" min="0" max="2" step="0.1" value="1"></div>
- <div class="fld"><label>明度 ×<b id="v_val">1.0</b></label>
-  <input type="range" id="r_val" min="0.2" max="1.6" step="0.1" value="1"></div>
- <div class="fld"><label>置信度裁剪分位 <b id="v_conf">40</b>%</label>
-  <input type="range" id="r_conf" min="0" max="90" step="5" value="40"></div>
- <div class="fld"><label>底色色相（烘焙） <b id="v_hue">0</b>°</label>
-  <input type="range" id="r_hue" min="-180" max="180" step="5" value="0"></div>
- <div class="fld"><label>离群裁剪 MAD×<b id="v_outlier_mad">12.0</b></label>
-  <input type="range" id="r_outlier_mad" min="2" max="20" step="0.5" value="12"></div>
  <div class="sec">点渲染 · 形态（实时）</div>
  <div class="fld"><label>点大小 <b id="v_pt_size">1.0</b></label>
   <input type="range" id="r_pt_size" min="0.5" max="12" step="0.5" value="1"></div>
@@ -2828,9 +2797,11 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 const $=id=>document.getElementById(id);
 const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无后端时目检布局用
 
-// ══ 背景层：六种来源下拉框选择（临时工具），默认设备深度图（g335 硬件深度伪彩）══
+// ══ 背景层：两种来源下拉框选择（临时工具），默认设备深度图（g335 硬件深度伪彩）══
+// 只保留硬件深度的两条：伪彩深度帧(mini 端渲染)与真深度反投影彩色点云(devpc)；
+// DA3/SAM3 派生的四种点云来源(高亮/双目高亮/单目/SAM3)已随去冗余下线
 let bgSource=localStorage.getItem('exp_bg')||'devdepth';
-if(!['hl','stereo','la','s3','devdepth','devpc'].includes(bgSource))bgSource='devdepth';   // 旧版存过 raw 等的自动回落默认
+if(!['devdepth','devpc'].includes(bgSource))bgSource='devdepth';   // 旧版存过 hl/stereo/la/s3/raw 的自动回落默认
 const MIN_SWAP_MS=0;               // 换图节流已停用（同 /panel，2026-08-13）；"加载中不打断"守卫仍在
 let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
 
@@ -2887,7 +2858,7 @@ function showModel(url,fov){          // GLB 产物：双缓冲——back 实例
 const DEF_VIEW={view_tilt:0,view_zoom:1.0,eye_lift:0,eye_back:0};  // 拍摄视角零offset
 function applyExpView(mvEl){const mv=mvEl||mvFront();
   try{const c=mv.getBoundingBoxCenter();const cz=(c.z<-0.001)?c.z:-1.5;
-    const v=(bgSource==='hl'||bgSource==='stereo')?hlView:DEF_VIEW;
+    const v=DEF_VIEW;   // 来源只剩硬件深度两条，不再有 hl/stereo 的专用视角
     const t=v.view_tilt*Math.PI/180;
     const dy=v.view_zoom*Math.sin(t)+v.eye_lift, dz=v.view_zoom*Math.cos(t)+v.eye_back;
     mv.cameraTarget='0m 0m '+cz.toFixed(4)+'m';
@@ -3766,41 +3737,13 @@ async function bgTick(){
   }
   // 本页任何情况都不展示设备原图：所选来源暂无产物（服务重启/切设备/首轮构建中）时
   // 保持黑场，等第一份点云产物就绪再上画
-  // 双目来源仅双目设备（G335）可用：选中设备不支持时禁用选项置灰；已选双目时保持黑场
-  const stOpt=$('selStyle').querySelector('option[value=stereo]');
-  if(stOpt)stOpt.disabled=s.stereo_supported!==true;
   // 设备深度图/设备点云来源仅带硬件深度的相机（G335 等）可用：无深度能力的设备置灰
   const ddOpt=$('selStyle').querySelector('option[value=devdepth]');
   if(ddOpt)ddOpt.disabled=s.has_depth!==true;
   const pcOpt=$('selStyle').querySelector('option[value=devpc]');
   if(pcOpt)pcOpt.disabled=s.has_depth!==true;
   renderDdCfg(s);
-  if(bgSource==='la'){
-    if(s.product_kind==='image')showImg('/api/frame/latest-product?t='+s.product_seq,'la:'+s.product_seq);
-    else if(s.product_kind==='model'&&s.product_url)showModel(s.product_url,s.product_meta&&s.product_meta.fov_deg);
-  }else if(bgSource==='stereo'){
-    if(s.stereo_supported===true){
-      const sh=await(await fetch('/api/stereohl/status',{cache:'no-store'})).json();
-      // device 比对：切设备后旧设备的双目 GLB 不上画（保持黑场等新产物）
-      if(sh.url&&sh.device===s.selected)showModel(sh.url,sh.meta&&sh.meta.fov_deg);
-    }else{
-      // 不支持双目的设备：主动清掉上一台设备残留的双目 GLB（该设备永远不会有新
-      // 双目产物顶掉旧画面），回到黑场
-      hideModelLayer();
-      $('bgA').classList.remove('on');$('bgB').classList.remove('on');
-    }
-  }else if(bgSource==='devdepth'){
-    // 设备深度图（仅 G335 等带硬件深度的相机）：直接展示 mini 端伪彩深度帧。
-    // 深度是相机产物不是设备 RGB 原图，不违反「本页不展示设备原图」的产品红线
-    if(s.has_depth&&s.depth_seq){
-      showImg('/api/frame/latest-depth?device='+encodeURIComponent(s.device||'')
-        +'&t='+s.depth_seq,'dd:'+s.depth_seq);
-    }else{
-      // 无深度能力/深度未就绪：清残留画面回黑场（同双目来源的降级语义）
-      hideModelLayer();
-      $('bgA').classList.remove('on');$('bgB').classList.remove('on');
-    }
-  }else if(bgSource==='devpc'){
+  if(bgSource==='devpc'){
     // 设备点云（硬件真深度反投影彩色点云 GLB）：轮询即点播——status 请求按 10s TTL
     // 续期服务端 demand，推流端 ~2-4s 内开始推原料、切走后自动停推
     if(s.has_depth){
@@ -3809,18 +3752,21 @@ async function bgTick(){
       // device 比对：切设备后旧设备的点云 GLB 不上画（保持黑场等新产物）
       if(pc.url&&pc.device===s.device)showModel(pc.url,pc.meta&&pc.meta.fov_deg);
     }else{
-      // 无硬件深度能力的设备：清残留画面回黑场（同双目来源的降级语义）
+      // 无硬件深度能力的设备：清残留画面回黑场
       hideModelLayer();
       $('bgA').classList.remove('on');$('bgB').classList.remove('on');
     }
-  }else if(bgSource==='s3'){
-    const s3=await(await fetch('/api/sam3cloud/status',{cache:'no-store'})).json();
-    if(s3.kind==='image'&&s3.seq)showImg('/api/sam3cloud/latest?t='+s3.seq,'s3:'+s3.seq);
-    else if(s3.kind==='model'&&s3.url)showModel(s3.url,null);
   }else{
-    const hl=await(await fetch('/api/sam3hl/status',{cache:'no-store'})).json();
-    if(hl.kind==='model'&&hl.url)showModel(hl.url,null);   // 高亮 GLB：与③同管线直渲
-    else if(hl.kind==='image'&&hl.seq&&hl.meta)showImg('/api/sam3hl/latest?t='+hl.seq,'hl:'+hl.seq);
+    // 设备深度图（默认来源，仅 G335 等带硬件深度的相机）：直接展示 mini 端伪彩深度帧。
+    // 深度是相机产物不是设备 RGB 原图，不违反「本页不展示设备原图」的产品红线
+    if(s.has_depth&&s.depth_seq){
+      showImg('/api/frame/latest-depth?device='+encodeURIComponent(s.device||'')
+        +'&t='+s.depth_seq,'dd:'+s.depth_seq);
+    }else{
+      // 无深度能力/深度未就绪：清残留画面回黑场
+      hideModelLayer();
+      $('bgA').classList.remove('on');$('bgB').classList.remove('on');
+    }
   }
   // 流水小窗：镜像当前背景画面——图片背景直接复用 url；GLB 背景截取 model-viewer
   // 画布（toDataURL）做镜像（不受流水态压暗影响）。GLB 换模加载中（loaded=false）
@@ -3953,13 +3899,12 @@ function applyRecog(r){
 // ══ 右下临时工具：来源下拉框 + 高亮调节抽屉开关 + 流水视图开关 ══
 function syncStyleUI(){
   $('selStyle').value=bgSource;
-  // 抽屉常驻可开（帧率区对所有来源有意义）；高亮样式区在高亮/双目高亮两个来源展示
-  // （双目高亮 GLB 读同一份 /api/sam3hl/config，全部滑杆同样生效）；
-  // 设备深度图调节区仅该来源展示
-  $('hlonly').style.display=(bgSource==='hl'||bgSource==='stereo')?'':'none';
+  // 抽屉常驻可开（帧率/识别触发区对所有来源有意义）；点渲染区仅 GLB 类来源（设备点云）
+  // 展示；设备深度图调节区仅该来源展示
+  $('hlonly').style.display=(bgSource==='devpc')?'':'none';
   $('ddonly').style.display=(bgSource==='devdepth')?'':'none';
-  // 点云化样式区对可能出图片类背景的来源展示（stereo/devpc 恒为 GLB 不列）
-  $('dotonly').style.display=(bgSource!=='stereo'&&bgSource!=='devpc')?'':'none';
+  // 点云化样式区只对图片类背景（设备深度图）有意义（devpc 恒为 GLB 不列）
+  $('dotonly').style.display=(bgSource!=='devpc')?'':'none';
   applyDdCss();   // 切来源即时挂上/摘掉深度显示的 CSS（其它来源不受深度显示参数影响）
   applyDotCfg();  // 点云化样式层随来源重估显隐（GLB 来源不遮挡）
   // 调节作用域收敛：图片类来源下停掉 GLB 侧一切动效——脉冲/闪烁 timer（applyPtStyle
@@ -3971,7 +3916,7 @@ $('selStyle').onchange=()=>{
   bgSource=$('selStyle').value;
   localStorage.setItem('exp_bg',bgSource);
   lastBgKey='';lastMvUrl='';   // 立刻允许下一轮加载新来源
-  applyExpView();              // hl↔其它来源视角参数不同：切换即按新来源重摆相机
+  applyExpView();              // 切来源后按当前来源重摆相机
   syncStyleUI();bgTick();
 };
 $('btnTl').onclick=()=>{
@@ -4019,17 +3964,18 @@ $('btnFs').onclick=()=>{
   document.addEventListener(ev,()=>{$('btnFs').textContent=fsOn()?'退出全屏':'全屏';}));
 syncStyleUI();
 
-// ══ 高亮点云样式调节抽屉：读写 /api/sam3hl/config（与 /panel 的「高亮样式调节」同一套配置） ══
-// 打开时从服务端读当前配置回填（不主动推初值，避免覆盖 /panel 已调好的参数），改动才下发
-// strength/dim/sat/val/conf 走服务端写进 GLB；view_* 四项是前端相机参数（拖动立即生效），
-// pt_* 三项是前端点材质参数（拖动立即生效），均存进服务端配置做持久化/与 /panel 互通。
-const HL_KEYS=['strength','dim','view_tilt','view_zoom','eye_lift','eye_back','sat','val','conf',
-  'hue','outlier_mad','pt_size','pt_opacity','pt_density','pt_hue','pt_sat','pt_val',
+// ══ 点云样式调节抽屉：读写 /api/sam3hl/config（与 /panel 的点渲染卡同一套配置） ══
+// 打开时从服务端读当前配置回填（不主动推初值，避免覆盖 /panel 已调好的参数），改动才下发。
+// 本页只保留「前端实时生效」的两类：view_* 相机参数、pt_* 点材质参数——它们对当前唯一的
+// GLB 背景（设备点云）有效。服务端烘焙类（strength/dim/sat/val/conf/hue/outlier_mad）随
+// DA3 派生点云来源一起从本页下线，配置本身仍在，/panel 那张卡照旧可调。
+const HL_KEYS=['view_tilt','view_zoom','eye_lift','eye_back',
+  'pt_size','pt_opacity','pt_density','pt_hue','pt_sat','pt_val',
   'pt_contrast','pt_exposure','pt_ramp_near','pt_ramp_far','pt_fog',
   'pt_clip_near','pt_clip_far','pt_clip_ylo','pt_clip_yhi',
   'pt_rotate_speed','pt_fov_off','pt_pulse_speed','pt_sparkle','pt_conf_size','pt_conf_alpha'];
 const _f1=v=>(+v).toFixed(1),_f2=v=>(+v).toFixed(2);
-const HL_FMT={view_zoom:_f2,eye_lift:_f2,eye_back:_f2,sat:_f1,val:_f1,outlier_mad:_f1,
+const HL_FMT={view_zoom:_f2,eye_lift:_f2,eye_back:_f2,
   pt_size:_f1,pt_opacity:_f2,pt_sat:_f1,pt_val:_f1,pt_contrast:_f2,pt_exposure:_f2,
   pt_ramp_near:_f1,pt_ramp_far:_f1,pt_fog:_f2,pt_clip_near:_f1,pt_clip_far:_f1,
   pt_clip_ylo:_f2,pt_clip_yhi:_f2,pt_pulse_speed:_f1,pt_sparkle:_f2,
@@ -4040,13 +3986,12 @@ const PT_RADIOS={ptshape:'pt_shape',ptatten:'pt_atten',ptblend:'pt_blend',
 const PT_COLORS={c_pt_duo_a:'pt_duo_a',c_pt_duo_b:'pt_duo_b',c_pt_bg:'pt_bg'};
 const VIEW_KEYS=['view_tilt','view_zoom','eye_lift','eye_back'];
 let hlView={view_tilt:0,view_zoom:1.0,eye_lift:0,eye_back:0};  // 拍摄视角零offset（服务端配置可调）
-let hlStyle='tint',hlPushTimer=null;
+let hlPushTimer=null;
 function hlLabel(k){$('v_'+k).textContent=(HL_FMT[k]||(v=>v))($('r_'+k).value);}
 function pushHlCfg(){
   clearTimeout(hlPushTimer);
   hlPushTimer=setTimeout(()=>{
-    const body={style:hlStyle,color:$('hlcolor').value,
-      color_mode:document.querySelector('input[name=hlcm]:checked').value};
+    const body={};
     HL_KEYS.forEach(k=>body[k]=+$('r_'+k).value);
     Object.keys(PT_RADIOS).forEach(nm=>
       body[PT_RADIOS[nm]]=+document.querySelector('input[name='+nm+']:checked').value);
@@ -4059,8 +4004,6 @@ async function loadHlCfg(){
   try{
     const st=await(await fetch('/api/sam3hl/status',{cache:'no-store'})).json();
     const c=st.cfg||{};
-    if(c.style){hlStyle=c.style;
-      document.querySelectorAll('#hlseg button').forEach(b=>b.classList.toggle('on',b.dataset.s===hlStyle));}
     HL_KEYS.forEach(k=>{if(c[k]!==undefined){$('r_'+k).value=c[k];hlLabel(k);}});
     VIEW_KEYS.forEach(k=>{if(c[k]!==undefined)hlView[k]=+c[k];});
     applyExpView();   // 服务端可能有 /panel 调过的视角参数，回填后立即应用
@@ -4072,8 +4015,6 @@ async function loadHlCfg(){
     Object.keys(PT_COLORS).forEach(id=>{const k=PT_COLORS[id];
       if(/^#[0-9a-fA-F]{6}$/.test(c[k]||'')){$(id).value=c[k];ptStyle[k]=c[k];}});
     applyPtStyle();   // 点渲染参数回填后立即应用到当前 GLB
-    if(c.color_mode)document.querySelector('input[name=hlcm][value='+c.color_mode+']').checked=true;
-    if(/^#[0-9a-fA-F]{6}$/.test(c.color||''))$('hlcolor').value=c.color;
   }catch(e){/* 读取失败保持面板默认值 */}
 }
 HL_KEYS.forEach(k=>$('r_'+k).addEventListener('input',()=>{hlLabel(k);
@@ -4090,13 +4031,6 @@ document.querySelectorAll(
     applyPtStyle();pushHlCfg();}));
 Object.keys(PT_COLORS).forEach(id=>$(id).addEventListener('input',()=>{
   ptStyle[PT_COLORS[id]]=$(id).value;applyPtStyle();pushHlCfg();}));
-document.querySelectorAll('#hlseg button').forEach(b=>b.addEventListener('click',()=>{
-  hlStyle=b.dataset.s;
-  document.querySelectorAll('#hlseg button').forEach(x=>x.classList.toggle('on',x===b));
-  pushHlCfg();}));
-document.querySelectorAll('input[name=hlcm]').forEach(r=>r.addEventListener('change',pushHlCfg));
-$('hlcolor').addEventListener('input',()=>{
-  document.querySelector('input[name=hlcm][value=custom]').checked=true;pushHlCfg();});
 $('btnHlCfg').onclick=()=>{
   const on=!$('hlcfg').classList.contains('on');
   $('hlcfg').classList.toggle('on',on);
