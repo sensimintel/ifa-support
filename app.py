@@ -2560,7 +2560,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <input type="range" id="r_dd_fps" min="0" max="30" step="0.5" value="30"></div>
  <div class="sec">深度显示（本页即时）</div>
  <div class="fld"><label>亮度 ×<b id="v_dc_bright">2.50</b></label>
-  <input type="range" id="r_dc_bright" min="0.2" max="2.5" step="0.05" value="2.5"></div>
+  <input type="range" id="r_dc_bright" min="0.2" max="4" step="0.05" value="2.5"></div>
+ <div class="fld"><label>亮核辉光 <b id="v_dc_glow">0.60</b>（顶格区已到显示上限，只能靠掺白变亮）</label>
+  <input type="range" id="r_dc_glow" min="0" max="1.5" step="0.05" value="0.6"></div>
  <div class="fld"><label>对比度 ×<b id="v_dc_contrast">1.00</b></label>
   <input type="range" id="r_dc_contrast" min="0.2" max="2.5" step="0.05" value="1"></div>
  <div class="fld"><label>饱和度 ×<b id="v_dc_sat">1.05</b></label>
@@ -3182,7 +3184,7 @@ function fillDdControls(c){
 }
 // ── 深度显示（本页 CSS 即时层）：只在 devdepth 来源挂到背景 img，切走来源即摘除 ──
 // 默认=服务器「默认」配置预设口径（2026-08-17 调定）：亮度2.5/对比1/饱和1.05/镜像开
-let ddCss={br:2.5,ct:1,sa:1.05,hu:0,inv:0,bl:0,op:1,fit:'cover',mir:1,rot:0,pix:0};
+let ddCss={br:2.5,gl:0.6,ct:1,sa:1.05,hu:0,inv:0,bl:0,op:1,fit:'cover',mir:1,rot:0,pix:0};
 try{Object.assign(ddCss,JSON.parse(localStorage.getItem('exp_dd_css')||'{}'));}catch(e){}
 // 深度显示颜色链（对比→饱和→色相→反相，与 CSS filter 同序同义）合成为
 // 一个 3×3 颜色矩阵+偏移，供 dotSample 烘进取色缓存。canvas 层因此不挂颜色类
@@ -3217,20 +3219,24 @@ function ddColorMatrix(){
 }
 // 亮度软肩曲线查找表（按 max 通道索引）：v'=1-(1-v)^br。br>1 时暗区/中间调
 // 实打实抬升、顶端平滑收敛永不硬截断（保住亮部层次）；三通道按 K 等比缩放，
-// 色相/饱和不动，不再有线性乘法的截断冲白。W 为掺白权重（∝v'^6——2026-08-17
-// 现场实测 v'^2 铺得太宽、饱和度掉到与线性截断相当，收窄到 ^6 后 br=2.5 时
-// 平均饱和度 0.80 vs 0.71），只让最亮的"亮核"随 br 增大轻微泛白（过曝辉光
-// 观感——人眼据此判定"画面很亮"）；br<=1 时 W 恒 0。br=1 恒等返回 null。
+// 色相/饱和不动，不再有线性乘法的截断冲白。
+// W=掺白权重：源头 max 通道已顶到 255 的像素（本机深度伪彩里近距离暖色区约
+// 占 6.5%）K 恒为 1——那是该色相在 sRGB 的亮度上限，等比缩放一点都推不动，
+// 只能靠掺白（过曝辉光）变亮，否则调亮度时那一坨橙色纹丝不动（2026-08-17
+// 现场实测：br 1→3 蓝色中间调 +103%，顶格橙色区仅 +13%）。门控用源头 m 而非
+// 输出 v'——用 v' 时高亮度下中间调也被判为"亮"而误吃掺白，饱和度掉到 0.60；
+// 改用 m^8 后中间调饱和稳在 0.98，辉光只打真正到顶的像素。强度由「亮核辉光」
+// 滑杆（ddCss.gl）控制，0=不掺白（橙色区就会回到"不响应亮度"）。
 function ddBrightLut(){
   if(bgSource!=='devdepth')return null;
-  const br=Math.max(0.1,+ddCss.br||1);
-  if(br===1)return null;
+  const br=Math.max(0.1,+ddCss.br||1),hd=Math.max(0,+ddCss.gl||0);
+  if(br===1&&!hd)return null;
   const K=new Float32Array(256),W=new Float32Array(256);
-  const HD=0.25,g=Math.max(0,1-1/br);   // HD=辉光（高光掺白）强度常量
+  const g=Math.max(0,1-1/br);   // 辉光随亮度增大而增强；br<=1 时恒 0
   for(let m=0;m<256;m++){
     const v2=1-Math.pow(1-m/255,br);
     K[m]=m?255*v2/m:0;
-    W[m]=HD*g*Math.pow(v2,6);
+    W[m]=hd*g*Math.pow(m/255,8);
   }
   return [K,W];
 }
@@ -3264,7 +3270,8 @@ function applyDdCss(){
     else dotDraw(performance.now()/1000);
   }
 }
-const DC_SLIDERS={br:['r_dc_bright','v_dc_bright',2],ct:['r_dc_contrast','v_dc_contrast',2],
+const DC_SLIDERS={br:['r_dc_bright','v_dc_bright',2],gl:['r_dc_glow','v_dc_glow',2],
+  ct:['r_dc_contrast','v_dc_contrast',2],
   sa:['r_dc_sat','v_dc_sat',2],hu:['r_dc_hue','v_dc_hue',0],bl:['r_dc_blur','v_dc_blur',0],
   op:['r_dc_opacity','v_dc_opacity',2]};
 const DC_RADIOS={dcinv:'inv',dcfit:'fit',dcmir:'mir',dcrot:'rot',dcpix:'pix'};

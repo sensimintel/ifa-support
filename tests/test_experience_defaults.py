@@ -14,8 +14,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 # 服务器「默认」预设的 display / dot 快照（saved_at 1786947200）
-PRESET_DISPLAY = {"br": 2.5, "ct": 1, "sa": 1.05, "hu": 0, "inv": 0, "bl": 0,
-                  "op": 1, "fit": "cover", "mir": 1, "rot": 0, "pix": 0}
+PRESET_DISPLAY = {"br": 2.5, "gl": 0.6, "ct": 1, "sa": 1.05, "hu": 0, "inv": 0,
+                  "bl": 0, "op": 1, "fit": "cover", "mir": 1, "rot": 0, "pix": 0}
 PRESET_DOT = {"on": 1, "mode": 1, "pitch": 5, "r": 34, "jitter": 0, "motion": 0,
               "speed": 3, "bg": "#000000", "gshape": 1, "pn": 50000, "psize": 3.5,
               "pcontrast": 0.5, "pmono": 0, "pcolor": "#fffdf7", "pdrift": 3,
