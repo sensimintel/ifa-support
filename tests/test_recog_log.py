@@ -201,6 +201,16 @@ class AppWiringTest(unittest.TestCase):
         self.assertIn('"live": live', self.src)
         self.assertIn('_tune_public(it) for it in items', self.src)
 
+    def test_word_label_is_explicit_then_sticky(self):
+        """label 决定命中算 food 还是 drink（框颜色 + prompt 的软接地信息）：
+        显式给了就用，只发词面则沿用旧值，最后才落词面兜底——绝不再无脑 drink。"""
+        cfg = self.src[self.src.index("def sam3tune_config_set"):]
+        cfg = cfg[:cfg.index("@app.get(\"/api/sam3tune/state\")")]
+        self.assertIn('known = {w["word"]: w.get("label") for w in', cfg)
+        self.assertIn('label = known.get(word) or ("food" if word == SAM3_TEXT_DEFAULT else "drink")',
+                      cfg)
+        self.assertNotIn('else None) or "drink"', cfg)   # 老的无脑兜底不能再出现
+
     def test_food_word_not_rerun_when_already_in_wordlist(self):
         # 词面已覆盖就不补跑：现网词表 food/drink 都标 label=drink，按 label 判会白跑一次
         self.assertIn('if not any(w == SAM3_TEXT_DEFAULT for (w, _lbl) in targets):', self.src)

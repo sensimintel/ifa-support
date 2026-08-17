@@ -62,6 +62,21 @@
 去冗余删掉双目链后，SAM3 门控改为直接跑触发线程手里的 RGB 帧——不再依赖任何 DA3 链，
 彩色图也比带散斑的 IR 灰度更适合认食物，food 与 drink 都算证据。
 
+## 3.4 识别词的 label（决定命中算食物还是液体）
+
+词表每个词都带 `label`（`food` / `drink`），它**不进 SAM3 请求**（查询词是 `word`），
+只在本地决定命中的类别，一路影响三处：
+
+1. `_sam3_gate_dets` 产出的 dets 类别位；
+2. `_draw_boxes` 的框颜色（food 红 / drink 蓝）——图2 的图例正是「红框=疑似食物，蓝框=疑似液体/容器」；
+3. prompt 里的软接地信息「检测器在当前画面的命中：食物框×N、液体框×M」。
+
+写入侧（唯一入口是 superadmin 控制面）按类别分两组下发 `[{word,label}]`。
+历史坑：控制面早期是一个不分类的 tags 输入，只发词面字符串，后端一律兜底
+`drink`——`food` 这个词因此长期被标成 drink，每轮都在告诉模型「画面里没有食物」
+（线上实测连续多轮 `n_food=0 n_drink=3`），食物框也被画成蓝色。现在后端的兜底顺序是：
+**显式 label → 沿用该词现有 label → `SAM3_TEXT_DEFAULT` 判 food、其余 drink**。
+
 ## 3.5 识别观测日志（2026-08-17 起）——控制面看得见的过程态
 
 浅体验区控制面（superadmin `/ifa-support/experience`，经 `/da3-api` 反代到 8060）两个页签：
@@ -94,7 +109,7 @@ top-K 原始分白拿；补跑的 food 词也进日志但标 `role="highlight"`�
 | `SAM3_STREAM_WINDOW` | `.env`，默认 5 | 流式服务端滚动窗口帧数 |
 | `SAM3_TEXT` | `.env`，默认 `food` | 系统补跑的 food 查询词。**判据是词面**：口径词表里已有这个词面就不补（早期按 label 判，现网 food/drink 都标 label=drink，会把 food 原样再跑一遍——白花一次 SAM3，命中时同一物体还会出两个框） |
 | `DISABLE_MONO_PIPELINE` | `.env`，现网 `1` | 停单目链：A' 的四个下游全停（不影响 A 的 SAM3 门控与识别） |
-| `sam3_score_cfg.json` | 仓根（gitignored） | 生产词表 + presence α + 检测阈值，`/sam3tune` 写、A 每帧读 |
+| `sam3_score_cfg.json` | 仓根（gitignored） | 生产词表（**每个词带 label=food\|drink**）+ presence α + 检测阈值，控制面写、A 每帧读 |
 | `sam3hl_preset.json` | 仓根（gitignored） | 高亮/点渲染样式，`/panel` 与 `/experience` 抽屉共写 |
 | `recog_direct_cfg.json` | 仓根（gitignored） | 直传识别开关/间隔/并发 |
 | `SAM3_OBS_LOG` | `.env`，默认开 | =0 关掉 SAM3 观测写回（控制面 SAM3 区随之空），嫌它占识别触发线程节拍时的应急开关 |
