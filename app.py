@@ -1890,19 +1890,6 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  #macros .mlab{display:block;font-size:.2rem;letter-spacing:-.002rem;color:var(--white)}
  #macros .mval{display:block;font-size:.36rem;letter-spacing:-.0036rem;margin-top:.09rem;
        font-variant-numeric:lining-nums proportional-nums}
- /* ── 食物定位小标（Figma 563-1251）：无底框——右对齐两行文字 + 下划线拐弯引线（161×36、4px 描边），
-    引线尾梢=锚点（识别 box 中心）；文字带 2px 半透明黑描边保证亮背景可读 ── */
- #ftag{position:absolute;left:0;top:0;z-index:3;pointer-events:none;opacity:0;
-   transition:opacity .35s ease,transform .5s ease;will-change:transform}
- #ftag.on{opacity:1}
- #ftag .ftin{transform:translate(0,-100%);display:flex;flex-direction:column;align-items:flex-end;
-   width:1.61rem}
- #ftname{font-size:.35rem;letter-spacing:-.0035rem;white-space:nowrap;text-align:right;
-   -webkit-text-stroke:.02rem rgba(0,0,0,.2);paint-order:stroke fill}
- #ftkcal{font-size:.27rem;margin-top:.04rem;color:var(--white);white-space:nowrap;text-align:right;
-   -webkit-text-stroke:.02rem rgba(0,0,0,.2);paint-order:stroke fill;
-   font-variant-numeric:lining-nums proportional-nums}
- #ftlead{display:block;width:1.61rem;height:.36rem;margin-top:.06rem;flex:none}
  /* ── 流水视图：实时画面小窗 + 当日识别记录列表 ── */
  #tl{position:absolute;inset:0;display:none}
  #tl.on{display:block;background:rgba(0,0,0,.62)}   /* 流水态强压暗背景，突出列表 */
@@ -2022,16 +2009,6 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <div class="krow" id="cclsrow"><span class="klab">Food Classification</span><span class="kval" id="ccls"></span></div>
   </div>
  </div>
-
- <div id="ftag"><div class="ftin">
-  <div id="ftname"></div><div id="ftkcal"></div>
-  <svg id="ftlead" viewBox="0 0 165 40" fill="none" preserveAspectRatio="none">
-   <defs><linearGradient id="ftlg" x1="0" y1="0" x2="1" y2="0">
-    <stop offset="0" stop-color="#FFFDF7" stop-opacity=".12"/>
-    <stop offset=".22" stop-color="#FFFDF7" stop-opacity=".9"/>
-    <stop offset="1" stop-color="#FFFDF7"/></linearGradient></defs>
-   <path d="M1.7 38L23.6 2H163.3" stroke="url(#ftlg)" stroke-width="4"/></svg>
- </div></div>
 
  <div id="tl">
   <div id="tlinset"><img id="tlraw" alt=""><span id="tlwait">Waiting for camera…</span></div>
@@ -3458,7 +3435,6 @@ let lastCardKey='',cardShownAt=0,curCard=null;
 function setState(st){
   $('idle').classList.toggle('on',st==='idle'&&!$('tl').classList.contains('on'));
   $('card').classList.toggle('on',st==='card'&&!$('tl').classList.contains('on'));
-  updateFtag();
 }
 function renderCard(c){
   $('cname').textContent=c.name||'';
@@ -3474,25 +3450,7 @@ function renderCard(c){
   const cls=c.classification||'';
   $('cclsrow').style.display=cls?'':'none';$('crule').style.display=cls?'':'none';
   $('ccls').textContent=cls;
-  // 定位小标与右卡同数据源（同一个 kcal 数）
-  $('ftname').textContent=c.name||'';
-  $('ftkcal').textContent=kcal;$('ftkcal').style.display=kcal?'':'none';
 }
-// ── 食物定位小标：VLM box（0-1 归一化、原帧坐标系）→ 屏幕坐标。背景按 object-fit:cover
-// 铺 16:9 画面（原帧/点云渲染同构图），窗口非 16:9 时有裁边，此处做同一套 cover 数学补偿；
-// 锚点=box 中心（引线笔尖落在食物上）。GLB 点云背景的前端相机默认带 10° 俯视角，
-// 与原帧取景有轻微偏差，小标会小幅偏移（原图/服务端渲染图背景则完全对准）。
-function updateFtag(){
-  const el=$('ftag'),c=curCard;
-  if(!(c&&c.box&&$('card').classList.contains('on'))){el.classList.remove('on');return;}
-  const b=c.box,W=innerWidth,H=innerHeight,AR=16/9;
-  let sw,sh,ox,oy;
-  if(W/H>AR){sw=W;sh=W/AR;ox=0;oy=(H-sh)/2;}else{sh=H;sw=H*AR;ox=(W-sw)/2;oy=0;}
-  el.style.transform='translate('+(ox+sw*(b[0]+b[2])/2).toFixed(0)+'px,'
-    +(oy+sh*(b[1]+b[3])/2).toFixed(0)+'px)';
-  el.classList.add('on');
-}
-addEventListener('resize',updateFtag);
 function renderTimeline(cards){
   const list=$('tllist');
   const rows=(cards||[]).slice(0,10).reverse();   // 最新 10 条，按时间升序排布（同设计稿）
