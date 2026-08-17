@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 Depth Anything 3 Web 服务：一个页面、一个 8060 端口，左右两栏对比。
-- 左栏：官方 Gradio UI（点云 / 网格 / 3D 量距等），通过 gr.mount_gradio_app 挂在同一 FastAPI 的 /gradio。
 - 右栏：自研扩展面板（/panel），可在网页上调参对比，支持三种产物：
     · 深度图      —— 彩色深度图（越亮=越近）
     · 点云+相机    —— DA3 导出 scene.glb（点云 + 相机线框），可 3D 转视角
     · 网格 mesh   —— 由深度反投影自建三角网格 GLB，可 3D 转视角
   可调参数：process_res、conf_thresh_percentile、num_max_points、show_cameras。
-- 顶层 / 是左右分栏首页，用两个同源 iframe 分别嵌入 /gradio 与 /panel。
+- 顶层 / 直接跳 /experience（主链路展示页）。
 - /experience 是 IFA 浅体验区展示页：品牌化全屏实时识别 UI（实时点云背景 + 待机/识别态 + 流水视图）。
-- 关键约束：5090 GPU 与产线服务共享，官方 Gradio 与右栏共用同一个模型单例（进程内只加载一份
-  权重），并用 GPU 锁串行化推理，避免加载两份权重撑爆显存。
+- 关键约束：5090 GPU 与产线服务共享，进程内只加载一份模型权重，并用 GPU 锁串行化推理。
 - 绑定 0.0.0.0，局域网内可直接用 http://<5090局域网IP>:8060 访问。
 """
 import base64
@@ -32,14 +30,13 @@ from pathlib import Path
 from typing import Optional
 
 import cv2
-import gradio as gr
 import numpy as np
 import torch
 import trimesh
 from fastapi import Body, FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse, Response,
-                               StreamingResponse)
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               RedirectResponse, Response, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps
 
@@ -47,7 +44,6 @@ from PIL import Image, ImageOps
 DA3_ROOT = Path("/home/odyss/Depth-Anything-3")
 sys.path.append(str(DA3_ROOT / "src"))
 from depth_anything_3.api import DepthAnything3  # noqa: E402
-from depth_anything_3.app.gradio_app import DepthAnything3App  # noqa: E402
 
 import devpc  # noqa: E402
 import recog_direct  # noqa: E402
@@ -79,13 +75,13 @@ if STATIC_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 _model = None
 _model_lock = threading.Lock()   # 保护模型单例的加载
-_gpu_lock = threading.Lock()     # 串行化所有 GPU 推理（右栏 + 官方 Gradio 共用同一模型）
+_gpu_lock = threading.Lock()     # 串行化所有 GPU 推理（进程内共用同一模型单例）
 
 
 def get_model():
     """懒加载并缓存 DA3 模型单例（fp32 权重；forward 内部用 autocast bf16 计算）。
 
-    右栏推理与官方 Gradio 都复用这同一个实例，进程内只占一份权重（约 6.5GB）。
+    进程内只占一份权重（约 6.5GB）。
     """
     global _model
     if _model is None:
@@ -1353,46 +1349,6 @@ def _track_stream_device(device_id):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 顶层分栏首页：左 iframe=扩展面板(/panel，设备帧+DA3)，右 iframe=实时识别(/recog)
-# ══════════════════════════════════════════════════════════════════════
-SPLIT_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DA3 · 设备实时帧 ＋ 实时识别</title>
-<style>
- *{box-sizing:border-box}
- html,body{margin:0;height:100%;font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#0d0d0f}
- .top{height:48px;display:flex;align-items:center;gap:14px;padding:0 18px;color:#fff;background:#1c1c1e;font-size:14px;flex-wrap:wrap}
- .top b{font-size:15px}
- .top .tag{font-size:12px;color:#9a9aa0}
- .wrap{display:flex;height:calc(100% - 48px)}
- .pane{flex:1 1 50%;min-width:0;display:flex;flex-direction:column;border-right:1px solid #2c2c2e}
- .pane:last-child{border-right:0}
- .pane .bar{height:34px;display:flex;align-items:center;padding:0 14px;color:#e5e5ea;background:#141416;font-size:13px;font-weight:600;border-bottom:1px solid #2c2c2e}
- .pane .bar .dot{width:8px;height:8px;border-radius:50%;margin-right:8px}
- .pane .bar a{margin-left:auto;font-size:12px;font-weight:500;color:#0a84ff;text-decoration:none}
- iframe{flex:1;width:100%;border:0;background:#fff}
- @media(max-width:900px){.wrap{flex-direction:column;height:auto}.pane{height:90vh;border-right:0;border-bottom:1px solid #2c2c2e}}
-</style></head><body>
- <div class="top"><b>Depth Anything 3</b>
-  <span class="tag">左：设备实时帧 + DA3 产物（深度图 · 点云 · 网格，可调参转视角）　·　右：实时识别卡片流　·　同一 8060 端口</span>
-  <a href="/sam3tune" target="_blank" style="margin-left:auto;font-size:13px;color:#0a84ff;text-decoration:none">SAM3 调优 ↗</a>
-  <a href="/experience" target="_blank" style="font-size:13px;color:#0a84ff;text-decoration:none">✨ 浅体验区展示页 ↗</a></div>
- <div class="wrap">
-  <div class="pane">
-   <div class="bar"><span class="dot" style="background:#0a84ff"></span>设备实时帧 · DA3 产物
-    <a href="/panel" target="_blank">单独打开 ↗</a></div>
-   <iframe src="/panel" title="设备实时帧 + DA3 产物"></iframe>
-  </div>
-  <div class="pane">
-   <div class="bar"><span class="dot" style="background:#34c759"></span>实时识别 · food/drink 命中 → Qwen3-VL
-    <a href="/recog" target="_blank">单独打开 ↗</a></div>
-   <iframe src="/recog" title="实时识别卡片流"></iframe>
-  </div>
- </div>
-</body></html>"""
-
-
-# ══════════════════════════════════════════════════════════════════════
 # 扩展面板：调参 + 三种产物（深度图 / 点云GLB / 网格GLB），前端 fetch + model-viewer
 # ══════════════════════════════════════════════════════════════════════
 PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
@@ -1432,7 +1388,7 @@ PANEL_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .seg button.on{background:#0071e3;border-color:#0071e3;color:#fff}
  @media(max-width:720px){.grid{grid-template-columns:1fr}}
 </style></head><body>
-<div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/sam3tune" target="_top">SAM3 调优</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
+<div class="nav"><a class="active" href="/panel">深度 / 点云 / 网格</a><a href="/sam3tune" target="_top">SAM3 调优</a><a class="home" href="/experience" target="_top">↗ 浅体验区</a></div>
 <h1>Depth Anything 3 · 扩展面板</h1>
 
 <div id="tunbar" style="display:flex;gap:8px;align-items:center;font-size:13px;margin:2px 0 12px;color:#6b6b70">
@@ -1864,6 +1820,7 @@ setInterval(tunTick,5000);tunTick();
 </body></html>"""
 
 
+# ══════════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════════
 # 浅体验区展示页（/experience）：IFA 展台品牌化全屏 UI（Figma「IFA 专项 · 浅体验区」）
 # - 全屏背景 = 实时点云（默认 SAM3 高亮点云，右下临时按钮在三种点云来源间切换；
@@ -3759,10 +3716,10 @@ if(new URLSearchParams(location.search).get('trace')==='1'){
 </body></html>"""
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def home():
-    """左右分栏对比首页。"""
-    return SPLIT_PAGE
+    """根路径直接进浅体验区展示页（主链路）；调试页从 /panel 的导航进。"""
+    return RedirectResponse("/experience")
 
 
 @app.get("/experience", response_class=HTMLResponse)
@@ -3819,7 +3776,7 @@ async def api_infer(
     try:
         t0 = time.time()
         # GPU 推理放锁内串行化；点云构建（CPU）挪到锁外，短占锁。
-        with _gpu_lock:  # 与官方 Gradio 共用同一模型，串行化 GPU 推理
+        with _gpu_lock:  # 串行化 GPU 推理
             with torch.no_grad():
                 pred = model.inference([arr], process_res=res, export_format="mini_npz")
 
@@ -4564,7 +4521,7 @@ def _da3_frame_processor(raw: bytes, config: dict, device_id: str,
       - export_format=depth → 彩色深度图（图片类产物，JPEG 字节）
       - export_format=glb   → 点云 + 相机线框 scene.glb（url）
       - export_format=mesh  → 深度反投影自建网格 GLB（模型类产物，url）
-    与官方 Gradio 共用同一模型、同一把 GPU 锁串行化，避免撞显存。首帧到达才懒加载模型。
+    同一把 GPU 锁串行化推理，避免撞显存。首帧到达才懒加载模型。
     device_id=本帧来源设备（frame_relay 只把选中设备的帧送进来）：与上一帧不同即视为
     切换，先重置全部跨帧时序缓存再处理，识别卡片落到该设备自己的桶。"""
     try:
@@ -4587,7 +4544,7 @@ def _da3_frame_processor(raw: bytes, config: dict, device_id: str,
     try:
         # GPU 推理放锁内串行化；产物构建（CPU）在构建级，
         # 不占 GPU 锁也不挡本线程吃下一帧。
-        with _gpu_lock:  # 与官方 Gradio 共用同一模型，串行化 GPU 推理
+        with _gpu_lock:  # 串行化 GPU 推理
             with torch.no_grad():
                 pred = model.inference([arr], process_res=res, export_format="mini_npz")
     except torch.cuda.OutOfMemoryError:
@@ -5353,7 +5310,7 @@ RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .newpill.on{opacity:1;transform:translateX(-50%);pointer-events:auto}
  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style></head><body>
-<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a href="/sam3tune">SAM3 调优</a><a class="home" href="/" target="_top">↗ 对比首页</a></div>
+<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a class="active" href="/recog">实时识别</a><a href="/sam3tune">SAM3 调优</a><a class="home" href="/experience" target="_top">↗ 浅体验区</a></div>
 <div class="head">
   <div class="l1"><h2>实时识别 · Live Recognition</h2>
     <span class="seg" id="seg"><button data-t="qwen">Qwen</button><button data-t="gemini">Gemini Pro</button></span>
@@ -5545,7 +5502,7 @@ setInterval(tick,700); tick();
 
 @app.get("/recog", response_class=HTMLResponse)
 def recog_page():
-    """实时识别卡片流页（首页右栏 iframe）。"""
+    """实时识别卡片流页。"""
     return RECOG_PAGE
 
 
@@ -5620,7 +5577,7 @@ SAM3TUNE_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
  .badge.hi{background:#e5f6ed;color:var(--ok)}
  @media (prefers-color-scheme:dark){.badge.lo{background:#3a1717}.badge.hi{background:#12301f}}
 </style></head><body>
-<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a href="/recog">实时识别</a><a class="active" href="/sam3tune">SAM3 调优</a><a href="/" style="margin-left:auto">↗ 对比首页</a></div>
+<div class="nav"><a href="/panel">深度 / 点云 / 网格</a><a href="/recog">实时识别</a><a class="active" href="/sam3tune">SAM3 调优</a><a href="/experience" style="margin-left:auto">↗ 浅体验区</a></div>
 <div class="wrap">
  <h1>SAM3 调优 · presence 分 / top-K query 原始分</h1>
  <div class="sub">分数分解：<code>p(query匹配) = p(query匹配 | 概念在图中) × p(概念在图中·presence)</code>，presence 是全局乘性门控。
@@ -5806,65 +5763,3 @@ fetch('/api/sam3/health').then(r=>r.json()).then(d=>{
 def sam3tune_page():
     """SAM3 调优页：动态原图+定位、presence/top-K query 原始分、运行历史。"""
     return SAM3TUNE_PAGE
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 兼容 shim：DA3 的 Gradio UI 按旧版 gradio 写，本机是 gradio 6.1.0，
-# 丢弃已移除的装饰性 kwargs（如 Gallery 的 show_download_button），避免改上游源码。
-# ══════════════════════════════════════════════════════════════════════
-_GRADIO6_REMOVED_KWARGS = {"show_download_button", "show_share_button"}
-
-
-def _shim_gradio_component(cls):
-    _orig_init = cls.__init__
-
-    def __init__(self, *args, **kwargs):
-        for _k in _GRADIO6_REMOVED_KWARGS:
-            kwargs.pop(_k, None)
-        return _orig_init(self, *args, **kwargs)
-
-    cls.__init__ = __init__
-
-
-for _cls in (gr.Gallery, gr.Image, gr.Video, gr.Model3D):
-    _shim_gradio_component(_cls)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 让官方 Gradio 复用同一个模型单例并串行化 GPU（避免进程内两份权重撑爆显存）
-# ══════════════════════════════════════════════════════════════════════
-import depth_anything_3.app.modules.model_inference as _mi_mod  # noqa: E402
-
-
-def _shared_initialize_model(self, device="cuda"):
-    """官方 UI 的模型初始化改为复用本服务的共享单例。"""
-    self.model = get_model()
-
-
-_orig_run_inference = _mi_mod.ModelInference.run_inference
-
-
-def _locked_run_inference(self, *args, **kwargs):
-    """官方 UI 的推理也走同一把 GPU 锁，与右栏串行，避免并发撞显存。"""
-    with _gpu_lock:
-        return _orig_run_inference(self, *args, **kwargs)
-
-
-_mi_mod.ModelInference.initialize_model = _shared_initialize_model
-_mi_mod.ModelInference.run_inference = _locked_run_inference
-
-
-# ══════════════════════════════════════════════════════════════════════
-# 挂载官方 Gradio UI 到同一 FastAPI（同端口，路径 /gradio）
-# ══════════════════════════════════════════════════════════════════════
-os.environ.setdefault("DA3_MODEL_DIR", MODEL_DIR)
-_GRADIO_WORKSPACE = str(Path("/home/odyss/da3-web/workspace/gradio"))
-_GRADIO_GALLERY = str(Path("/home/odyss/da3-web/workspace/gallery"))
-Path(_GRADIO_WORKSPACE).mkdir(parents=True, exist_ok=True)
-Path(_GRADIO_GALLERY).mkdir(parents=True, exist_ok=True)
-
-_da3_gradio_app = DepthAnything3App(
-    model_dir=MODEL_DIR, workspace_dir=_GRADIO_WORKSPACE, gallery_dir=_GRADIO_GALLERY)
-_gradio_blocks = _da3_gradio_app.create_app()
-_gradio_blocks.queue(max_size=20)
-app = gr.mount_gradio_app(app, _gradio_blocks, path="/gradio")
