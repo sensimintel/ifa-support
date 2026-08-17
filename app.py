@@ -3166,15 +3166,16 @@ function fillDdControls(c){
 // 默认=服务器「默认」配置预设口径（2026-08-17 调定）：亮度2.5/对比1/饱和1.05/镜像开
 let ddCss={br:2.5,ct:1,sa:1.05,hu:0,inv:0,bl:0,op:1,fit:'cover',mir:1,rot:0,pix:0};
 try{Object.assign(ddCss,JSON.parse(localStorage.getItem('exp_dd_css')||'{}'));}catch(e){}
-// 深度显示颜色链（亮度→对比→饱和→色相→反相，与 CSS filter 同序同义）合成为
+// 深度显示颜色链（对比→饱和→色相→反相，与 CSS filter 同序同义）合成为
 // 一个 3×3 颜色矩阵+偏移，供 dotSample 烘进取色缓存。canvas 层因此不挂颜色类
 // CSS 滤镜——合成器偶发漏套滤镜的帧不再产生可见亮度跳变（全屏暗闪根因）。
-// 恒等变换返回 null（零开销）
+// 亮度不进矩阵：线性乘法在饱和伪彩上截断冲白（亮度拉不动、颜色发灰），改走
+// ddBrightLut 的软肩曲线单独烘焙。恒等变换返回 null（零开销）
 function ddColorMatrix(){
   if(bgSource!=='devdepth')return null;
-  const br=Math.max(0,+ddCss.br||1),ct=Math.max(0,+ddCss.ct||1),sa=Math.max(0,+ddCss.sa||1);
+  const ct=Math.max(0,+ddCss.ct||1),sa=Math.max(0,+ddCss.sa||1);
   const hu=(+ddCss.hu||0)*Math.PI/180,inv=+ddCss.inv?1:0;
-  let M=[br,0,0,0,br,0,0,0,br],off=[0,0,0];
+  let M=[1,0,0,0,1,0,0,0,1],off=[0,0,0];
   function mul(A,ao){
     const R=new Array(9),ro=new Array(3);
     for(let r=0;r<3;r++){
@@ -3195,6 +3196,24 @@ function ddColorMatrix(){
   const ident=M[0]===1&&M[4]===1&&M[8]===1&&!M[1]&&!M[2]&&!M[3]&&!M[5]&&!M[6]&&!M[7]
     &&!off[0]&&!off[1]&&!off[2];
   return ident?null:[M,off];
+}
+// 亮度软肩曲线查找表（按 max 通道索引）：v'=1-(1-v)^br。br>1 时暗区/中间调
+// 实打实抬升、顶端平滑收敛永不硬截断（保住亮部层次）；三通道按 K 等比缩放，
+// 色相/饱和不动，不再有线性乘法的截断冲白。W 为掺白权重（∝v'^2），只让最亮的
+// "亮核"随 br 增大轻微泛白（过曝辉光观感——人眼据此判定"画面很亮"），中间调
+// 颜色纹丝不动；br<=1 时 W 恒 0。br=1 恒等返回 null（零开销）。
+function ddBrightLut(){
+  if(bgSource!=='devdepth')return null;
+  const br=Math.max(0.1,+ddCss.br||1);
+  if(br===1)return null;
+  const K=new Float32Array(256),W=new Float32Array(256);
+  const HD=0.4,g=Math.max(0,1-1/br);   // HD=辉光（高光掺白）强度常量
+  for(let m=0;m<256;m++){
+    const v2=1-Math.pow(1-m/255,br);
+    K[m]=m?255*v2/m:0;
+    W[m]=HD*g*v2*v2;
+  }
+  return [K,W];
 }
 function applyDdCss(){
   const on=bgSource==='devdepth';
@@ -3294,9 +3313,10 @@ function dotSample(){
   const octx=dotOffCv.getContext('2d',{willReadFrequently:true});
   octx.drawImage(im,sx,sy,sw,sh,0,0,dotCols,dotRows);
   dotData=octx.getImageData(0,0,dotCols,dotRows).data;
-  // 深度显示的整条颜色滤镜链（亮度/对比/饱和/色相/反相）烘进像素
-  //（Uint8ClampedArray 自动截断），canvas 层不再挂颜色类 CSS 滤镜——
-  // 合成器偶发"漏套滤镜"的帧从此与正常帧无差别（全屏暗闪根因，2026-08-14）
+  // 深度显示颜色链烘进像素（Uint8ClampedArray 自动截断），canvas 层不再挂
+  // 颜色类 CSS 滤镜——合成器偶发"漏套滤镜"的帧从此与正常帧无差别（全屏暗闪
+  // 根因，2026-08-14）。对比/饱和/色相/反相走矩阵；亮度走软肩曲线+高光辉光
+  //（ddBrightLut，2026-08-17）——顺序：先矩阵后亮度
   const cm=ddColorMatrix();
   if(cm){const d=dotData,M=cm[0],off=cm[1];
     for(let i=0;i<d.length;i+=4){
@@ -3304,6 +3324,15 @@ function dotSample(){
       d[i]  =M[0]*r+M[1]*g+M[2]*b+off[0];
       d[i+1]=M[3]*r+M[4]*g+M[5]*b+off[1];
       d[i+2]=M[6]*r+M[7]*g+M[8]*b+off[2];
+    }}
+  const bl=ddBrightLut();
+  if(bl){const d=dotData,K=bl[0],W=bl[1];
+    for(let i=0;i<d.length;i+=4){
+      const r=d[i],g=d[i+1],b=d[i+2],m=Math.max(r,g,b);
+      const k=K[m],w=W[m];
+      d[i]  =r*k+(255-r*k)*w;
+      d[i+1]=g*k+(255-g*k)*w;
+      d[i+2]=b*k+(255-b*k)*w;
     }}
   dotEdge=null;
   if(+dotCfg.pfloat>0)dotEdgeBuild();   // 漂浮强度开启时随取色缓存一并重建边缘场
@@ -4073,7 +4102,7 @@ if(new URLSearchParams(location.search).get('trace')==='1'){
   })();
   setInterval(()=>{
     fetch('/api/flicker-report',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({page_ts:Date.now(),total:tbuf.length,v:3,bld:'bake2',
+      body:JSON.stringify({page_ts:Date.now(),total:tbuf.length,v:3,bld:'bake3-softknee',
         cfg:Object.assign({},dotCfg),dd:Object.assign({},ddCss),
         fdot:getComputedStyle($('bgDot')).filter,
         samples:tbuf.slice(-900)})
