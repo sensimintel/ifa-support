@@ -5205,19 +5205,30 @@ def sam3tune_config_set(body: dict = Body(default=None)):
         thresh = min(max(float((body or {}).get("thresh", 0.0)), 0.0), 0.95)
     except (TypeError, ValueError):
         return JSONResponse({"error": "alpha/thresh 必须是数字"}, status_code=400)
+    # label 决定这个词的命中算 food 还是 drink，一路影响：送 VLM 的检测框颜色、
+    # prompt 里的「食物框×N、液体框×M」软接地信息、以及单目链的液体证据过滤。
+    # 老客户端只发词面字符串（控制面 tags 输入曾如此），历史上一律兜底成 drink——
+    # 于是 food 这个词被标成 drink，每轮都在告诉模型「画面里没有食物」。现在：
+    #   给了 label 就用给的；只发词面就**沿用该词现有的 label**（幂等，不打翻已配好的）；
+    #   都没有才落到 SAM3_TEXT_DEFAULT 判 food、其余 drink 这条最后兜底。
+    known = {w["word"]: w.get("label") for w in _get_score_cfg().get("words") or []}
     words = []
     for w in ((body or {}).get("words") or [])[:4]:   # 识别词最多 4 个；空则回落默认词表
         word = (w.get("word") if isinstance(w, dict) else str(w)).strip()
-        if word:
-            words.append({"word": word,
-                          "label": (w.get("label") if isinstance(w, dict) else None) or "drink"})
+        if not word:
+            continue
+        label = (w.get("label") or "").strip() if isinstance(w, dict) else ""
+        if label not in ("food", "drink"):
+            label = known.get(word) or ("food" if word == SAM3_TEXT_DEFAULT else "drink")
+        words.append({"word": word, "label": label})
     with _sam3_score_lock:
         _sam3_score_cfg = {"alpha": alpha, "thresh": thresh, "words": words}
         try:
             _SCORE_CFG_PATH.write_text(json.dumps(_sam3_score_cfg, ensure_ascii=False))
         except Exception as e:
             print(f"[da3-web] 口径配置落盘失败：{type(e).__name__}: {e}", flush=True)
-    print(f"[da3-web] 生产 SAM3 口径更新：alpha={alpha} thresh={thresh} words={[w['word'] for w in words]}", flush=True)
+    print("[da3-web] 生产 SAM3 口径更新：alpha=%s thresh=%s words=%s" % (
+        alpha, thresh, [f"{w['word']}({w['label']})" for w in words]), flush=True)
     return JSONResponse({"ok": True, "alpha": alpha, "thresh": thresh, "words": words})
 
 
