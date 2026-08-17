@@ -66,7 +66,7 @@ _dev_config: dict = {}
 # 数值键：push_fps=RGB 推帧频率（fps）；product_interval=点云产物上传间隔（秒）；
 # depth_*=硬件深度伪彩渲染参数——本服务只存储与下发，渲染在推流端（mac mini
 # cam-pusher）应用：推流端每 2s 经 /api/frame/status 的 devices[].config 轮询取走，
-# 约 2~4s 生效。默认值全部留在推流端（未下发的键=历史固定量程 TURBO 行为）。
+# 约 2~4s 生效。默认值全部留在推流端（未下发的键=「默认」配置预设口径）。
 DEV_CONFIG_LIMITS = {
     "push_fps": (0.1, 30.0), "product_interval": (0.5, 30.0),
     "depth_min_m": (0.05, 10.0),      # 固定量程近端（米）

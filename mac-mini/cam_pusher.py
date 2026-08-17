@@ -7,9 +7,10 @@ da3-web 服务。每台相机独立成一个 device_id 桶，/panel 下拉可切
 每个推帧节拍推两路（同一个节拍 → 同设备两路 fps 天然一致）：
   1. RGB 彩色帧 → POST /api/frame（契约与手机 App 一致，8060 单目链路零改动）；
      带硬件深度的相机同请求附可选字段 depth——深度帧在 mini 端做伪彩渲染
-     （默认固定量程 TURBO：近亮暖/远暗冷/无效点黑，默认 0.2~2m 防手/物进出画面
-     时整图颜色跳变），供 /panel「原设备深度图」格与 /experience「设备深度图」
-     来源展示，不参与 DA3 处理。渲染参数（色彩映射/量程/gamma/均衡/填洞/滤波/
+     （默认=「默认」配置预设口径（2026-08-17 起）：radar 色表、自动分位量程、
+     30fps、JPEG 80，见 _depth_to_jpeg docstring），供 /panel「原设备深度图」格
+     与 /experience「设备深度图」来源展示，不参与 DA3 处理。渲染参数（色彩映射/
+     量程/gamma/均衡/填洞/滤波/
      描边/等值线等 depth_* 键）可由服务端 per-device 配置逐项覆盖，经
      device-config 轮询热生效（约 2~4s），未下发时全走默认=历史行为；
   2. 辅助帧    → POST /api/frame/aux（仅双目相机）：左 IR + 右 IR 灰度 JPEG，
@@ -40,7 +41,7 @@ da3-web 服务。每台相机独立成一个 device_id 桶，/panel 下拉可切
   PUSH_FPS      推帧频率兜底值，默认 3——仅在拿不到服务端配置时生效
   JPEG_QUALITY  非 MJPG 相机转码 JPEG 质量，默认 80
   LASER_MODE    G335 激光策略 interleave|on|off，默认 interleave（失败自动退 on）
-  DEPTH_MIN_M / DEPTH_MAX_M  深度伪彩固定量程（米），默认 0.2~2.0
+  DEPTH_MIN_M / DEPTH_MAX_M  深度伪彩固定量程（米），默认 0.05~1.4
 
 推帧频率的权威来源是 8060 服务端配置，**按设备分桶、两台相机各调各的**：
 /panel 设备栏滑杆与 /experience「调节」抽屉都 POST /api/frame/device-config
@@ -67,9 +68,9 @@ PUSH_FPS = float(os.environ.get("PUSH_FPS", "3"))
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
 LASER_MODE = os.environ.get("LASER_MODE", "interleave").strip().lower()
 # 硬件深度图伪彩的固定量程（米）：固定而非逐帧 min/max 自适应——展台上手/物进出画面
-# 时整图颜色才不会跳变闪烁。桌面演示场景默认 0.2~2m，按展台纵深经 .env 调整。
-DEPTH_MIN_M = float(os.environ.get("DEPTH_MIN_M", "0.15"))
-DEPTH_MAX_M = float(os.environ.get("DEPTH_MAX_M", "1.6"))
+# 时整图颜色才不会跳变闪烁。默认 0.05~1.4m（「默认」配置预设口径），按展台纵深经 .env 调整。
+DEPTH_MIN_M = float(os.environ.get("DEPTH_MIN_M", "0.05"))
+DEPTH_MAX_M = float(os.environ.get("DEPTH_MAX_M", "1.4"))
 
 # 已知相机 PID → 能力描述（新相机接入时补这张表即可）
 #   tag                 device_id 尾缀（macmini-<tag>）
@@ -211,7 +212,7 @@ def get_push_interval(device_id: str) -> float:
 
 def get_depth_cfg(device_id: str) -> dict:
     """该设备当前的深度伪彩渲染配置（服务端 device-config 下发的 depth_* 键；
-    未下发时空 dict=全部走默认值，即历史固定量程 TURBO 行为）。"""
+    未下发时空 dict=全部走默认值，即「默认」配置预设口径）。"""
     with _fps_lock:
         return dict(_dev_depth.get(device_id) or {})
 
@@ -377,9 +378,10 @@ def _cfg_num(cfg: dict, key: str, default: float) -> float:
 def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     """硬件深度帧（uint16，单位由 depth_scale 折算毫米）→ 伪彩 JPEG。
 
-    默认（无下发配置）= 展会现场调定口径（2026-08-13）：自动分位量程（8~89%）、
-    gamma 0.65、全局直方图均衡、形态学填洞（半径 5px）、时域平滑 0.15、JPEG 95、
-    深度独立 1.5fps；色彩仍为 TURBO 近亮远暗、无效点黑。服务端可经 device-config 下发 depth_* 键逐项
+    默认（无下发配置）=「默认」配置预设口径（2026-08-17 调定）：自动分位量程
+    （8~89%）、gamma 0.65、全局直方图均衡、形态学填洞（半径 5px）、时域平滑 0.2、
+    JPEG 80、深度独立 30fps；色彩 radar（雷达蓝绿·暖尖）近亮远暗、无效点黑。
+    服务端可经 device-config 下发 depth_* 键逐项
     覆盖：色彩映射/方向/量程（固定或分位自适应）/gamma/直方图均衡/孔洞填充/
     时空域滤波/边缘描边/等值线/无效点颜色/JPEG 质量（/experience「调节」抽屉可视化
     调节）。state 为该相机线程私有的渲染状态（时域 EMA 上一帧等），重连后重置。
@@ -411,7 +413,7 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
     state["hole_ts"] = now_ts
 
     # ── 时域平滑（EMA）：只混合两帧都有效的像素；分辨率变化即重置 ──
-    ema = min(max(_cfg_num(cfg, "depth_ema", 0.15), 0.0), 0.95)
+    ema = min(max(_cfg_num(cfg, "depth_ema", 0.2), 0.0), 0.95)
     prev = state.get("ema_prev")
     if ema > 0 and prev is not None and prev.shape == d_mm.shape:
         m = (~invalid) & (prev > 0)
@@ -484,7 +486,7 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
         t8 = cv2.bilateralFilter(t8, 7, 50, 50)
 
     # ── 伪彩映射 ──
-    cmap = str(cfg.get("depth_colormap", "turbo"))
+    cmap = str(cfg.get("depth_colormap", "radar"))
     if cmap == "gray":
         img = cv2.cvtColor(t8, cv2.COLOR_GRAY2BGR)
     elif cmap in _CUSTOM_LUTS:
@@ -515,7 +517,7 @@ def _depth_to_jpeg(frame, cfg: dict, state: dict) -> bytes:
         bgr = (0, 0, 0)
     img[invalid] = bgr
 
-    q = int(min(max(_cfg_num(cfg, "depth_jpeg_q", 95), 30), 95))
+    q = int(min(max(_cfg_num(cfg, "depth_jpeg_q", 80), 30), 95))
     ok, jpeg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q])
     if not ok:
         raise ValueError("深度图 JPEG 编码失败")
@@ -832,7 +834,7 @@ def _camera_worker(pid: int, spec: dict, device_id: str, gen: int = 0):
                 # 自己的节拍（可高于 RGB，RGB 节拍之间发 depth-only 上报），=0 跟随
                 # RGB（历史行为）。两路都未到节拍则跳过本帧组 ──
                 dcfg = get_depth_cfg(device_id)
-                dfps = _cfg_num(dcfg, "depth_fps", 1.5)
+                dfps = _cfg_num(dcfg, "depth_fps", 30.0)
                 dep_itv = (1.0 / min(max(dfps, 0.2), 30.0)) if dfps > 0 else None
                 rgb_due = now - last_push >= get_push_interval(device_id)
                 dep_due = (now - depth_state.get("last_push", 0.0) >= dep_itv
