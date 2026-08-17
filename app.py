@@ -2817,9 +2817,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 const $=id=>document.getElementById(id);
 const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无后端时目检布局用
 
-// ══ 背景层：六种来源下拉框选择（临时工具），默认 SAM3 高亮点云 ══
-let bgSource=localStorage.getItem('exp_bg')||'hl';
-if(!['hl','stereo','la','s3','devdepth','devpc'].includes(bgSource))bgSource='hl';   // 旧版存过 raw 的自动回落高亮点云
+// ══ 背景层：六种来源下拉框选择（临时工具），默认设备深度图（g335 硬件深度伪彩）══
+let bgSource=localStorage.getItem('exp_bg')||'devdepth';
+if(!['hl','stereo','la','s3','devdepth','devpc'].includes(bgSource))bgSource='devdepth';   // 旧版存过 raw 等的自动回落默认
 const MIN_SWAP_MS=0;               // 换图节流已停用（同 /panel，2026-08-13）；"加载中不打断"守卫仍在
 let bgFlip=false,lastBgKey='',lastMvUrl='',lastMvSwap=0,mvFov=55;
 
@@ -3044,6 +3044,11 @@ function pushDefaultConfig(){
 }
 
 // ── 多设备：下拉选设备（服务端只处理选中设备一路；同 /panel 的下拉逻辑） ──
+// 打开默认设备：页面加载后第一次在状态里看到 g335 在线时，若未被选中则切过去一次
+// （选中是服务端全局粘性态，可能粘在手机等无深度设备上——如 g335 掉线重连后的回落）。
+// 只在页面加载时干预一次，此后的选择权完全交还下拉与其它页面
+const PREF_DEVICE='macmini-g335';
+let prefDevDone=false;
 let lastDevKey='',curDev=null;
 function renderDevices(s){
   const devs=s.devices||[],sel=$('selDev');
@@ -3696,6 +3701,15 @@ async function bgTick(){
  try{
   const s=await(await fetch('/api/frame/status',{cache:'no-store'})).json();
   if(s.processor&&s.config_gen===0)pushDefaultConfig();
+  // 打开默认设备：首次见到 g335 在线即（按需）选中它，本轮先返回、下一轮按新选中渲染
+  if(!prefDevDone&&(s.devices||[]).some(d=>d.device_id===PREF_DEVICE)){
+    prefDevDone=true;
+    if(s.selected!==PREF_DEVICE){
+      await fetch('/api/frame/select',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({device_id:PREF_DEVICE})}).catch(()=>{});
+      return;
+    }
+  }
   renderDevices(s);
   renderRate(s);
   // 供轮询自适应排程用：选中设备的实测入帧 fps（无帧/无效时 0）

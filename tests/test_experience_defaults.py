@@ -41,6 +41,12 @@ class ExperienceDefaultsTest(unittest.TestCase):
         got = _parse_js_object((ROOT / "app.py").read_text(encoding="utf-8"), "dotCfg")
         self.assertEqual(got, PRESET_DOT)
 
+    def test_default_bg_source_is_g335_device_depth(self):
+        # 打开默认=g335 的设备深度图：来源兜底 devdepth + 加载时按需选中 g335 一次
+        src = (ROOT / "app.py").read_text(encoding="utf-8")
+        self.assertIn("localStorage.getItem('exp_bg')||'devdepth'", src)
+        self.assertIn("const PREF_DEVICE='macmini-g335'", src)
+
     def test_pusher_depth_render_defaults_match_preset(self):
         src = (ROOT / "mac-mini" / "cam_pusher.py").read_text(encoding="utf-8")
         for needle in ('os.environ.get("DEPTH_MIN_M", "0.05")',
