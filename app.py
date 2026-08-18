@@ -1929,6 +1929,10 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    color:rgba(255,253,247,.72);font:12px system-ui,sans-serif;padding:6px 10px;border-radius:99px;
    cursor:pointer;backdrop-filter:blur(6px);outline:none}
  #tools select option{background:#1c1c1e;color:#eee}
+ /* 隧道状态按钮：绿=已连通 / 橙=重建中 / 红=已断开（红时点击一键重建） */
+ #btnTun{display:inline-flex;align-items:center;gap:6px}
+ #tunDot{width:7px;height:7px;border-radius:50%;background:#bbb;flex:none}
+ #btnTun.down{border-color:rgba(255,59,48,.55);color:#ff8478}
  /* ── 高亮点云样式调节抽屉（临时工程工具；物理像素、不随设计稿缩放；同 /panel 两张调节卡） ── */
  #hlcfg{position:fixed;top:0;right:-340px;bottom:0;width:320px;z-index:20;overflow-y:auto;
    background:rgba(12,12,14,.94);border-left:1px solid rgba(255,253,247,.14);
@@ -2024,6 +2028,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <option value="devdepth" title="仅 G335 等带硬件深度的相机支持">设备深度图</option>
   <option value="devpc" title="硬件真深度反投影彩色点云，仅 G335 等带硬件深度的相机支持">设备点云</option>
  </select>
+ <button id="btnTun" title="Qwen 识别隧道：检测中…"><span id="tunDot"></span><span id="tunTxt">隧道</span></button>
  <button id="btnHlCfg">调节</button>
  <button id="btnTl">流水</button>
  <button id="btnFs" title="整页铺满显示器（Esc 退出）">全屏</button>
@@ -3570,6 +3575,43 @@ $('btnFs').onclick=()=>{
 // 状态跟随浏览器事件（Esc/系统手势退出也能同步按钮文案）
 ['fullscreenchange','webkitfullscreenchange'].forEach(ev=>
   document.addEventListener(ev,()=>{$('btnFs').textContent=fsOn()?'退出全屏':'全屏';}));
+// ══ Qwen 识别隧道状态 + 一键重建（复用 /panel 那套 /api/tunnel/*）══
+// 链路：5090:8011 ←反向SSH← Mac:18011 ←IAP← GCP gpu-g4-01 的 vLLM。GCP 凭证只在 Mac，
+// 所以网页只负责「下发重建指令」，真正重建由 Mac 上常驻的 qwen_tunnel_keeper 心跳领走执行。
+let tunReqAt=0;        // 本页最近一次下发重建的时刻，用于在探测到通之前显示「重建中…」
+let tunKeeper=false;   // Mac 守护是否在线；不在线时网页下发也没人执行
+async function tunTick(){
+ try{
+  const t=await(await fetch('/api/tunnel/status',{cache:'no-store'})).json();
+  const dot=$('tunDot'),txt=$('tunTxt'),btn=$('btnTun');
+  tunKeeper=!!t.keeper_alive;
+  const rebuilding=!t.up&&(t.pending||Date.now()-tunReqAt<90000)&&tunReqAt;
+  const msg=t.keeper_msg?('（'+t.keeper_msg+'）'):'';
+  btn.classList.toggle('down',!t.up&&!rebuilding);
+  if(t.up){
+   dot.style.background='#34c759';txt.textContent='隧道';
+   btn.title='Qwen 识别隧道：已连通'+(t.rtt_ms?(' · RTT '+Math.round(t.rtt_ms)+'ms'):'')+'（点击可强制重建）';
+  }else if(rebuilding){
+   dot.style.background='#ff9f0a';txt.textContent='重建中…';
+   btn.title='Qwen 识别隧道：重建指令已下发，等 Mac 守护执行'+msg;
+  }else{
+   dot.style.background='#ff3b30';
+   txt.textContent=tunKeeper?'隧道断开 · 重建':'隧道断开';
+   btn.title=tunKeeper?('Qwen 识别隧道：已断开，点击一键重建'+msg)
+     :'Qwen 识别隧道：已断开，且 Mac 守护不在线，网页无法远程重建（需在 Mac 上拉起 qwen_tunnel_keeper）'+msg;
+  }
+ }catch(e){/* 单次轮询失败忽略，下轮重试 */}
+}
+$('btnTun').onclick=async()=>{
+ if(!tunKeeper){   // 守护离线：就地提示 2s 再回落，避免下发一条没人领的指令
+  $('tunTxt').textContent='Mac 守护离线';setTimeout(tunTick,2000);return;}
+ tunReqAt=Date.now();
+ $('tunDot').style.background='#ff9f0a';$('tunTxt').textContent='已下发…';
+ try{await fetch('/api/tunnel/rebuild',{method:'POST'});}catch(e){}
+ setTimeout(tunTick,1500);
+};
+setInterval(tunTick,5000);tunTick();
+
 syncStyleUI();
 
 // ══ 点云样式调节抽屉：读写 /api/sam3hl/config（与 /panel 的点渲染卡同一套配置） ══
