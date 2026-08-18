@@ -107,12 +107,12 @@ class ExperienceWiringTest(unittest.TestCase):
         """驻留与新鲜度是两个口径不同的量，合成一个就会出现
         「屏上驻留 = 驻留 − 端到端延时」——延时把驻留吃掉。"""
         self.assertHas("let DWELL_MS=Math.min(30,Math.max(1,"
-                       "+(localStorage.getItem('exp_card_dwell_s')||2)))*1000;")
+                       "+(localStorage.getItem('exp_card_dwell_s')||3)))*1000;")
         self.assertHas("let FRESH_TTL_MS=Math.min(20,Math.max(2,"
                        "+(localStorage.getItem('exp_card_ttl_s')||5)))*1000;")
         self.assertLacks("FRESH_MS=")        # 合成语义的旧变量必须彻底消失
         # 两个滑杆都在抽屉里
-        self.assertHas('id="r_card_s" min="1" max="30" step="0.5" value="2"')
+        self.assertHas('id="r_card_s" min="1" max="30" step="0.5" value="3"')
         self.assertHas('id="r_card_ttl" min="2" max="20" step="0.5" value="5"')
 
     def test_dwell_clock_counts_from_render_not_frame_time(self):

@@ -2085,8 +2085,8 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   且并发轮次拿的是同一份去重候选、可能给同一食物重复建卡。间隔也快不过 RGB 推帧
   （下方「数据源帧率」），同一帧不会重复送。<br>实测：<b id="v_rd_stat">--</b></div>
  <div class="sec">识别卡片</div>
- <div class="fld"><label>卡片驻留时长 <b id="v_card_s">2.0</b> s（上屏后停多久；同食物的后续识别会续期）</label>
-  <input type="range" id="r_card_s" min="1" max="30" step="0.5" value="2"></div>
+ <div class="fld"><label>卡片驻留时长 <b id="v_card_s">3.0</b> s（上屏后停多久；同食物的后续识别会续期）</label>
+  <input type="range" id="r_card_s" min="1" max="30" step="0.5" value="3"></div>
  <div class="fld"><label>结果新鲜度上限 <b id="v_card_ttl">5.0</b> s（帧到服务器→结果落卡，超了整条丢弃）</label>
   <input type="range" id="r_card_ttl" min="2" max="20" step="0.5" value="5"></div>
  <div class="hint">两层各管一件事，别混：<b>新鲜度</b>是「这个结果还代不代表此刻的画面」，
@@ -3435,7 +3435,7 @@ async function bgTick(){
 // 两个都可调（调节抽屉「识别卡片」区），localStorage 按展示端持久化。
 // 用新 key（不复用旧的 exp_card_fresh_s）：旧 key 存的是"合成语义"的 4s，
 // 继承过来会让老浏览器拿着旧值跑新逻辑。
-let DWELL_MS=Math.min(30,Math.max(1,+(localStorage.getItem('exp_card_dwell_s')||2)))*1000;
+let DWELL_MS=Math.min(30,Math.max(1,+(localStorage.getItem('exp_card_dwell_s')||3)))*1000;
 let FRESH_TTL_MS=Math.min(20,Math.max(2,+(localStorage.getItem('exp_card_ttl_s')||5)))*1000;
 (function(){
   const bind=(rid,vid,ms,key,set)=>{
