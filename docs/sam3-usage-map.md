@@ -95,7 +95,8 @@ top-K 原始分白拿；补跑的 food 词也进日志但标 `role="highlight"`�
 |---|---|
 | 一条日志 | 请求图（原图缩略 + 门控口径下的带框图）、候选参考图、prompt 原文、模型/endpoint/max_tokens/temperature、模型原始返回（截断 `VLMLOG_RAW_MAX`=20000 字符）、解析出的每一项、五道去重闸门的逐项判定（`outcome[].gate`/`action`/`card_id`） |
 | 容量 | 内存环形 `VLMLOG_MAX`=30 条，不落盘，重启即空 |
-| 接口 | `GET /api/recoglog/list?device=&limit=`（列表态剥掉 prompt/raw/参考图，只给长度与摘要）、`GET /api/recoglog/{id}`（全文，原图不内嵌）、`GET /api/recoglog/{id}/image/{orig\|boxed}`（**真正送进请求体的那张原尺寸图**，最近 `full_keep`=8 条）、`POST /api/recoglog/clear` |
+| 实时 | 控制面走**长轮询**：`list` 带 `since_gen` + `wait_s`，服务端在版本号上挂起，来一条立刻返回（`RECOGLOG_HOLD_MAX`=25s 上限，必须小于 nginx 对 `/da3-api` 的 30s 读超时）。选长轮询而非 SSE 是因为它对反代零要求——每次仍是一个普通的一次性响应 |
+| 接口 | `GET /api/recoglog/list?device=&limit=&since_gen=&wait_s=`（列表态剥掉 prompt/raw/参考图，只给长度与摘要）、`GET /api/recoglog/{id}`（全文，原图不内嵌）、`GET /api/recoglog/{id}/image/{orig\|boxed}`（**真正送进请求体的那张原尺寸图**，最近 `full_keep`=8 条）、`POST /api/recoglog/clear` |
 | 代码 | 缓冲与投影在 `recog_log.py`（纯逻辑、可单测），图片编码在 `app.py` 的 `_thumb_uri` |
 
 与识别卡片流的区别：卡片是「桌上现在有什么」的结果态，日志是过程态——漏识别 / 幻觉 / 错并

@@ -5077,10 +5077,24 @@ def recog_clear(device: Optional[str] = None):
 
 
 # ── VLM 识别观测日志接口（浅体验区控制面用）────────────────────────────────
+# 长轮询挂起上限（秒）：必须小于 superadmin nginx 对 /da3-api 的 proxy_read_timeout(30s)，
+# 否则反代会先掐断连接、前端看到的是一串报错而不是"还没有新日志"
+RECOGLOG_HOLD_MAX = 25.0
+
+
 @app.get("/api/recoglog/list")
-def recoglog_list(device: Optional[str] = None, limit: int = 12):
+def recoglog_list(device: Optional[str] = None, limit: int = 12,
+                  since_gen: int = -1, wait_s: float = 0.0):
     """识别日志列表（最新在前）。列表态不含 prompt 全文 / 原始返回 / 候选参考图——
-    那三样在详情里取，避免秒级轮询把响应撑成几 MB。"""
+    那三样在详情里取，避免秒级轮询把响应撑成几 MB。
+
+    wait_s>0 = 长轮询：当 since_gen 已是最新版本时把请求挂起，有新日志立刻返回，
+    否则等到 wait_s（上限 RECOGLOG_HOLD_MAX）超时返回。控制面据此做到"来一条画一条"，
+    而不是按固定间隔猜。挂起走同步端点跑在线程池里（与 /api/recog/events 同款做法），
+    展台量级（个位数页面）没有压力；用长轮询而不是 SSE 是因为它对反代零要求——
+    每次仍是一个普通的一次性响应，nginx 的缓冲与超时都不用改。"""
+    if wait_s and wait_s > 0:
+        _vlmlog.wait_for(since_gen, min(float(wait_s), RECOGLOG_HOLD_MAX))
     items, total = _vlmlog.list(device=device, limit=limit)
     # 顺带刷新网络基线：控制面在看日志时才探（探测自带 2s 缓存），没人看就不探。
     # 探测跑在这条 HTTP 请求线程里而不是识别 worker 里——worker 里补发请求会把
@@ -5091,6 +5105,7 @@ def recoglog_list(device: Optional[str] = None, limit: int = 12):
         pass
     tgt = RECOG_TARGETS[_recog_target]
     return JSONResponse({"items": items, "total": total, "max": VLMLOG_MAX,
+                         "gen": _vlmlog.gen(),
                          "target": tgt["label"], "model": tgt["model"],
                          "direct": _recog_direct.snapshot(),
                          "tunnel_rtt_ms": _tunnel_rtt_ms()})
