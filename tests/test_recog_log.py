@@ -255,6 +255,13 @@ class AppWiringTest(unittest.TestCase):
                        '"req_bytes": len(body)'):
             self.assertIn(needle, self.src, needle)
 
+    def test_list_endpoint_refreshes_the_baseline(self):
+        """基线要有人去刷新，否则 HTTP 段永远拆不开：放在列表接口里（有人看才探，
+        自带 2s 缓存），而不是识别 worker 里。"""
+        fn = self.src[self.src.index("def recoglog_list("):]
+        fn = fn[:fn.index("@app.get(\"/api/recoglog/{entry_id}\")")]
+        self.assertIn("_tunnel_probe()", fn)
+
     def test_tunnel_rtt_is_read_only_baseline(self):
         """网络基线取自隧道探测的缓存值，worker 里绝不主动再发一枪（会搅乱被测对象）。"""
         fn = self.src[self.src.index("def _tunnel_rtt_ms():"):]

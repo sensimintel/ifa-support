@@ -5033,6 +5033,13 @@ def recoglog_list(device: Optional[str] = None, limit: int = 12):
     """识别日志列表（最新在前）。列表态不含 prompt 全文 / 原始返回 / 候选参考图——
     那三样在详情里取，避免秒级轮询把响应撑成几 MB。"""
     items, total = _vlmlog.list(device=device, limit=limit)
+    # 顺带刷新网络基线：控制面在看日志时才探（探测自带 2s 缓存），没人看就不探。
+    # 探测跑在这条 HTTP 请求线程里而不是识别 worker 里——worker 里补发请求会把
+    # 被测对象自己搅乱。基线没有值的话，时序图的 HTTP 段就永远拆不出「网络 / 服务端」。
+    try:
+        _tunnel_probe()
+    except Exception:       # 探测失败不影响日志本身
+        pass
     tgt = RECOG_TARGETS[_recog_target]
     return JSONResponse({"items": items, "total": total, "max": VLMLOG_MAX,
                          "target": tgt["label"], "model": tgt["model"],
