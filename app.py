@@ -3468,7 +3468,14 @@ function applyRecog(r){
   renderTimeline(cards);
   const c=cards[0];
   if(c){const key=c.id+':'+(c.rev||0);
-    if(key!==lastCardKey){lastCardKey=key;cardShownAt=Date.now();curCard=c;renderCard(c);}}
+    // 驻留计时起点 = 卡片真实识别时间(last_ts, epoch 秒)而非"本页首次见到它"：
+    // 刷新后 lastCardKey 内存清零,任何存量卡都会被判成新卡,若取 Date.now() 则半小时前
+    // 的旧卡每次刷新都重新"新鲜"一次,导致刷新先闪一下旧卡才回落待机(2026-08-18 修)。
+    // 钳制到 [now-FRESH_MS, now]:展示端与 5090 时钟偏移时不至于把新卡直接判过期。
+    if(key!==lastCardKey){lastCardKey=key;
+      const ts=c.last_ts?c.last_ts*1000:Date.now();
+      cardShownAt=Math.min(Date.now(),Math.max(ts,Date.now()-FRESH_MS));
+      curCard=c;renderCard(c);}}
   setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
 }
 
