@@ -230,12 +230,22 @@ class AppWiringTest(unittest.TestCase):
 
     def test_end_to_end_timing_starts_at_frame_arrival(self):
         """端到端从「帧到达 8060」起算，不是从触发起算——否则帧在缓存里等的时间被藏掉。"""
-        self.assertIn('"frame_age_ms": (round((enq_ts - stage["frame_recv_at"]) * 1000.0, 1)',
+        self.assertIn('"frame_age_ms": (round((stage["pick_at"] - stage["frame_recv_at"]) * 1000.0, 1)',
                       self.src)
         self.assertIn('vlog["timings"]["total_ms"] = (round((now2 - stage["frame_recv_at"])',
                       self.src)
         # 拿不到帧时刻时留空，不用别的起点冒充
         self.assertIn('if stage.get("frame_recv_at") else None', self.src)
+
+    def test_frame_age_excludes_decode_and_gate(self):
+        """帧龄只能是「帧在缓存里等触发线程」那段：用入队时刻减帧到达时刻的话，
+        解码与 SAM3 门控（都发生在入队之前）会被算两遍，各段之和就大于端到端。"""
+        self.assertIn('"pick_at": _t', self.src)
+        loop = self.src[self.src.index("def _recog_direct_loop():"):]
+        self.assertNotIn('enq_ts - stage["frame_recv_at"]', self.src)
+        # 触发线程里门控跑完到入队的零头单独留一格，不并进别的段
+        self.assertIn('"enqueue_ms":', self.src)
+        self.assertIn('_t = time.time()          # 触发线程拿起这一帧、开始本轮处理的时刻', loop)
 
     def test_vlm_call_split_into_local_and_network(self):
         """VLM 那段拆成 本地编码 / HTTP 往返 / 解析——只报一个 llm_ms 归不了因。"""
