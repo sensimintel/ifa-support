@@ -1900,24 +1900,37 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  h1{font-family:'ABC Arizona Serif',Georgia,serif;font-weight:400;font-size:.5rem;line-height:1;
     letter-spacing:-.01rem;margin:0}
  #idle h1{text-align:right}
- .sub{font-size:.2rem;line-height:1.2;letter-spacing:-.002rem;margin:.08rem 0 0;color:var(--white)}
- .rule{border:0;border-top:1px solid #54514A;margin:.24rem 0 0}
+ .sub{font-size:.2rem;line-height:1.2;letter-spacing:-.002rem;margin:0;color:var(--white)}
+ .rule{border:0;border-top:1px solid #54514A;margin:0}
  /* 识别成功卡（Figma 563-1251 里的 nutrition-snapshot 748-1145）：532×536（高度由内容撑）、
     右边距 26、10% 白 + 40px 背景模糊的浅色玻璃面板、直角；内边距 44/24、
-    区块间距一律 24（名称+描述 / Calories / 三列宏量 / Food Classification） */
- #card{width:5.32rem;margin-right:.26rem;
-   background:rgba(255,253,247,.1);padding:.44rem .24rem;backdrop-filter:blur(.4rem);
-   position:relative}
+    区块间距一律 24（名称+描述 / Calories / 三列宏量 / Food Classification）。
+    行距挪到了各行的遮罩层 .rvw 上，内层元素一律不留 margin（否则遮罩会连空白一起裁） */
+ #card{position:relative;width:5.32rem;margin-right:.26rem;padding:.44rem .24rem;transition:none}
  /* 库内命中标记：内容来自参考食物库（而非模型现编）。展台上运营一眼可辨，
     观众几乎注意不到——排障时不必再开控制面去翻日志 */
  #creg{position:absolute;right:.1rem;top:.1rem;width:.07rem;height:.07rem;border-radius:50%;
        background:rgba(255,253,247,.55);display:none}
  #creg.on{display:block}
- .krow{display:flex;justify-content:space-between;align-items:center;gap:.3rem;margin-top:.24rem}
+ /* ── 卡片出入场动效 ──
+    出现：玻璃底先从中间往上下拉开，随后各行依次从下往上推入（上一行走到一半下一行就起步）
+    消失：内容先一起淡出，再由玻璃底向中间折叠收走（宽度不变、只压高度） */
+ #cardbg{position:absolute;inset:0;background:rgba(255,253,247,.1);backdrop-filter:blur(.4rem);
+   transform:scaleY(0);transform-origin:center;
+   transition:transform .42s cubic-bezier(.22,.61,.36,1)}
+ #card.bgin #cardbg{transform:scaleY(1)}
+ #card .rvw{position:relative;overflow:hidden}
+ #card .rvw+.rvw{margin-top:.24rem}
+ #card .rvw.g8{margin-top:.08rem}          /* 名称与描述之间是 8，不是 24 */
+ #card .rvw>*{transform:translateY(105%);opacity:0;
+   transition:transform .46s cubic-bezier(.22,.61,.36,1),opacity .46s ease}
+ #card .rvw.in>*{transform:none;opacity:1}
+ #card.out .rvw>*,#card.out #creg{transition:opacity .24s ease;opacity:0;transform:none}
+ .krow{display:flex;justify-content:space-between;align-items:center;gap:.3rem}
  .klab{font-size:.2rem;letter-spacing:-.002rem;color:var(--white);white-space:nowrap}
  .kval{font-size:.36rem;letter-spacing:-.0036rem;white-space:nowrap;
        font-variant-numeric:lining-nums proportional-nums}
- #macros{display:flex;justify-content:center;gap:.9rem;text-align:left;margin-top:.24rem;padding:.3rem 0}
+ #macros{display:flex;justify-content:center;gap:.9rem;text-align:left;padding:.3rem 0}
  #macros .mlab{display:block;font-size:.2rem;letter-spacing:-.002rem;color:var(--white)}
  #macros .mval{display:block;font-size:.36rem;letter-spacing:-.0036rem;margin-top:.09rem;
        font-variant-numeric:lining-nums proportional-nums}
@@ -2033,19 +2046,22 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <h1>Place your food here</h1>
   </div>
   <div class="state" id="card">
+   <!-- 玻璃底独立成层：出入场缩放只作用在它身上，不会把文字一起压扁 -->
+   <div id="cardbg"></div>
    <span id="creg" title="from reference catalog"></span>
-   <h1 id="cname"></h1>
-   <p class="sub" id="cdesc"></p>
-   <hr class="rule">
-   <div class="krow" id="ckcalrow"><span class="klab">Calories</span><span class="kval" id="ckcal"></span></div>
-   <hr class="rule" id="mrule">
-   <div id="macros">
+   <!-- 每行外面套一层 .rvw 当遮罩，内容从下往上推入；行距移到 .rvw 上（内层不再留 margin） -->
+   <div class="rvw"><h1 id="cname"></h1></div>
+   <div class="rvw g8"><p class="sub" id="cdesc"></p></div>
+   <div class="rvw"><hr class="rule"></div>
+   <div class="rvw"><div class="krow" id="ckcalrow"><span class="klab">Calories</span><span class="kval" id="ckcal"></span></div></div>
+   <div class="rvw"><hr class="rule" id="mrule"></div>
+   <div class="rvw"><div id="macros">
     <div class="m" id="mpro"><span class="mlab">Protein</span><span class="mval"></span></div>
     <div class="m" id="mcarb"><span class="mlab">Carbs</span><span class="mval"></span></div>
     <div class="m" id="mfat"><span class="mlab">Fat</span><span class="mval"></span></div>
-   </div>
-   <hr class="rule" id="crule">
-   <div class="krow" id="cclsrow"><span class="klab">Food Classification</span><span class="kval" id="ccls"></span></div>
+   </div></div>
+   <div class="rvw"><hr class="rule" id="crule"></div>
+   <div class="rvw"><div class="krow" id="cclsrow"><span class="klab">Food Classification</span><span class="kval" id="ccls"></span></div></div>
   </div>
  </div>
  </div>
@@ -3508,26 +3524,75 @@ function grpAnchor(cards,k){
   for(const c of cards||[]) if(grpKey(c)===k && (!a || c.id<a.id)) a=c;
   return a;
 }
+// ══ 成功卡出入场动效 ══
+// 出现：玻璃底先拉开(CARD_BG_IN)，再逐行推入——每行 CARD_ROW，相邻两行错峰 CARD_STAGGER
+//       (= 行时长的一半，上一行走到一半下一行就起步)
+// 消失：内容先一起淡出(CARD_OUT_TXT)，再折叠玻璃底(CARD_OUT_BG)，收完才让待机文案渐显
+const CARD_BG_IN=420,CARD_ROW_DELAY=160,CARD_STAGGER=230,CARD_OUT_TXT=240,CARD_OUT_BG=420;
+let cardTimers=[];
+function cardClear(){cardTimers.forEach(clearTimeout);cardTimers=[];}
+function cardRows(){   // 只取当前可见的行（无营养数据的行整行隐藏，不该占动画节拍）
+  return [...$('card').querySelectorAll('.rvw')].filter(w=>w.style.display!=='none');
+}
+function cardRowsIn(delay0){   // 逐行推入
+  cardRows().forEach((w,i)=>cardTimers.push(
+    setTimeout(()=>w.classList.add('in'),delay0+i*CARD_STAGGER)));
+}
+function cardIn(){
+  cardClear();
+  const card=$('card');
+  card.classList.remove('out');
+  card.querySelectorAll('.rvw').forEach(w=>w.classList.remove('in'));
+  card.classList.add('on');
+  // 下一帧再挂 bgin：同帧加 on+bgin 会被浏览器合成成"直接是终态"，看不到拉开过程
+  requestAnimationFrame(()=>{card.classList.add('bgin');cardRowsIn(CARD_ROW_DELAY);});
+}
+function cardOut(done){
+  cardClear();
+  const card=$('card');
+  card.classList.add('out');                                     // 内容一起淡出
+  cardTimers.push(setTimeout(()=>card.classList.remove('bgin'),CARD_OUT_TXT));   // 玻璃底折叠
+  cardTimers.push(setTimeout(()=>{
+    card.classList.remove('on','out');
+    card.querySelectorAll('.rvw').forEach(w=>w.classList.remove('in'));
+    done&&done();},CARD_OUT_TXT+CARD_OUT_BG));
+}
+let uiState=null;   // 'card' | 'idle' | 'none'(流水态两者都不显示)
 function setState(st){
-  $('idle').classList.toggle('on',st==='idle'&&!$('tl').classList.contains('on'));
-  $('card').classList.toggle('on',st==='card'&&!$('tl').classList.contains('on'));
+  const want=$('tl').classList.contains('on')?'none':st;
+  if(want===uiState)return;                    // 每秒都会调，状态没变就不重播动画
+  const prev=uiState;uiState=want;
+  if(want==='card'){$('idle').classList.remove('on');cardIn();return;}
+  if(prev==='card'){                           // 先把卡片收干净，再让待机文案渐显
+    cardOut(()=>{if(uiState==='idle')$('idle').classList.add('on');});
+    return;
+  }
+  $('idle').classList.toggle('on',want==='idle');
+}
+function rowShow(id,on){   // 整行显隐：作用在该行的遮罩层上，隐藏行不占位也不占动画节拍
+  const e=$(id),w=(e&&e.closest('.rvw'))||e;
+  if(w)w.style.display=on?'':'none';
 }
 function renderCard(c){
   $('cname').textContent=c.name||'';
   $('cdesc').textContent=c.description_en||'';
   // 营养数字与分级：VLM 偶发不给（guardrail 置 null/空）→ 对应行整行隐藏
   const kcal=(c.calories_kcal!=null)?c.calories_kcal+' kcal':'';
-  $('ckcalrow').style.display=kcal?'':'none';$('ckcal').textContent=kcal;
+  rowShow('ckcalrow',!!kcal);$('ckcal').textContent=kcal;
   let anyMac=false;
   [['mpro',c.protein_g],['mcarb',c.carbs_g],['mfat',c.fat_g]].forEach(([id,v])=>{
     const on=v!=null;$(id).style.display=on?'':'none';
     if(on){$(id).querySelector('.mval').textContent=v+'g';anyMac=true;}});
-  $('macros').style.display=anyMac?'':'none';$('mrule').style.display=anyMac?'':'none';
+  rowShow('macros',anyMac);rowShow('mrule',anyMac);
   const cls=c.classification||'';
-  $('cclsrow').style.display=cls?'':'none';$('crule').style.display=cls?'':'none';
+  rowShow('cclsrow',!!cls);rowShow('crule',!!cls);
   $('ccls').textContent=cls;
   // 库内命中：整组内容来自参考食物库（名称/描述/营养/分级都是录入的定值）
   $('creg').classList.toggle('on',c.source==='catalog');
+  // 卡片在场时换了一批（换了个食物）：玻璃底不动，只把各行重推一遍
+  if(uiState==='card'){cardClear();
+    $('card').querySelectorAll('.rvw').forEach(w=>w.classList.remove('in'));
+    requestAnimationFrame(()=>cardRowsIn(0));}
 }
 function renderTimeline(cards){
   const list=$('tllist');

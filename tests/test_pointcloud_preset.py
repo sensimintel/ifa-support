@@ -88,8 +88,13 @@ class PointcloudPresetTest(unittest.TestCase):
         # 待机态 Figma 653-25306：515 宽、右边距 43
         self.assertIn("#idle{width:5.15rem;margin-right:.43rem}", source)
         # 识别成功卡 Figma 748-1145：532 宽、右边距 26、40px 背景模糊
-        self.assertIn("#card{width:5.32rem;margin-right:.26rem;", source)
+        self.assertIn("#card{position:relative;width:5.32rem;margin-right:.26rem;", source)
         self.assertIn("backdrop-filter:blur(.4rem)", source)
+        # 出入场动效：玻璃底独立成层做缩放、每行套遮罩从下往上推入
+        self.assertIn("#cardbg{position:absolute;inset:0", source)
+        self.assertIn("#card.bgin #cardbg{transform:scaleY(1)}", source)
+        self.assertIn("#card .rvw>*{transform:translateY(105%);opacity:0;", source)
+        self.assertIn("#card .rvw.in>*{transform:none;opacity:1}", source)
         self.assertIn("h1{font-family:'ABC Arizona Serif',Georgia,serif;font-weight:400;font-size:.5rem", source)
 
 
