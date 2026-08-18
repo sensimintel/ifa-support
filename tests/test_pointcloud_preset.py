@@ -79,8 +79,17 @@ class PointcloudPresetTest(unittest.TestCase):
     def test_experience_overlay_matches_figma_logo_and_idle_layout(self):
         source = APP_PATH.read_text(encoding="utf-8")
 
+        # logo：Figma 653-25299，左边距 26、210×60、垂直居中
         self.assertIn("#logo{position:absolute;left:.26rem;top:50%;transform:translateY(-50%);width:2.1rem", source)
-        self.assertIn("#panel{position:absolute;right:.43rem;top:50%;transform:translateY(-50%);width:5.15rem", source)
+        # UI 定位画布：设计稿 2240×1260 内接屏幕并水平居中，UI 不贴视口两端
+        self.assertIn("width:22.4rem;height:12.6rem", source)
+        # 面板只负责贴右与垂直居中，宽度/右边距由各态自己给
+        self.assertIn("#panel{position:absolute;right:0;top:50%;transform:translateY(-50%);display:grid;justify-items:end}", source)
+        # 待机态 Figma 653-25306：515 宽、右边距 43
+        self.assertIn("#idle{width:5.15rem;margin-right:.43rem}", source)
+        # 识别成功卡 Figma 748-1145：532 宽、右边距 26、40px 背景模糊
+        self.assertIn("#card{width:5.32rem;margin-right:.26rem;", source)
+        self.assertIn("backdrop-filter:blur(.4rem)", source)
         self.assertIn("h1{font-family:'ABC Arizona Serif',Georgia,serif;font-weight:400;font-size:.5rem", source)
 
 

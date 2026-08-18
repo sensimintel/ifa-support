@@ -1884,20 +1884,27 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
      width:22.4rem;height:12.6rem;pointer-events:none}
  /* ── 左侧 ODYSS logo（Figma 653-25299：左边距 26px、210×60、垂直居中） ── */
  #logo{position:absolute;left:.26rem;top:50%;transform:translateY(-50%);width:2.1rem;height:auto}
- /* ── 右侧状态区（两态叠放，淡入淡出切换；Figma 653-25306：右边距 43px、宽 515px、垂直居中） ── */
- #panel{position:absolute;right:.43rem;top:50%;transform:translateY(-50%);width:5.15rem;display:grid}
+ /* ── 右侧状态区（两态叠放，淡入淡出切换）──
+    两态在设计稿里是两张不同的图，宽度与右边距各不相同，故面板本身只负责贴右
+    与垂直居中，宽度/右边距由各自的态给：
+      待机 Figma 653-25306：515 宽、右边距 43
+      成功 Figma 748-1145 ：532 宽、右边距 26 */
+ #panel{position:absolute;right:0;top:50%;transform:translateY(-50%);display:grid;justify-items:end}
  /* 两态同格叠放；状态盒在面板高度内纵向居中（待机态只有一行标题，Figma 上为垂直居中） */
  #panel .state{grid-area:1/1;opacity:0;transition:opacity .5s ease;pointer-events:none;
    display:flex;flex-direction:column;justify-content:center}
  #panel .state.on{opacity:1}
+ #idle{width:5.15rem;margin-right:.43rem}
  h1{font-family:'ABC Arizona Serif',Georgia,serif;font-weight:400;font-size:.5rem;line-height:1;
     letter-spacing:-.01rem;margin:0}
  #idle h1{text-align:right}
- .sub{font-size:.2rem;line-height:1.4;letter-spacing:-.002rem;margin:.08rem 0 0;color:var(--white)}
+ .sub{font-size:.2rem;line-height:1.2;letter-spacing:-.002rem;margin:.08rem 0 0;color:var(--white)}
  .rule{border:0;border-top:1px solid #54514A;margin:.24rem 0 0}
- /* 识别成功卡（Figma 563-1251）：10% 白 + 强背景模糊的浅色玻璃面板、直角；
-    内边距 44/24、区块间距一律 24（名称+描述 / Calories / 三列宏量 / Food Classification） */
- #card{background:rgba(255,253,247,.1);padding:.44rem .24rem;backdrop-filter:blur(.2rem)}
+ /* 识别成功卡（Figma 563-1251 里的 nutrition-snapshot 748-1145）：532×536（高度由内容撑）、
+    右边距 26、10% 白 + 40px 背景模糊的浅色玻璃面板、直角；内边距 44/24、
+    区块间距一律 24（名称+描述 / Calories / 三列宏量 / Food Classification） */
+ #card{width:5.32rem;margin-right:.26rem;
+   background:rgba(255,253,247,.1);padding:.44rem .24rem;backdrop-filter:blur(.4rem)}
  .krow{display:flex;justify-content:space-between;align-items:center;gap:.3rem;margin-top:.24rem}
  .klab{font-size:.2rem;letter-spacing:-.002rem;color:var(--white);white-space:nowrap}
  .kval{font-size:.36rem;letter-spacing:-.0036rem;white-space:nowrap;
