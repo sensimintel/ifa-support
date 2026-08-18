@@ -43,6 +43,15 @@ BUSY_LIMIT = 60           # 连续「拥塞」多少次(×POLL 秒)才兜底重�
 IAP_LOG = os.path.expanduser("~/Library/Logs/qwen-tunnel-keeper-iap.log")
 
 # IAP 段：Mac:18011 → gpu-g4-01:8000（vllm Qwen）
+# 试过 ssh -C 压缩，无效，已回退（2026-08-18 实测）：请求体是 base64 的 JPEG，
+# gzip 确实能压到 71.6%（1,065,522 → 762,687 bytes），但真实 payload 全链路耗时
+# 1.63~2.02s vs 不压缩的 1.42~1.72s——没快反而略慢。原因是固定延迟 0.7s 压不掉，
+# 能省的那 0.2s 淹在测量噪声里，还白烧一份 CPU。别再试这条。
+#
+# ⚠️ 本段带宽的真正开关是 **gcloud virtenv 里的 numpy**：IAP 隧道是纯 Python 实现，
+# 装了 numpy 后段B 带宽 1.78→3.04 MB/s、全链路 0.8→1.27 MB/s。换机器/重装 gcloud
+# 后务必补上，否则带宽直接腰斩：
+#   /Users/yu/.config/gcloud/virtenv/bin/python3.14 -m pip install numpy
 IAP_CMD = ["gcloud", "compute", "ssh", "gpu-g4-01",
            "--project=pelagic-pod-489307-g3", "--zone=asia-southeast1-b",
            "--tunnel-through-iap", "--quiet", "--",
