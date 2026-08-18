@@ -28,7 +28,7 @@ import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import cv2
 import numpy as np
@@ -47,6 +47,7 @@ sys.path.append(str(DA3_ROOT / "src"))
 from depth_anything_3.api import DepthAnything3  # noqa: E402
 
 import devpc  # noqa: E402
+import foodref  # noqa: E402
 import recog_direct  # noqa: E402
 import recog_log  # noqa: E402
 import recog_match  # noqa: E402
@@ -1904,7 +1905,13 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     右边距 26、10% 白 + 40px 背景模糊的浅色玻璃面板、直角；内边距 44/24、
     区块间距一律 24（名称+描述 / Calories / 三列宏量 / Food Classification） */
  #card{width:5.32rem;margin-right:.26rem;
-   background:rgba(255,253,247,.1);padding:.44rem .24rem;backdrop-filter:blur(.4rem)}
+   background:rgba(255,253,247,.1);padding:.44rem .24rem;backdrop-filter:blur(.4rem);
+   position:relative}
+ /* 库内命中标记：内容来自参考食物库（而非模型现编）。展台上运营一眼可辨，
+    观众几乎注意不到——排障时不必再开控制面去翻日志 */
+ #creg{position:absolute;right:.1rem;top:.1rem;width:.07rem;height:.07rem;border-radius:50%;
+       background:rgba(255,253,247,.55);display:none}
+ #creg.on{display:block}
  .krow{display:flex;justify-content:space-between;align-items:center;gap:.3rem;margin-top:.24rem}
  .klab{font-size:.2rem;letter-spacing:-.002rem;color:var(--white);white-space:nowrap}
  .kval{font-size:.36rem;letter-spacing:-.0036rem;white-space:nowrap;
@@ -2025,6 +2032,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <h1>Place your food here</h1>
   </div>
   <div class="state" id="card">
+   <span id="creg" title="from reference catalog"></span>
    <h1 id="cname"></h1>
    <p class="sub" id="cdesc"></p>
    <hr class="rule">
@@ -3531,6 +3539,8 @@ function renderCard(c){
   const cls=c.classification||'';
   $('cclsrow').style.display=cls?'':'none';$('crule').style.display=cls?'':'none';
   $('ccls').textContent=cls;
+  // 库内命中：整组内容来自参考食物库（名称/描述/营养/分级都是录入的定值）
+  $('creg').classList.toggle('on',c.source==='catalog');
 }
 function renderTimeline(cards){
   const list=$('tllist');
@@ -4066,7 +4076,8 @@ def _pick_rule(last_pick, candidates):
             "  · 只有它确实已经不在画面里了，才从画面里挑你最有把握、最主要的那一个。\n" % who)
 
 
-def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False, last_pick=None):
+def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False, last_pick=None,
+                        refs=None, min_conf="medium"):
     """按候选动态生成「识别 + 去重」prompt。
 
     direct=True 是主链路直传口径：没有 SAM3 检测框，也就没有图2带框图与命中计数，
@@ -4091,6 +4102,12 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False, last_pick
             "（检测器可能漏检，但当前画面里明显不存在的东西绝不要输出）。\n"
             "任务一·识别：只识别图1/图2 当前画面里**真实存在**的食物、以及液体/饮料"
         )
+    if refs:
+        # 参考清单在**上一条消息**里（固定前缀），本条消息的图1 起才是当前画面。
+        # 这句话必须顶在最前面：不说清楚，模型会把参考图也数进本条消息的图号里。
+        p = ("上一条消息里那 %d 项带“REFERENCE”横幅的图片是**参考清单**，"
+             "不是当前画面、也不代表桌上有这些东西；本条消息的图片才是当前画面。\n"
+             % len(refs)) + p
     p += (
         "（咖啡/水/可乐/茶/杯装饮品等）。\n"
         "**画面里就算有好几样，也只输出一个 item**——展示端一次只显示一个，多给的会被直接丢弃。\n"
@@ -4118,6 +4135,9 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False, last_pick
         "  classification：食物健康分级，只能从这些里选一个：" + "、".join(FOOD_CLASSIFICATIONS)
         + "（营养密度高、天然少加工的选 Good；高糖/高盐/油炸/高度加工的选 Bad；介于两者之间选 Neutral）。\n"
     )
+    if refs:
+        # 任务零放在字段定义之后：它要能引用上面那些字段，说清楚「命中时哪些不用填」。
+        p += foodref.task_zero(refs, min_conf)
     if candidates:
         lines = "\n".join("  [%d] %s（%s）—— %s" % (i + 1, c.get("name", ""),
                                                     c.get("type") or "食物", c.get("desc") or "无描述")
@@ -4163,7 +4183,9 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False, last_pick
     p += (
         "只输出 JSON，不要任何解释："
         "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\","
-        "\"description_en\":\"A quick source of everyday energy.\","
+        + ("\"ref_id\":null,\"ref_confidence\":null,\"ref_evidence\":null,"
+           if refs else "")
+        + "\"description_en\":\"A quick source of everyday energy.\","
         "\"description_de\":\"Ein schneller Energielieferant für den Alltag.\","
         "\"calories_kcal\":89,\"protein_g\":1.1,\"carbs_g\":22.8,\"fat_g\":0.3,"
         "\"classification\":\"Good\","
@@ -4216,6 +4238,171 @@ def _save_cloud_shot(pred, dets, conf):
         except OSError:
             pass
     return f"/shotimg/{name}"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 参考食物库：录入的实物图 → 每轮请求最前面那段固定「参考清单」
+#   动机：识别链路原本让 VLM 从零现编名称/描述/营养，同一根香蕉两轮之间卡路里
+#   会从 89 跳到 105，展台上肉眼可见。参考库把展台真正要摆的那几种食物先录进来
+#   （实物图 + 营养 + 描述），识别时把这批图钉在请求最前面，VLM 只回答「桌上那个
+#   是不是清单里第几项」，命中就由服务端查库回填——数字不再由模型编，逐轮恒定。
+#   · 前缀必须逐字节稳定：参考图在**录入时**就按当前档位规范化并落盘，之后每轮
+#     复用同一份文件字节（不重新编码），vLLM 的 prefix cache 才能命中；顺序恒按
+#     id 升序（见 foodref.Catalog.menu_items）。
+#   · 换档位（edge/quality）不丢已有产物：规范化结果按 (id, 序号, 边长, 质量) 落盘
+#     缓存，换回旧档位直接命中老文件，不必重新处理原图。
+#   · 目录与配置态在 foodref.py（纯逻辑可单测），这里只管图片处理与接口。
+# ══════════════════════════════════════════════════════════════════════
+FOODREF_DIR = Path(__file__).resolve().parent / "food_ref"
+FOODREF_CACHE_DIR = FOODREF_DIR / "cache"      # 规范化产物（送 VLM 的那一份）
+FOODREF_ORIG_MAX = 2048        # 上传原图存盘前的长边上限：换档位重算够用，又不撑爆磁盘
+FOODREF_ORIG_Q = 92            # 原图副本的 JPEG 质量（它只是重算的源，不进请求）
+_foodref = foodref.Catalog(Path(__file__).resolve().parent / "food_catalog.json")
+_foodref_lock = threading.Lock()
+_foodref_uri_cache = {}        # 缓存文件名 → dataURI（避免每轮读盘 + base64 40 张）
+_foodref_menu_cache = {"version": -1}   # 整段参考区（blocks + 元信息）的内存缓存
+print(f"[da3-web] 参考食物库：{len(_foodref.menu_items())} 种参与识别，"
+      f"配置 {_foodref.config()}", flush=True)
+
+
+def _foodref_orig_path(item_id, n):
+    return FOODREF_DIR / ("%d_%d.orig.jpg" % (int(item_id), int(n)))
+
+
+def _foodref_cache_path(item_id, n, edge, quality):
+    return FOODREF_CACHE_DIR / ("%d_%d_e%dq%d.jpg" % (int(item_id), int(n),
+                                                      int(edge), int(quality)))
+
+
+def _make_menu_img(bgr, edge, quality):
+    """录入原图 → 送 VLM 的参考图：等比缩放 + 顶部 REFERENCE 横幅 + 灰边框，返回 JPEG 字节。
+
+    横幅与边框是防幻觉的视觉防线：实测过画面空无一物时模型照着参考图报 Snickers，
+    参考区又被放到了请求最前面，风险更高——图上写死「不是当前画面」，配合 prompt
+    里的明令与服务端的证据校验，三道一起用。
+    横幅不写清单编号：编号会随增删变动，写进图里会让所有缓存产物在删一项后全部失效；
+    编号由紧挨着的文字标签行承担。"""
+    h, w = bgr.shape[:2]
+    nw, nh = foodref.fit_size(w, h, edge)
+    out = cv2.resize(bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+    bh = max(20, nh // 10)
+    cv2.rectangle(out, (0, 0), (nw, bh), (90, 90, 90), -1)
+    cv2.putText(out, "REFERENCE - NOT CURRENT FRAME", (6, int(bh * 0.74)),
+                cv2.FONT_HERSHEY_SIMPLEX, bh / 46.0, (255, 255, 255),
+                max(1, bh // 18), cv2.LINE_AA)
+    cv2.rectangle(out, (0, 0), (nw - 1, nh - 1), (90, 90, 90), max(2, nw // 110))
+    ok, buf = cv2.imencode(".jpg", out, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+    return buf.tobytes() if ok else None
+
+
+def _foodref_save_original(item_id, n, raw):
+    """存一张上传原图（长边限 FOODREF_ORIG_MAX），返回图片元信息；失败返回 None。"""
+    arr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if arr is None:
+        return None
+    h, w = arr.shape[:2]
+    if max(w, h) > FOODREF_ORIG_MAX:
+        s = FOODREF_ORIG_MAX / float(max(w, h))
+        arr = cv2.resize(arr, (max(1, round(w * s)), max(1, round(h * s))),
+                         interpolation=cv2.INTER_AREA)
+        h, w = arr.shape[:2]
+    ok, buf = cv2.imencode(".jpg", arr, [int(cv2.IMWRITE_JPEG_QUALITY), FOODREF_ORIG_Q])
+    if not ok:
+        return None
+    FOODREF_DIR.mkdir(parents=True, exist_ok=True)
+    _foodref_orig_path(item_id, n).write_bytes(buf.tobytes())
+    return {"n": int(n), "w": int(w), "h": int(h), "bytes": len(buf.tobytes())}
+
+
+def _foodref_ref_uri(item_id, n, edge, quality):
+    """取某张参考图的 dataURI：内存缓存 → 磁盘缓存 → 从原图重算并落盘。
+
+    三级都命中不了（原图丢了）返回 None，该项本轮不进参考区。"""
+    path = _foodref_cache_path(item_id, n, edge, quality)
+    key = path.name
+    hit = _foodref_uri_cache.get(key)
+    if hit:
+        return hit
+    data = None
+    if path.exists():
+        try:
+            data = path.read_bytes()
+        except OSError:
+            data = None
+    if data is None:
+        src = _foodref_orig_path(item_id, n)
+        if not src.exists():
+            return None
+        arr = cv2.imread(str(src), cv2.IMREAD_COLOR)
+        if arr is None:
+            return None
+        data = _make_menu_img(arr, edge, quality)
+        if not data:
+            return None
+        FOODREF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".jpg.tmp")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+        print("[da3-web] 参考图规范化：%s（%d 字节）" % (path.name, len(data)), flush=True)
+    uri = "data:image/jpeg;base64," + base64.b64encode(data).decode()
+    _foodref_uri_cache[key] = uri
+    return uri
+
+
+def _foodref_menu():
+    """本轮要发的参考区：返回 (items, content_blocks, meta)。
+
+    items 的下标 +1 就是模型要回填的 ref_id，落卡时也拿同一份做命中回填——
+    两处必须是同一个快照，否则并发换库时编号会错位。
+    blocks 是 OpenAI content 数组片段：开场白 → [标签行 + 该项的图]×N。"""
+    if not _foodref.enabled():
+        return [], [], {"items": 0, "images": 0, "tokens": 0, "bytes": 0, "version": 0}
+    version = _foodref.version()
+    with _foodref_lock:
+        cached = _foodref_menu_cache
+        if cached.get("version") == version:
+            return cached["items"], cached["blocks"], cached["meta"]
+    cfg = _foodref.config()
+    edge, quality = cfg["edge"], cfg["quality"]
+    items, blocks, n_images = foodref.build_blocks(
+        _foodref.menu_items(),
+        lambda item_id, n: _foodref_ref_uri(item_id, n, edge, quality))
+    n_bytes = sum(len(b["image_url"]["url"]) for b in blocks
+                  if b.get("type") == "image_url") * 3 // 4    # base64 → 原始字节
+    meta = {"items": len(items), "images": n_images,
+            "tokens": n_images * foodref.est_tokens(edge),
+            "bytes": n_bytes, "edge": edge, "version": version}
+    with _foodref_lock:
+        _foodref_menu_cache.clear()
+        _foodref_menu_cache.update({"version": version, "items": items,
+                                    "blocks": blocks, "meta": meta})
+    print("[da3-web] 参考区重建（版本 %d）：%d 种 / %d 张 / 约 %d token / %.0f KB" % (
+        version, meta["items"], meta["images"], meta["tokens"], meta["bytes"] / 1024.0),
+        flush=True)
+    return items, blocks, meta
+
+
+def _foodref_drop_cache(item_id):
+    """作废某条的规范化产物（重传图片后必须调用）。
+
+    缓存文件名只含 (id, 序号, 边长, 质量)，不含内容哈希——换了原图而文件名不变，
+    不清缓存就会一直发着旧图。这里连内存里的 dataURI 一起清。"""
+    for path in list(FOODREF_CACHE_DIR.glob("%d_*.jpg" % int(item_id))):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        _foodref_uri_cache.pop(path.name, None)
+
+
+def _foodref_drop_files(item_id):
+    """删条目时清掉它的原图与所有档位的缓存产物（含内存里的 dataURI）。"""
+    _foodref_drop_cache(item_id)
+    for path in list(FOODREF_DIR.glob("%d_*.orig.jpg" % int(item_id))):
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 def _make_ref_img(rgb):
@@ -4289,7 +4476,17 @@ def _parse_recog(content):
         mname = str(it.get("matched_name") or "").strip()[:40]
         conf = str(it.get("match_confidence") or "").strip().lower()
         conf = conf if conf in ("high", "low") else ""    # 非法/缺省按 low 语义处理（不合并）
-        out.append({"name": name, "type": "液体" if is_liquid else "食物",
+        # 参考食物库的命中三件套（没开参考库时模型不会给，一律留空/None）：
+        # 范围校验放在 foodref.resolve_hit（要对齐本轮清单长度），这里只做类型归一
+        try:
+            ref_id = int(it.get("ref_id"))
+        except (TypeError, ValueError):
+            ref_id = None
+        ref_conf = str(it.get("ref_confidence") or "").strip().lower()
+        ref_conf = ref_conf if ref_conf in foodref.CONFIDENCE_ORDER else ""
+        ref_ev = str(it.get("ref_evidence") or "").strip().replace("\n", " ")[:120]
+        out.append({"ref_id": ref_id, "ref_confidence": ref_conf, "ref_evidence": ref_ev,
+                    "name": name, "type": "液体" if is_liquid else "食物",
                     "description_en": desc_en, "description_de": desc_de,
                     "calories_kcal": kcal, "protein_g": protein,
                     "carbs_g": carbs, "fat_g": fat, "classification": cls,
@@ -4323,7 +4520,7 @@ def _vlmlog_begin(device, trigger, candidates, n_food, n_drink, orig_rgb, boxed_
 
 
 def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, target=None,
-                     log=None, last_pick=None):
+                     log=None, last_pick=None, refs=None):
     """调多模态 VLM 识别 + 去重。一次多图请求：图1原图 + 图2带框图 + 各候选参考图(带横幅标记)。
     candidates: [{"id","name","type","desc","ref_img"}...]（顺序即参考图编号）。
     n_food/n_drink：当前画面检测器命中数，作为软接地信息进 prompt。
@@ -4349,15 +4546,26 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     for c in candidates:      # 其后依次是候选参考图（带 HISTORY REF 横幅，仅供对照）
         if c.get("ref_img"):
             content.append({"type": "image_url", "image_url": {"url": c["ref_img"]}})
+    # 参考食物库：清单图独占**第一条消息**，且逐字节固定（顺序按 id 升序、图片是录入时
+    # 编码好的同一份字节）——vLLM 的 prefix cache 按前缀命中，任何每轮会变的东西
+    # （当前帧、去重候选、上次选中）都必须留在后面那条消息里，否则整段前缀白算。
+    ref_items, ref_blocks, ref_meta = refs if refs else ([], [], {})
     prompt = _build_recog_prompt(candidates, n_food, n_drink, direct=direct,
-                                 last_pick=last_pick)
+                                 last_pick=last_pick, refs=ref_items,
+                                 min_conf=_foodref.config()["min_confidence"])
     content.append({"type": "text", "text": prompt})
     # temperature=0：判同结果下游有硬合并动作，消除轮间抖动、日志巡检可复现；
     # max_tokens 1536：每 item 的输出字段不少（营养四数字
     # + classification），多物品帧 1024 有截断风险——截断会被 _parse_recog 的容错
     # 整体吞掉 items，表现为静默丢识别。
-    payload = {"model": cfg["model"],
-               "messages": [{"role": "user", "content": content}],
+    messages = []
+    if ref_blocks:
+        # 三段式（清单 → 固定回执 → 当前画面）而不是一条消息塞完：前缀边界正好落在
+        # 回执那句上，缓存块对齐更干净，语义上也把「参考清单」与「当前画面」硬隔开。
+        messages.append({"role": "user", "content": ref_blocks})
+        messages.append({"role": "assistant", "content": foodref.menu_ack(len(ref_items))})
+    messages.append({"role": "user", "content": content})
+    payload = {"model": cfg["model"], "messages": messages,
                "max_tokens": 1536, "temperature": 0}
     if RECOG_STREAM:
         # include_usage：流式下 token 数只在最后一个 usage-only chunk 里给
@@ -4372,6 +4580,14 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
         log["req"] = {"label": cfg["label"], "model": cfg["model"],
                       "endpoint": cfg["endpoint"], "direct": direct,
                       "n_images": len(content) - 1, "prompt": prompt,
+                      # 参考区规模单独留一格：排障时「这一轮到底带没带清单、带了多大」
+                      # 是第一个要问的问题，混进 n_images 里就分不出来了
+                      "ref": dict(ref_meta) if ref_meta else None,
+                      "ref_prompt": (foodref.menu_intro(len(ref_items), ref_meta.get("images", 0))
+                                     + "\n" + "\n".join(
+                                         foodref.item_label(i + 1, it)
+                                         for i, it in enumerate(ref_items))
+                                     if ref_items else None),
                       "max_tokens": payload["max_tokens"],
                       "temperature": payload["temperature"],
                       "stream": bool(payload.get("stream")),
@@ -4484,10 +4700,12 @@ def _recog_worker(idx=0):
         # 失败轮也要 commit——「这一轮压根没调通」正是最该被看见的一种日志
         vlog = _vlmlog_begin(dev, "direct" if boxed is None else "sam3",
                              candidates, n_food, n_drink, orig, boxed)
+        # 参考清单快照：请求与落卡回填必须用**同一份**，否则并发轮次撞上换库时编号会错位
+        refs = _foodref_menu()
         _tq = time.time()
         try:
             items = _recognize_dedup(orig, boxed, candidates, n_food, n_drink, tgt,
-                                     log=vlog, last_pick=lp)
+                                     log=vlog, last_pick=lp, refs=refs)
         finally:
             with _recog_lock:
                 _recog_direct_stats["in_flight"] -= 1
@@ -4502,7 +4720,35 @@ def _recog_worker(idx=0):
             items = items[:1]
             print("[da3-web] 门禁截断：模型返回 %d 项，只放行『%s』，丢弃 %s" % (
                 len(gate_dropped) + 1, items[0].get("name"), "、".join(gate_dropped)), flush=True)
+        # ── 参考食物库命中：模型只负责给编号，内容一律查库回填 ──────────────
+        # 命中项的名称/描述/营养/分级整组由库覆盖，模型编的数字直接丢弃——这正是
+        # 参考库的意义：同一根香蕉的卡路里不该在 89 和 105 之间来回跳。
+        ref_items = refs[0]
+        if ref_items and items:
+            min_conf = _foodref.config()["min_confidence"]
+            resolved = []
+            for it in items:
+                hit, src, reason = foodref.resolve_hit(it, ref_items, min_conf)
+                if hit is not None:
+                    print("[da3-web] 参考库命中：『%s』→ [%d] %s（%s，%s）｜证据 %s" % (
+                        it.get("name"), hit["id"], hit.get("name"), src, reason,
+                        it.get("ref_evidence") or "（模型未给）"), flush=True)
+                    it = foodref.apply_hit(it, hit, src)
+                else:
+                    it = dict(it, source="vlm")
+                    if it.get("ref_id") is not None:
+                        print("[da3-web] 参考库未命中（模型给了编号 %s）：%s" % (
+                            it.get("ref_id"), reason), flush=True)
+                it["ref_reason"] = reason
+                resolved.append(it)
+            items = resolved
         if vlog.get("resp") is not None:
+            vlog["resp"]["ref"] = [
+                {"name": i.get("name"), "ref_id": i.get("ref_id"),
+                 "hit_id": i.get("ref_hit_id"), "source": i.get("source", "vlm"),
+                 "confidence": i.get("ref_confidence", ""),
+                 "evidence": i.get("ref_evidence", ""), "reason": i.get("ref_reason", "")}
+                for i in items]
             vlog["resp"]["llm_ms"] = int(llm_ms)
             vlog["resp"]["wait_ms"] = int(wait_ms)
             vlog["resp"].setdefault("n_items", len(items))
@@ -4557,7 +4803,18 @@ def _recog_worker(idx=0):
                 # 日志/合并史/控制面展示的是解码后的中文——码是给机器省 token 的，
                 # 不该让人去背 B1C1S1V1
                 ev_verdict, ev_text = recog_match.check_evidence(it.get("match_evidence"))
-                if isinstance(m, int) and 1 <= m <= len(candidates):
+                ref_hit = it.get("ref_hit_id")
+                if ref_hit:
+                    # 参考库命中项不走证据码那五道闸：库里的 id 本身就是「同一种东西」的
+                    # 权威判据，比让模型逐项对照品牌/颜色/形状/容器可靠得多，也少一次错并
+                    # 的机会。活跃窗口内已有同一 ref 的卡就并过去，否则建新卡。
+                    target = next((c for c in reversed(cards)
+                                   if c.get("ref_hit_id") == ref_hit
+                                   and now - c.get("last_ts", 0) <= RECOG_ACTIVE_WINDOW),
+                                  None)
+                    if target is not None:
+                        ev_text = "参考库同项（[%d] %s）" % (ref_hit, it["name"])
+                elif isinstance(m, int) and 1 <= m <= len(candidates):
                     cand = candidates[m - 1]
                     if (it.get("matched_name") or "").strip().casefold() \
                             != cand["name"].strip().casefold():
@@ -4646,6 +4903,10 @@ def _recog_worker(idx=0):
                         "calories_kcal": it.get("calories_kcal"),
                         "protein_g": it.get("protein_g"), "carbs_g": it.get("carbs_g"),
                         "fat_g": it.get("fat_g"), "classification": it.get("classification", ""),
+                        # 参考库命中标记：展示端据此打「库内命中」的角标，
+                        # 下一轮也拿它做去重（同一 ref 直接并卡，不再问模型）
+                        "ref_hit_id": it.get("ref_hit_id"),
+                        "source": it.get("source", "vlm"),
                         "shots": [shot_url] if shot_url else [], "ref_img": ref_uri,
                         "merge_history": [],
                         "latency_ms": int(llm_ms), "latency_model": tgt["label"],
@@ -5222,6 +5483,112 @@ def recog_direct_config_set(body: dict = Body(default=None)):
         stats = dict(_recog_direct_stats)
     print(f"[da3-web] 直传识别配置更新：{cfg}", flush=True)
     return JSONResponse({"ok": True, "config": cfg, "stats": stats})
+
+
+# ── 参考食物库接口（浅体验区控制面「参考食物库」页签）──────────────────────
+# 录入即生效：任何写操作都会 bump 目录版本，下一轮识别自动重建参考区，无需重启。
+@app.get("/api/foodref/list")
+def foodref_list():
+    """目录全量 + 配置 + 参考区规模。控制面据此渲染列表与顶部预算条。
+
+    不下发图片本体（40 张 dataURI 有几百 KB），控制面按 /api/foodref/image 取。"""
+    snap = _foodref.snapshot()
+    items = [foodref.item_public(it) for it in snap["items"]]
+    menu = _foodref.menu_items()
+    cfg = snap["config"]
+    return JSONResponse({
+        "config": cfg, "version": snap["version"],
+        "items": items,
+        "budget": foodref.budget(menu, cfg["edge"]),
+        "limits": {"edge_choices": foodref.EDGE_CHOICES,
+                   "max_items": foodref.MAX_ITEMS,
+                   "max_images_per_item": foodref.MAX_IMAGES_PER_ITEM,
+                   "confidences": foodref.CONFIDENCE_ORDER,
+                   "types": foodref.TYPES,
+                   "classifications": foodref.CLASSIFICATIONS},
+    })
+
+
+@app.post("/api/foodref/config")
+def foodref_config_set(body: dict = Body(default=None)):
+    """更新参考库配置（merge-patch：on / edge / quality / min_confidence）。
+
+    edge/quality 变了等于参考图字节变了：版本 +1、下一轮重建；老档位的产物留在
+    磁盘上不删，切回去立刻命中，不必重新处理原图。"""
+    cfg = _foodref.set_config(body or {})
+    print(f"[da3-web] 参考食物库配置更新：{cfg}", flush=True)
+    return JSONResponse({"ok": True, "config": cfg, "version": _foodref.version()})
+
+
+@app.post("/api/foodref/item")
+async def foodref_item_save(meta: str = Form(...), item_id: Optional[str] = Form(None),
+                            images: List[UploadFile] = File(default=[])):
+    """新增或更新一条参考食物。
+
+    meta 是 JSON 串（名称/别名/类型/外观/营养/分级/描述）；images 传了就**整组替换**
+    该条的实物图，不传就保留原有的——控制面改个营养数字不必重新上传照片。"""
+    try:
+        patch = json.loads(meta or "{}")
+    except ValueError:
+        return JSONResponse({"error": "meta 不是合法 JSON"}, status_code=400)
+    try:
+        item = _foodref.upsert(patch, int(item_id) if item_id else None)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except KeyError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    files = [f for f in (images or []) if f is not None and f.filename]
+    if files:
+        if len(files) > foodref.MAX_IMAGES_PER_ITEM:
+            return JSONResponse({"error": "每种最多 %d 张实物图"
+                                 % foodref.MAX_IMAGES_PER_ITEM}, status_code=400)
+        _foodref_drop_cache(item["id"])      # 换图必须作废旧产物，否则一直发老图
+        metas = []
+        for n, f in enumerate(files):
+            raw = await f.read()
+            got = _foodref_save_original(item["id"], n, raw)
+            if got is None:
+                return JSONResponse({"error": "第 %d 张图解不出来（只收 jpg/png）" % (n + 1)},
+                                    status_code=400)
+            metas.append(got)
+        for stale in FOODREF_DIR.glob("%d_*.orig.jpg" % item["id"]):
+            try:                              # 从 2 张改成 1 张时，把多出来的原图删掉
+                if int(stale.stem.split(".")[0].split("_")[1]) >= len(metas):
+                    stale.unlink()
+            except (OSError, ValueError, IndexError):
+                pass
+        item = _foodref.set_images(item["id"], metas)
+    print("[da3-web] 参考食物库保存：[%d] %s（%d 张图）" % (
+        item["id"], item.get("name"), len(item.get("images") or [])), flush=True)
+    return JSONResponse({"ok": True, "item": foodref.item_public(item),
+                         "version": _foodref.version()})
+
+
+@app.delete("/api/foodref/item/{item_id}")
+def foodref_item_delete(item_id: int):
+    """删除一条参考食物（连同原图与所有档位的缓存产物）。"""
+    if not _foodref.delete(item_id):
+        return JSONResponse({"error": "条目不存在"}, status_code=404)
+    _foodref_drop_files(item_id)
+    print("[da3-web] 参考食物库删除：[%d]" % item_id, flush=True)
+    return JSONResponse({"ok": True, "version": _foodref.version()})
+
+
+@app.get("/api/foodref/image/{item_id}/{n}")
+def foodref_image(item_id: int, n: int, kind: str = "ref"):
+    """取某张参考图：kind=ref 是真正送 VLM 的那一份（按当前档位规范化、带横幅），
+    kind=orig 是上传的原图副本。控制面用 ref 做「模型看到的到底是什么」的目检。"""
+    if kind == "orig":
+        path = _foodref_orig_path(item_id, n)
+        if not path.exists():
+            return JSONResponse({"error": "图片不存在"}, status_code=404)
+        return FileResponse(str(path), media_type="image/jpeg")
+    cfg = _foodref.config()
+    uri = _foodref_ref_uri(item_id, n, cfg["edge"], cfg["quality"])
+    if not uri:
+        return JSONResponse({"error": "图片不存在"}, status_code=404)
+    return Response(content=base64.b64decode(uri.split(",", 1)[1]),
+                    media_type="image/jpeg")
 
 
 @app.post("/api/recog/clear")

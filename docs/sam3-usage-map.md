@@ -79,7 +79,7 @@
 
 ## 3.5 识别观测日志（2026-08-17 起）——控制面看得见的过程态
 
-浅体验区控制面（superadmin `/ifa-support/experience`，经 `/da3-api` 反代到 8060）两个页签：
+浅体验区控制面（superadmin `/ifa-support/experience`，经 `/da3-api` 反代到 8060）三个页签（第三个「参考食物库」是录入态而非观测态，见 README「参考食物库」一节）：
 
 **SAM3 侧**：`_sam3_gate_dets` 每轮写 `_sam3tune_record_prod(src="gate")` → `/api/sam3tune/state|history`；
 原尺寸帧按 `SAM3TUNE_FULL_KEEP`(4) 条 + 各设备实时条留 ndarray 引用（**懒编码**：只有有人点开

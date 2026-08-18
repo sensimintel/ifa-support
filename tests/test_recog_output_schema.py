@@ -257,7 +257,8 @@ class SingleItemWiringTest(WiringTest):
 
     def test_prompt_carries_last_pick_rule(self):
         self.assertHas("+ _pick_rule(last_pick, candidates)")
-        self.assertHas("last_pick=lp)")
+        # 参考食物库上线后这行还多带了 refs=refs，只断言粘性锚确实传了下去
+        self.assertHas("last_pick=lp,")
 
     def test_gate_truncates_to_one(self):
         self.assertHas('gate_dropped = [str(i.get("name") or "") for i in items[1:]]')
