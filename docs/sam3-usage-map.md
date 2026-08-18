@@ -79,7 +79,7 @@
 
 ## 3.5 识别观测日志（2026-08-17 起）——控制面看得见的过程态
 
-浅体验区控制面（superadmin `/ifa-support/experience`，经 `/da3-api` 反代到 8060）两个页签：
+浅体验区控制面（superadmin `/ifa-support/experience`，经 `/da3-api` 反代到 8060）三个页签（第三个「参考食物库」是录入态而非观测态，见 README「参考食物库」一节）：
 
 **SAM3 侧**：`_sam3_gate_dets` 每轮写 `_sam3tune_record_prod(src="gate")` → `/api/sam3tune/state|history`；
 原尺寸帧按 `SAM3TUNE_FULL_KEEP`(4) 条 + 各设备实时条留 ndarray 引用（**懒编码**：只有有人点开
@@ -89,7 +89,7 @@
 top-K 原始分白拿；补跑的 food 词也进日志但标 `role="highlight"`、不计 `n_inst`（口径统计只认配置词）；
 写历史按 `SAM3TUNE_HIST_MIN_GAP`(1.5s) 采样，实时区不受限；`/api/sam3tune/history` 支持 `device`/`limit`。
 
-**VLM 侧**：每一轮识别（含失败轮）整轮留痕。
+**VLM 侧**：每一轮识别（含失败轮）整轮留痕。2026-08-18 起 `req.prompt` 记的是**整个 content 序列**（文字块原样 + 图片位置占位，见 `recog_prompt.render_for_log`）——这次重排的要害就是排布，只记文字块就看不出图片排在哪儿；逐项判定里另带 `seen`/`cur_text`/`diff` 三个自证字段，用来分辨「没看清画面」与「看清了但被候选清单带跑」。
 
 | 项 | 内容 |
 |---|---|

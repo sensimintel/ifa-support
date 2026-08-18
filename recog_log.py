@@ -18,13 +18,15 @@ import time
 # 候选参考图 dataURI）一律留给详情接口
 _HEAD_KEYS = ("id", "ts", "device", "trigger", "img_orig", "img_boxed",
               "n_food", "n_drink", "outcome", "timings")
+# ⚠️ 这是白名单：req 里新加的字段不写进来就到不了控制面（踩过两次——stream 一次、
+# 参考食物库的 ref 一次）。加字段时顺手加断言，见 tests/test_foodref.py。
 _REQ_KEYS = ("label", "model", "endpoint", "direct", "n_images",
-             "max_tokens", "temperature", "stream", "img_full_px")
+             "max_tokens", "temperature", "stream", "img_full_px", "ref")
 # 详情才给的大字段（原尺寸图本身不进 JSON，走 /api/recoglog/{id}/image/{kind} 端点：
 # 详情响应从几百 KB 回到几 KB，点开大图时才拉那一张）
-_REQ_DETAIL_KEYS = ("prompt",)
+_REQ_DETAIL_KEYS = ("prompt", "ref_prompt")
 _RESP_KEYS = ("ok", "error", "llm_ms", "wait_ms", "n_items", "gate_dropped",
-               "dropped_reason")
+               "dropped_reason", "ref")
 
 
 class RecogLog:

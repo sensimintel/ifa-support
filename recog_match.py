@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""去重合并的证据码校验与解码（纯逻辑，无 cv2/torch 依赖，可单测）。
+"""去重合并相关的纯逻辑（证据码校验与解码 + 参考图取框），无 cv2/torch 依赖，可单测。
 
 模型在 match_evidence 里给的不再是自然语言对照文本，而是一个 8 字符证据码
 `BxCxSxVx`（x ∈ 1 一致 / 0 不一致 / ? 看不清），无相似候选时给 `NONE`。
@@ -20,6 +20,13 @@ _EV_FIELDS = ("品牌与包装", "颜色与外观", "形状与份量", "容器�
 _EV_STATE = {"1": "一致", "0": "不一致", "?": "看不清"}
 _EV_RE = re.compile(r"B([10?])C([10?])S([10?])V([10?])")
 
+# diff 字段的逃逸话术：写了这些等于没给否定证据。旧版证据码之所以退化成清一色
+# B1C1S1V1，就是因为「说不出差别」零成本——现在说不出就不许合并。
+# prompt 那侧的文案也从这里取，避免两处各写一份、改一处漏一处。
+DIFF_BLANKS = ("完全一致", "无差别", "一模一样", "没有不同", "完全相同", "无差异")
+DIFF_MIN_LEN = 6          # diff 至少这么长才算写了东西（中文 6 字 ≈ 一个短句）
+_NO_TEXT = ("", "none", "null", "无", "无文字", "n/a", "-")   # cur_text 视同「没读到文字」
+
 
 def check_evidence(code):
     """校验并解码证据码，返回 (verdict, text)。
@@ -38,3 +45,70 @@ def check_evidence(code):
         return "malformed", "证据码非法：%s" % (code or "空")
     text = "；".join("%s%s" % (f, _EV_STATE[s]) for f, s in zip(_EV_FIELDS, m.groups()))
     return ("mismatch" if "0" in m.groups() else "ok"), text
+
+
+def check_self_evidence(item):
+    """闸门六·当前画面自证 + 闸门七·B 位抵押（纯格式判定，零语义、零误伤空间）。
+
+    背景：线上出现过一张卡自我确认 252 次，合并史里清一色「四项全一致 + high」。
+    根因之一是填 `1` 零成本——模型不需要为「一致」这个主张付出任何额外输出。
+    这两道闸把成本加回去：
+      · 说不出【当前画面】里这一样东西长什么样（seen 空）→ 多半是照着参考图编的；
+      · 说不出与候选的任何一处差别（diff 空/太短/是套话）→ 不许合并；
+      · 证据码 B 位填 1，却没在 cur_text 里照抄出任何包装文字 → 这个 1 没有抵押物。
+
+    返回 (ok, reason)：ok=False 时 reason 是给日志与控制面看的中文拒合并理由。"""
+    seen = str((item or {}).get("seen") or "").strip()
+    if not seen:
+        return False, "没写 seen：说不出当前画面里它长什么样"
+    diff = str((item or {}).get("diff") or "").strip()
+    if not diff:
+        return False, "没写 diff：说不出与候选的任何差别"
+    # 先判套话再判长度：套话往往本身就短，先报长度会把真正的原因盖掉，
+    # 而拒合并理由是要给人看的（控制面「VLM 识别日志」直接展示这句）
+    if any(w in diff for w in DIFF_BLANKS):
+        return False, "diff 是套话：%s" % diff
+    if len(diff) < DIFF_MIN_LEN:
+        return False, "diff 太短（%d 字）：%s" % (len(diff), diff)
+    code = str((item or {}).get("match_evidence") or "").strip().upper()
+    m = _EV_RE.fullmatch(code)
+    if m and m.group(1) == "1":
+        cur_text = str((item or {}).get("cur_text") or "").strip().lower()
+        if cur_text in _NO_TEXT:
+            return False, "证据码 B=1 却没读到任何包装文字（cur_text=%s）" % (cur_text or "空")
+    return True, ""
+
+
+# 参考图取框：外扩比例与最小边长（归一化坐标）。外扩是因为检测框常常贴着物体边缘，
+# 裁太紧会把包装文字的边角切掉，而那正是判同最有价值的信息。
+REF_CROP_EXPAND = 1.25
+REF_CROP_MIN = 0.12
+
+
+def pick_ref_box(detections, expand=REF_CROP_EXPAND):
+    """从本轮检测框里挑一个用来裁参考图，返回归一化 (x1,y1,x2,y2)；没有框返回 None。
+
+    为什么要裁：参考图过去存的是**整帧**，而当前画面也是同一台相机、同一张桌子——
+    两张图九成像素相同，于是「品牌/颜色/形状/容器四项一致」成了客观事实，
+    证据码必然全 1，去重形同虚设（线上一张卡因此自我确认了 252 次）。
+    裁成物体特写之后，四项对照才重新有区分度。
+
+    挑最大的那个框：一轮只放行一个 item，最大框最可能就是它。"""
+    best, best_area = None, 0.0
+    for det in detections or []:
+        try:
+            _, x1, y1, x2, y2 = det
+        except (TypeError, ValueError):
+            continue
+        x1, y1, x2, y2 = (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        if area > best_area:
+            best, best_area = (x1, y1, x2, y2), area
+    if best is None or best_area <= 0:
+        return None
+    x1, y1, x2, y2 = best
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    hw = max(REF_CROP_MIN, (x2 - x1) * expand) / 2.0
+    hh = max(REF_CROP_MIN, (y2 - y1) * expand) / 2.0
+    return (max(0.0, cx - hw), max(0.0, cy - hh),
+            min(1.0, cx + hw), min(1.0, cy + hh))

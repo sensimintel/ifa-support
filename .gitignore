@@ -56,3 +56,8 @@ depth_presets.json
 
 # Orbbec SDK 运行时日志目录（mac-cam 推流脚本运行时生成）
 tools/mac-cam/Log/
+
+# 参考食物库（foodref 落盘持久化，运行时生成）：目录 JSON + 原图与规范化产物
+food_catalog.json
+food_catalog.json.tmp
+food_ref/

@@ -76,11 +76,14 @@ class WiringTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.src = (ROOT / "app.py").read_text(encoding="utf-8")
+        # prompt 文案 2026-08-18 搬进 recog_prompt.py（拆固定段/可变段），
+        # 接线断言跟着一起看这两份源码
+        cls.src = ((ROOT / "app.py").read_text(encoding="utf-8")
+                   + (ROOT / "recog_prompt.py").read_text(encoding="utf-8"))
 
     def assertHas(self, needle):
-        """app.py 里必须有这段。失败只报 needle——assertIn 会把整份源码打进报告。"""
-        self.assertTrue(needle in self.src, "app.py 里找不到：%s" % needle)
+        """代码里必须有这段。失败只报 needle——assertIn 会把整份源码打进报告。"""
+        self.assertTrue(needle in self.src, "app.py / recog_prompt.py 里找不到：%s" % needle)
 
     def assertLacks(self, needle):
         self.assertTrue(needle not in self.src, "app.py 里仍残留：%s" % needle)
@@ -183,8 +186,8 @@ class MatchFieldWiringTest(WiringTest):
     """match 三字段：evidence 换码、reason 删除、matched_name 保持不动。"""
 
     def test_prompt_asks_for_evidence_code(self):
-        self.assertHas("结果写成 8 字符证据码 BxCxSxVx")
-        self.assertHas("无相似候选时写 NONE")
+        self.assertHas("match_evidence：8 字符证据码 BxCxSxVx")
+        self.assertHas("match_evidence 写 NONE")
 
     def test_match_reason_gone_everywhere(self):
         self.assertLacks("match_reason")
@@ -204,15 +207,9 @@ class MatchFieldWiringTest(WiringTest):
 
 
 def _load_pick_rule():
-    """从 app.py 抽出 _pick_rule 源码执行——它只依赖内置，不用扛 cv2/torch。"""
-    import re as _re
-    src = (ROOT / "app.py").read_text(encoding="utf-8")
-    m = _re.search(r"^def _pick_rule\(last_pick, candidates\):.*?\n(?=\n\ndef )", src, _re.M | _re.S)
-    if not m:
-        raise AssertionError("app.py 里找不到 _pick_rule —— 单选粘性规则被改名或删了")
-    ns = {}
-    exec(m.group(0), ns)
-    return ns["_pick_rule"]
+    """粘性规则 2026-08-18 搬进 recog_prompt（纯逻辑模块），直接 import 即可。"""
+    import recog_prompt
+    return recog_prompt.pick_rule
 
 
 class PickRuleTest(unittest.TestCase):
@@ -234,7 +231,10 @@ class PickRuleTest(unittest.TestCase):
         t = self.rule({"name": "Wine", "card_id": 9}, cands)
         self.assertIn("「Wine」", t)
         self.assertIn("清单[2]", t)
-        self.assertIn("仍在当前画面里", t)
+        # 新文案不再问「它还在不在」（那是要求确认，会让错误自我延续），
+        # 改成先独立得出结论、再决定要不要沿用
+        self.assertIn("独立写完 seen 与 name", t)
+        self.assertNotIn("就继续选它", t)
 
     def test_history_not_in_candidates_falls_back_to_name(self):
         """上次那张卡掉出活跃窗口后不在候选里了，只提名称，别编个不存在的编号。"""
@@ -256,8 +256,10 @@ class SingleItemWiringTest(WiringTest):
         self.assertLacks("逐一分别输出")
 
     def test_prompt_carries_last_pick_rule(self):
-        self.assertHas("+ _pick_rule(last_pick, candidates)")
-        self.assertHas("last_pick=lp)")
+        self.assertHas("recog_prompt.tail(last_pick, cands)")
+        self.assertHas("pick_rule(last_pick, candidates)")
+        # 参考食物库上线后这行还多带了 refs=refs，只断言粘性锚确实传了下去
+        self.assertHas("last_pick=lp,")
 
     def test_gate_truncates_to_one(self):
         self.assertHas('gate_dropped = [str(i.get("name") or "") for i in items[1:]]')
@@ -383,3 +385,80 @@ class OrderingWiringTest(WiringTest):
         self.assertHas('vlog["resp"]["dropped_reason"]')
         import recog_log
         self.assertIn("dropped_reason", recog_log._RESP_KEYS)
+
+
+class SelfEvidenceGateTest(unittest.TestCase):
+    """闸门六/七：当前画面自证 + B 位抵押（纯格式判定）。
+
+    线上那张自我确认 252 次的卡，合并史清一色「四项全一致 + high」——填 1 零成本
+    是根因之一。这两道闸把成本加回去：说不出观察、说不出差别、或者 B=1 却没照抄出
+    任何包装文字，都不许合并。"""
+
+    def _item(self, **kw):
+        base = {"seen": "金黄方形软包装，桌面中央", "diff": "候选是橙色球形果实",
+                "match_evidence": "B1C1S?V1", "cur_text": "Werther's"}
+        base.update(kw)
+        return base
+
+    def test_pass(self):
+        self.assertEqual(recog_match.check_self_evidence(self._item()), (True, ""))
+
+    def test_missing_seen_blocked(self):
+        ok, why = recog_match.check_self_evidence(self._item(seen="  "))
+        self.assertFalse(ok)
+        self.assertIn("seen", why)
+
+    def test_missing_or_short_diff_blocked(self):
+        for bad in ("", "  ", "一样"):
+            self.assertFalse(recog_match.check_self_evidence(self._item(diff=bad))[0], bad)
+
+    def test_boilerplate_diff_blocked(self):
+        for blank in recog_match.DIFF_BLANKS:
+            ok, why = recog_match.check_self_evidence(self._item(diff="两者" + blank))
+            self.assertFalse(ok, blank)
+            self.assertIn("套话", why)
+
+    def test_b_one_without_collateral_blocked(self):
+        for empty in ("", "none", "None", "无", "-"):
+            ok, why = recog_match.check_self_evidence(
+                self._item(match_evidence="B1C1S1V1", cur_text=empty))
+            self.assertFalse(ok, empty)
+            self.assertIn("B=1", why)
+
+    def test_b_question_mark_needs_no_collateral(self):
+        """没读到包装文字时填 ? 是被期待的行为，不该被拦。"""
+        self.assertTrue(recog_match.check_self_evidence(
+            self._item(match_evidence="B?C1S?V1", cur_text="none"))[0])
+
+    def test_malformed_code_is_not_this_gates_business(self):
+        """码非法由闸门三判，这里不重复拦（拦两次日志理由会互相盖掉）。"""
+        self.assertTrue(recog_match.check_self_evidence(
+            self._item(match_evidence="乱写"))[0])
+
+
+class RefCropBoxTest(unittest.TestCase):
+    """参考图取框：整帧对照必然四项全一致，裁成特写后才重新有区分度。"""
+
+    def test_picks_the_largest_box(self):
+        box = recog_match.pick_ref_box([("drink", 0.1, 0.1, 0.2, 0.2),
+                                        ("food", 0.4, 0.4, 0.8, 0.8)])
+        cx = (box[0] + box[2]) / 2
+        self.assertAlmostEqual(cx, 0.6, places=3)     # 取的是大的那个
+
+    def test_expands_and_clamps(self):
+        box = recog_match.pick_ref_box([("food", 0.0, 0.0, 0.2, 0.2)])
+        self.assertGreaterEqual(box[0], 0.0)          # 外扩后不许越界
+        self.assertLessEqual(box[3], 1.0)
+        self.assertGreater(box[2] - box[0], 0.2)      # 确实扩了
+
+    def test_tiny_box_gets_a_floor(self):
+        box = recog_match.pick_ref_box([("food", 0.5, 0.5, 0.51, 0.51)])
+        self.assertGreaterEqual(box[2] - box[0], recog_match.REF_CROP_MIN - 1e-9)
+
+    def test_no_detections(self):
+        self.assertIsNone(recog_match.pick_ref_box([]))
+        self.assertIsNone(recog_match.pick_ref_box(None))
+        self.assertIsNone(recog_match.pick_ref_box([("food", 0.5, 0.5, 0.5, 0.5)]))
+
+    def test_garbage_rows_skipped(self):
+        self.assertIsNone(recog_match.pick_ref_box([("food", 0.1), None, "x"]))
