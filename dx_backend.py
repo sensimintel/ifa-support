@@ -569,15 +569,25 @@ def api_necklace_meal_state_get(device_id: str):
 
 @app.put("/api/necklaces/{device_id}/meal-state")
 def api_necklace_meal_state_set(device_id: str, body: dict = Body(...)):
-    """设置某条项链的演示状态（控制面用：设 ready 与 reset 都是 state=ready）。"""
+    """设置某条项链的演示状态（控制面用：设 ready 与 reset 都是 state=ready）。
+
+    persona_id 可选，且只在 state=ready（开一轮新演示）时有意义：一轮演示绑定一个
+    深区角色与至多一份报告，App 侧靠这条绑定在用户离开深区再回来时落回「那个人的报告」。
+    控制面这条路是辅助入口（现场先点开始新一轮、访客随后才选人时用），主路径仍是
+    App 选角色页与 Start your trip 自己上报，所以这里不填也完全成立。
+    """
     device_id = (device_id or "").strip()
     if not device_id:
         return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
     state = str((body or {}).get("state") or "").strip()
     if not state:
         return JSONResponse({"ok": False, "error": "需要 state"}, status_code=400)
+    payload = {"state": state}
+    persona_id = str((body or {}).get("persona_id") or "").strip()
+    if persona_id:
+        payload["persona_id"] = persona_id
     data, status = _ifa_services_request(
-        "PUT", "/api/v1/ifa/devices/%s/meal-state" % urllib.parse.quote(device_id), {"state": state})
+        "PUT", "/api/v1/ifa/devices/%s/meal-state" % urllib.parse.quote(device_id), payload)
     ok = status < 400
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
 
