@@ -4234,7 +4234,11 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     try:
         req = urllib.request.Request(cfg["endpoint"], data=body, headers=headers)
         with urllib.request.urlopen(req, timeout=RECOG_TIMEOUT) as r:
-            out = json.loads(r.read().decode())["choices"][0]["message"]["content"]
+            data = json.loads(r.read().decode())
+            out = data["choices"][0]["message"]["content"]
+            # vLLM 的 OpenAI 兼容响应**不带服务端耗时**，只有 token 数——拿它解释
+            # 「这轮为什么慢」：输出 token 越多解码越久，是 http 段里最可归因的一项
+            usage = data.get("usage") or {}
     except Exception as e:
         print(f"[da3-web] 识别调用失败：{type(e).__name__}: {e}", flush=True)
         _vlmlog.set_response(log, False, error=f"{type(e).__name__}: {e}",
@@ -4252,7 +4256,9 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
                          timings={"encode_ms": round(encode_ms, 1),
                                   "http_ms": round(http_ms, 1),
                                   "parse_ms": round((time.time() - _t_parse) * 1000.0, 1),
-                                  "req_bytes": len(body)})
+                                  "req_bytes": len(body),
+                                  "prompt_tokens": usage.get("prompt_tokens"),
+                                  "completion_tokens": usage.get("completion_tokens")})
     return items
 
 
@@ -4313,8 +4319,12 @@ def _recog_worker(idx=0):
             vlog["resp"].setdefault("n_items", len(items))
         # 链路分段：触发线程测到的三段 + 本 worker 的排队/调用，落卡后再补 post/total
         vlog.setdefault("timings", {}).update({
-            "frame_age_ms": (round((enq_ts - stage["frame_recv_at"]) * 1000.0, 1)
-                             if stage.get("frame_recv_at") else None),
+            "frame_age_ms": (round((stage["pick_at"] - stage["frame_recv_at"]) * 1000.0, 1)
+                             if stage.get("frame_recv_at") and stage.get("pick_at") else None),
+            # 触发线程里「门控跑完 → 任务入队」的零头，单独留一格免得并进别人头上
+            "enqueue_ms": (round((enq_ts - stage["pick_at"]) * 1000.0, 1)
+                           - (stage.get("decode_ms") or 0) - (stage.get("gate_ms") or 0)
+                           if stage.get("pick_at") else None),
             "decode_ms": stage.get("decode_ms"),
             "gate_ms": stage.get("gate_ms"),
             "wait_ms": round(wait_ms, 1),
@@ -4601,13 +4611,16 @@ def _recog_direct_loop():
                 time.sleep(min(0.2, itv))
                 continue
             last_dev, last_seq = dev, seq
-            _t = time.time()
+            _t = time.time()          # 触发线程拿起这一帧、开始本轮处理的时刻
             arr = np.array(ImageOps.exif_transpose(
                 Image.open(io.BytesIO(raw))).convert("RGB"))
             # 本轮的链路计时随任务下传，worker 合并出端到端分段（见 _recog_worker）。
             # frame_recv_at 是帧到 8060 的时刻：端到端从它起算，才盖得住「帧在缓存里
             # 等触发线程」这段——只从触发算起会把推帧慢造成的延时藏起来。
-            stage = {"frame_recv_at": recv_at, "seq": seq,
+            # pick_at 与 frame_recv_at 分开记：帧龄只能算「帧在缓存里等触发线程」那段。
+            # 用入队时刻减帧到达时刻的话，解码与 SAM3 门控（都在入队之前）会被算两遍，
+            # 各段之和就会大于端到端（实测多出 183ms，正是 decode+gate）。
+            stage = {"frame_recv_at": recv_at, "pick_at": _t, "seq": seq,
                      "decode_ms": round((time.time() - _t) * 1000.0, 1), "gate_ms": None}
             if _recog_direct.enabled():
                 _maybe_recognize(arr, [], None, f"d{seq}", pred=None, conf=40.0,
