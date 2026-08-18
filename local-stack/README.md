@@ -101,6 +101,18 @@ docker exec odyss-local-postgres psql -U odyss -d odyss_services \
 
 服务代码或前端有更新时，回到阶段 A 重跑 `./stack build && ./stack bundle` 得到新 bundle，目标机解包后重跑 `./stack bootstrap` 即可（配置重渲染 + 镜像重建 + 增量 migrate，数据在命名卷里不受影响）。
 
+### 5090 演示机（孤本栈）的增量更新
+
+5090 的 `~/odyss-services-ifa` 是标准化之前的手工孤本（见 `MANAGEMENT.md` §5），走不了上面的 bundle 流程。ifa 分支有新代码时用：
+
+```bash
+./stack deploy-5090     # 校验两仓在 ifa tip → 本机构建 → 建镜像 → migrate → 只重建 services/llm-mock → 发 dist → 探活
+```
+
+不在局域网时走 frp：`DEPLOY_TARGET=odyss-server-frpc ./stack deploy-5090`。
+
+⚠️ 该栈的 pg/minio **没有命名卷**，数据在容器可写层里。所以更新只能用这个脚本（它对 compose 的每次调用都点名服务并带 `--no-deps`），**不要手敲 `docker compose up -d`**——按 depends_on 连带重建 postgres 就是清库。脚本每次部署前自动 `pg_dump -Fc` 留一份退路（滚动保留 3 份），dist 同样滚动备份 3 份。
+
 ## 边界与注意事项
 
 - **安全边界**：18090/18091 仅应在局域网可达，不要做公网暴露；账号密码是唯一防线。`config/` 下渲染出的运行配置与 `stack.env` 含密钥，随备份妥善保管，均不入 git。

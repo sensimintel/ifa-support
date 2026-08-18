@@ -50,7 +50,7 @@
 | 部署点 | 状态 | 待办 |
 |---|---|---|
 | GCP gpu-g4-01（VLM） | 与 odyss-models 正源一致；`GPU_UTIL=0.90` 整卡承接 VLM（2026-08-03 容量压测定标：meal 并发容量依赖大 KV 池，51.11GiB/558k tokens；legacy sam3(8001) 已停用腾显存，恢复方式见该单元 README） | — |
-| 5090 `~/odyss-services-ifa` | **手工演化的孤本**（容器名 odyss-ifa-*、pg/minio **无命名卷**、配置手改） | 下次维护窗口用本仓 SOP 重新拉起：`./stack backup` 思路导出数据 → 按 bundle 重部署 → restore；在此之前只允许对齐 nginx conf、superadmin `dist` 等无状态文件（`superadmin/dist` 是 bind mount，换文件即生效，不需重建容器） |
+| 5090 `~/odyss-services-ifa` | **手工演化的孤本**（容器名 odyss-ifa-*、pg/minio **无命名卷**、配置手改）；业务版本更新已收敛到 `./stack deploy-5090`（2026-08-18 起） | 下次维护窗口用本仓 SOP 重新拉起：`./stack backup` 思路导出数据 → 按 bundle 重部署 → restore。在此之前，业务代码更新一律走 `./stack deploy-5090`（构建 → 建镜像 → migrate → **只**重建 services/llm-mock → 发 dist），**严禁手敲 `docker compose up -d`**：pg/minio 无命名卷，按 depends_on 连带重建等于清空演示库 |
 | 5090 `~/odyss-ifa-lumen`（lumen overlay） | 由本仓 `local-stack/lumen/` 管理（独立 compose 项目挂 `odyss-ifa-network`，collector 以别名 `lumen-collector.odyss.internal:80` 接住 services 默认导出；lumen 数据在命名卷 `odyss-ifa-lumen-pg-data`） | 更新一律 `deploy-5090.sh` 重放；业务栈重拉为标准 local-stack 后把 `LUMEN_ATTACH_NETWORK` 换成 `odyss-local-network` 重挂 |
 
 ## 6. 违规即失败

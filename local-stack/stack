@@ -28,6 +28,7 @@ usage() {
   build       【开发机】按 manifest 校验分支并构建业务产物（二进制 + 前端 dist）
   bundle      【开发机】拉齐 base 镜像，打自包含离线包
   bootstrap   【目标机】一键拉起/更新整套栈（幂等；LLM_MODE 由 stack.env 决定）
+  deploy-5090 【开发机】把 ifa tip 的 services 镜像与 superadmin dist 部署到 5090 演示机
   up          起栈（自动带当前模式的 compose profile）
   down        停栈（数据在命名卷里，不丢）
   restart     重启业务容器（services + superadmin）
@@ -44,6 +45,7 @@ case "$cmd" in
   build)     exec ./scripts/build-artifacts.sh "$@" ;;
   bundle)    exec ./scripts/make-offline-bundle.sh "$@" ;;
   bootstrap) exec ./scripts/bootstrap.sh "$@" ;;
+  deploy-5090) exec ./scripts/deploy-5090.sh "$@" ;;
   up)        exec docker compose up -d "$@" ;;
   down)      exec docker compose down "$@" ;;
   restart)   exec docker compose restart odyss-services superadmin "$@" ;;
