@@ -64,6 +64,21 @@ class MealStatePassthroughTest(IfaProxyTestBase):
         self.assertEqual(self.last["body"], {"state": "ready"})
         self.assertEqual(resp.json()["cycle_id"], "")
 
+    def test_put_带_persona_id_一并透传(self):
+        """开一轮新演示时可以直接把这一轮绑给某个角色（现场先开轮、后选人的顺序）。"""
+        self.reply = ({"device_id": DEVICE, "state": "ready", "persona_id": "leo"}, 200)
+        resp = self.client.put("/api/necklaces/%s/meal-state" % DEVICE,
+                               json={"state": "ready", "persona_id": "leo"})
+        self.assertEqual(self.last["body"], {"state": "ready", "persona_id": "leo"})
+        self.assertEqual(resp.json()["persona_id"], "leo")
+
+    def test_put_不带_persona_id_时不塞空值(self):
+        """留空是常态：主路径是访客在 App 上选完角色自己补绑，别把空串写进这一轮。"""
+        self.reply = ({"device_id": DEVICE, "state": "ready"}, 200)
+        self.client.put("/api/necklaces/%s/meal-state" % DEVICE,
+                        json={"state": "ready", "persona_id": "  "})
+        self.assertEqual(self.last["body"], {"state": "ready"})
+
     def test_缺_state_不打给_services(self):
         resp = self.client.put("/api/necklaces/%s/meal-state" % DEVICE, json={})
         self.assertEqual(resp.status_code, 400)
