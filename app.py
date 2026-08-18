@@ -1897,6 +1897,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    display:flex;flex-direction:column;justify-content:center}
  #panel .state.on{opacity:1}
  #idle{width:5.15rem;margin-right:.43rem}
+ /* 让位给卡片时快速退场（默认的 .5s 渐隐会和卡片展开撞在一起，两段文案叠着）；
+    卡片收完再渐显时把这个类摘掉，走回默认的慢渐显 */
+ #idle.fast{transition:opacity .18s ease}
  h1{font-family:'ABC Arizona Serif',Georgia,serif;font-weight:400;font-size:.5rem;line-height:1;
     letter-spacing:-.01rem;margin:0}
  #idle h1{text-align:right}
@@ -3566,9 +3569,9 @@ function setState(st){
   const want=$('tl').classList.contains('on')?'none':st;
   if(want===uiState)return;                    // 每秒都会调，状态没变就不重播动画
   const prev=uiState;uiState=want;
-  if(want==='card'){$('idle').classList.remove('on');cardIn();return;}
+  if(want==='card'){$('idle').classList.add('fast');$('idle').classList.remove('on');cardIn();return;}
   if(prev==='card'){                           // 先把卡片收干净，再让待机文案渐显
-    cardOut(()=>{if(uiState==='idle')$('idle').classList.add('on');});
+    cardOut(()=>{if(uiState==='idle'){$('idle').classList.remove('fast');$('idle').classList.add('on');}});
     return;
   }
   $('idle').classList.toggle('on',want==='idle');
