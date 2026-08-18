@@ -3426,8 +3426,9 @@ function rdStat(s){
   const gate=off?('SAM3 门控 '+(s.gate_ms||0)+'ms · 命中 '+(s.gate_hits||0)
     +'/'+((s.gate_hits||0)+(s.gate_misses||0))+' 轮 · '):'';
   // 陈旧帧丢弃：非零就显示，它是"积压有没有被截住"的直接读数
-  const drop=s.dropped_stale?(' · 陈旧丢弃 '+s.dropped_stale+' 轮'
-    +(s.last_drop_age_ms?'（最近 '+(s.last_drop_age_ms/1000).toFixed(1)+'s）':'')):'';
+  const drop=(s.dropped_stale?(' · 陈旧丢弃 '+s.dropped_stale+' 轮'
+    +(s.last_drop_age_ms?'（最近 '+(s.last_drop_age_ms/1000).toFixed(1)+'s）':'')):'')
+    +(s.dropped_out_of_order?' · 乱序丢弃 '+s.dropped_out_of_order+' 轮':'');
   el.textContent=gate+'VLM '+(s.last_ms||0)+'ms · 在飞 '+(s.in_flight||0)+' 路 · 累计 '
     +(s.rounds||0)+' 轮'+(age!==null?' · 最近一轮 '+age+'s 前':'')+drop
     +(s.last_error?' · 错误：'+s.last_error:'');
@@ -3504,7 +3505,11 @@ function applyRecog(r){
   const cards=r.cards||[];
   renderTimeline(cards);
   const head=cards[0];                       // 后端最后碰过的那条：决定"现在该看哪一批"
-  if(head){const key=grpKey(head);
+  // 陈旧结果整条忽略：last_ts 现在是**帧时刻**，一个飞了十几秒才回来的结果，
+  // 它的画面早过期了。不只是不上屏——连 curCard/lastCardKey 都不能动，否则
+  // 屏幕当下虽判 idle 不显示，下一次任何更新到来时会先闪一下这份旧内容。
+  const headFresh=head&&(Date.now()-(head.last_ts?head.last_ts*1000:Date.now()))<FRESH_MS;
+  if(head&&headFresh){const key=grpKey(head);
     // 内容取批次锚点(最早那张)，不取 head——head 可能是这批里第 14 张，
     // 拿它的描述/营养上屏正是"跳"的来源
     const anchor=grpAnchor(cards,key)||head;
@@ -3936,6 +3941,13 @@ _recog_last_ts = 0.0       # 上次触发识别的时刻(节流用)
 # 选中的告诉模型、让它「还在画面里就继续选它」，粘性从 prompt 层就建立了。
 # 超过 RECOG_ACTIVE_WINDOW 视为过期（人早换东西吃了，再提上次没意义）。
 _recog_last_pick = {}
+# device_id -> 已落卡的最新**帧时刻**（wall clock）。识别链路原先没有任何时序保护
+# （SAM3 流那侧早有 _stream_gen 代次机制，这边一直没有），并发>1 或隧道抖动时，
+# 先发的请求可能后回来，把一张更新的卡覆盖成更旧的画面。落卡前拿它当水位线：
+# 比水位线还旧的结果直接丢弃，不落卡、不更新 last_pick、不推 SSE。
+# 用 frame_recv_at 而不是 stage["seq"]：设备桶闲置 60s 被清后 seq 会从 1 重计
+# （见 frame_relay 撞键那条），拿它当水位线会永久卡死；wall clock 不受影响。
+_recog_applied_at = {}
 _recog_pending = []        # 待识别任务队列(worker 池消费，最新优先、丢弃积压)
 _recog_workers = 0         # 已起的 worker 线程数（按并发配置只增不减；多余线程自行退出）
 
@@ -3959,7 +3971,9 @@ _recog_direct_stats = {"rounds": 0, "in_flight": 0, "last_ms": 0,
                        # SAM3 门控（直传关闭时）观测：单轮耗时 + 命中/空轮计数
                        "gate_ms": 0, "gate_hits": 0, "gate_misses": 0,
                        # 陈旧帧截断：丢弃轮次数 + 最近一次丢弃时的帧龄（排积压时看这两个）
-                       "dropped_stale": 0, "last_drop_age_ms": 0}
+                       "dropped_stale": 0, "last_drop_age_ms": 0,
+                       # 乱序丢弃：结果回来时发现比已落卡的帧还旧
+                       "dropped_out_of_order": 0}
 print(f"[da3-web] 直传识别配置：{_recog_direct.snapshot()}", flush=True)
 
 # 食物健康分级的合法枚举（静态 guardrail 白名单：模型输出只保留集合内的值、其余置空）。
@@ -4462,6 +4476,23 @@ def _recog_worker(idx=0):
             "直传" if boxed is None else "SAM3", wait_ms, tgt["label"], llm_ms, len(items),
             len(candidates), "、".join(c["name"] for c in candidates) or "无"), flush=True)
         now = time.time()
+        # ── 保序闸门：比已落卡的帧还旧的结果，一律不落卡 ──────────────────
+        # 检查与推进必须在同一把锁内，否则并发多路会同时通过检查。
+        frame_at = stage.get("frame_recv_at")
+        with _recog_lock:
+            stale = (frame_at is not None
+                     and frame_at < _recog_applied_at.get(dev, 0.0))
+            if stale:
+                behind_s = _recog_applied_at[dev] - frame_at
+                _recog_direct_stats["dropped_out_of_order"] += 1
+            elif frame_at is not None:
+                _recog_applied_at[dev] = frame_at
+        if stale:
+            print("[da3-web] 乱序丢弃：本轮帧比已落卡的旧 %.1fs，结果不落卡（%d 项）" % (
+                behind_s, len(items)), flush=True)
+            if vlog.get("resp") is not None:
+                vlog["resp"]["dropped_reason"] = "乱序：帧比已落卡的旧 %.1fs" % behind_s
+            items = []       # 后面的落卡循环自然空转；resp.n_items 仍保留模型真实返回数
         with _recog_lock:
             cards = _recog_cards.setdefault(dev, [])   # 该设备自己的卡片流
             for it in items:
@@ -4534,7 +4565,10 @@ def _recog_worker(idx=0):
                         target["shots"].append(shot_url)
                     # shots 只留最近 8 张：磁盘只保留最近 SHOT_KEEP 张，太多前端也摆不下
                     del target["shots"][:-8]
-                    target["last_ts"] = now
+                    # 用**帧时刻**而不是落卡时刻：一个飞了 20 秒才回来的结果，带的是
+                    # 20 秒前的画面，不该盖一个"此刻"的时间戳——前端正是按这个值判
+                    # 卡片还新不新鲜，盖成此刻就会把待机态("Please place your food")顶掉
+                    target["last_ts"] = frame_at or now
                     target["t"] = t
                     target["frame"] = frame
                     # 最近一次识别到该食物的 VLM 延时（合并也刷新：卡片右侧展示）
@@ -4561,7 +4595,7 @@ def _recog_worker(idx=0):
                         "shots": [shot_url] if shot_url else [], "ref_img": ref_uri,
                         "merge_history": [],
                         "latency_ms": int(llm_ms), "latency_model": tgt["label"],
-                        "frame": frame, "t": t, "last_ts": now, "rev": 0})
+                        "frame": frame, "t": t, "last_ts": frame_at or now, "rev": 0})
                 # 逐项判定进观测日志：控制面据此回答「这一项为什么建了新卡/并到了哪张」
                 vlog["outcome"].append({
                     "name": it["name"], "type": it["type"], "match": m,

@@ -23,7 +23,8 @@ _REQ_KEYS = ("label", "model", "endpoint", "direct", "n_images",
 # 详情才给的大字段（原尺寸图本身不进 JSON，走 /api/recoglog/{id}/image/{kind} 端点：
 # 详情响应从几百 KB 回到几 KB，点开大图时才拉那一张）
 _REQ_DETAIL_KEYS = ("prompt",)
-_RESP_KEYS = ("ok", "error", "llm_ms", "wait_ms", "n_items", "gate_dropped")
+_RESP_KEYS = ("ok", "error", "llm_ms", "wait_ms", "n_items", "gate_dropped",
+               "dropped_reason")
 
 
 class RecogLog:

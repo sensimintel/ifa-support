@@ -334,3 +334,44 @@ class KeeperRebuildPolicyTest(unittest.TestCase):
     def test_falls_back_when_server_has_no_state_field(self):
         """守护可能先于 5090 升级，老服务端没有 state 字段时不能乱重建。"""
         self.assertHas('if state not in ("up", "busy", "down"):')
+
+
+class OrderingWiringTest(WiringTest):
+    """时序保护：更旧的结果不许覆盖更新的，也不许把待机态顶回卡片态。"""
+
+    def test_watermark_uses_wall_clock_not_seq(self):
+        """seq 在设备桶闲置 60s 被清后会从 1 重计，拿它当水位线会永久卡死。"""
+        self.assertHas("_recog_applied_at = {}")
+        self.assertHas('frame_at < _recog_applied_at.get(dev, 0.0)')
+        self.assertLacks('_recog_applied_at[dev] = stage["seq"]')
+
+    def test_check_and_advance_share_one_lock(self):
+        """检查与推进必须在同一把锁内，否则并发多路会同时通过检查。"""
+        seg = self.src[self.src.index("stale = (frame_at is not None"):][:700]
+        self.assertIn("_recog_applied_at[dev] = frame_at", seg)
+        self.assertIn("dropped_out_of_order", seg)
+
+    def test_stale_result_does_not_land(self):
+        self.assertHas("items = []       # 后面的落卡循环自然空转")
+
+    def test_gate_runs_before_cards_are_touched(self):
+        gate = self.src.index("stale = (frame_at is not None")
+        touch = self.src.index("cards = _recog_cards.setdefault(dev, [])")
+        self.assertLess(gate, touch)
+
+    def test_card_timestamp_is_frame_time_not_land_time(self):
+        """飞了 20 秒才回来的结果带的是 20 秒前的画面，不该盖一个"此刻"的时间戳。"""
+        self.assertHas('target["last_ts"] = frame_at or now')
+        self.assertHas('"last_ts": frame_at or now')
+        self.assertLacks('target["last_ts"] = now\n')
+
+    def test_frontend_ignores_stale_head_entirely(self):
+        """不只是不上屏——curCard 也不能动，否则下次更新会先闪一下旧内容。"""
+        self.assertHas("const headFresh=head&&(Date.now()-(head.last_ts?head.last_ts*1000:Date.now()))<FRESH_MS;")
+        self.assertHas("if(head&&headFresh){const key=grpKey(head);")
+
+    def test_drops_are_observable(self):
+        self.assertHas('"dropped_out_of_order": 0')
+        self.assertHas('vlog["resp"]["dropped_reason"]')
+        import recog_log
+        self.assertIn("dropped_reason", recog_log._RESP_KEYS)
