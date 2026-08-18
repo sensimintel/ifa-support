@@ -103,17 +103,23 @@ class ExperienceWiringTest(unittest.TestCase):
         self.assertHas("if(key!==lastCardKey){lastCardKey=key;"
                        "curCard=grpAnchor(cards,key)||head;renderCard(curCard);}")
 
-    def test_two_clocks_are_separate_knobs(self):
+    def test_two_clocks_are_separate_constants(self):
         """驻留与新鲜度是两个口径不同的量，合成一个就会出现
-        「屏上驻留 = 驻留 − 端到端延时」——延时把驻留吃掉。"""
-        self.assertHas("let DWELL_MS=Math.min(30,Math.max(1,"
-                       "+(localStorage.getItem('exp_card_dwell_s')||3)))*1000;")
-        self.assertHas("let FRESH_TTL_MS=Math.min(20,Math.max(2,"
-                       "+(localStorage.getItem('exp_card_ttl_s')||5)))*1000;")
+        「屏上驻留 = 驻留 − 端到端延时」——延时把驻留吃掉。
+        两者都写死（现场调定后不暴露旋钮），新鲜度必须明显大于端到端延时。"""
+        self.assertHas("const DWELL_MS=3000;")
+        self.assertHas("const FRESH_TTL_MS=5000;")
         self.assertLacks("FRESH_MS=")        # 合成语义的旧变量必须彻底消失
-        # 两个滑杆都在抽屉里
-        self.assertHas('id="r_card_s" min="1" max="30" step="0.5" value="3"')
-        self.assertHas('id="r_card_ttl" min="2" max="20" step="0.5" value="5"')
+
+    def test_no_leftover_dwell_knob(self):
+        """抽屉滑杆已移除：残留的 localStorage 值会盖掉代码里的常量，
+        重演一遍「明明改了代码怎么没生效」，所以要主动清掉。"""
+        for gone in ('id="r_card_s"', 'id="v_card_s"',
+                     'id="r_card_ttl"', 'id="v_card_ttl"',
+                     "localStorage.getItem('exp_card"):
+            self.assertLacks(gone)
+        self.assertHas("['exp_card_fresh_s','exp_card_dwell_s','exp_card_ttl_s']")
+        self.assertHas(".forEach(k=>{try{localStorage.removeItem(k)}catch(e){}});")
 
     def test_dwell_clock_counts_from_render_not_frame_time(self):
         """驻留起点必须是**上屏时刻**：取帧时刻会让端到端延时直接从驻留里扣，
