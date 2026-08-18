@@ -75,8 +75,9 @@ NECKLACE_SOURCE_TIMEOUT = 2.0
 # 多设备下拉、/panel 的选中设备回落都依赖它，调小会让那些页面在短暂停传时就丢设备。
 # 这里只在本接口按更严的阈值过滤，影响面收在深体验区内。
 NECKLACE_ONLINE_MAX_AGE = float(os.environ.get("NECKLACE_ONLINE_MAX_AGE", "15"))
-# ifa 演示状态机（项链 ready / meal_in_progress / meal_complete）：状态机本体在
-# local-stack 的 odyss-services（宿主 18090），这里只做控制面代理——控制面依旧
+# ifa 演示状态机（项链 ready / meal_in_progress / analyzing / report_published / failed，
+# 一次「开餐→分析→出报告」为一轮 cycle）：状态机本体在 local-stack 的 odyss-services
+# （宿主 18090），这里只做控制面代理——控制面依旧
 # 免认证走 /dx-api/，由本服务补上 services 的 service token（X-Odyss-Service-Token）。
 # token 必须与 local-stack runtime-config 的 infra.http.service_tokens.ifa_demo_control 一致。
 IFA_SERVICES_BASE_URL = os.environ.get(
@@ -551,7 +552,12 @@ def _ifa_services_request(method, path, body=None):
 
 @app.get("/api/necklaces/{device_id}/meal-state")
 def api_necklace_meal_state_get(device_id: str):
-    """查询某条项链的演示状态机状态（tracked=false 表示未参与演示）。"""
+    """查询某条项链的演示状态机状态（tracked=false 表示未参与演示）。
+
+    services 的 data 段整体透传，不逐字段挑选——状态取值（ready / meal_in_progress /
+    analyzing / report_published / failed）和一轮演示的 cycle_id、cycle_started_at
+    都由 services 定义，本服务只加一个 ok 标志，services 加字段这里不用跟着改。
+    """
     device_id = (device_id or "").strip()
     if not device_id:
         return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
@@ -576,9 +582,31 @@ def api_necklace_meal_state_set(device_id: str, body: dict = Body(...)):
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
 
 
+@app.delete("/api/necklaces/{device_id}/meal-state")
+def api_necklace_meal_state_delete(device_id: str):
+    """让某条项链退出演示状态机，回到原有逻辑。
+
+    「退出演示」与「本轮失败」在数据上是两回事：前者是这台设备根本不参与，
+    后者是参与了但这一轮没跑出结果。控制面必须能表达前者，否则现场只能把
+    不参与的设备也标成 failed，看板上分不清哪台是真出问题。
+    """
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    data, status = _ifa_services_request(
+        "DELETE", "/api/v1/ifa/devices/%s/meal-state" % urllib.parse.quote(device_id))
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
 @app.get("/api/necklaces/{device_id}/meal-segments")
 def api_necklace_meal_segments(device_id: str, limit: int = 10):
-    """列出某条项链最近的演示餐段（meal 分析链的取帧时间窗）。"""
+    """列出某条项链最近的演示餐段（meal 分析链的取帧时间窗）。
+
+    同样整体透传 services 的 data 段：每个餐段除时间窗外还带所属轮次 cycle_id、
+    是否因超过窗口上限被截断 window_truncated、报告状态 report{...} 与本轮实际生效的
+    深区分析参数 params{...}，这些都由 services 决定，本服务不解释、不裁剪。
+    """
     device_id = (device_id or "").strip()
     if not device_id:
         return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
@@ -603,6 +631,62 @@ def api_necklace_meal_segment_analyze(device_id: str, segment_id: str):
             urllib.parse.quote(device_id), urllib.parse.quote(segment_id, safe=":")))
     ok = status < 400
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 202)
+
+
+@app.post("/api/necklaces/{device_id}/close-meal")
+def api_necklace_close_meal(device_id: str):
+    """强制关餐：把该项链正在进行的这一餐立刻收尾，交由 services 走后续分析。
+
+    现场兜底用——App 或 Live Activity 上的「结束用餐」点不动时，控制面从这里补一刀。
+    无请求体；响应形如 {"device_id": "...", "closed": true}，整体透传 services 的 data 段。
+    关不关得掉、当前状态允不允许关，全由 services 判断（本服务不做状态判断），
+    不允许时它回 4xx，这里原样透传状态码与 error 说明。
+    """
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    data, status = _ifa_services_request(
+        "POST", "/api/v1/ifa/devices/%s/close-meal" % urllib.parse.quote(device_id))
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
+@app.get("/api/necklaces/{device_id}/params")
+def api_necklace_params_get(device_id: str):
+    """查询该项链当前生效的深区分析参数（取帧窗口 / 帧数 / 图片规格 / 模型 / prompt）。
+
+    响应带 scope：global 表示这台项链没有自己的覆盖值、吃的是全局默认，device 表示
+    已按设备覆盖过。整体透传 services 的 data 段——参数有哪些项由 services 定义，
+    这里不维护字段白名单，免得 services 加一项就要跟着改一次代理。
+    """
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    data, status = _ifa_services_request(
+        "GET", "/api/v1/ifa/devices/%s/params" % urllib.parse.quote(device_id))
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
+@app.put("/api/necklaces/{device_id}/params")
+def api_necklace_params_set(device_id: str, body: dict = Body(...)):
+    """覆盖该项链的深区分析参数，支持只传要改的那几项（部分更新）。
+
+    请求体 {"params": {...}}，原样透传给 services，本服务不校验参数名与取值范围——
+    合法值域（窗口上限、帧数上限、模型与 prompt 名等）只有 services 知道，
+    在代理这层再抄一份校验规则必然与它漂移，不如让 services 回 4xx 再透传出去。
+    """
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    body = body or {}
+    # 只做一处结构性把关：params 必须是对象。少了它，误传的裸参数会被静默当成空更新。
+    if not isinstance(body.get("params"), dict):
+        return JSONResponse({"ok": False, "error": "需要 params 对象"}, status_code=400)
+    data, status = _ifa_services_request(
+        "PUT", "/api/v1/ifa/devices/%s/params" % urllib.parse.quote(device_id), body)
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
 
 
 @app.get("/api/pairing-log")
