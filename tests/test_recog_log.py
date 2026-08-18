@@ -152,6 +152,33 @@ class ProjectionTest(unittest.TestCase):
             self.assertEqual(got["outcome"][0]["action"], "new")
 
 
+class TimingsTest(unittest.TestCase):
+    """链路分段：识别调用内部的三段并进 entry["timings"]，投影时原样带出。"""
+
+    def test_set_response_merges_timings(self):
+        log = recog_log.RecogLog()
+        e = log.begin("dev", "direct", [], img_orig="data:orig")
+        log.set_response(e, True, raw="{}", items=[],
+                         timings={"encode_ms": 12.3, "http_ms": 3400.0, "parse_ms": 0.4})
+        e["timings"]["total_ms"] = 4200.0          # worker 落卡后补的端到端
+        log.commit(e)
+        got = log.list()[0][0]["timings"]
+        self.assertEqual(got["http_ms"], 3400.0)
+        self.assertEqual(got["encode_ms"], 12.3)
+        self.assertEqual(got["total_ms"], 4200.0)
+
+    def test_failed_round_still_reports_encode_and_http(self):
+        """调用失败也要留分段——「卡在网络还是卡在编码」正是这时候最该知道的。"""
+        log = recog_log.RecogLog()
+        e = log.begin("dev", "sam3", [], img_orig="data:orig")
+        log.set_response(e, False, error="timed out",
+                         timings={"encode_ms": 10.0, "http_ms": 30000.0})
+        log.commit(e)
+        got = log.list()[0][0]
+        self.assertFalse(got["resp"]["ok"])
+        self.assertEqual(got["timings"]["http_ms"], 30000.0)
+
+
 class AppWiringTest(unittest.TestCase):
     """app.py 侧接线：日志真的被写、SAM3 门控真的写观测、接口真的挂上。"""
 
@@ -200,6 +227,30 @@ class AppWiringTest(unittest.TestCase):
         self.assertIn('out = {k: v for k, v in entry.items() if not k.startswith("_")}', self.src)
         self.assertIn('"live": live', self.src)
         self.assertIn('_tune_public(it) for it in items', self.src)
+
+    def test_end_to_end_timing_starts_at_frame_arrival(self):
+        """端到端从「帧到达 8060」起算，不是从触发起算——否则帧在缓存里等的时间被藏掉。"""
+        self.assertIn('"frame_age_ms": (round((enq_ts - stage["frame_recv_at"]) * 1000.0, 1)',
+                      self.src)
+        self.assertIn('vlog["timings"]["total_ms"] = (round((now2 - stage["frame_recv_at"])',
+                      self.src)
+        # 拿不到帧时刻时留空，不用别的起点冒充
+        self.assertIn('if stage.get("frame_recv_at") else None', self.src)
+
+    def test_vlm_call_split_into_local_and_network(self):
+        """VLM 那段拆成 本地编码 / HTTP 往返 / 解析——只报一个 llm_ms 归不了因。"""
+        for needle in ('"encode_ms": round(encode_ms, 1)',
+                       '"http_ms": round(http_ms, 1)',
+                       '"parse_ms": round((time.time() - _t_parse) * 1000.0, 1)',
+                       '"req_bytes": len(body)'):
+            self.assertIn(needle, self.src, needle)
+
+    def test_tunnel_rtt_is_read_only_baseline(self):
+        """网络基线取自隧道探测的缓存值，worker 里绝不主动再发一枪（会搅乱被测对象）。"""
+        fn = self.src[self.src.index("def _tunnel_rtt_ms():"):]
+        fn = fn[:fn.index("def _tunnel_probe")]
+        self.assertIn('return _tunnel["rtt_ms"]', fn)
+        self.assertNotIn("urlopen", fn)
 
     def test_word_label_is_explicit_then_sticky(self):
         """label 决定命中算 food 还是 drink（框颜色 + prompt 的软接地信息）：

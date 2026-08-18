@@ -256,14 +256,16 @@ def get_latest_frame(device_id: str) -> Optional[bytes]:
 
 
 def get_latest_frame_seq(device_id: str):
-    """取最新一帧的 (字节, seq)，无设备/无帧返回 (None, 0)。
+    """取最新一帧的 (字节, seq, received_at)，无设备/无帧返回 (None, 0, 0.0)。
     seq 供旁路链去重用——直传 VLM 识别的触发间隔可能快过 RGB 推帧，
-    seq 没变说明还是同一张图，重复送 VLM 纯属烧算力。"""
+    seq 没变说明还是同一张图，重复送 VLM 纯属烧算力。
+    received_at 是本服务收到该帧的时刻（epoch 秒，本机时钟）：识别链路拿它算
+    「帧龄」与端到端延时，跨机器时钟的 capture/upload 时刻另见 _timing_locked。"""
     with _cv:
         st = _devices.get(device_id)
         if not st or st["image"] is None:
-            return None, 0
-        return st["image"], int(st["seq"])
+            return None, 0, 0.0
+        return st["image"], int(st["seq"]), float(st["received_at"] or 0.0)
 
 
 def _parse_ms(val) -> Optional[int]:
