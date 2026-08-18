@@ -366,9 +366,17 @@ class OrderingWiringTest(WiringTest):
         self.assertLacks('target["last_ts"] = now\n')
 
     def test_frontend_ignores_stale_head_entirely(self):
-        """不只是不上屏——curCard 也不能动，否则下次更新会先闪一下旧内容。"""
-        self.assertHas("const headFresh=head&&(Date.now()-(head.last_ts?head.last_ts*1000:Date.now()))<FRESH_MS;")
-        self.assertHas("if(head&&headFresh){const key=grpKey(head);")
+        """不只是不上屏——curCard/lastCardKey/cardShownAt 都不能动，
+        否则下次更新会先闪一下旧内容。口径是**帧时刻**（now-last_ts=端到端延时），
+        阈值走独立的 FRESH_TTL_MS，不再与驻留共用一个数。"""
+        self.assertHas("const ts=head?(head.last_ts?head.last_ts*1000:Date.now()):0;")
+        self.assertHas("if(head&&Date.now()-ts<=FRESH_TTL_MS){")
+        # 过期分支里不许有任何状态写入：整个赋值都在 if 内
+        body = self.src[self.src.index("function applyRecog(r){"):]
+        body = body[:body.index("\n}")]
+        for name in ("curCard=", "lastCardKey=", "cardShownAt="):
+            self.assertLess(body.index("if(head&&Date.now()-ts<=FRESH_TTL_MS){"),
+                            body.index(name), "%s 必须在新鲜度闸之内" % name)
 
     def test_drops_are_observable(self):
         self.assertHas('"dropped_out_of_order": 0')

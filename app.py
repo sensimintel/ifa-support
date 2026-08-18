@@ -2085,8 +2085,15 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   且并发轮次拿的是同一份去重候选、可能给同一食物重复建卡。间隔也快不过 RGB 推帧
   （下方「数据源帧率」），同一帧不会重复送。<br>实测：<b id="v_rd_stat">--</b></div>
  <div class="sec">识别卡片</div>
- <div class="fld"><label>卡片驻留时长 <b id="v_card_s">4</b> s（无新识别多久回落待机）</label>
-  <input type="range" id="r_card_s" min="3" max="60" step="1" value="4"></div>
+ <div class="fld"><label>卡片驻留时长 <b id="v_card_s">2.0</b> s（上屏后停多久；同食物的后续识别会续期）</label>
+  <input type="range" id="r_card_s" min="1" max="30" step="0.5" value="2"></div>
+ <div class="fld"><label>结果新鲜度上限 <b id="v_card_ttl">5.0</b> s（帧到服务器→结果落卡，超了整条丢弃）</label>
+  <input type="range" id="r_card_ttl" min="2" max="20" step="0.5" value="5"></div>
+ <div class="hint">两层各管一件事，别混：<b>新鲜度</b>是「这个结果还代不代表此刻的画面」，
+  按<b>帧时刻</b>算（就是上面实测的端到端延时），超时的结果静默丢弃——实物已经离场、
+  只是请求飞得久才回来的，不会再"啪"一下跳出来。<b>驻留</b>是「人眼要读多久」，
+  按<b>上屏时刻</b>算，与延时无关。新鲜度必须明显大于端到端延时（实测中位约 2.1s、
+  抖动时 3.5s+），调太小会把慢轮整轮丢掉，表现为「这次识别凭空消失」。</div>
  <div class="sec" style="border-top:0;padding-top:0;margin-top:8px">数据源帧率（当前设备）</div>
  <div class="fld"><label>RGB 推帧 <b id="v_push_fps">2.0</b> fps · 实测到帧 <b id="v_fps_meas">--</b> fps</label>
   <input type="range" id="r_push_fps" min="0.5" max="30" step="0.5" value="2"></div>
@@ -3417,13 +3424,28 @@ async function bgTick(){
 }
 
 // ══ 状态机：待机 ↔ 识别成功（识别失败态暂不做）══
-// 最新卡片有更新（id/rev 变化）即进入成功态并驻留 FRESH_MS；无更新则回落待机
-// 卡片驻留时长可调（调节抽屉「识别卡片」区）：localStorage 按展示端持久化，默认 4s
-let FRESH_MS=Math.min(60,Math.max(3,+(localStorage.getItem('exp_card_fresh_s')||4)))*1000;
-(function(){const r=$('r_card_s'),v=$('v_card_s');if(!r)return;
-  r.value=FRESH_MS/1000;v.textContent=r.value;
-  r.addEventListener('input',()=>{v.textContent=r.value;
-    FRESH_MS=(+r.value)*1000;localStorage.setItem('exp_card_fresh_s',r.value);});})();
+// 两个时钟，口径不同，别再合成一个（旧实现合成了一个 4s，是"卡只显示一秒"的根因）：
+//   · DWELL_MS   驻留：按**上屏时刻**算——人眼读完一张卡要多久，与链路延时无关。
+//                同一批的后续识别只续期不重画，所以持续识别到同一个食物就一直停着。
+//   · FRESH_TTL_MS 新鲜度：按**帧时刻**算——now-last_ts 就是端到端延时（帧到 8060
+//                → 结果落卡）。超了说明这份结果描述的画面早过去了，整条丢弃。
+// 旧实现两者共用一个 FRESH_MS 且都从帧时刻起算，于是
+//   屏上驻留 = FRESH_MS − 端到端延时 = 4s − 2.1s ≈ 1.9s（延时一抖就只剩零点几秒，
+//   延时 ≥ 4s 更是完全不上屏）——这是数学上的必然，不是偶发。
+// 两个都可调（调节抽屉「识别卡片」区），localStorage 按展示端持久化。
+// 用新 key（不复用旧的 exp_card_fresh_s）：旧 key 存的是"合成语义"的 4s，
+// 继承过来会让老浏览器拿着旧值跑新逻辑。
+let DWELL_MS=Math.min(30,Math.max(1,+(localStorage.getItem('exp_card_dwell_s')||2)))*1000;
+let FRESH_TTL_MS=Math.min(20,Math.max(2,+(localStorage.getItem('exp_card_ttl_s')||5)))*1000;
+(function(){
+  const bind=(rid,vid,ms,key,set)=>{
+    const r=$(rid),v=$(vid);if(!r)return;
+    r.value=ms/1000;v.textContent=(+r.value).toFixed(1);
+    r.addEventListener('input',()=>{v.textContent=(+r.value).toFixed(1);
+      set((+r.value)*1000);localStorage.setItem(key,r.value);});};
+  bind('r_card_s','v_card_s',DWELL_MS,'exp_card_dwell_s',v=>DWELL_MS=v);
+  bind('r_card_ttl','v_card_ttl',FRESH_TTL_MS,'exp_card_ttl_s',v=>FRESH_TTL_MS=v);
+})();
 
 // ══ 识别触发（主链路直传 VLM）：读写 /api/recog/direct/config（服务端全局配置，
 //    与卡片驻留那种纯展示端 localStorage 不同——直传节奏是链路行为，所有页面共享）══
@@ -3530,25 +3552,31 @@ function applyRecog(r){
   const cards=r.cards||[];
   renderTimeline(cards);
   const head=cards[0];                       // 后端最后碰过的那条：决定"现在该看哪一批"
-  // 陈旧结果整条忽略：last_ts 现在是**帧时刻**，一个飞了十几秒才回来的结果，
-  // 它的画面早过期了。不只是不上屏——连 curCard/lastCardKey 都不能动，否则
-  // 屏幕当下虽判 idle 不显示，下一次任何更新到来时会先闪一下这份旧内容。
-  const headFresh=head&&(Date.now()-(head.last_ts?head.last_ts*1000:Date.now()))<FRESH_MS;
-  if(head&&headFresh){const key=grpKey(head);
+  // ── 第一层·新鲜度闸（帧时刻口径）──────────────────────────────────
+  // last_ts 是**帧时刻**，Date.now()-last_ts 就是这轮的端到端延时。超过 FRESH_TTL_MS
+  // 说明它描述的画面早过去了（多半是实物已离场、请求飞得久才回来）——整条静默丢弃。
+  // 不只是不上屏：curCard/lastCardKey/cardShownAt 一律不动，否则屏幕当下虽判 idle，
+  // 下一次任何更新到来时会先闪一下这份旧内容。这就是"离场保护"的落点。
+  // 后端也有一道帧龄闸（发请求前，max_frame_age_s），但那道管的是"值不值得发"，
+  // 挡不住"发出去之后飞太久"；两道口径不同，都要有。
+  // 这一层同时兜住刷新场景（2026-08-18 修过的老坑）：刷新后 lastCardKey 内存清零，
+  // 存量卡都会被判成"新的一批"，但半小时前的卡在这里就被判过期整条丢掉，
+  // 不会再"刷新先闪一下旧卡才回落待机"。
+  const ts=head?(head.last_ts?head.last_ts*1000:Date.now()):0;
+  if(head&&Date.now()-ts<=FRESH_TTL_MS){
+    const key=grpKey(head);
+    // ── 第二层·驻留计时（上屏时刻口径）────────────────────────────
+    // 只有换了一批（换了个食物）才重画；同批次内的后续命中一个字都不改，只续期。
     // 内容取批次锚点(最早那张)，不取 head——head 可能是这批里第 14 张，
-    // 拿它的描述/营养上屏正是"跳"的来源
-    const anchor=grpAnchor(cards,key)||head;
-    // 驻留计时起点 = 真实识别时间(last_ts, epoch 秒)而非"本页首次见到它"：
-    // 刷新后 lastCardKey 内存清零,任何存量卡都会被判成新的,若取 Date.now() 则半小时前
-    // 的旧卡每次刷新都重新"新鲜"一次,导致刷新先闪一下旧卡才回落待机(2026-08-18 修)。
-    // 钳制到 [now-FRESH_MS, now]:展示端与 5090 时钟偏移时不至于把新卡直接判过期。
-    // **每次推送都刷新**（不再只在 key 变化时刷）：批次身份稳定后 key 不再频繁变，
-    // 若跟着 key 走，明明还在持续识别却会 FRESH_MS 到期回落待机。
-    const ts=head.last_ts?head.last_ts*1000:Date.now();
-    cardShownAt=Math.min(Date.now(),Math.max(ts,Date.now()-FRESH_MS));
-    // 只有换了一批（换了个食物）才重画；同批次内的新命中一个字都不改
-    if(key!==lastCardKey){lastCardKey=key;curCard=anchor;renderCard(anchor);}}
-  setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
+    // 拿它的描述/营养上屏正是"跳"的来源。
+    if(key!==lastCardKey){lastCardKey=key;curCard=grpAnchor(cards,key)||head;renderCard(curCard);}
+    // 起点 = 真正 render/续期的这一刻，与端到端延时彻底解耦：调 2s 就是屏上 2s。
+    // 续期而非"key 变才刷"：批次身份稳定后 key 不再变，跟着 key 走会导致明明还在
+    // 持续识别却到期回落待机。画面稳不稳由响应内容决定（还认得出同一个食物就一直
+    // 续着），不靠压请求。
+    cardShownAt=Date.now();
+  }
+  setState(curCard&&Date.now()-cardShownAt<DWELL_MS?'card':'idle');
 }
 
 // ══ 右下临时工具：来源下拉框 + 高亮调节抽屉开关 + 流水视图开关 ══
@@ -3579,7 +3607,7 @@ $('btnTl').onclick=()=>{
   $('tl').classList.toggle('on',on);
   document.body.classList.toggle('tlon',on);   // 流水态：状态文案彻底隐藏 + 背景压暗
   $('btnTl').textContent=on?'实时':'流水';
-  setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
+  setState(curCard&&Date.now()-cardShownAt<DWELL_MS?'card':'idle');
 };
 // ══ 控制台显隐：右下调试按钮组默认隐藏（观众看不到），右键菜单「显示/隐藏控制台」
 // 切换，选择记进 localStorage（刷新保持；从未设置过=默认隐藏）══
@@ -3765,8 +3793,9 @@ if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布
   })();
   // 识别结果 SSE 推送：连上即收全量快照，之后有变更即刻到达（断线 EventSource 自动重连）
   new EventSource('/api/recog/events').onmessage=ev=>{try{applyRecog(JSON.parse(ev.data))}catch(e){}};
-  // 成功态驻留 FRESH_MS 到期回落待机是纯本地状态，用轻量本地定时器驱动（不发请求）
-  setInterval(()=>setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle'),1000);
+  // 成功态驻留到期回落待机是纯本地状态，用轻量本地定时器驱动（不发请求）。
+  // 250ms 而不是 1s：驻留可短到 1s，1s 的 tick 会把它拖成最多 2s（量化误差和驻留同量级）
+  setInterval(()=>setState(curCard&&Date.now()-cardShownAt<DWELL_MS?'card':'idle'),250);
 }
 
 // ══ 临时诊断（屏闪排障）v2：URL 加 ?trace=1 开启逐帧采样——每个动画帧在

@@ -82,7 +82,7 @@ class GroupAnchorTest(unittest.TestCase):
 
 
 class ExperienceWiringTest(unittest.TestCase):
-    """接线：内容取锚点、驻留计时不再跟着 key 走、流水同口径去重。"""
+    """接线：内容取锚点、两个时钟口径不混、驻留只续期不重画、流水同口径去重。"""
 
     @classmethod
     def setUpClass(cls):
@@ -91,19 +91,51 @@ class ExperienceWiringTest(unittest.TestCase):
     def assertHas(self, needle):
         self.assertTrue(needle in self.src, "app.py 里找不到：%s" % needle)
 
-    def test_card_renders_anchor_not_head(self):
-        self.assertHas("const anchor=grpAnchor(cards,key)||head;")
-        self.assertHas("if(key!==lastCardKey){lastCardKey=key;curCard=anchor;renderCard(anchor);}")
+    def assertLacks(self, needle):
+        self.assertNotIn(needle, self.src, "app.py 里不该再有：%s" % needle)
 
-    def test_dwell_clock_updates_on_every_push(self):
-        """批次身份稳定后 key 不再频繁变；驻留计时若还跟着 key 走，
-        明明在持续识别却会到期回落待机。"""
+    def applyRecogBody(self):
         m = re.search(r"function applyRecog\(r\)\{(.*?)\n\}", self.src, re.S)
-        self.assertIsNotNone(m)
-        body = m.group(1)
-        clock = body.index("cardShownAt=Math.min")
-        branch = body.index("if(key!==lastCardKey)")
-        self.assertLess(clock, branch, "驻留计时必须在 key 判断之前无条件执行")
+        self.assertIsNotNone(m, "找不到 applyRecog")
+        return m.group(1)
+
+    def test_card_renders_anchor_not_head(self):
+        self.assertHas("if(key!==lastCardKey){lastCardKey=key;"
+                       "curCard=grpAnchor(cards,key)||head;renderCard(curCard);}")
+
+    def test_two_clocks_are_separate_knobs(self):
+        """驻留与新鲜度是两个口径不同的量，合成一个就会出现
+        「屏上驻留 = 驻留 − 端到端延时」——延时把驻留吃掉。"""
+        self.assertHas("let DWELL_MS=Math.min(30,Math.max(1,"
+                       "+(localStorage.getItem('exp_card_dwell_s')||2)))*1000;")
+        self.assertHas("let FRESH_TTL_MS=Math.min(20,Math.max(2,"
+                       "+(localStorage.getItem('exp_card_ttl_s')||5)))*1000;")
+        self.assertLacks("FRESH_MS=")        # 合成语义的旧变量必须彻底消失
+        # 两个滑杆都在抽屉里
+        self.assertHas('id="r_card_s" min="1" max="30" step="0.5" value="2"')
+        self.assertHas('id="r_card_ttl" min="2" max="20" step="0.5" value="5"')
+
+    def test_dwell_clock_counts_from_render_not_frame_time(self):
+        """驻留起点必须是**上屏时刻**：取帧时刻会让端到端延时直接从驻留里扣，
+        实测延时中位 2.1s，4s 驻留只剩 1.9s，延时 ≥ 驻留时更是完全不上屏。"""
+        body = self.applyRecogBody()
+        self.assertIn("cardShownAt=Date.now();", body)
+        self.assertNotIn("cardShownAt=Math.min", body)   # 旧的帧时刻起点
+        self.assertNotIn("Date.now()-FRESH", body)       # 旧的钳制口径
+
+    def test_dwell_renews_on_every_fresh_push_without_repaint(self):
+        """同一批的后续识别只续期、不重画：续期若跟着 key 走，批次身份稳定后
+        key 不再变，明明在持续识别却会到期回落待机。"""
+        body = self.applyRecogBody()
+        branch = next(l for l in body.split("\n") if "if(key!==lastCardKey)" in l)
+        self.assertNotIn("cardShownAt", branch, "续期不能只在换批次时发生")
+        self.assertLess(body.index("if(key!==lastCardKey)"),
+                        body.index("cardShownAt=Date.now();"),
+                        "先重画（若换批）再统一续期")
+
+    def test_dwell_expiry_ticks_finer_than_the_shortest_dwell(self):
+        """驻留可短到 1s，1s 的 tick 会把它拖成最多 2s（量化误差与驻留同量级）。"""
+        self.assertHas("Date.now()-cardShownAt<DWELL_MS?'card':'idle'),250);")
 
     def test_timeline_dedupes_by_group(self):
         self.assertHas("const seen=new Set(),uniq=[];")
