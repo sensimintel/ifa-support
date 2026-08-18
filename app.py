@@ -3434,6 +3434,20 @@ document.querySelectorAll('input[name=rdon]').forEach(r=>r.addEventListener('cha
 loadRdCfg();
 setInterval(()=>{if($('hlcfg').classList.contains('on'))loadRdCfg();},3000);  // 抽屉开着才刷实测
 let lastCardKey='',cardShownAt=0,curCard=null;
+// ══ 展示批次：同一个物体在后端常被登记成多张卡（模型没认领候选就另起一张，
+//    实测一瓶酒能散成 14 张），每张卡自己的内容是冻结的，但屏幕取 cards[0] 就会
+//    在这些卡之间来回跳——描述从 "glass bottle" 变 "transparent bottle"、
+//    卡路里从 35 变 50。这里不动后端，只在展示层把「归一名+类型」相同的卡看成
+//    同一批，内容一律取批次里**最早建立**的那张：_recog_id 全局自增，
+//    min(id) 就是第一次识别到它时给的那份描述与营养。
+//    注：批次锚点若被 RECOG_MAX_CARDS(200) 淘汰，锚点会前移一次、内容跟着变一次。
+//    不额外做内存快照兜底——那会让「真的换了另一个橙子」也永远显示旧内容。
+function grpKey(c){return String(c&&c.name||'').trim().toLowerCase()+'|'+(c&&c.type||'');}
+function grpAnchor(cards,k){
+  let a=null;
+  for(const c of cards||[]) if(grpKey(c)===k && (!a || c.id<a.id)) a=c;
+  return a;
+}
 function setState(st){
   $('idle').classList.toggle('on',st==='idle'&&!$('tl').classList.contains('on'));
   $('card').classList.toggle('on',st==='card'&&!$('tl').classList.contains('on'));
@@ -3455,7 +3469,11 @@ function renderCard(c){
 }
 function renderTimeline(cards){
   const list=$('tllist');
-  const rows=(cards||[]).slice(0,10).reverse();   // 最新 10 条，按时间升序排布（同设计稿）
+  // 与主面板同口径按批次去重：cards 最新在前，每批留先遇到的那条(时间最新、同批同名)，
+  // 否则流水里会连着列出十几条 Wine
+  const seen=new Set(),uniq=[];
+  for(const c of cards||[]){const k=grpKey(c);if(!seen.has(k)){seen.add(k);uniq.push(c);}}
+  const rows=uniq.slice(0,10).reverse();   // 最新 10 条，按时间升序排布（同设计稿）
   if(!rows.length){list.innerHTML='<span id="tlempty">No records yet today.</span>';return;}
   list.innerHTML=rows.map(c=>{
     const busy=c.status&&c.status!=='done';
@@ -3468,16 +3486,21 @@ function renderTimeline(cards){
 function applyRecog(r){
   const cards=r.cards||[];
   renderTimeline(cards);
-  const c=cards[0];
-  if(c){const key=c.id+':'+(c.rev||0);
-    // 驻留计时起点 = 卡片真实识别时间(last_ts, epoch 秒)而非"本页首次见到它"：
-    // 刷新后 lastCardKey 内存清零,任何存量卡都会被判成新卡,若取 Date.now() 则半小时前
+  const head=cards[0];                       // 后端最后碰过的那条：决定"现在该看哪一批"
+  if(head){const key=grpKey(head);
+    // 内容取批次锚点(最早那张)，不取 head——head 可能是这批里第 14 张，
+    // 拿它的描述/营养上屏正是"跳"的来源
+    const anchor=grpAnchor(cards,key)||head;
+    // 驻留计时起点 = 真实识别时间(last_ts, epoch 秒)而非"本页首次见到它"：
+    // 刷新后 lastCardKey 内存清零,任何存量卡都会被判成新的,若取 Date.now() 则半小时前
     // 的旧卡每次刷新都重新"新鲜"一次,导致刷新先闪一下旧卡才回落待机(2026-08-18 修)。
     // 钳制到 [now-FRESH_MS, now]:展示端与 5090 时钟偏移时不至于把新卡直接判过期。
-    if(key!==lastCardKey){lastCardKey=key;
-      const ts=c.last_ts?c.last_ts*1000:Date.now();
-      cardShownAt=Math.min(Date.now(),Math.max(ts,Date.now()-FRESH_MS));
-      curCard=c;renderCard(c);}}
+    // **每次推送都刷新**（不再只在 key 变化时刷）：批次身份稳定后 key 不再频繁变，
+    // 若跟着 key 走，明明还在持续识别却会 FRESH_MS 到期回落待机。
+    const ts=head.last_ts?head.last_ts*1000:Date.now();
+    cardShownAt=Math.min(Date.now(),Math.max(ts,Date.now()-FRESH_MS));
+    // 只有换了一批（换了个食物）才重画；同批次内的新命中一个字都不改
+    if(key!==lastCardKey){lastCardKey=key;curCard=anchor;renderCard(anchor);}}
   setState(curCard&&Date.now()-cardShownAt<FRESH_MS?'card':'idle');
 }
 
