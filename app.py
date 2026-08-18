@@ -3538,6 +3538,10 @@ function cardRowsIn(delay0){   // 逐行推入
   cardRows().forEach((w,i)=>cardTimers.push(
     setTimeout(()=>w.classList.add('in'),delay0+i*CARD_STAGGER)));
 }
+// 下一帧执行；页面被切到后台时 rAF 会停摆，用定时器兜底一次（只会跑一次），
+// 免得运营切走窗口那会儿的状态切换把卡片卡在半路
+function nextTick(fn){let done=false;const run=()=>{if(done)return;done=true;fn();};
+  requestAnimationFrame(run);setTimeout(run,32);}
 function cardIn(){
   cardClear();
   const card=$('card');
@@ -3545,7 +3549,7 @@ function cardIn(){
   card.querySelectorAll('.rvw').forEach(w=>w.classList.remove('in'));
   card.classList.add('on');
   // 下一帧再挂 bgin：同帧加 on+bgin 会被浏览器合成成"直接是终态"，看不到拉开过程
-  requestAnimationFrame(()=>{card.classList.add('bgin');cardRowsIn(CARD_ROW_DELAY);});
+  nextTick(()=>{card.classList.add('bgin');cardRowsIn(CARD_ROW_DELAY);});
 }
 function cardOut(done){
   cardClear();
@@ -3592,7 +3596,7 @@ function renderCard(c){
   // 卡片在场时换了一批（换了个食物）：玻璃底不动，只把各行重推一遍
   if(uiState==='card'){cardClear();
     $('card').querySelectorAll('.rvw').forEach(w=>w.classList.remove('in'));
-    requestAnimationFrame(()=>cardRowsIn(0));}
+    nextTick(()=>cardRowsIn(0));}
 }
 function renderTimeline(cards){
   const list=$('tllist');
