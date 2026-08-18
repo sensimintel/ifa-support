@@ -257,6 +257,177 @@
       ]
     },
     {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Decode 延时: 逐 token(ITL) p50/p90/p99 + 每请求均值(TPOT)",
+      "description": "decode(解码/生成)阶段的逐 token 延时, 只覆盖「首 token 之后」的吐字过程, 不含排队与 prefill\n(那两段分别看「排队等待」「TTFT」面板)。\n\n两条口径故意并列, 语义不同, 勿只留其一:\n- ITL(inter_token_latency): 相邻两个输出 token 的实际间隔, decode 每步都记一条, 是「实时抖动」视角,\n  请求进行中就有数据; 并发升高/被抢占时最先反映在 p90-p99 上。\n- TPOT(request_time_per_output_token): 单个请求的 decode 总时长 ÷ 该请求输出 token 数, 是「整条请求平均」视角,\n  只在请求结束时记一条, 因此长请求会有滞后, burst 结束后才补上。\n\n读数注意(重要): 直方图桶上界虽到 80s, 但本机 decode 实测样本几乎全落在最低那档(le=0.01), 后续桶边界是\n0.025/0.05/0.075/0.1。histogram_quantile 在桶内做线性插值, 样本全挤在第一档时 p50/p90 只会给出\n0.005/0.009 这类「档内均匀分布」的假象值, 不是真实分位。因此常态下以 ITL 均值 / TPOT 均值 为准,\n分位线只用来看「有没有跨档恶化」(如 p99 抬到 0.025 甚至 0.05 档), 那才是真信号。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "g4-01-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by(le, model_name) (rate(vllm:inter_token_latency_seconds_bucket[1m])))",
+          "legendFormat": "{{model_name}} · ITL p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "histogram_quantile(0.9, sum by(le, model_name) (rate(vllm:inter_token_latency_seconds_bucket[1m])))",
+          "legendFormat": "{{model_name}} · ITL p90"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by(le, model_name) (rate(vllm:inter_token_latency_seconds_bucket[1m])))",
+          "legendFormat": "{{model_name}} · ITL p99"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "sum by(model_name) (rate(vllm:inter_token_latency_seconds_sum[1m])) / sum by(model_name) (rate(vllm:inter_token_latency_seconds_count[1m]))",
+          "legendFormat": "{{model_name}} · ITL 均值"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "sum by(model_name) (rate(vllm:request_time_per_output_token_seconds_sum[1m])) / sum by(model_name) (rate(vllm:request_time_per_output_token_seconds_count[1m]))",
+          "legendFormat": "{{model_name}} · TPOT 均值(每请求)"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Decode 输出速度 (tok/s): 单请求 vs 整机合计",
+      "description": "decode 输出速度 = 每秒吐出多少 token, 即上面 decode 延时的倒数, 用来直接回答「模型说话有多快」。\n\n- 单请求均速 = rate(ITL_count) / rate(ITL_sum) = 1 / ITL 均值, 表示「一个请求自己感受到的 tok/s」,\n  是用户/上游 SSE 端感知的吐字速度。\n- p50 速度 / 慢尾速度分别取 ITL 的 p50 与 p90 求倒数。注意 1/x 单调递减, 所以\n  1/(延时 p90) 对应的是「速度 p10」即慢的那一端, 不要读成「速度 p90」。\n- 整机合计 = rate(vllm:generation_tokens_total), 是全部并发请求的 decode token 之和(与「吞吐」面板同源),\n  放在同图是为了对照: 并发上来时整机合计上涨、单请求均速下降, 二者背离即说明 GPU 已在分摊算力。\n\n低负载时「整机合计」低于「单请求均速」是正常的: 整机合计按墙钟时间摊薄(含没有请求的空闲秒),\n单请求均速只在真正 decode 的时刻计。并发 >1 之后整机合计才会超过单请求均速。\n\np50/慢尾两条同样受直方图分档限制(见左侧延时面板的读数注意), 常态下以「单请求均速」为准。\n单位是 tok/s(Grafana 无内置 token 速率单位, 故不设 unit, 直接看数值)。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "g4-01-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "sum by(model_name) (rate(vllm:inter_token_latency_seconds_count[1m])) / sum by(model_name) (rate(vllm:inter_token_latency_seconds_sum[1m]))",
+          "legendFormat": "{{model_name}} · 单请求均速"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "1 / histogram_quantile(0.5, sum by(le, model_name) (rate(vllm:inter_token_latency_seconds_bucket[1m])))",
+          "legendFormat": "{{model_name}} · p50 速度"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "1 / histogram_quantile(0.9, sum by(le, model_name) (rate(vllm:inter_token_latency_seconds_bucket[1m])))",
+          "legendFormat": "{{model_name}} · 慢尾速度(=1/ITL p90)"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "sum by(model_name) (rate(vllm:generation_tokens_total[1m]))",
+          "legendFormat": "{{model_name}} · 整机合计"
+        }
+      ]
+    },
+    {
       "id": 5,
       "type": "timeseries",
       "title": "端到端延时 p50/p90/p99",
@@ -268,7 +439,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 16
+        "y": 24
       },
       "fieldConfig": {
         "defaults": {
@@ -339,7 +510,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 16
+        "y": 24
       },
       "fieldConfig": {
         "defaults": {
@@ -401,7 +572,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 24
+        "y": 32
       },
       "fieldConfig": {
         "defaults": {
@@ -483,7 +654,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 24
+        "y": 32
       },
       "fieldConfig": {
         "defaults": {
@@ -592,7 +763,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 40
       },
       "fieldConfig": {
         "defaults": {
@@ -655,7 +826,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 40
       },
       "fieldConfig": {
         "defaults": {
