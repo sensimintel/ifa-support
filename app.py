@@ -1868,9 +1868,10 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
       visibility 延迟 .3s 切换保住双缓冲 crossfade 不闪 */
    visibility:hidden;transition:opacity .3s ease,visibility 0s linear .3s}
  .bgmv.on{opacity:1;visibility:visible;transition:opacity .3s ease,visibility 0s}
- /* 压暗层（Figma 653-25294）：四周暗角 radial 渐变——中心透明、边角压黑，保证两侧文案可读 */
+ /* 压暗层（设计稿导出 static/bg-shade.png，2240×1260 RGBA）：中心全透、椭圆边一圈微光、
+    四周暗角压黑，保证两侧文案可读。铺满 100% 100%（不裁切），暗角始终贴合视口四边 */
  #shade{position:absolute;inset:0;pointer-events:none;
-   background:radial-gradient(99.6% 99.6% at 50% 50%,rgba(0,0,0,0) 0%,rgba(0,0,0,.92) 100%)}
+   background:url('/static/bg-shade.png') center/100% 100% no-repeat}
  /* ── 左侧 ODYSS logo（Figma：左边距 26px、宽 210px、垂直居中） ── */
  #logo{position:absolute;left:.26rem;top:50%;transform:translateY(-50%);width:2.1rem;height:auto;opacity:.95}
  /* ── 右侧状态区（两态叠放，淡入淡出切换；Figma：右边距 43px、宽 515px、垂直居中） ── */
