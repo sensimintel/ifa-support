@@ -18,14 +18,15 @@ ROOT = Path(__file__).resolve().parents[1]
 class NormalizeTest(unittest.TestCase):
     def test_defaults(self):
         self.assertEqual(recog_direct.normalize({}), recog_direct.DEFAULTS)
-        # 默认口径：开启、0.5s、串行
+        # 默认口径：开启、0.5s、串行、帧超过 8s 不再发
         self.assertEqual(recog_direct.DEFAULTS,
-                         {"on": True, "interval_s": 0.5, "concurrency": 1})
+                         {"on": True, "interval_s": 0.5, "concurrency": 1,
+                          "max_frame_age_s": 8.0})
 
     def test_merge_patch_keeps_untouched_keys(self):
-        base = {"on": True, "interval_s": 2.0, "concurrency": 3}
+        base = recog_direct.normalize({"interval_s": 2.0, "concurrency": 3})
         got = recog_direct.normalize({"interval_s": 1.0}, base)
-        self.assertEqual(got, {"on": True, "interval_s": 1.0, "concurrency": 3})
+        self.assertEqual(got, dict(base, interval_s=1.0))
 
     def test_clamp_out_of_range(self):
         got = recog_direct.normalize({"interval_s": 999, "concurrency": 99})
@@ -36,7 +37,7 @@ class NormalizeTest(unittest.TestCase):
         self.assertEqual(got["concurrency"], recog_direct.LIMITS["concurrency"][0])
 
     def test_bad_values_ignored(self):
-        base = {"on": True, "interval_s": 1.5, "concurrency": 2}
+        base = recog_direct.normalize({"interval_s": 1.5, "concurrency": 2})
         for patch in ({"interval_s": "abc"}, {"concurrency": None},
                       {"interval_s": float("nan")}, {"unknown": 1}, "not a dict", None):
             self.assertEqual(recog_direct.normalize(patch, base), base, patch)
@@ -79,7 +80,8 @@ class ConfigPersistTest(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text(encoding="utf-8"))["interval_s"], 3.0)
         again = recog_direct.DirectConfig(self.path)      # 重启后回读，不回落默认
         self.assertEqual(again.snapshot(),
-                         {"on": False, "interval_s": 3.0, "concurrency": 4})
+                         recog_direct.normalize({"on": False, "interval_s": 3.0,
+                                                 "concurrency": 4}))
         self.assertFalse(again.enabled())
         self.assertEqual(again.interval_s(), 3.0)
         self.assertEqual(again.concurrency(), 4)
@@ -178,3 +180,82 @@ class TrimmedSurfaceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MaxFrameAgeTest(unittest.TestCase):
+    """帧新鲜度上限：一轮慢请求会让后面的帧在队列里等，等到了画面早过去了。"""
+
+    def test_default_sits_in_the_asked_range(self):
+        """用户要的口径是 5~10s 可调，默认取中间。"""
+        self.assertTrue(5.0 <= recog_direct.DEFAULTS["max_frame_age_s"] <= 10.0)
+
+    def test_clamped_like_the_other_numeric_keys(self):
+        self.assertEqual(recog_direct.normalize({"max_frame_age_s": 999})["max_frame_age_s"], 30.0)
+        self.assertEqual(recog_direct.normalize({"max_frame_age_s": 0.1})["max_frame_age_s"], 1.0)
+
+    def test_bad_value_keeps_previous(self):
+        """控制面来的是不可信输入，坏值不该把闸门打成 0 或抛异常。"""
+        base = recog_direct.normalize({"max_frame_age_s": 6})
+        for bad in ("abc", None, float("nan"), {}):
+            self.assertEqual(recog_direct.normalize({"max_frame_age_s": bad}, base)["max_frame_age_s"],
+                             6.0, bad)
+
+    def test_upper_bound_means_no_truncation(self):
+        """上限等于 RECOG_TIMEOUT：调到顶就是"不截断"，别让人以为还有暗门。"""
+        self.assertEqual(recog_direct.LIMITS["max_frame_age_s"][1], 30.0)
+
+    def test_config_object_exposes_accessor(self):
+        import tempfile, os
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd); os.unlink(path)
+        cfg = recog_direct.DirectConfig(path)
+        try:
+            self.assertEqual(cfg.max_frame_age_s(), recog_direct.DEFAULTS["max_frame_age_s"])
+            cfg.update({"max_frame_age_s": 5})
+            self.assertEqual(cfg.max_frame_age_s(), 5.0)
+            self.assertEqual(recog_direct.DirectConfig(path).max_frame_age_s(), 5.0)  # 落盘可回读
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+
+class StaleFrameGateWiringTest(unittest.TestCase):
+    """app.py 接线：截断必须发生在「干重活之前」，且要留下可观测的读数。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="utf-8")
+
+    def assertHas(self, needle):
+        self.assertTrue(needle in self.src, "app.py 里找不到：%s" % needle)
+
+    def test_gate_uses_frame_capture_time(self):
+        self.assertHas('age_ms = ((time.time() - stage["frame_recv_at"]) * 1000.0')
+        self.assertHas("max_age_ms = _recog_direct.max_frame_age_s() * 1000.0")
+
+    def test_gate_runs_before_any_expensive_work(self):
+        """截断点必须早于 JPEG 编码和识别调用，注定要丢的轮次不该先烧一遍 CPU。"""
+        gate = self.src.index("age_ms is not None and age_ms > max_age_ms")
+        encode = self.src.index("boxed_uri = _img_data_uri(_make_ref_img(")
+        call = self.src.index("items = _recognize_dedup(")
+        self.assertLess(gate, encode)
+        self.assertLess(gate, call)
+
+    def test_gate_releases_inflight_slot(self):
+        """丢弃前 in_flight 已经 +1 过，不还回去并发槽会被永久占死。"""
+        seg = self.src[self.src.index("age_ms is not None and age_ms > max_age_ms"):][:600]
+        self.assertIn('_recog_direct_stats["in_flight"] -= 1', seg)
+        self.assertIn("continue", seg)
+
+    def test_drop_is_observable(self):
+        self.assertHas('"dropped_stale": 0, "last_drop_age_ms": 0')
+        self.assertHas("陈旧帧截断：帧龄")
+
+    def test_missing_capture_time_does_not_drop(self):
+        """旧链路/手动灌帧没有 frame_recv_at，缺时间戳不能一律当过期丢掉。"""
+        self.assertHas('if stage.get("frame_recv_at") else None)')
+
+    def test_control_panel_exposes_the_knob(self):
+        self.assertHas('id="r_rd_age"')
+        self.assertHas("max_frame_age_s:+$('r_rd_age').value")
+        self.assertHas("if(c.max_frame_age_s!==undefined)")

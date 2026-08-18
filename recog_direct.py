@@ -13,11 +13,13 @@ from pathlib import Path
 
 # 直传默认口径：开启、0.5s 一发、并发 1（同一时刻只 1 个 VLM 请求在飞，
 # 间隔到了但上一轮没回就丢旧帧用最新帧——即「串行·最新优先」）
-DEFAULTS = {"on": True, "interval_s": 0.5, "concurrency": 1}
+DEFAULTS = {"on": True, "interval_s": 0.5, "concurrency": 1, "max_frame_age_s": 8.0}
 
 # 数值键取值范围：interval 下限 0.2s（再密也快不过 RGB 推帧），
-# concurrency 上限 6（每路都是一次完整 VLM 多图请求，再高就是纯烧 GPU）
-LIMITS = {"interval_s": (0.2, 10.0), "concurrency": (1, 6)}
+# concurrency 上限 6（每路都是一次完整 VLM 多图请求，再高就是纯烧 GPU）；
+# max_frame_age_s 上限 30s = RECOG_TIMEOUT，调到顶就等于不截断
+LIMITS = {"interval_s": (0.2, 10.0), "concurrency": (1, 6),
+          "max_frame_age_s": (1.0, 30.0)}
 
 
 def normalize(patch, base=None) -> dict:
@@ -119,3 +121,12 @@ class DirectConfig:
     def concurrency(self) -> int:
         with self._lock:
             return int(self._cfg["concurrency"])
+
+    def max_frame_age_s(self) -> float:
+        """帧新鲜度上限：worker 真要发请求时，帧比这个还旧就整轮丢掉。
+
+        动机：一轮慢请求（隧道抖一下就是十几秒）会让后面的帧在队列里干等，
+        等轮到它们时画面早就过去了——识别一张 30 秒前的画面既没有展示价值，
+        还要占住隧道让后面的请求更堵，是把一次抖动放大成持续积压的正反馈。"""
+        with self._lock:
+            return float(self._cfg["max_frame_age_s"])

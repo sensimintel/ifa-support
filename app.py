@@ -2052,6 +2052,8 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <input type="range" id="r_rd_itv" min="0.2" max="10" step="0.1" value="0.5"></div>
  <div class="fld"><label>并发上限 <b id="v_rd_conc">1</b> 路</label>
   <input type="range" id="r_rd_conc" min="1" max="6" step="1" value="1"></div>
+ <div class="fld"><label>帧新鲜度上限 <b id="v_rd_age">8.0</b> s（帧比这更旧就整轮丢掉，不发请求）</label>
+  <input type="range" id="r_rd_age" min="1" max="30" step="0.5" value="8"></div>
  <div class="hint">两种口径共用同一条触发线程与帧源（当前设备的最新 <b>RGB 帧</b>——VLM 与
   SAM3 都吃彩色图，伪彩深度图只是背景呈现）。<b>开</b>=整帧直送 Qwen VLM 问画面里有什么食物；
   <b>关</b>=同一帧先过 SAM3（生产词表 + food 词，直接跑彩色帧），认出食物/饮品才带框送 VLM——
@@ -3404,13 +3406,15 @@ let rdTimer=null;
 function rdLabels(){
   $('v_rd_itv').textContent=(+$('r_rd_itv').value).toFixed(1);
   $('v_rd_conc').textContent=$('r_rd_conc').value;
+  $('v_rd_age').textContent=(+$('r_rd_age').value).toFixed(1);
 }
 function pushRdCfg(){
   clearTimeout(rdTimer);
   rdTimer=setTimeout(()=>{
     fetch('/api/recog/direct/config',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({on:document.querySelector('input[name=rdon]:checked').value==='1',
-        interval_s:+$('r_rd_itv').value,concurrency:+$('r_rd_conc').value})})
+        interval_s:+$('r_rd_itv').value,concurrency:+$('r_rd_conc').value,
+        max_frame_age_s:+$('r_rd_age').value})})
       .then(r=>r.json()).then(j=>{if(j&&j.stats)rdStat(j.stats);}).catch(()=>{});
   },250);
 }
@@ -3421,8 +3425,11 @@ function rdStat(s){
   // 关（SAM3 门控）时把门控耗时与命中率一并回显——空轮多说明画面里确实没东西
   const gate=off?('SAM3 门控 '+(s.gate_ms||0)+'ms · 命中 '+(s.gate_hits||0)
     +'/'+((s.gate_hits||0)+(s.gate_misses||0))+' 轮 · '):'';
+  // 陈旧帧丢弃：非零就显示，它是"积压有没有被截住"的直接读数
+  const drop=s.dropped_stale?(' · 陈旧丢弃 '+s.dropped_stale+' 轮'
+    +(s.last_drop_age_ms?'（最近 '+(s.last_drop_age_ms/1000).toFixed(1)+'s）':'')):'';
   el.textContent=gate+'VLM '+(s.last_ms||0)+'ms · 在飞 '+(s.in_flight||0)+' 路 · 累计 '
-    +(s.rounds||0)+' 轮'+(age!==null?' · 最近一轮 '+age+'s 前':'')
+    +(s.rounds||0)+' 轮'+(age!==null?' · 最近一轮 '+age+'s 前':'')+drop
     +(s.last_error?' · 错误：'+s.last_error:'');
 }
 async function loadRdCfg(){
@@ -3433,11 +3440,13 @@ async function loadRdCfg(){
     if(on)on.checked=true;
     if(c.interval_s!==undefined)$('r_rd_itv').value=c.interval_s;
     if(c.concurrency!==undefined)$('r_rd_conc').value=c.concurrency;
+    if(c.max_frame_age_s!==undefined)$('r_rd_age').value=c.max_frame_age_s;
     rdLabels();rdStat(j.stats);
   }catch(e){/* 读取失败保持面板默认值 */}
 }
 $('r_rd_itv').addEventListener('input',()=>{rdLabels();pushRdCfg();});
 $('r_rd_conc').addEventListener('input',()=>{rdLabels();pushRdCfg();});
+$('r_rd_age').addEventListener('input',()=>{rdLabels();pushRdCfg();});
 document.querySelectorAll('input[name=rdon]').forEach(r=>r.addEventListener('change',pushRdCfg));
 loadRdCfg();
 setInterval(()=>{if($('hlcfg').classList.contains('on'))loadRdCfg();},3000);  // 抽屉开着才刷实测
@@ -3948,7 +3957,9 @@ _recog_direct = recog_direct.DirectConfig(
 _recog_direct_stats = {"rounds": 0, "in_flight": 0, "last_ms": 0,
                        "last_ts": 0.0, "skipped_same_frame": 0, "last_error": "",
                        # SAM3 门控（直传关闭时）观测：单轮耗时 + 命中/空轮计数
-                       "gate_ms": 0, "gate_hits": 0, "gate_misses": 0}
+                       "gate_ms": 0, "gate_hits": 0, "gate_misses": 0,
+                       # 陈旧帧截断：丢弃轮次数 + 最近一次丢弃时的帧龄（排积压时看这两个）
+                       "dropped_stale": 0, "last_drop_age_ms": 0}
 print(f"[da3-web] 直传识别配置：{_recog_direct.snapshot()}", flush=True)
 
 # 食物健康分级的合法枚举（静态 guardrail 白名单：模型输出只保留集合内的值、其余置空）。
@@ -4379,6 +4390,23 @@ def _recog_worker(idx=0):
                 lp = None
             _recog_direct_stats["in_flight"] += 1
         wait_ms = (time.time() - enq_ts) * 1000.0     # 在队列里等 worker 的时长
+        # ── 陈旧帧截断：帧太旧就整轮丢掉，别发出去 ──────────────────────
+        # 一轮慢请求（隧道抖一下就是十几秒）会让后面的帧在队列里干等；等轮到它们
+        # 时画面早过去了。识别一张十几秒前的画面既没有展示价值，还要占住隧道让
+        # 后面更堵——一次抖动就这样被放大成持续积压。阈值走控制面配置。
+        # 卡在这里而不是更靠后：下面 _make_ref_img + JPEG 编码是实打实的 CPU，
+        # 注定要丢的轮次不该先烧一遍。
+        age_ms = ((time.time() - stage["frame_recv_at"]) * 1000.0
+                  if stage.get("frame_recv_at") else None)
+        max_age_ms = _recog_direct.max_frame_age_s() * 1000.0
+        if age_ms is not None and age_ms > max_age_ms:
+            with _recog_lock:
+                _recog_direct_stats["in_flight"] -= 1
+                _recog_direct_stats["dropped_stale"] += 1
+                _recog_direct_stats["last_drop_age_ms"] = int(age_ms)
+            print("[da3-web] 陈旧帧截断：帧龄 %.1fs > 上限 %.1fs（排队 %.0fms），本轮不发" % (
+                age_ms / 1000.0, max_age_ms / 1000.0, wait_ms), flush=True)
+            continue          # 回去领下一个（大概率是刚入队的新鲜帧）
         # 新卡代表图：整帧带框图加 HISTORY REF 横幅。同轮所有新卡共享这一张——
         # 模型输出去掉 box 后没法再裁本物品特写，这条曾是 over-merge 的根因路径，
         # 属去 box 的已知代价。直传口径没有带框图（boxed=None），用原帧。
