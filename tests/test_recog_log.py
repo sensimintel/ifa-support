@@ -195,8 +195,10 @@ class AppWiringTest(unittest.TestCase):
 
     def test_every_gate_writes_reason(self):
         # 五道闸门都要把拒合并原因写进日志，否则控制面只能看到"又建了一张新卡"
-        for needle in ("回显不一致：", "类型不一致：", "证据矛盾：", "低置信：", "名称零重叠："):
-            self.assertRegex(self.src, r'gate = "%s' % needle)
+        # （断言失败只报 needle：assertRegex 会把整份 app.py 打进报告，噪音淹没结论）
+        for needle in ("回显不一致：", "类型不一致：", "证据不通过（", "低置信：", "名称零重叠："):
+            self.assertTrue('gate = "%s' % needle in self.src,
+                            "闸门没把拒合并原因写进日志：%s" % needle)
 
     def test_routes_registered(self):
         for route in ('@app.get("/api/recoglog/list")',

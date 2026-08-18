@@ -48,6 +48,7 @@ from depth_anything_3.api import DepthAnything3  # noqa: E402
 import devpc  # noqa: E402
 import recog_direct  # noqa: E402
 import recog_log  # noqa: E402
+import recog_match  # noqa: E402
 import recog_sse  # noqa: E402
 from frame_relay import (  # noqa: E402
     DEFERRED, UNKNOWN_DEVICE, get_latest_frame, get_latest_frame_seq,
@@ -3905,7 +3906,7 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False):
     关键防线一：历史参考图（图3起）带 HISTORY REF 横幅 + prompt 明令，防止参考图内容
     泄漏进任务一被当成当前画面的物品（实测过：画面空无一物时模型照着参考图报 Snickers）。
     关键防线二（治 over-merge）：合并不是自由心证，而是逐项对照（品牌/颜色/形状/容器）
-    的 checklist，字段顺序上证据(match_evidence)先于结论(match)生成，high 有硬性定义；
+    的证据码 BxCxSxVx，字段顺序上证据(match_evidence)先于结论(match)生成，high 有硬性定义；
     「同名≠同物」明确写死——两根不同的香蕉、两杯咖啡必须分开记录。"""
     if direct:
         p = (
@@ -3960,34 +3961,35 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False):
             "判断识别出的每个物品是否就是清单里某一项的**同一个具体物品**在持续出现。"
             "默认它是新物品（match=null）；只有走完下面的对照流程并全部通过，才允许 match。\n"
             "对每个物品，先在 match_evidence 字段里对最像的那个候选做逐项对照"
-            "（对照该候选的参考图与当前画面里的这个物品），每一项只能填“一致/不一致/看不清”：\n"
-            "  · 品牌与包装文字（无包装食物填“无包装”）；\n"
-            "  · 颜色与外观；\n"
-            "  · 形状与份量（明显被吃掉/喝掉一部分属于允许的变化）；\n"
-            "  · 容器/餐具/摆放位置。\n"
-            "然后按对照结果下结论：\n"
-            "  · 任何一项为“不一致” → match=null，禁止合并；\n"
-            "  · 包装食品：品牌与包装文字必须“一致”才可 match；\n"
-            "  · 无包装食物/饮品：颜色外观、形状份量、容器摆放三项中至少两项“一致”且无一项“不一致”，"
+            "（对照该候选的参考图与当前画面里的这个物品），结果写成 8 字符证据码 BxCxSxVx：\n"
+            "  · B=品牌与包装文字（无包装食物按“一致”算，填 1）；\n"
+            "  · C=颜色与外观；\n"
+            "  · S=形状与份量（明显被吃掉/喝掉一部分属于允许的变化，仍填 1）；\n"
+            "  · V=容器/餐具/摆放位置；\n"
+            "  · 每个 x 只能是 1(一致) / 0(不一致) / ?(看不清)，"
+            "例：B1C1S1V1=四项全一致，B1C0S1V?=颜色不一致且容器看不清。\n"
+            "然后按证据码下结论：\n"
+            "  · 码里出现任何 0 → match=null，禁止合并；\n"
+            "  · 包装食品：B 必须为 1 才可 match；\n"
+            "  · 无包装食物/饮品：C、S、V 三项中至少两项为 1 且无一项为 0，"
             "才可 match；只是名称相同（如都叫 Banana、都叫 Coffee）绝不构成 match 的理由——"
             "不同的两根香蕉、两杯咖啡必须分开记录；\n"
             "  · 同类目但不同产品必须判新：巧克力棒 vs 谷物棒、可乐 vs 橙汁、品牌/口味/包装不同的同类零食，一律 match=null；\n"
             "  · 参考图看不清、被遮挡、或在参考图里无法定位该候选物品时 → match=null。\n"
-            "match_confidence 的判定标准（先给证据再定档，不允许跳过对照直接定档）：\n"
-            "  · high：对照项中至少两项明确“一致”、零项“不一致”，且参考图清晰可辨；\n"
-            "  · low：其余一切情况（有“看不清”项、只有一项“一致”、或仅凭名称相似）。\n"
+            "match_confidence 的判定标准（先给证据码再定档，不允许跳过对照直接定档）：\n"
+            "  · high：证据码中至少两项为 1、零项为 0，且参考图清晰可辨；\n"
+            "  · low：其余一切情况（码里有 ?、只有一项为 1、或仅凭名称相似）。\n"
             "错误合并（把不同食物记成同一个）比重复建卡严重得多；宁可多一张卡，不可错并一次。\n"
             "每个物品额外输出这些字段（严格按此顺序，证据先于结论）：\n"
-            "  match_evidence：上述逐项对照结果（如“品牌一致；颜色一致；形状一致；容器一致”，"
-            "或“颜色不一致（红vs绿）”）；无相似候选时写“无相似候选”；\n"
-            "  match_reason：一句简短中文，给出 match 或判新的结论依据；\n"
+            "  match_evidence：上述证据码本身（形如 B1C1S1V1，只有这 8 个字符，不要写别的）；"
+            "无相似候选时写 NONE；\n"
             "  match：候选编号，或 null；\n"
             "  matched_name：match≠null 时，一字不差照抄清单里该编号的名称；match=null 时为 null；\n"
             "  match_confidence：match≠null 时按上面的标准填“high”或“low”。\n"
         )
     else:
         p += ("任务二·去重：当前没有已记录的物品，识别到的都是新的，match 一律为 null，"
-              "match_evidence 写“无相似候选”，match_reason 写“无已记录物品”，matched_name 为 null。\n")
+              "match_evidence 写 NONE，matched_name 为 null。\n")
     p += (
         "只输出 JSON，不要任何解释："
         "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\","
@@ -3995,7 +3997,7 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False):
         "\"description_de\":\"Ein schneller Energielieferant für den Alltag.\","
         "\"calories_kcal\":89,\"protein_g\":1.1,\"carbs_g\":22.8,\"fat_g\":0.3,"
         "\"classification\":\"Good\","
-        "\"match_evidence\":\"无相似候选\",\"match_reason\":\"画面新出现的物品\","
+        "\"match_evidence\":\"NONE\","
         "\"match\":null,\"matched_name\":null,\"match_confidence\":null}]}。"
         "画面里没有食物也没有液体时，items 为空数组。"
     )
@@ -4082,7 +4084,8 @@ def _parse_recog(content):
       description_de  同上，限 RECOG_DESC_DE_MAX（德语更长，放宽）；
       calories_kcal  整数、夹到 [0,5000]，非法置 None；
       protein_g/carbs_g/fat_g  数字（1 位小数）、夹到 [0,500]，非法置 None；
-      classification 枚举白名单 FOOD_CLASSIFICATIONS，非法值置空。"""
+      classification 枚举白名单 FOOD_CLASSIFICATIONS，非法值置空；
+      match_evidence 只截长度（证据码合法性由 recog_match 在闸门里判）。"""
     try:
         obj = json.loads(content[content.index("{"): content.rindex("}") + 1])
     except Exception:
@@ -4110,8 +4113,9 @@ def _parse_recog(content):
             match = int(it.get("match"))     # 命中的候选编号；范围校验在 worker（要对齐候选数）
         except (TypeError, ValueError):
             match = None
-        evidence = str(it.get("match_evidence", "")).strip().replace("\n", " ")[:80]
-        reason = str(it.get("match_reason", "")).strip().replace("\n", " ")[:60]
+        # 证据码最长 8 字符（BxCxSxVx）/ NONE；留点余量让非法码进日志可读，
+        # 合法性交给 recog_match.check_evidence，这里不做语义判断
+        evidence = str(it.get("match_evidence", "")).strip().replace("\n", " ")[:16]
         mname = str(it.get("matched_name") or "").strip()[:40]
         conf = str(it.get("match_confidence") or "").strip().lower()
         conf = conf if conf in ("high", "low") else ""    # 非法/缺省按 low 语义处理（不合并）
@@ -4119,7 +4123,7 @@ def _parse_recog(content):
                     "description_en": desc_en, "description_de": desc_de,
                     "calories_kcal": kcal, "protein_g": protein,
                     "carbs_g": carbs, "fat_g": fat, "classification": cls,
-                    "match": match, "match_evidence": evidence, "match_reason": reason,
+                    "match": match, "match_evidence": evidence,
                     "matched_name": mname, "match_confidence": conf})
     return out
 
@@ -4178,7 +4182,7 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     prompt = _build_recog_prompt(candidates, n_food, n_drink, direct=direct)
     content.append({"type": "text", "text": prompt})
     # temperature=0：判同结果下游有硬合并动作，消除轮间抖动、日志巡检可复现；
-    # max_tokens 1536：每 item 的输出字段持续增多（match_evidence 对照文本、营养四数字
+    # max_tokens 1536：每 item 的输出字段不少（营养四数字
     # + classification），多物品帧 1024 有截断风险——截断会被 _parse_recog 的容错
     # 整体吞掉 items，表现为静默丢识别。
     payload = {"model": cfg["model"],
@@ -4328,6 +4332,10 @@ def _recog_worker(idx=0):
                 target = None
                 gate = ""            # 非空=被某道闸门拦下（进日志的拒合并原因）
                 m = it.get("match")   # 命中候选编号；还要过五道闸才允许合并（宁拒勿并）
+                # 证据码 → (判定, 中文对照文本)。解码一次复用：闸门三判它，
+                # 日志/合并史/控制面展示的是解码后的中文——码是给机器省 token 的，
+                # 不该让人去背 B1C1S1V1
+                ev_verdict, ev_text = recog_match.check_evidence(it.get("match_evidence"))
                 if isinstance(m, int) and 1 <= m <= len(candidates):
                     cand = candidates[m - 1]
                     if (it.get("matched_name") or "").strip().casefold() \
@@ -4346,12 +4354,14 @@ def _recog_worker(idx=0):
                         print("[da3-web] 识别拒合并（类型不一致）：『%s』(%s) match=%s 候选『%s』(%s) → 按新卡处理" % (
                             it["name"], it["type"], m, cand["name"],
                             cand.get("type") or "食物"), flush=True)
-                    elif "不一致" in (it.get("match_evidence") or ""):
-                        gate = "证据矛盾：证据里已写不一致"
-                        # 闸门三·证据自洽：逐项对照里已有「不一致」却仍给 match——
-                        # 模型自相矛盾（prompt 明令任一项不一致禁并），确定性拦截
-                        print("[da3-web] 识别拒合并（证据矛盾）：『%s』match=%s 证据『%s』含不一致 → 按新卡处理" % (
-                            it["name"], m, it.get("match_evidence")), flush=True)
+                    elif ev_verdict != "ok":
+                        gate = "证据不通过（%s）：%s" % (ev_verdict, ev_text)
+                        # 闸门三·证据自洽：证据码里有 0（自称某项不一致却仍要合并）、
+                        # 自称 NONE 却给了 match、或码本身不合法——三者都是自相矛盾。
+                        # 旧版判的是「文本里含『不一致』三个字」，模型换个措辞就绕过去了；
+                        # 码可校验，格式不合法本身就是拒合并的理由（宁拒勿并）。
+                        print("[da3-web] 识别拒合并（证据不通过·%s）：『%s』match=%s 证据『%s』→ 按新卡处理" % (
+                            ev_verdict, it["name"], m, it.get("match_evidence")), flush=True)
                     elif it.get("match_confidence") != "high":
                         gate = "低置信：confidence=%s" % (it.get("match_confidence") or "缺省")
                         # 闸门四·置信度：模型自报不确定 → 宁拒勿并（high 在 prompt 里有硬性定义）
@@ -4368,22 +4378,20 @@ def _recog_worker(idx=0):
                         if target is None:
                             gate = "候选卡已不在流里（被淘汰/清空）"
                 if target is not None:
-                    print("[da3-web] 识别去重：『%s』match=%s(high) → 合并到卡%s『%s』｜证据：%s｜理由：%s" % (
+                    print("[da3-web] 识别去重：『%s』match=%s(high) → 合并到卡%s『%s』｜证据 %s：%s" % (
                         it["name"], m, target["id"], target["name"],
-                        it.get("match_evidence") or "（模型未给）",
-                        it.get("match_reason") or "（模型未给）"), flush=True)
+                        it.get("match_evidence") or "（模型未给）", ev_text), flush=True)
                 else:
-                    print("[da3-web] 识别新卡：『%s』(%s) match=%s｜理由：%s" % (
+                    print("[da3-web] 识别新卡：『%s』(%s) match=%s｜证据 %s：%s" % (
                         it["name"], it["type"], m,
-                        it.get("match_reason") or "（模型未给）"), flush=True)
+                        it.get("match_evidence") or "（模型未给）", ev_text), flush=True)
                 # 缩略图 = 该帧点云（与②/③同一渲染链路）。模型输出已去掉 box，
                 # 3D 框无从画起，一律渲无框点云——去 box 是明确的产品取舍，不是回退。
                 shot_url = _save_cloud_shot(pred, [], conf) if pred is not None else None
                 if target is not None:           # 去重命中：合并（显示名不改，本轮名称进合并史）
                     target.setdefault("merge_history", []).append({
                         "t": t, "name": it["name"],
-                        "evidence": it.get("match_evidence", ""),
-                        "reason": it.get("match_reason", ""),
+                        "evidence": ev_text,
                         "confidence": it.get("match_confidence", "")})
                     del target["merge_history"][:-20]    # 只留最近 20 条
                     if shot_url:
@@ -4424,8 +4432,7 @@ def _recog_worker(idx=0):
                     "action": "merge" if target is not None else "new",
                     "card_id": target["id"] if target is not None else _recog_id,
                     "gate": gate, "confidence": it.get("match_confidence", ""),
-                    "evidence": it.get("match_evidence", ""),
-                    "reason": it.get("match_reason", "")})
+                    "evidence": ev_text})
             if len(cards) > RECOG_MAX_CARDS:
                 del cards[:len(cards) - RECOG_MAX_CARDS]
             if items:                    # 本轮有卡片变更（新卡/合并）→ 通知 SSE 推送线程

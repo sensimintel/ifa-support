@@ -8,6 +8,7 @@ prompt / 解析 / worker / 页面那侧只做接线断言（正则抽源码）�
 import unittest
 from pathlib import Path
 
+import recog_match
 import recog_sse
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -138,3 +139,65 @@ class WiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EvidenceCodeTest(unittest.TestCase):
+    """证据码：合法性校验 + 解码。旧版闸门判的是「文本含『不一致』」，
+    模型换个措辞就绕过去了；码可校验，非法本身就是拒合并的理由。"""
+
+    def test_all_consistent_passes(self):
+        verdict, text = recog_match.check_evidence("B1C1S1V1")
+        self.assertEqual(verdict, "ok")
+        self.assertEqual(text, "品牌与包装一致；颜色与外观一致；形状与份量一致；容器与摆放一致")
+
+    def test_any_zero_blocks_merge(self):
+        verdict, text = recog_match.check_evidence("B1C0S1V?")
+        self.assertEqual(verdict, "mismatch")
+        self.assertIn("颜色与外观不一致", text)
+        self.assertIn("容器与摆放看不清", text)
+
+    def test_unclear_alone_still_ok(self):
+        """? 不是矛盾，只该压低 confidence，别在闸门三就拦——那是闸门四的活。"""
+        self.assertEqual(recog_match.check_evidence("B1C?S1V1")[0], "ok")
+
+    def test_none_with_match_is_contradiction(self):
+        """自称无相似候选却仍给了 match：矛盾，拒合并。"""
+        verdict, text = recog_match.check_evidence("NONE")
+        self.assertEqual(verdict, "none")
+        self.assertEqual(text, "无相似候选")
+
+    def test_case_insensitive(self):
+        self.assertEqual(recog_match.check_evidence("b1c1s1v1")[0], "ok")
+        self.assertEqual(recog_match.check_evidence("none")[0], "none")
+
+    def test_malformed_codes_rejected(self):
+        for bad in ("", None, "B1C1S1", "B1C1S1V2", "品牌一致；颜色一致", "B1C1S1V1X"):
+            self.assertEqual(recog_match.check_evidence(bad)[0], "malformed", bad)
+
+    def test_malformed_text_carries_the_bad_code(self):
+        """非法码要原样进日志，否则排障时看不出模型到底吐了什么。"""
+        self.assertIn("品牌一致", recog_match.check_evidence("品牌一致")[1])
+
+
+class MatchFieldWiringTest(WiringTest):
+    """match 三字段：evidence 换码、reason 删除、matched_name 保持不动。"""
+
+    def test_prompt_asks_for_evidence_code(self):
+        self.assertHas("结果写成 8 字符证据码 BxCxSxVx")
+        self.assertHas("无相似候选时写 NONE")
+
+    def test_match_reason_gone_everywhere(self):
+        self.assertLacks("match_reason")
+
+    def test_matched_name_gate_intact(self):
+        """闸门一是抓编号幻觉的唯一防线，不能跟着一起删。"""
+        self.assertHas('it.get("matched_name") or "").strip().casefold()')
+
+    def test_gate_three_uses_code_verdict(self):
+        self.assertHas("ev_verdict, ev_text = recog_match.check_evidence")
+        self.assertHas('elif ev_verdict != "ok":')
+        self.assertLacks('"不一致" in (it.get("match_evidence")')
+
+    def test_log_stores_decoded_text_not_raw_code(self):
+        """控制面给人看，存解码后的中文——superadmin 那侧因此不用改。"""
+        self.assertHas('"evidence": ev_text')
