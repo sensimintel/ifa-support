@@ -1926,7 +1926,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  #card .rvw+.rvw{margin-top:.24rem}
  #card .rvw.g8{margin-top:.08rem}          /* 名称与描述之间是 8，不是 24 */
  #card .rvw>*{transform:translateY(105%);opacity:0;
-   transition:transform .46s cubic-bezier(.22,.61,.36,1),opacity .46s ease}
+   transition:transform .3s cubic-bezier(.22,.61,.36,1),opacity .3s ease}
  #card .rvw.in>*{transform:none;opacity:1}
  #card.out .rvw>*,#card.out #creg{transition:opacity .24s ease;opacity:0;transform:none}
  .krow{display:flex;justify-content:space-between;align-items:center;gap:.3rem}
@@ -3531,7 +3531,10 @@ function grpAnchor(cards,k){
 // 出现：玻璃底先拉开(CARD_BG_IN)，再逐行推入——每行 CARD_ROW，相邻两行错峰 CARD_STAGGER
 //       (= 行时长的一半，上一行走到一半下一行就起步)
 // 消失：内容先一起淡出(CARD_OUT_TXT)，再折叠玻璃底(CARD_OUT_BG)，收完才让待机文案渐显
-const CARD_BG_IN=420,CARD_ROW_DELAY=160,CARD_STAGGER=230,CARD_OUT_TXT=240,CARD_OUT_BG=420;
+// 行时长 300、错峰 150 = 行时长的一半（规格：上一行走到一半下一行起步）。
+// 8 行铺满也只要 120+7×150+300 ≈ 1.5s，卡片驻留 DWELL_MS(3s) 里还剩 1.5s 给人读，
+// 退场再花 0.66s——节奏往上调之前先看这本账，别让最后一行刚落地就被收走。
+const CARD_BG_IN=420,CARD_ROW_DELAY=120,CARD_STAGGER=150,CARD_OUT_TXT=240,CARD_OUT_BG=420;
 let cardTimers=[];
 function cardClear(){cardTimers.forEach(clearTimeout);cardTimers=[];}
 function cardRows(){   // 只取当前可见的行（无营养数据的行整行隐藏，不该占动画节拍）
