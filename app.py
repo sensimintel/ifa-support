@@ -3877,6 +3877,11 @@ _recog_evt_cv = threading.Condition(_recog_lock)
 _recog_cards = {}
 _recog_id = 0              # 卡片自增 id（全设备共用一个计数器，保证 id 全局唯一）
 _recog_last_ts = 0.0       # 上次触发识别的时刻(节流用)
+# device_id -> {"name","type","card_id","ts"}：上一轮真正上屏的那个物品。
+# 展示端一次只显示一个，若每轮各挑各的，屏幕就会在几样东西之间反复闪；把上次
+# 选中的告诉模型、让它「还在画面里就继续选它」，粘性从 prompt 层就建立了。
+# 超过 RECOG_ACTIVE_WINDOW 视为过期（人早换东西吃了，再提上次没意义）。
+_recog_last_pick = {}
 _recog_pending = []        # 待识别任务队列(worker 池消费，最新优先、丢弃积压)
 _recog_workers = 0         # 已起的 worker 线程数（按并发配置只增不减；多余线程自行退出）
 
@@ -3921,7 +3926,23 @@ def _recog_num(v, lo, hi, as_int=False):
     f = min(hi, max(lo, f))
     return int(round(f)) if as_int else round(f, 1)
 
-def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False):
+def _pick_rule(last_pick, candidates):
+    """任务一的挑选规则：优先沿用上一轮选中的那个，其次挑最有把握的。
+
+    没有上次记录（首轮/过期/换设备）时退化成纯「挑最有把握的」。
+    上次那个若还在候选清单里，顺带把编号给出来——模型对编号的指称比对名称稳。"""
+    if not last_pick or not last_pick.get("name"):
+        return "挑选规则：挑你最有把握、且在画面里最主要的那一个。\n"
+    idx = next((i + 1 for i, c in enumerate(candidates or [])
+                if c.get("id") == last_pick.get("card_id")), None)
+    who = "「%s」%s" % (last_pick["name"], ("（就是清单[%d]）" % idx) if idx else "")
+    return ("挑选规则（按顺序判断）：\n"
+            "  · 上一轮你选中的是 %s。只要它**仍在当前画面里**，就继续选它，"
+            "别换——展示端一次只显示一个，来回换画面会反复闪；\n"
+            "  · 只有它确实已经不在画面里了，才从画面里挑你最有把握、最主要的那一个。\n" % who)
+
+
+def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False, last_pick=None):
     """按候选动态生成「识别 + 去重」prompt。
 
     direct=True 是主链路直传口径：没有 SAM3 检测框，也就没有图2带框图与命中计数，
@@ -3947,11 +3968,13 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False):
             "任务一·识别：只识别图1/图2 当前画面里**真实存在**的食物、以及液体/饮料"
         )
     p += (
-        "（咖啡/水/可乐/茶/杯装饮品等），逐一分别输出，食物和液体必须拆成不同 item；"
-        + ("画面里明显的都要识别（画面里没有食物也没有液体就直接给空数组，不要硬凑）；"
-           if direct else "不要局限于框，画面里明显的都要识别；")
-        + "但**严禁**把只出现在历史参考图里的物品当成当前物品输出——"
-        "当前画面没有食物/液体时，即使参考图里有，items 也必须为空数组。每个物品输出：\n"
+        "（咖啡/水/可乐/茶/杯装饮品等）。\n"
+        "**画面里就算有好几样，也只输出一个 item**——展示端一次只显示一个，多给的会被直接丢弃。\n"
+        + _pick_rule(last_pick, candidates)
+        + ("画面里没有食物也没有液体就给空数组，不要硬凑；" if direct
+           else "不要局限于框；画面里没有食物也没有液体就给空数组，不要硬凑；")
+        + "**严禁**把只出现在历史参考图里的物品当成当前物品输出——"
+        "当前画面没有食物/液体时，即使参考图里有，items 也必须为空数组。这一个物品输出：\n"
         "  name：具体名称（简短，优先英文）。食物可用品牌名（如 Banana、Snickers）；"
         "液体一律按**内容物**命名（如 Water、Coffee、Cola、Orange juice）——"
         "容器上的文字只有当它是饮料产品本身的品牌（如可乐罐上的 Coca-Cola）才可用作名称，"
@@ -4022,7 +4045,7 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False):
         "\"classification\":\"Good\","
         "\"match_evidence\":\"NONE\","
         "\"match\":null,\"matched_name\":null,\"match_confidence\":null}]}。"
-        "画面里没有食物也没有液体时，items 为空数组。"
+        "items 里**只放一个对象**；画面里没有食物也没有液体时，items 为空数组。"
     )
     return p
 
@@ -4176,7 +4199,7 @@ def _vlmlog_begin(device, trigger, candidates, n_food, n_drink, orig_rgb, boxed_
 
 
 def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, target=None,
-                     log=None):
+                     log=None, last_pick=None):
     """调多模态 VLM 识别 + 去重。一次多图请求：图1原图 + 图2带框图 + 各候选参考图(带横幅标记)。
     candidates: [{"id","name","type","desc","ref_img"}...]（顺序即参考图编号）。
     n_food/n_drink：当前画面检测器命中数，作为软接地信息进 prompt。
@@ -4202,7 +4225,8 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     for c in candidates:      # 其后依次是候选参考图（带 HISTORY REF 横幅，仅供对照）
         if c.get("ref_img"):
             content.append({"type": "image_url", "image_url": {"url": c["ref_img"]}})
-    prompt = _build_recog_prompt(candidates, n_food, n_drink, direct=direct)
+    prompt = _build_recog_prompt(candidates, n_food, n_drink, direct=direct,
+                                 last_pick=last_pick)
     content.append({"type": "text", "text": prompt})
     # temperature=0：判同结果下游有硬合并动作，消除轮间抖动、日志巡检可复现；
     # max_tokens 1536：每 item 的输出字段不少（营养四数字
@@ -4304,6 +4328,10 @@ def _recog_worker(idx=0):
             orig, boxed, glb_url, frame, t, candidates, n_food, n_drink, enq_ts, pred, conf, dev, \
                 stage = _recog_pending.pop()     # 最新优先
             _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
+            # 上次命中：过期的不再喂给模型（人早换东西吃了，再提上次只会误导）
+            lp = _recog_last_pick.get(dev)
+            if lp and time.time() - lp.get("ts", 0) > RECOG_ACTIVE_WINDOW:
+                lp = None
             _recog_direct_stats["in_flight"] += 1
         wait_ms = (time.time() - enq_ts) * 1000.0     # 在队列里等 worker 的时长
         # 新卡代表图：整帧带框图加 HISTORY REF 横幅。同轮所有新卡共享这一张——
@@ -4317,15 +4345,27 @@ def _recog_worker(idx=0):
                              candidates, n_food, n_drink, orig, boxed)
         _tq = time.time()
         try:
-            items = _recognize_dedup(orig, boxed, candidates, n_food, n_drink, tgt, log=vlog)
+            items = _recognize_dedup(orig, boxed, candidates, n_food, n_drink, tgt,
+                                     log=vlog, last_pick=lp)
         finally:
             with _recog_lock:
                 _recog_direct_stats["in_flight"] -= 1
         llm_ms = (time.time() - _tq) * 1000.0
+        # ── 门禁：一轮只放行一个 item ──────────────────────────────────
+        # 展示端一次只显示一张卡，所以一轮也只该动一张。prompt 已明令只输出一个，
+        # 这里是兜底：模型不守规矩多给了，取第一个（prompt 要求把最有把握的排第一），
+        # 其余只记进观测日志——不建卡、不上屏、也不刷新任何卡的 last_ts。
+        # 代价是已知的：桌上其他东西不再被本轮续命，掉出候选窗口后会被判成新物品。
+        gate_dropped = [str(i.get("name") or "") for i in items[1:]]
+        if gate_dropped:
+            items = items[:1]
+            print("[da3-web] 门禁截断：模型返回 %d 项，只放行『%s』，丢弃 %s" % (
+                len(gate_dropped) + 1, items[0].get("name"), "、".join(gate_dropped)), flush=True)
         if vlog.get("resp") is not None:
             vlog["resp"]["llm_ms"] = int(llm_ms)
             vlog["resp"]["wait_ms"] = int(wait_ms)
             vlog["resp"].setdefault("n_items", len(items))
+            vlog["resp"]["gate_dropped"] = gate_dropped
         # 链路分段：触发线程测到的三段 + 本 worker 的排队/调用，落卡后再补 post/total
         vlog.setdefault("timings", {}).update({
             "frame_age_ms": (round((stage["pick_at"] - stage["frame_recv_at"]) * 1000.0, 1)
@@ -4456,6 +4496,10 @@ def _recog_worker(idx=0):
                     "card_id": target["id"] if target is not None else _recog_id,
                     "gate": gate, "confidence": it.get("match_confidence", ""),
                     "evidence": ev_text})
+                # 记下本轮真正上屏的这一个，下一轮 prompt 拿它做「还在就别换」的粘性锚
+                _recog_last_pick[dev] = {
+                    "name": it["name"], "type": it["type"], "ts": now,
+                    "card_id": target["id"] if target is not None else _recog_id}
             if len(cards) > RECOG_MAX_CARDS:
                 del cards[:len(cards) - RECOG_MAX_CARDS]
             if items:                    # 本轮有卡片变更（新卡/合并）→ 通知 SSE 推送线程
@@ -5026,6 +5070,7 @@ def recog_clear(device: Optional[str] = None):
     dev = (device or "").strip() or get_selected_device()
     with _recog_lock:
         _recog_cards.pop(dev, None)
+        _recog_last_pick.pop(dev, None)   # 卡都清了，再拿上次命中指称就是悬空引用
         _recog_gen += 1              # 清空也算变更，SSE 立即推空列表
         _recog_evt_cv.notify_all()
     return JSONResponse({"ok": True, "device": dev})

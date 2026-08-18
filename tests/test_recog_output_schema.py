@@ -201,3 +201,84 @@ class MatchFieldWiringTest(WiringTest):
     def test_log_stores_decoded_text_not_raw_code(self):
         """控制面给人看，存解码后的中文——superadmin 那侧因此不用改。"""
         self.assertHas('"evidence": ev_text')
+
+
+def _load_pick_rule():
+    """从 app.py 抽出 _pick_rule 源码执行——它只依赖内置，不用扛 cv2/torch。"""
+    import re as _re
+    src = (ROOT / "app.py").read_text(encoding="utf-8")
+    m = _re.search(r"^def _pick_rule\(last_pick, candidates\):.*?\n(?=\n\ndef )", src, _re.M | _re.S)
+    if not m:
+        raise AssertionError("app.py 里找不到 _pick_rule —— 单选粘性规则被改名或删了")
+    ns = {}
+    exec(m.group(0), ns)
+    return ns["_pick_rule"]
+
+
+class PickRuleTest(unittest.TestCase):
+    """一轮只出一个 item 时的挑选规则：上次选中的还在就别换，否则挑最有把握的。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rule = staticmethod(_load_pick_rule())
+
+    def test_no_history_degrades_to_most_confident(self):
+        for empty in (None, {}, {"name": ""}):
+            t = self.rule(empty, [])
+            self.assertIn("挑你最有把握", t)
+            self.assertNotIn("上一轮", t)
+
+    def test_history_in_candidates_carries_the_index(self):
+        """模型对编号的指称比对名称稳，上次那个还在候选里就把编号一起给它。"""
+        cands = [{"id": 7, "name": "Water"}, {"id": 9, "name": "Wine"}]
+        t = self.rule({"name": "Wine", "card_id": 9}, cands)
+        self.assertIn("「Wine」", t)
+        self.assertIn("清单[2]", t)
+        self.assertIn("仍在当前画面里", t)
+
+    def test_history_not_in_candidates_falls_back_to_name(self):
+        """上次那张卡掉出活跃窗口后不在候选里了，只提名称，别编个不存在的编号。"""
+        t = self.rule({"name": "Persimmon", "card_id": 99}, [{"id": 7, "name": "Water"}])
+        self.assertIn("「Persimmon」", t)
+        self.assertNotIn("清单[", t)
+
+    def test_history_survives_empty_candidate_list(self):
+        t = self.rule({"name": "Water", "card_id": 1}, None)
+        self.assertIn("「Water」", t)
+
+
+class SingleItemWiringTest(WiringTest):
+    """每轮只更新一张卡：prompt 明令单选 + worker 侧门禁兜底。"""
+
+    def test_prompt_demands_exactly_one_item(self):
+        self.assertHas("**画面里就算有好几样，也只输出一个 item**")
+        self.assertHas("items 里**只放一个对象**")
+        self.assertLacks("逐一分别输出")
+
+    def test_prompt_carries_last_pick_rule(self):
+        self.assertHas("+ _pick_rule(last_pick, candidates)")
+        self.assertHas("last_pick=lp)")
+
+    def test_gate_truncates_to_one(self):
+        self.assertHas('gate_dropped = [str(i.get("name") or "") for i in items[1:]]')
+        self.assertHas("items = items[:1]")
+
+    def test_gate_runs_before_cards_are_touched(self):
+        """门禁必须卡在「拿到结果」与「更新卡片」之间，落到循环里就晚了。"""
+        gate = self.src.index("gate_dropped = [str(i.get")
+        touch = self.src.index("cards = _recog_cards.setdefault(dev, [])")
+        self.assertLess(gate, touch)
+
+    def test_dropped_items_are_observable(self):
+        """被丢弃的项要能在控制面看到，否则「模型到底守不守规矩」无从判断。"""
+        self.assertHas('vlog["resp"]["gate_dropped"] = gate_dropped')
+        import recog_log
+        self.assertIn("gate_dropped", recog_log._RESP_KEYS)
+
+    def test_last_pick_written_back_and_expires(self):
+        self.assertHas("_recog_last_pick[dev] = {")
+        self.assertHas('if lp and time.time() - lp.get("ts", 0) > RECOG_ACTIVE_WINDOW:')
+
+    def test_clear_drops_last_pick(self):
+        """卡都清空了还留着上次命中，下一轮 prompt 会指着一张不存在的卡说话。"""
+        self.assertHas("_recog_last_pick.pop(dev, None)")

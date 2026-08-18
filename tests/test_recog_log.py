@@ -190,8 +190,11 @@ class AppWiringTest(unittest.TestCase):
         self.assertIn("vlog = _vlmlog_begin(dev, \"direct\" if boxed is None else \"sam3\"",
                       self.src)
         self.assertIn("_vlmlog.commit(vlog)", self.src)
-        self.assertIn("_recognize_dedup(orig, boxed, candidates, n_food, n_drink, tgt, log=vlog)",
-                      self.src)
+        # 只钉「worker 拿这组参数调识别」这件事，别把整行签名钉死——
+        # 加一个关键字参数就红一次，且 assertIn 失败会把整份 app.py 打进报告
+        self.assertTrue("_recognize_dedup(orig, boxed, candidates, n_food, n_drink, tgt,"
+                        in self.src, "worker 没在调 _recognize_dedup")
+        self.assertTrue("log=vlog" in self.src, "识别调用没把观测日志传下去")
 
     def test_every_gate_writes_reason(self):
         # 五道闸门都要把拒合并原因写进日志，否则控制面只能看到"又建了一张新卡"
