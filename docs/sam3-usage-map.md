@@ -89,7 +89,7 @@
 top-K 原始分白拿；补跑的 food 词也进日志但标 `role="highlight"`、不计 `n_inst`（口径统计只认配置词）；
 写历史按 `SAM3TUNE_HIST_MIN_GAP`(1.5s) 采样，实时区不受限；`/api/sam3tune/history` 支持 `device`/`limit`。
 
-**VLM 侧**：每一轮识别（含失败轮）整轮留痕。
+**VLM 侧**：每一轮识别（含失败轮）整轮留痕。2026-08-18 起 `req.prompt` 记的是**整个 content 序列**（文字块原样 + 图片位置占位，见 `recog_prompt.render_for_log`）——这次重排的要害就是排布，只记文字块就看不出图片排在哪儿；逐项判定里另带 `seen`/`cur_text`/`diff` 三个自证字段，用来分辨「没看清画面」与「看清了但被候选清单带跑」。
 
 | 项 | 内容 |
 |---|---|

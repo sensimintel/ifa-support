@@ -14,7 +14,8 @@ from pathlib import Path
 import foodref
 
 ROOT = Path(__file__).resolve().parents[1]
-APP = (ROOT / "app.py").read_text(encoding="utf-8")
+APP = ((ROOT / "app.py").read_text(encoding="utf-8")
+       + (ROOT / "recog_prompt.py").read_text(encoding="utf-8"))
 
 
 def _item(**kw):
@@ -406,6 +407,14 @@ class AppWiringTest(unittest.TestCase):
                       "/api/foodref/item/{item_id}", "/api/foodref/image/{item_id}/{n}"):
             self.assertHas(route)
 
+    def test_log_whitelist_carries_ref_fields(self):
+        """req/resp 的投影是白名单：漏了字段，控制面就看不见参考库这一段
+        （踩过——stream 当年也是这么漏掉的）。"""
+        import recog_log
+        self.assertIn("ref", recog_log._REQ_KEYS)
+        self.assertIn("ref_prompt", recog_log._REQ_DETAIL_KEYS)
+        self.assertIn("ref", recog_log._RESP_KEYS)
+
     def test_gitignored(self):
         ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
         # 5090 的 ~/da3-web 是只读 checkout，运行时产物不能污染工作区
@@ -413,7 +422,7 @@ class AppWiringTest(unittest.TestCase):
         self.assertHas("food_ref/", ignore)
 
     def test_prompt_declares_reference_section(self):
-        self.assertHas("foodref.task_zero(refs, min_conf)")
+        self.assertHas("foodref.task_zero(refs, min_conf)")   # 在 recog_prompt.fixed_head 里
         self.assertTrue(re.search(r"ref_id\\\":null", APP))
 
 
