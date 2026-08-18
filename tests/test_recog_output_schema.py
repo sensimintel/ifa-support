@@ -122,6 +122,11 @@ class WiringTest(unittest.TestCase):
         self.assertHas('payload["stream_options"] = {"include_usage": True}')
         self.assertHas("recog_sse.read_sse_completion(")
 
+    def test_stream_flag_survives_log_projection(self):
+        """req 字段有白名单，新加的 stream 不进白名单就到不了控制面（实测踩过）。"""
+        import recog_log
+        self.assertIn("stream", recog_log._REQ_KEYS)
+
     def test_ttft_recorded_in_timings(self):
         self.assertHas('"ttft_ms": (round(ttft_ms, 1) if ttft_ms is not None else None)')
 

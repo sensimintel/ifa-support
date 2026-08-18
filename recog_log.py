@@ -18,7 +18,7 @@ import threading
 _HEAD_KEYS = ("id", "ts", "device", "trigger", "img_orig", "img_boxed",
               "n_food", "n_drink", "outcome", "timings")
 _REQ_KEYS = ("label", "model", "endpoint", "direct", "n_images",
-             "max_tokens", "temperature", "img_full_px")
+             "max_tokens", "temperature", "stream", "img_full_px")
 # 详情才给的大字段（原尺寸图本身不进 JSON，走 /api/recoglog/{id}/image/{kind} 端点：
 # 详情响应从几百 KB 回到几 KB，点开大图时才拉那一张）
 _REQ_DETAIL_KEYS = ("prompt",)
