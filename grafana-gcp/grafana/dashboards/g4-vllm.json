@@ -428,6 +428,212 @@
       ]
     },
     {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Decode 总时长(整条请求) p50/p90/p99 + 均值 · 右轴: 输出 token 数",
+      "description": "请求级(整条请求)的 decode 段总时长: 从首 token 产出到最后一个 token 结束的墙钟耗时,\n不含排队与 prefill。与上一行「逐 token(ITL)」的区别是口径不是「每个 token」而是「整条请求」——\ndecode 总时长 ≈ 该请求输出 token 数 × TPOT, 所以它同时被「回答多长」和「吐字多快」两件事驱动。\n\n右轴叠了「每请求输出 token 数均值」正是为了拆这两个因子: 总时长涨而 token 数不涨 = 真的变慢(看 ITL 面板);\n总时长涨且 token 数同步涨 = 只是回答变长了, 不是性能退化。\n\n本指标只在请求结束时记一条, 因此进行中的长请求不体现, burst 结束后才补上。\n桶边界 0.3/0.5/0.8/1/1.5/2/2.5/5/10/15/20/30…s, 分档比 ITL 密, 分位数可当量级读(但仍是桶内插值估计)。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "g4-01-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": ".*输出 token 数.*"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "none"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.axisLabel",
+                "value": "tokens/请求"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    4,
+                    4
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "histogram_quantile(0.5, sum by(le, model_name) (rate(vllm:request_decode_time_seconds_bucket[1m])))",
+          "legendFormat": "{{model_name}} · decode 总时长 p50"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "histogram_quantile(0.9, sum by(le, model_name) (rate(vllm:request_decode_time_seconds_bucket[1m])))",
+          "legendFormat": "{{model_name}} · decode 总时长 p90"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "histogram_quantile(0.99, sum by(le, model_name) (rate(vllm:request_decode_time_seconds_bucket[1m])))",
+          "legendFormat": "{{model_name}} · decode 总时长 p99"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "sum by(model_name) (rate(vllm:request_decode_time_seconds_sum[1m])) / sum by(model_name) (rate(vllm:request_decode_time_seconds_count[1m]))",
+          "legendFormat": "{{model_name}} · decode 总时长 均值"
+        },
+        {
+          "refId": "E",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "sum by(model_name) (rate(vllm:request_generation_tokens_sum[1m])) / sum by(model_name) (rate(vllm:request_generation_tokens_count[1m]))",
+          "legendFormat": "{{model_name}} · 输出 token 数 均值(右轴)"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "单请求耗时分解(均值): 排队 / prefill / decode（对照 e2e）",
+      "description": "把「一条请求从进来到结束」按 vLLM 自己的分段拆开, 全部取均值(rate(_sum)/rate(_count)), 一眼看清耗时花在哪:\n- 排队 queue: 请求进来到被调度进 batch 的等待, 涨说明并发打满/被限流。\n- prefill: 处理输入(含多模态图像 token)的一次性前向, 图越多越大它越高。\n- decode: 逐 token 生成阶段总耗时(与左侧面板同源)。\n- e2e(对照): 端到端总时长。近似关系 e2e ≈ 排队 + prefill + decode, 差值是引擎内的杂项开销\n  (调度、detokenize、多模态预处理等), 不必强求三段严格相加等于 e2e。\n\n用法: 看哪一段占大头再决定优化方向——排队高→加并发/扩容; prefill 高→降图数/分辨率或开前缀缓存;\ndecode 高→看是输出太长还是单 token 太慢(左侧面板的右轴 token 数)。",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "g4-01-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "sum by(model_name) (rate(vllm:request_queue_time_seconds_sum[1m])) / sum by(model_name) (rate(vllm:request_queue_time_seconds_count[1m]))",
+          "legendFormat": "{{model_name}} · 排队"
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "sum by(model_name) (rate(vllm:request_prefill_time_seconds_sum[1m])) / sum by(model_name) (rate(vllm:request_prefill_time_seconds_count[1m]))",
+          "legendFormat": "{{model_name}} · prefill"
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "sum by(model_name) (rate(vllm:request_decode_time_seconds_sum[1m])) / sum by(model_name) (rate(vllm:request_decode_time_seconds_count[1m]))",
+          "legendFormat": "{{model_name}} · decode"
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "g4-01-prometheus"
+          },
+          "expr": "sum by(model_name) (rate(vllm:e2e_request_latency_seconds_sum[1m])) / sum by(model_name) (rate(vllm:e2e_request_latency_seconds_count[1m]))",
+          "legendFormat": "{{model_name}} · e2e(对照)"
+        }
+      ]
+    },
+    {
       "id": 5,
       "type": "timeseries",
       "title": "端到端延时 p50/p90/p99",
@@ -439,7 +645,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 24
+        "y": 32
       },
       "fieldConfig": {
         "defaults": {
@@ -510,7 +716,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 24
+        "y": 32
       },
       "fieldConfig": {
         "defaults": {
@@ -572,7 +778,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 40
       },
       "fieldConfig": {
         "defaults": {
@@ -654,7 +860,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 40
       },
       "fieldConfig": {
         "defaults": {
@@ -763,7 +969,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 40
+        "y": 48
       },
       "fieldConfig": {
         "defaults": {
@@ -826,7 +1032,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 40
+        "y": 48
       },
       "fieldConfig": {
         "defaults": {
