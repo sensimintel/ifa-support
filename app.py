@@ -48,6 +48,7 @@ from depth_anything_3.api import DepthAnything3  # noqa: E402
 import devpc  # noqa: E402
 import recog_direct  # noqa: E402
 import recog_log  # noqa: E402
+import recog_sse  # noqa: E402
 from frame_relay import (  # noqa: E402
     DEFERRED, UNKNOWN_DEVICE, get_latest_frame, get_latest_frame_seq,
     get_selected_device, router as frame_router,
@@ -3438,7 +3439,7 @@ function setState(st){
 }
 function renderCard(c){
   $('cname').textContent=c.name||'';
-  $('cdesc').textContent=c.description_en||c.description||'';
+  $('cdesc').textContent=c.description_en||'';
   // 营养数字与分级：VLM 偶发不给（guardrail 置 null/空）→ 对应行整行隐藏
   const kcal=(c.calories_kcal!=null)?c.calories_kcal+' kcal':'';
   $('ckcalrow').style.display=kcal?'':'none';$('ckcal').textContent=kcal;
@@ -3624,8 +3625,9 @@ $('hlcfgClose').onclick=()=>$('hlcfg').classList.remove('on');
 
 if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布局
   curCard={name:'Banana',description_en:'A quick source of everyday energy.',
+           description_de:'Ein schneller Energielieferant für den Alltag.',
            calories_kcal:89,protein_g:1.1,carbs_g:22.8,fat_g:0.3,
-           classification:'Good',box:[0.30,0.34,0.45,0.66]};
+           classification:'Good'};
   renderCard(curCard);cardShownAt=Date.now();lastCardKey='demo';
   setInterval(()=>{cardShownAt=Date.now();},5000);   // 常驻成功态
   renderTimeline([
@@ -3833,6 +3835,10 @@ if _recog_target not in RECOG_TARGETS or not RECOG_TARGETS[_recog_target]["endpo
     _recog_target = "qwen"   # 非法或未配置的默认目标一律回退 qwen（与历史行为一致）
 RECOG_MIN_INTERVAL = float(os.environ.get("RECOG_MIN_INTERVAL", "4.0"))  # 两次识别最小间隔(秒)，节流防刷屏
 RECOG_TIMEOUT = 30.0
+# 流式返回：开=stream=true 逐块收 SSE。收满才建卡的链路不变，但能把 http 段拆成
+# 「网络往返+prefill」(ttft) 与「decode」两截——之前这两截混在一个 http_ms 里，
+# 「这轮慢是慢在传图还是慢在生成」只能靠猜。出问题设 RECOG_STREAM=0 立刻回非流式。
+RECOG_STREAM = os.environ.get("RECOG_STREAM", "1").strip() not in ("0", "false", "False")
 RECOG_MAX_CARDS = 200
 RECOG_ACTIVE_WINDOW = 30.0   # 去重活跃窗口(秒)：只在最后出现≤此窗口的卡里找重复(滑动窗口)
 RECOG_MAX_CANDIDATES = 8     # 每次最多带几张候选参考图(带框图)喂 VLM，控多图请求成本
@@ -3874,7 +3880,10 @@ print(f"[da3-web] 直传识别配置：{_recog_direct.snapshot()}", flush=True)
 # 食物健康分级的合法枚举（静态 guardrail 白名单：模型输出只保留集合内的值、其余置空）。
 FOOD_CLASSIFICATIONS = ["Good", "Neutral", "Bad"]
 _CLS_CANON = {c.lower(): c for c in FOOD_CLASSIFICATIONS}   # 小写→规范写法，校验大小写不敏感
-RECOG_DESC_MAX = 20         # 一句话描述最大字数
+RECOG_DESC_MAX = 60         # 英文描述最大字符数
+# 德文单独放宽：德语复合词长、句式也长，同样一句话按 60 字符切会把结尾削掉半个词
+# （实测 "…die Wachsamkeit steig" 这种断尾），落卡后前端直接显示残句。
+RECOG_DESC_DE_MAX = 90      # 德文描述最大字符数
 
 
 def _recog_num(v, lo, hi, as_int=False):
@@ -3924,8 +3933,10 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False):
         "容器上的文字只有当它是饮料产品本身的品牌（如可乐罐上的 Coca-Cola）才可用作名称，"
         "杯子/瓶子上的装饰文案（如 Good morning）不是名称；\n"
         "  type：只能是“食物”或“液体”；\n"
-        "  description：一句话中文描述（不超过" + str(RECOG_DESC_MAX) + "字，如“快速补能的小食”）；\n"
-        "  description_en：一句话英文描述（不超过 60 字符，如 \"A quick source of everyday energy.\"）；\n"
+        "  description_en：一句话英文描述（不超过 " + str(RECOG_DESC_MAX) + " 字符，"
+        "如 \"A quick source of everyday energy.\"）；\n"
+        "  description_de：一句话德文描述（不超过 " + str(RECOG_DESC_DE_MAX) + " 字符，"
+        "如 \"Ein schneller Energielieferant für den Alltag.\"）；\n"
         "  calories_kcal：整数卡路里；protein_g / carbs_g / fat_g：蛋白质/碳水/脂肪克数（数字，最多 1 位小数）。"
         "这四个营养数字**一律按画面里这一份的实际可见份量估算**，绝不是每 100 克的标准值：\n"
         "    · 先目测这份食物的大小/体积/数量（对照画面里的手、餐具、容器等参照物），"
@@ -3934,9 +3945,7 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False):
         "    · 只剩一部分（吃剩一半、喝剩小半杯）就按剩下的量估；\n"
         "    · 液体按容器容量与液面高度估算内容物的量；\n"
         "  classification：食物健康分级，只能从这些里选一个：" + "、".join(FOOD_CLASSIFICATIONS)
-        + "（营养密度高、天然少加工的选 Good；高糖/高盐/油炸/高度加工的选 Bad；介于两者之间选 Neutral）；\n"
-        "  box：该物品在图1中的包围框 [x1,y1,x2,y2]，0-1000 归一化整数（左上、右下），"
-        "框要紧贴物品本体。\n"
+        + "（营养密度高、天然少加工的选 Good；高糖/高盐/油炸/高度加工的选 Bad；介于两者之间选 Neutral）。\n"
     )
     if candidates:
         lines = "\n".join("  [%d] %s（%s）—— %s" % (i + 1, c.get("name", ""),
@@ -3981,10 +3990,11 @@ def _build_recog_prompt(candidates, n_food=0, n_drink=0, direct=False):
               "match_evidence 写“无相似候选”，match_reason 写“无已记录物品”，matched_name 为 null。\n")
     p += (
         "只输出 JSON，不要任何解释："
-        "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\",\"description\":\"快速补能的小食\","
+        "{\"items\":[{\"name\":\"Banana\",\"type\":\"食物\","
         "\"description_en\":\"A quick source of everyday energy.\","
+        "\"description_de\":\"Ein schneller Energielieferant für den Alltag.\","
         "\"calories_kcal\":89,\"protein_g\":1.1,\"carbs_g\":22.8,\"fat_g\":0.3,"
-        "\"classification\":\"Good\",\"box\":[412,530,668,845],"
+        "\"classification\":\"Good\","
         "\"match_evidence\":\"无相似候选\",\"match_reason\":\"画面新出现的物品\","
         "\"match\":null,\"matched_name\":null,\"match_confidence\":null}]}。"
         "画面里没有食物也没有液体时，items 为空数组。"
@@ -3998,14 +4008,15 @@ def _img_data_uri(rgb):
     return ("data:image/jpeg;base64," + base64.b64encode(buf.tobytes()).decode()) if ok else None
 
 
-SHOT_DIR = GLB_DIR.parent / "recog_shots"   # 识别缩略图目录（点云+Qwen框 服务端渲染图）
+SHOT_DIR = GLB_DIR.parent / "recog_shots"   # 识别缩略图目录（点云服务端渲染图）
 SHOT_KEEP = 160                             # 磁盘最多保留的缩略图数量
 
 
 def _save_cloud_shot(pred, dets, conf):
     """识别缩略图：用该帧 DA3 pred 走与②/③相同的服务端点云渲染链路，
-    叠 Qwen 给的 box（食物红/液体蓝 3D 框），存盘返回 /shotimg url；渲染失败返回 None。
-    dets: [(label, nx1, ny1, nx2, ny2)]，坐标 0-1 归一化（左上、右下）；空则渲无框点云。"""
+    存盘返回 /shotimg url；渲染失败返回 None。
+    dets: [(label, nx1, ny1, nx2, ny2)]，坐标 0-1 归一化（左上、右下）；空则渲无框点云。
+    识别链路自模型输出去掉 box 起一律传空，框由别的调用方（若将来有）自带。"""
     try:
         # 相机模型已改为「调优视角」（对准点云中心、按场景深度定距，场景相对不跳帧）：
         # 缩略图取稍近距离(1.0×) + 俯视 20°；splat=1 + out_size=1140 保持点状离散
@@ -4050,38 +4061,6 @@ def _make_ref_img(rgb):
     return out
 
 
-REF_CROP_MARGIN = 0.18   # 参考图裁剪的 box 外扩比例：保留少量容器/摆放上下文
-REF_CROP_MIN = 224       # 参考图裁剪最小边长(px)：太小的 crop 会糊，以中心为基准向外扩到该尺寸
-
-
-def _make_ref_crop(rgb, box):
-    """新卡参考图：按物品 box 外扩裁剪出「只含本物品」的特写，再打 HISTORY REF 横幅。
-    动机（over-merge 第一根因）：整帧参考图在多物品同框时彼此几乎相同——同一轮建的
-    多张卡甚至共享同一张图，「用参考图核对」被结构性架空；候选特写才真正可判别。
-    box 为 0-1 归一化 (x1,y1,x2,y2)；box 缺失、疑似退化（面积<2%帧面积）或裁剪
-    结果过小时返回 None，调用方回退整帧带框图（与旧行为一致）。"""
-    if not box:
-        return None
-    H, W = rgb.shape[:2]
-    x1, y1, x2, y2 = box[0] * W, box[1] * H, box[2] * W, box[3] * H
-    bw, bh = x2 - x1, y2 - y1
-    if bw * bh < 0.02 * W * H:      # 面积过小：疑似漂移/退化框，裁下来也认不出，不如整帧
-        return None
-    mx, my = bw * REF_CROP_MARGIN, bh * REF_CROP_MARGIN
-    x1, y1, x2, y2 = x1 - mx, y1 - my, x2 + mx, y2 + my
-    if x2 - x1 < REF_CROP_MIN:
-        cx = (x1 + x2) / 2
-        x1, x2 = cx - REF_CROP_MIN / 2, cx + REF_CROP_MIN / 2
-    if y2 - y1 < REF_CROP_MIN:
-        cy = (y1 + y2) / 2
-        y1, y2 = cy - REF_CROP_MIN / 2, cy + REF_CROP_MIN / 2
-    x1, y1 = max(0, int(x1)), max(0, int(y1))
-    x2, y2 = min(W, int(x2)), min(H, int(y2))
-    if x2 - x1 < 32 or y2 - y1 < 32:
-        return None
-    return _make_ref_img(rgb[y1:y2, x1:x2])
-
-
 def _draw_boxes(rgb, detections):
     """在原图上画 food(红)/drink(蓝) 检测框，返回带框图(RGB)。"""
     out = rgb.copy()
@@ -4099,7 +4078,8 @@ def _parse_recog(content):
     校验规则（每字段一个静态 guardrail）：
       name           非空、限 40 字，否则丢弃该 item；
       type           枚举 → 归一到 “食物”/“液体”；
-      description     字符串、去换行、限 RECOG_DESC_MAX 字；
+      description_en  字符串、去换行、限 RECOG_DESC_MAX 字符；
+      description_de  同上，限 RECOG_DESC_DE_MAX（德语更长，放宽）；
       calories_kcal  整数、夹到 [0,5000]，非法置 None；
       protein_g/carbs_g/fat_g  数字（1 位小数）、夹到 [0,500]，非法置 None；
       classification 枚举白名单 FOOD_CLASSIFICATIONS，非法值置空。"""
@@ -4119,8 +4099,8 @@ def _parse_recog(content):
             continue
         typ = str(it.get("type", "")).strip().lower()
         is_liquid = ("液" in typ or "饮" in typ or "drink" in typ or "liquid" in typ)
-        desc = str(it.get("description", "")).strip().replace("\n", " ")[:RECOG_DESC_MAX]
-        desc_en = str(it.get("description_en", "")).strip().replace("\n", " ")[:60]
+        desc_en = str(it.get("description_en", "")).strip().replace("\n", " ")[:RECOG_DESC_MAX]
+        desc_de = str(it.get("description_de", "")).strip().replace("\n", " ")[:RECOG_DESC_DE_MAX]
         kcal = _recog_num(it.get("calories_kcal"), 0, 5000, as_int=True)
         protein = _recog_num(it.get("protein_g"), 0, 500)
         carbs = _recog_num(it.get("carbs_g"), 0, 500)
@@ -4135,22 +4115,12 @@ def _parse_recog(content):
         mname = str(it.get("matched_name") or "").strip()[:40]
         conf = str(it.get("match_confidence") or "").strip().lower()
         conf = conf if conf in ("high", "low") else ""    # 非法/缺省按 low 语义处理（不合并）
-        box = None                                        # 物品包围框：0-1000 归一化 → 0-1 浮点
-        raw_box = it.get("box")
-        if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4:
-            try:
-                x1, y1, x2, y2 = [min(1000, max(0, int(v))) for v in raw_box]
-                if abs(x2 - x1) >= 10 and abs(y2 - y1) >= 10:   # 退化框丢弃
-                    box = (min(x1, x2) / 1000.0, min(y1, y2) / 1000.0,
-                           max(x1, x2) / 1000.0, max(y1, y2) / 1000.0)
-            except (TypeError, ValueError):
-                box = None
         out.append({"name": name, "type": "液体" if is_liquid else "食物",
-                    "description": desc, "description_en": desc_en,
+                    "description_en": desc_en, "description_de": desc_de,
                     "calories_kcal": kcal, "protein_g": protein,
                     "carbs_g": carbs, "fat_g": fat, "classification": cls,
                     "match": match, "match_evidence": evidence, "match_reason": reason,
-                    "matched_name": mname, "match_confidence": conf, "box": box})
+                    "matched_name": mname, "match_confidence": conf})
     return out
 
 
@@ -4214,6 +4184,10 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     payload = {"model": cfg["model"],
                "messages": [{"role": "user", "content": content}],
                "max_tokens": 1536, "temperature": 0}
+    if RECOG_STREAM:
+        # include_usage：流式下 token 数只在最后一个 usage-only chunk 里给
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
     body = json.dumps(payload).encode()      # 序列化几百 KB base64 也要算进本地耗时
     encode_ms = (time.time() - _t_enc) * 1000.0
     if log is not None:
@@ -4225,20 +4199,26 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
                       "n_images": len(content) - 1, "prompt": prompt,
                       "max_tokens": payload["max_tokens"],
                       "temperature": payload["temperature"],
+                      "stream": bool(payload.get("stream")),
                       "img_full": u1, "img_boxed_full": u2,
                       "img_full_px": "%dx%d" % (orig_rgb.shape[1], orig_rgb.shape[0])}
     headers = {"Content-Type": "application/json"}
     if cfg["api_key"]:
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
     _t_http = time.time()
+    ttft_ms = None          # 首个内容块到达耗时（仅流式有）：网络往返 + 服务端 prefill
     try:
         req = urllib.request.Request(cfg["endpoint"], data=body, headers=headers)
         with urllib.request.urlopen(req, timeout=RECOG_TIMEOUT) as r:
-            data = json.loads(r.read().decode())
-            out = data["choices"][0]["message"]["content"]
-            # vLLM 的 OpenAI 兼容响应**不带服务端耗时**，只有 token 数——拿它解释
-            # 「这轮为什么慢」：输出 token 越多解码越久，是 http 段里最可归因的一项
-            usage = data.get("usage") or {}
+            if payload.get("stream"):
+                out, usage, ttft_ms = recog_sse.read_sse_completion(
+                    r, _t_http, RECOG_TIMEOUT, time.time)
+            else:
+                data = json.loads(r.read().decode())
+                out = data["choices"][0]["message"]["content"]
+                # vLLM 的 OpenAI 兼容响应**不带服务端耗时**，只有 token 数——拿它解释
+                # 「这轮为什么慢」：输出 token 越多解码越久，是 http 段里最可归因的一项
+                usage = data.get("usage") or {}
     except Exception as e:
         print(f"[da3-web] 识别调用失败：{type(e).__name__}: {e}", flush=True)
         _vlmlog.set_response(log, False, error=f"{type(e).__name__}: {e}",
@@ -4251,6 +4231,8 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     # 三段的边界说明（前端照此展示，别再靠猜）：
     #   encode = 本机 CPU（两张原图 JPEG q95 + base64 + JSON 序列化，几百 KB）
     #   http   = 发请求到收完响应：网络往返(经隧道) + 服务端排队 + 模型推理 + 回传
+    #   ttft   = http 里到「首个内容块」为止的那截：上行传图 + 排队 + prefill；
+    #            http - ttft 即 decode 段（仅流式；非流式为 None，拆不开）
     #   parse  = 解析模型输出 + 字段 guardrail
     _vlmlog.set_response(log, True, raw=out, items=items,
                          timings={"encode_ms": round(encode_ms, 1),
@@ -4258,7 +4240,8 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
                                   "parse_ms": round((time.time() - _t_parse) * 1000.0, 1),
                                   "req_bytes": len(body),
                                   "prompt_tokens": usage.get("prompt_tokens"),
-                                  "completion_tokens": usage.get("completion_tokens")})
+                                  "completion_tokens": usage.get("completion_tokens"),
+                                  "ttft_ms": (round(ttft_ms, 1) if ttft_ms is not None else None)})
     return items
 
 
@@ -4276,7 +4259,7 @@ def _name_tokens(s):
 def _recog_worker(idx=0):
     """后台 worker：取最新识别任务、丢弃积压，识别 + 去重：
       duplicate 命中且通过全部闸门 → 合并到那张卡（只追加缩略图、刷新 last_ts、rev+1，内容不改）；
-      否则 → 新建卡（ref_img=按物品 box 裁剪的特写，无 box 回退整帧带框图）。
+      否则 → 新建卡（ref_img=整帧带框图；模型输出已无 box，不再裁本物品特写）。
     合并闸门共五道（宁拒勿并，错并比重复建卡严重）：回显校验 → 类型一致 →
     证据自洽 → high 置信 → 名称零重叠拦截。
 
@@ -4296,10 +4279,9 @@ def _recog_worker(idx=0):
             _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
             _recog_direct_stats["in_flight"] += 1
         wait_ms = (time.time() - enq_ts) * 1000.0     # 在队列里等 worker 的时长
-        # 新卡代表图兜底：整帧带框图加 HISTORY REF 横幅（物品无 box/裁剪失败时用）。
-        # 注意：这张图同轮所有新卡共享，正是曾经 over-merge 的第一根因——正常路径
-        # 走建卡处按各自 box 裁剪的特写，这里仅作退路。
-        # 直传口径没有带框图（boxed=None），退路图用原帧。
+        # 新卡代表图：整帧带框图加 HISTORY REF 横幅。同轮所有新卡共享这一张——
+        # 模型输出去掉 box 后没法再裁本物品特写，这条曾是 over-merge 的根因路径，
+        # 属去 box 的已知代价。直传口径没有带框图（boxed=None），用原帧。
         boxed_uri = _img_data_uri(_make_ref_img(boxed if boxed is not None else orig))
         tgt = RECOG_TARGETS[_recog_target]   # 快照本轮识别目标：切换只影响后续轮次
         # 控制面观测：整轮留痕（请求图/prompt/原始返回/解析结果/去重判定），
@@ -4394,12 +4376,9 @@ def _recog_worker(idx=0):
                     print("[da3-web] 识别新卡：『%s』(%s) match=%s｜理由：%s" % (
                         it["name"], it["type"], m,
                         it.get("match_reason") or "（模型未给）"), flush=True)
-                # 缩略图 = 该帧点云 + Qwen box 的 3D 框（与②/③同一渲染链路；无框渲无框点云）
-                shot_dets = []
-                if it.get("box"):
-                    shot_dets = [(("drink" if it["type"] == "液体" else "food"),)
-                                 + tuple(it["box"])]
-                shot_url = _save_cloud_shot(pred, shot_dets, conf) if pred is not None else None
+                # 缩略图 = 该帧点云（与②/③同一渲染链路）。模型输出已去掉 box，
+                # 3D 框无从画起，一律渲无框点云——去 box 是明确的产品取舍，不是回退。
+                shot_url = _save_cloud_shot(pred, [], conf) if pred is not None else None
                 if target is not None:           # 去重命中：合并（显示名不改，本轮名称进合并史）
                     target.setdefault("merge_history", []).append({
                         "t": t, "name": it["name"],
@@ -4411,10 +4390,6 @@ def _recog_worker(idx=0):
                         target["shots"].append(shot_url)
                     # shots 只留最近 8 张：磁盘只保留最近 SHOT_KEEP 张，太多前端也摆不下
                     del target["shots"][:-8]
-                    if it.get("box"):
-                        # 位置随本轮刷新（食物会被挪动，/experience 的定位小标要跟着走）；
-                        # 本轮没给 box 就保留旧位置，营养内容仍维持「合并不改内容」策略
-                        target["box"] = it["box"]
                     target["last_ts"] = now
                     target["t"] = t
                     target["frame"] = frame
@@ -4427,18 +4402,18 @@ def _recog_worker(idx=0):
                     cards.append(target)
                 else:                            # 新食物：新建卡
                     _recog_id += 1
-                    # 参考图优先用按本物品 box 裁剪的特写（横幅在 crop 上），
-                    # 让后续轮次的去重对照真正可判别；裁剪失败回退整帧带框图
-                    crop = _make_ref_crop(orig, it.get("box"))
-                    ref_uri = (_img_data_uri(crop) if crop is not None else None) or boxed_uri
+                    # 参考图=整帧（带框图，直传口径下是原帧）。模型输出去掉 box 后
+                    # 没法再裁本物品特写——同轮多张新卡会共享同一张整帧参考图，
+                    # 下一轮去重的逐项对照因此变弱（曾是 over-merge 的根因），已知取舍。
+                    ref_uri = boxed_uri
                     cards.append({
                         "id": _recog_id, "status": "done",
-                        "name": it["name"], "type": it["type"], "description": it["description"],
+                        "name": it["name"], "type": it["type"],
                         "description_en": it.get("description_en", ""),
+                        "description_de": it.get("description_de", ""),
                         "calories_kcal": it.get("calories_kcal"),
                         "protein_g": it.get("protein_g"), "carbs_g": it.get("carbs_g"),
                         "fat_g": it.get("fat_g"), "classification": it.get("classification", ""),
-                        "box": it.get("box"),
                         "shots": [shot_url] if shot_url else [], "ref_img": ref_uri,
                         "merge_history": [],
                         "latency_ms": int(llm_ms), "latency_model": tgt["label"],
@@ -4450,8 +4425,7 @@ def _recog_worker(idx=0):
                     "card_id": target["id"] if target is not None else _recog_id,
                     "gate": gate, "confidence": it.get("match_confidence", ""),
                     "evidence": it.get("match_evidence", ""),
-                    "reason": it.get("match_reason", ""),
-                    "box": it.get("box")})
+                    "reason": it.get("match_reason", "")})
             if len(cards) > RECOG_MAX_CARDS:
                 del cards[:len(cards) - RECOG_MAX_CARDS]
             if items:                    # 本轮有卡片变更（新卡/合并）→ 通知 SSE 推送线程
@@ -4506,7 +4480,7 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
         active.sort(key=lambda c: c.get("last_ts", 0), reverse=True)
         # type 进快照：候选清单文字带类型，且供 worker 的「类型不一致禁并」闸门用
         candidates = [{"id": c["id"], "name": c.get("name", ""), "type": c.get("type", "食物"),
-                       "desc": c.get("description", ""), "ref_img": c["ref_img"]}
+                       "desc": c.get("description_en", ""), "ref_img": c["ref_img"]}
                       for c in active[:RECOG_MAX_CANDIDATES]]
     t = time.strftime("%H:%M:%S")
     # 直传口径不画框、也不发图2（boxed=None 一路透传到 _recognize_dedup）
@@ -5524,7 +5498,7 @@ def sam3hl_config(body: dict = Body(default=None)):
 
 @app.get("/shotimg/{name}")
 def shot_img(name: str):
-    """识别裁剪缩略图（Qwen box 裁自原图的 JPEG）。"""
+    """识别缩略图（该帧点云的服务端渲染 JPEG）。"""
     if not re.fullmatch(r"[0-9a-f]{32}\.jpg", name):
         return JSONResponse({"error": "非法文件名"}, status_code=400)
     p = SHOT_DIR / name
@@ -5546,7 +5520,7 @@ def serve_glb(token: str, name: str):
 
 # ══════════════════════════════════════════════════════════════════════
 # 实时识别卡片流页：轮询 /api/recog/list，最近新建/更新的卡在最上；
-# 缩略图=该帧点云叠 Qwen box 的服务端渲染图（/shotimg/*）；名称流式打字；食物红 / 液体蓝。
+# 缩略图=该帧点云的服务端渲染图（/shotimg/*）；名称流式打字；食物红 / 液体蓝。
 # ══════════════════════════════════════════════════════════════════════
 RECOG_PAGE = """<!doctype html><html lang="zh"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -5696,7 +5670,8 @@ function cardEl(c){
     +'<div class="rbody">'
     +'  <div class="fld"><div class="flab">识别对象 / Detected Food</div>'
     +'    <div class="name"><span class="tdot '+typeCls(c.type)+'"></span><span class="nm"></span></div></div>'
-    +'  <div class="fld f-desc hide"><div class="flab">一句话描述 / Description</div><div class="desc"></div></div>'
+    +'  <div class="fld f-desc hide"><div class="flab">一句话描述 / Description (EN)</div><div class="desc"></div></div>'
+    +'  <div class="fld f-desde hide"><div class="flab">德文描述 / Beschreibung (DE)</div><div class="desde"></div></div>'
     +'  <div class="fld f-nutr hide"><div class="flab">卡路里与营养（按可见份量估算）/ Nutrition (est.)</div><div class="tags nutr"></div></div>'
     +'  <div class="fld f-cls hide"><div class="flab">健康分级 / Classification</div><div class="sig cls"></div></div>'
     +'  <div class="meta"><span>帧 '+(c.frame||'')+'</span><span>'+(c.t||'')+'</span></div>'
@@ -5704,7 +5679,8 @@ function cardEl(c){
     +'<div class="rlat"><div class="flab">识别延时 / Latency</div><div class="lv"></div><div class="lm"></div></div>';
   latFill(el, c);
   typeInto(el.querySelector('.nm'), c.name||'');
-  if(c.description){ el.querySelector('.f-desc').classList.remove('hide'); el.querySelector('.desc').textContent=c.description; }
+  if(c.description_en){ el.querySelector('.f-desc').classList.remove('hide'); el.querySelector('.desc').textContent=c.description_en; }
+  if(c.description_de){ el.querySelector('.f-desde').classList.remove('hide'); el.querySelector('.desde').textContent=c.description_de; }
   const nutr=[];   // 老卡（改版前识别的）没有这些字段 → 整段隐藏，不炸
   if(c.calories_kcal!=null)nutr.push(c.calories_kcal+' kcal');
   if(c.protein_g!=null)nutr.push('蛋白 '+c.protein_g+'g');
