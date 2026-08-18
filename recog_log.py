@@ -12,6 +12,7 @@
 不需要 OpenCV，也方便以后换编码口径。
 """
 import threading
+import time
 
 # 列表态与详情态的字段划分：列表要能秒级轮询，大字段（prompt 全文 / 原始返回 /
 # 候选参考图 dataURI）一律留给详情接口
@@ -40,7 +41,11 @@ class RecogLog:
         self.full_keep = int(full_keep)
         self._items = []
         self._lock = threading.Lock()
+        # 与锁共用一把 Condition：控制面挂长轮询在这上面等，有新日志立刻被唤醒，
+        # 不必靠固定间隔去猜（1.5s 轮询在展台上肉眼可见地"慢半拍"）
+        self._cv = threading.Condition(self._lock)
         self._seq = 0
+        self._gen = 0
 
     def begin(self, device, trigger, candidates, n_food=0, n_drink=0,
               img_orig=None, img_boxed=None) -> dict:
@@ -72,7 +77,9 @@ class RecogLog:
             entry.setdefault("timings", {}).update(timings)
 
     def commit(self, entry) -> None:
-        with self._lock:
+        with self._cv:
+            self._gen += 1
+            self._cv.notify_all()      # 唤醒所有挂着的长轮询
             self._items.insert(0, entry)
             del self._items[self.max_items:]
             for old in self._items[self.full_keep:]:      # 滑出窗口的条目丢掉原尺寸图
@@ -107,8 +114,30 @@ class RecogLog:
             hit = next((it for it in self._items if it.get("id") == entry_id), None)
         return (hit.get("req") or {}).get(key) if hit else None
 
-    def clear(self) -> None:
+    def gen(self) -> int:
+        """变更版本号：每 commit 一条 +1。长轮询用它判断"我看到的还是不是最新的"。"""
         with self._lock:
+            return self._gen
+
+    def wait_for(self, since_gen, timeout_s) -> int:
+        """挂起直到版本号变化或超时，返回当前版本号。
+
+        since_gen 与当前版本不同（含调用方给 -1 的首帧）时立即返回——保证第一拍
+        永远拿得到数据，只有"我已是最新"的连接才真正挂起。
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        with self._cv:
+            while self._gen == since_gen:
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    break
+                self._cv.wait(remain)
+            return self._gen
+
+    def clear(self) -> None:
+        with self._cv:
+            self._gen += 1
+            self._cv.notify_all()
             self._items.clear()
 
     def __len__(self):

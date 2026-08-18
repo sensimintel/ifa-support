@@ -5,6 +5,8 @@
 app.py 与页面那侧只做接线断言（正则抽源码），与 test_recog_direct 同款做法。
 """
 import re
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -152,6 +154,45 @@ class ProjectionTest(unittest.TestCase):
             self.assertEqual(got["outcome"][0]["action"], "new")
 
 
+class LongPollTest(unittest.TestCase):
+    """长轮询：控制面挂在版本号上等，来一条画一条。"""
+
+    def test_gen_advances_on_commit_and_clear(self):
+        log = recog_log.RecogLog()
+        self.assertEqual(log.gen(), 0)
+        _entry(log)
+        self.assertEqual(log.gen(), 1)
+        log.clear()
+        self.assertEqual(log.gen(), 2)   # 清空也是变更，挂着的连接要被唤醒
+
+    def test_wait_returns_at_once_when_caller_is_behind(self):
+        """调用方版本落后（含首帧的 -1）时立刻返回，绝不白等一个 hold 周期。"""
+        log = recog_log.RecogLog()
+        _entry(log)
+        t0 = time.monotonic()
+        self.assertEqual(log.wait_for(-1, 5.0), 1)
+        self.assertLess(time.monotonic() - t0, 0.3)
+
+    def test_wait_wakes_on_new_entry(self):
+        """已是最新时挂起，新日志一到立刻醒——这才是"实时"的来源。"""
+        log = recog_log.RecogLog()
+        _entry(log)
+        threading.Timer(0.15, lambda: _entry(log, "薯条")).start()
+        t0 = time.monotonic()
+        gen = log.wait_for(1, 5.0)
+        dt = time.monotonic() - t0
+        self.assertEqual(gen, 2)
+        self.assertLess(dt, 1.0)      # 被唤醒而不是等满
+        self.assertGreater(dt, 0.05)  # 确实挂起过
+
+    def test_wait_times_out_quietly(self):
+        log = recog_log.RecogLog()
+        _entry(log)
+        t0 = time.monotonic()
+        self.assertEqual(log.wait_for(1, 0.2), 1)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.18)
+
+
 class TimingsTest(unittest.TestCase):
     """链路分段：识别调用内部的三段并进 entry["timings"]，投影时原样带出。"""
 
@@ -256,6 +297,14 @@ class AppWiringTest(unittest.TestCase):
                        '"parse_ms": round((time.time() - _t_parse) * 1000.0, 1)',
                        '"req_bytes": len(body)'):
             self.assertIn(needle, self.src, needle)
+
+    def test_list_endpoint_supports_long_poll(self):
+        """长轮询挂起时长必须留在反代超时之内，否则前端收到的是断连而不是空结果。"""
+        self.assertIn("def recoglog_list(device: Optional[str] = None, limit: int = 12,\n"
+                      "                  since_gen: int = -1, wait_s: float = 0.0):", self.src)
+        self.assertIn("_vlmlog.wait_for(since_gen, min(float(wait_s), RECOGLOG_HOLD_MAX))", self.src)
+        self.assertIn("RECOGLOG_HOLD_MAX = 25.0", self.src)
+        self.assertIn('"gen": _vlmlog.gen()', self.src)
 
     def test_list_endpoint_refreshes_the_baseline(self):
         """基线要有人去刷新，否则 HTTP 段永远拆不开：放在列表接口里（有人看才探，
