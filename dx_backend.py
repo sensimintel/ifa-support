@@ -75,8 +75,10 @@ NECKLACE_SOURCE_TIMEOUT = 2.0
 # 多设备下拉、/panel 的选中设备回落都依赖它，调小会让那些页面在短暂停传时就丢设备。
 # 这里只在本接口按更严的阈值过滤，影响面收在深体验区内。
 NECKLACE_ONLINE_MAX_AGE = float(os.environ.get("NECKLACE_ONLINE_MAX_AGE", "15"))
-# ifa 演示状态机（项链 ready / meal_in_progress / analyzing / report_published / failed，
-# 一次「开餐→分析→出报告」为一轮 cycle）：状态机本体在 local-stack 的 odyss-services
+# ifa 演示状态机（项链 standby / ready / meal_in_progress / analyzing /
+# report_published / failed，一次「开轮→开餐→分析→出报告」为一轮 cycle；
+# standby 是控制面「归零」的落点，那时还没有人认领这一轮，进食信号不算数）：
+# 状态机本体在 local-stack 的 odyss-services
 # （宿主 18090），这里只做控制面代理——控制面依旧
 # 免认证走 /dx-api/，由本服务补上 services 的 service token（X-Odyss-Service-Token）。
 # token 必须与 local-stack runtime-config 的 infra.http.service_tokens.ifa_demo_control 一致。
@@ -569,12 +571,16 @@ def api_necklace_meal_state_get(device_id: str):
 
 @app.put("/api/necklaces/{device_id}/meal-state")
 def api_necklace_meal_state_set(device_id: str, body: dict = Body(...)):
-    """设置某条项链的演示状态（控制面用：设 ready 与 reset 都是 state=ready）。
+    """设置某条项链的演示状态（控制面主用两个取值）。
 
-    persona_id 可选，且只在 state=ready（开一轮新演示）时有意义：一轮演示绑定一个
-    深区角色与至多一份报告，App 侧靠这条绑定在用户离开深区再回来时落回「那个人的报告」。
-    控制面这条路是辅助入口（现场先点开始新一轮、访客随后才选人时用），主路径仍是
-    App 选角色页与 Start your trip 自己上报，所以这里不填也完全成立。
+    · state=standby 是「归零」：换周期、清角色、把 App 弹回宣言页，但**不开窗**。
+      这是控制面的主按钮，桌边最常按的就是它。
+    · state=ready 是「手动开轮」兜底：定下取帧窗口的左端。正常场次由访客在 App 上
+      点 Start your trip 完成，只有访客不碰手机、工作人员替他跑全程时才用它。
+
+    persona_id 可选，且只在 state=ready（手动开轮）时有意义：一轮演示绑定一个深区
+    角色与至多一份报告，App 侧靠这条绑定在用户离开深区再回来时落回「那个人的报告」。
+    归零刻意忽略它（后端也会忽略）：那个动作就是「清空场子等下一位访客」。
     """
     device_id = (device_id or "").strip()
     if not device_id:
