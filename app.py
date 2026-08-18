@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import struct
 import sys
 import threading
@@ -1805,7 +1806,9 @@ async function tunTick(){
   const t=await(await fetch('/api/tunnel/status',{cache:'no-store'})).json();
   const dot=$('tundot'),txt=$('tuntxt'),btn=$('tunbtn');
   const rebuilding=!t.up && (t.pending || Date.now()-tunReqAt<90000) && tunReqAt;
-  if(t.up){dot.style.background='#34c759';txt.textContent='Qwen 识别隧道：已连通';btn.style.display='none';}
+  if(t.state==='busy'){dot.style.background='#ffd60a';   // 拥塞≠断开：链路在，探测排在大请求后面
+   txt.textContent='Qwen 识别隧道：拥塞（链路在，探测排队中）';btn.style.display='none';}
+  else if(t.up){dot.style.background='#34c759';txt.textContent='Qwen 识别隧道：已连通';btn.style.display='none';}
   else if(rebuilding){dot.style.background='#ff9f0a';
    txt.textContent='Qwen 识别隧道：重建中…'+(t.keeper_msg?('（'+t.keeper_msg+'）'):'');btn.style.display='none';}
   else{dot.style.background='#ff3b30';
@@ -5197,11 +5200,15 @@ def recoglog_clear():
 # ══════════════════════════════════════════════════════════════════════
 TUNNEL_PROBE_URL = "http://127.0.0.1:8011/v1/models"
 TUNNEL_PROBE_CACHE = 2.0     # 探测结果缓存(秒)：多个前端轮询共享，避免每次都真探一枪
+# 探测超时：原来 3s。识别满负载时单个请求体 600KB+、并发 2，隧道上行只有 ~400KB/s，
+# 探测小包要排在几 MB 数据后面——3s 必然探不通，而链路其实好好的。放宽到 8s。
+TUNNEL_PROBE_TIMEOUT = 8.0
 TUNNEL_KEEPER_ALIVE = 15.0   # 守护心跳超时(秒)：超过视为 Mac 守护不在线
 
 _tunnel_lock = threading.Lock()
-_tunnel = {"up": False, "checked_at": 0.0, "last_ok": 0.0, "rtt_ms": None,
-           "rebuild_requested": False, "keeper_seen": 0.0, "keeper_msg": ""}
+_tunnel = {"up": False, "state": "down", "checked_at": 0.0, "last_ok": 0.0,
+           "rtt_ms": None, "rebuild_requested": False, "keeper_seen": 0.0,
+           "keeper_msg": ""}
 
 
 def _tunnel_rtt_ms():
@@ -5215,39 +5222,64 @@ def _tunnel_rtt_ms():
 
 
 def _tunnel_probe():
-    """探一次本机 8011（缓存期内直接复用上次结果）。有 HTTP 应答（含 4xx）=通。"""
+    """探一次本机 8011（缓存期内复用上次结果），返回三态 up / busy / down。
+
+    为什么必须区分「堵」和「断」（2026-08-18 实发）：识别满负载时隧道被 600KB 的
+    请求体连续占满，探测小包排在后面必然超时。守护把「超时」当成「断了」，就会
+    kill 掉一条**正在正常工作**的隧道去重建——重建那几十秒才是真空期，日志里那
+    一串 Connection refused 全是守护自己制造的。隧道本来没断，是守护把它拆了。
+
+    判据：真断是**立刻**失败（端口没了→连接被拒 / 对端关闭→连接被重置），
+    拥塞是**超时**。据此分流：
+      up   有应答（含 4xx，说明链路通到了 vllm）
+      busy 超时——链路多半还在，只是排队，**不构成重建理由**
+      down 硬失败——反向段或 IAP 段真没了，该重建
+    """
     now = time.time()
     with _tunnel_lock:
         if now - _tunnel["checked_at"] < TUNNEL_PROBE_CACHE:
-            return _tunnel["up"]
+            return _tunnel["state"]
     _t = time.time()
     try:
-        with urllib.request.urlopen(TUNNEL_PROBE_URL, timeout=3.0):
-            up = True
+        with urllib.request.urlopen(TUNNEL_PROBE_URL, timeout=TUNNEL_PROBE_TIMEOUT):
+            state = "up"
     except urllib.error.HTTPError:
-        up = True            # 服务有应答（如未带 key 的 401），链路本身是通的
+        state = "up"         # 服务有应答（如未带 key 的 401），链路本身是通的
+    except socket.timeout:
+        state = "busy"
+    except urllib.error.URLError as e:
+        # urllib 会把超时包一层，剥开看真正的原因；其余（拒绝/重置/无路由）算真断
+        state = "busy" if isinstance(e.reason, (socket.timeout, TimeoutError)) else "down"
+    except TimeoutError:
+        state = "busy"
     except Exception:
-        up = False
+        state = "down"
     rtt_ms = round((time.time() - _t) * 1000.0, 1)
     with _tunnel_lock:
-        _tunnel["up"] = up
-        _tunnel["rtt_ms"] = rtt_ms if up else None    # 不通时的耗时是超时值，没有参考意义
+        _tunnel["state"] = state
+        # up 是给前端状态灯用的布尔值：busy 时沿用上次，别让拥塞把灯打成"已断开"
+        _tunnel["up"] = _tunnel["up"] if state == "busy" else (state == "up")
+        _tunnel["rtt_ms"] = rtt_ms if state == "up" else None  # 超时/失败的耗时没有参考意义
         _tunnel["checked_at"] = time.time()
-        if up:
+        if state == "up":
             _tunnel["last_ok"] = _tunnel["checked_at"]
         # 注意：重建指令只由守护心跳领取消费，这里绝不代为撤销——
         # 探测(2s缓存)比守护心跳(5s)勤，恢复瞬间撤销会把刚下发的指令静默吞掉。
-    return up
+    return state
 
 
 @app.get("/api/tunnel/status")
 def tunnel_status():
-    """识别隧道状态（网页轮询）：up=5090→GCP Qwen 全链路是否通；keeper_alive=Mac 守护是否在线。"""
-    up = _tunnel_probe()
+    """识别隧道状态（网页轮询）：up=5090→GCP Qwen 全链路是否通；keeper_alive=Mac 守护是否在线。
+
+    state 比 up 多一档 busy（链路在、只是被大请求塞住）——守护据它决定要不要重建，
+    网页据它把状态灯从"已断开"改说成"拥塞"，别让满负载看起来像故障。"""
+    state = _tunnel_probe()
     now = time.time()
     with _tunnel_lock:
         return JSONResponse({
-            "up": up, "last_ok": _tunnel["last_ok"], "rtt_ms": _tunnel["rtt_ms"],
+            "up": _tunnel["up"], "state": state,
+            "last_ok": _tunnel["last_ok"], "rtt_ms": _tunnel["rtt_ms"],
             "keeper_alive": now - _tunnel["keeper_seen"] <= TUNNEL_KEEPER_ALIVE,
             "keeper_msg": _tunnel["keeper_msg"],
             "pending": _tunnel["rebuild_requested"],
@@ -5271,7 +5303,11 @@ def tunnel_keeper(body: dict = Body(default=None)):
         _tunnel["keeper_msg"] = str((body or {}).get("msg", ""))[:120]
         req = _tunnel["rebuild_requested"]
         _tunnel["rebuild_requested"] = False
-    return JSONResponse({"rebuild": req, "up": _tunnel_probe()})
+    state = _tunnel_probe()
+    with _tunnel_lock:
+        up = _tunnel["up"]
+    # state 是给守护做重建决策的；up 仅供展示（busy 时沿用上次，不打成断开）
+    return JSONResponse({"rebuild": req, "up": up, "state": state})
 
 
 @app.get("/api/sam3/health")

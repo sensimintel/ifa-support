@@ -282,3 +282,55 @@ class SingleItemWiringTest(WiringTest):
     def test_clear_drops_last_pick(self):
         """卡都清空了还留着上次命中，下一轮 prompt 会指着一张不存在的卡说话。"""
         self.assertHas("_recog_last_pick.pop(dev, None)")
+
+
+class TunnelProbeWiringTest(WiringTest):
+    """隧道探测三态：拥塞不得被当成断线，否则守护会拆掉正在干活的隧道。"""
+
+    def test_probe_returns_three_states(self):
+        self.assertHas('state = "busy"')
+        self.assertHas('state = "down"')
+        self.assertHas('isinstance(e.reason, (socket.timeout, TimeoutError))')
+
+    def test_busy_keeps_previous_up_flag(self):
+        """busy 时状态灯不许翻红——链路没断，翻红会让人以为故障。"""
+        self.assertHas('_tunnel["up"] = _tunnel["up"] if state == "busy" else (state == "up")')
+
+    def test_probe_timeout_widened(self):
+        self.assertHas("TUNNEL_PROBE_TIMEOUT = 8.0")
+        self.assertLacks("timeout=3.0")
+
+    def test_keeper_endpoint_exposes_state(self):
+        self.assertHas('"rebuild": req, "up": up, "state": state')
+
+
+class KeeperRebuildPolicyTest(unittest.TestCase):
+    """守护的重建判据：只认「进程退出」和「硬失败」，拥塞另算。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = (ROOT / "tools" / "qwen_tunnel_keeper.py").read_text(encoding="utf-8")
+
+    def assertHas(self, needle):
+        self.assertTrue(needle in self.src, "keeper 里找不到：%s" % needle)
+
+    def test_busy_does_not_count_as_down(self):
+        self.assertHas('down_n = down_n + 1 if server_state == "down" else 0')
+        self.assertHas('busy_n = busy_n + 1 if server_state == "busy" else 0')
+
+    def test_rebuild_needs_dead_or_hard_failure(self):
+        self.assertHas("elif (dead or down_n >= 3 or busy_n >= BUSY_LIMIT)")
+
+    def test_busy_backstop_is_far_from_trigger_happy(self):
+        """兜底阈值必须远大于硬失败阈值，否则满负载下会退化成定时重建。"""
+        import re as _re
+        limit = int(_re.search(r"^BUSY_LIMIT = (\d+)", self.src, _re.M).group(1))
+        self.assertGreaterEqual(limit, 30, "拥塞兜底阈值太小，满负载会被误触发")
+
+    def test_heartbeat_timeout_widened(self):
+        self.assertHas("HEARTBEAT_TIMEOUT = 15.0")
+        self.assertHas("timeout=HEARTBEAT_TIMEOUT")
+
+    def test_falls_back_when_server_has_no_state_field(self):
+        """守护可能先于 5090 升级，老服务端没有 state 字段时不能乱重建。"""
+        self.assertHas('if state not in ("up", "busy", "down"):')
