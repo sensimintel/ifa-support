@@ -94,6 +94,20 @@ domain:
     # ifa 双链架构·实时链：帧事件触发时只判定最新 4 帧滑窗（stride=2），产 eating
     # 信号驱动演示状态机，永不回补积压。配合 services 启动参数
     # -realtime-workflow-lane=false（停用 workflow lane 周期编排）使用。
+    # ifa 深区手动开关餐链路的分析参数缺省值。这些只是「表里没记录时」的兜底，
+    # 现场调参走控制面的参数面板（写 ifa_demo_analysis_params 表），改完下一次关餐即生效、
+    # 不需要重启容器。想改默认值才动这里。
+    ifa_demo:
+      # 取帧窗口上限（分钟）：Ready 到关餐超过这么久时，只取关餐前这么多分钟的帧。
+      window_max_minutes: 20
+      # 送进整餐 LLM 的选帧配额。
+      max_frames: 32
+      # 图片长边上限：600x800 的原始帧缩到 480x640，请求体从约 9 MB 降到约 2 MB。
+      image_max_edge: 640
+      image_jpeg_quality: 85
+      # 留空表示用 workflow 定义（frame_to_meal.ifa.yaml）里的模型与 prompt。
+      model: ""
+      prompt: ""
     latest_window_realtime:
       enabled: true
       window_size: 4
