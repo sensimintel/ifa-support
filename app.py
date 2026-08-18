@@ -4186,6 +4186,7 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
         _vlmlog.set_response(log, False, error="识别服务未接入（endpoint 为空）")
         return []
     direct = boxed_rgb is None
+    _t_enc = time.time()      # 本地编码段起点：两张原图 JPEG + base64 + JSON 序列化
     u1 = _img_data_uri(orig_rgb)
     u2 = None if direct else _img_data_uri(boxed_rgb)
     if not u1 or (not direct and not u2):
@@ -4206,6 +4207,8 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     payload = {"model": cfg["model"],
                "messages": [{"role": "user", "content": content}],
                "max_tokens": 1536, "temperature": 0}
+    body = json.dumps(payload).encode()      # 序列化几百 KB base64 也要算进本地耗时
+    encode_ms = (time.time() - _t_enc) * 1000.0
     if log is not None:
         # img_full/img_boxed_full = 真正送进请求体的那两张图（原帧原尺寸、cv2 默认 q95），
         # 直接引用同一个 dataURI 字符串：不重复编码、不额外占内存。详情页据此判断
@@ -4220,16 +4223,29 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     headers = {"Content-Type": "application/json"}
     if cfg["api_key"]:
         headers["Authorization"] = f"Bearer {cfg['api_key']}"
+    _t_http = time.time()
     try:
-        req = urllib.request.Request(cfg["endpoint"], data=json.dumps(payload).encode(), headers=headers)
+        req = urllib.request.Request(cfg["endpoint"], data=body, headers=headers)
         with urllib.request.urlopen(req, timeout=RECOG_TIMEOUT) as r:
             out = json.loads(r.read().decode())["choices"][0]["message"]["content"]
     except Exception as e:
         print(f"[da3-web] 识别调用失败：{type(e).__name__}: {e}", flush=True)
-        _vlmlog.set_response(log, False, error=f"{type(e).__name__}: {e}")
+        _vlmlog.set_response(log, False, error=f"{type(e).__name__}: {e}",
+                             timings={"encode_ms": round(encode_ms, 1),
+                                      "http_ms": round((time.time() - _t_http) * 1000.0, 1)})
         return []
+    http_ms = (time.time() - _t_http) * 1000.0
+    _t_parse = time.time()
     items = _parse_recog(out)
-    _vlmlog.set_response(log, True, raw=out, items=items)
+    # 三段的边界说明（前端照此展示，别再靠猜）：
+    #   encode = 本机 CPU（两张原图 JPEG q95 + base64 + JSON 序列化，几百 KB）
+    #   http   = 发请求到收完响应：网络往返(经隧道) + 服务端排队 + 模型推理 + 回传
+    #   parse  = 解析模型输出 + 字段 guardrail
+    _vlmlog.set_response(log, True, raw=out, items=items,
+                         timings={"encode_ms": round(encode_ms, 1),
+                                  "http_ms": round(http_ms, 1),
+                                  "parse_ms": round((time.time() - _t_parse) * 1000.0, 1),
+                                  "req_bytes": len(body)})
     return items
 
 
@@ -4262,8 +4278,8 @@ def _recog_worker(idx=0):
                 _recog_workers -= 1      # 并发被调小：多余 worker 退场
                 _recog_cv.notify_all()   # 把刚才领到的唤醒还回去，别把任务闷死
                 return
-            orig, boxed, glb_url, frame, t, candidates, n_food, n_drink, enq_ts, pred, conf, dev = \
-                _recog_pending.pop()             # 最新优先
+            orig, boxed, glb_url, frame, t, candidates, n_food, n_drink, enq_ts, pred, conf, dev, \
+                stage = _recog_pending.pop()     # 最新优先
             _recog_pending.clear()                                             # 丢弃积压，防慢识别拖垮
             _recog_direct_stats["in_flight"] += 1
         wait_ms = (time.time() - enq_ts) * 1000.0     # 在队列里等 worker 的时长
@@ -4288,6 +4304,16 @@ def _recog_worker(idx=0):
             vlog["resp"]["llm_ms"] = int(llm_ms)
             vlog["resp"]["wait_ms"] = int(wait_ms)
             vlog["resp"].setdefault("n_items", len(items))
+        # 链路分段：触发线程测到的三段 + 本 worker 的排队/调用，落卡后再补 post/total
+        vlog.setdefault("timings", {}).update({
+            "frame_age_ms": (round((enq_ts - stage["frame_recv_at"]) * 1000.0, 1)
+                             if stage.get("frame_recv_at") else None),
+            "decode_ms": stage.get("decode_ms"),
+            "gate_ms": stage.get("gate_ms"),
+            "wait_ms": round(wait_ms, 1),
+            "llm_ms": round(llm_ms, 1),
+        })
+        _t_post = time.time()
         with _recog_lock:                     # 观测：抽屉里回显实测延时与轮次
             _recog_direct_stats["rounds"] += 1
             _recog_direct_stats["last_ms"] = int(llm_ms)
@@ -4414,6 +4440,13 @@ def _recog_worker(idx=0):
             if items:                    # 本轮有卡片变更（新卡/合并）→ 通知 SSE 推送线程
                 _recog_gen += 1
                 _recog_evt_cv.notify_all()
+        now2 = time.time()
+        vlog["timings"]["post_ms"] = round((now2 - _t_post) * 1000.0, 1)
+        # 端到端 = 帧到 8060 → 本轮结果落卡。拿不到帧时刻（旧链路/手动灌帧）时留空，
+        # 不用"从触发算起"冒充端到端——那会把帧在缓存里等触发的时间藏掉
+        vlog["timings"]["total_ms"] = (round((now2 - stage["frame_recv_at"]) * 1000.0, 1)
+                                       if stage.get("frame_recv_at") else None)
+        vlog["timings"]["tunnel_rtt_ms"] = _tunnel_rtt_ms()
         _vlmlog.commit(vlog)
 
 
@@ -4429,7 +4462,7 @@ def _recog_ensure_workers_locked():
 
 
 def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
-                     device=UNKNOWN_DEVICE, direct=False):
+                     device=UNKNOWN_DEVICE, direct=False, stage=None):
     """detections 非空 + 节流通过 → 取该设备活跃卡快照作去重候选、提交异步识别。
     processor 里调用，不阻塞产线。去重候选与新卡都落在 device 自己的卡片桶里。
     不再加 pending 占位卡（去重后归属不定），识别中用前端顶部 live 指示。
@@ -4465,7 +4498,8 @@ def _maybe_recognize(orig_rgb, detections, glb_url, frame, pred=None, conf=40.0,
     n_drink = len(detections) - n_food
     with _recog_cv:
         _recog_pending.append((orig_rgb.copy(), boxed, glb_url, frame, t, candidates,
-                               n_food, n_drink, time.time(), pred, conf, device))
+                               n_food, n_drink, time.time(), pred, conf, device,
+                               dict(stage or {})))
         _recog_cv.notify_all()   # worker 池可能不止一个线程在等（并发>1）
 
 
@@ -4552,7 +4586,7 @@ def _recog_direct_loop():
             if not dev:
                 time.sleep(min(1.0, itv))
                 continue
-            raw, seq = get_latest_frame_seq(dev)
+            raw, seq, recv_at = get_latest_frame_seq(dev)
             if raw is None or (dev == last_dev and seq == last_seq):
                 with _recog_lock:      # 推帧比触发慢：本轮无新图，不重复送
                     if raw is not None:
@@ -4560,20 +4594,27 @@ def _recog_direct_loop():
                 time.sleep(min(0.2, itv))
                 continue
             last_dev, last_seq = dev, seq
+            _t = time.time()
             arr = np.array(ImageOps.exif_transpose(
                 Image.open(io.BytesIO(raw))).convert("RGB"))
+            # 本轮的链路计时随任务下传，worker 合并出端到端分段（见 _recog_worker）。
+            # frame_recv_at 是帧到 8060 的时刻：端到端从它起算，才盖得住「帧在缓存里
+            # 等触发线程」这段——只从触发算起会把推帧慢造成的延时藏起来。
+            stage = {"frame_recv_at": recv_at, "seq": seq,
+                     "decode_ms": round((time.time() - _t) * 1000.0, 1), "gate_ms": None}
             if _recog_direct.enabled():
                 _maybe_recognize(arr, [], None, f"d{seq}", pred=None, conf=40.0,
-                                 device=dev, direct=True)
+                                 device=dev, direct=True, stage=stage)
             else:
                 _track_stream_device(dev)      # 切设备重置 SAM3 流式会话（幂等）
                 dets, gate_ms = _sam3_gate_dets(arr, device=dev)
+                stage["gate_ms"] = round(gate_ms, 1)
                 with _recog_lock:
                     _recog_direct_stats["gate_ms"] = int(gate_ms)
                     _recog_direct_stats["gate_hits" if dets else "gate_misses"] += 1
                 if dets:
                     _maybe_recognize(arr, dets, None, f"g{seq}", pred=None, conf=40.0,
-                                     device=dev, direct=False)
+                                     device=dev, direct=False, stage=stage)
             with _recog_lock:
                 _recog_direct_stats["last_error"] = ""
         except Exception as e:         # 触发线程必须长命：任何异常只记录不退出
@@ -4975,7 +5016,8 @@ def recoglog_list(device: Optional[str] = None, limit: int = 12):
     tgt = RECOG_TARGETS[_recog_target]
     return JSONResponse({"items": items, "total": total, "max": VLMLOG_MAX,
                          "target": tgt["label"], "model": tgt["model"],
-                         "direct": _recog_direct.snapshot()})
+                         "direct": _recog_direct.snapshot(),
+                         "tunnel_rtt_ms": _tunnel_rtt_ms()})
 
 
 @app.get("/api/recoglog/{entry_id}")
@@ -5025,8 +5067,18 @@ TUNNEL_PROBE_CACHE = 2.0     # 探测结果缓存(秒)：多个前端轮询共�
 TUNNEL_KEEPER_ALIVE = 15.0   # 守护心跳超时(秒)：超过视为 Mac 守护不在线
 
 _tunnel_lock = threading.Lock()
-_tunnel = {"up": False, "checked_at": 0.0, "last_ok": 0.0,
+_tunnel = {"up": False, "checked_at": 0.0, "last_ok": 0.0, "rtt_ms": None,
            "rebuild_requested": False, "keeper_seen": 0.0, "keeper_msg": ""}
+
+
+def _tunnel_rtt_ms():
+    """最近一次隧道探测（GET 8011 /v1/models）的往返耗时，毫秒。
+
+    识别日志拿它当**网络基线**：VLM 那段的 http_ms 里网络往返占多少，靠这个数对照——
+    同一条隧道、同样的 5090→Mac→IAP→GCP 路径，只是请求体极小、服务端不做推理。
+    只读缓存不主动探测：worker 里再发一枪网络请求会把被测对象自己搅乱。"""
+    with _tunnel_lock:
+        return _tunnel["rtt_ms"]
 
 
 def _tunnel_probe():
@@ -5035,6 +5087,7 @@ def _tunnel_probe():
     with _tunnel_lock:
         if now - _tunnel["checked_at"] < TUNNEL_PROBE_CACHE:
             return _tunnel["up"]
+    _t = time.time()
     try:
         with urllib.request.urlopen(TUNNEL_PROBE_URL, timeout=3.0):
             up = True
@@ -5042,8 +5095,10 @@ def _tunnel_probe():
         up = True            # 服务有应答（如未带 key 的 401），链路本身是通的
     except Exception:
         up = False
+    rtt_ms = round((time.time() - _t) * 1000.0, 1)
     with _tunnel_lock:
         _tunnel["up"] = up
+        _tunnel["rtt_ms"] = rtt_ms if up else None    # 不通时的耗时是超时值，没有参考意义
         _tunnel["checked_at"] = time.time()
         if up:
             _tunnel["last_ok"] = _tunnel["checked_at"]
@@ -5059,7 +5114,7 @@ def tunnel_status():
     now = time.time()
     with _tunnel_lock:
         return JSONResponse({
-            "up": up, "last_ok": _tunnel["last_ok"],
+            "up": up, "last_ok": _tunnel["last_ok"], "rtt_ms": _tunnel["rtt_ms"],
             "keeper_alive": now - _tunnel["keeper_seen"] <= TUNNEL_KEEPER_ALIVE,
             "keeper_msg": _tunnel["keeper_msg"],
             "pending": _tunnel["rebuild_requested"],

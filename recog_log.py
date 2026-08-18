@@ -16,7 +16,7 @@ import threading
 # 列表态与详情态的字段划分：列表要能秒级轮询，大字段（prompt 全文 / 原始返回 /
 # 候选参考图 dataURI）一律留给详情接口
 _HEAD_KEYS = ("id", "ts", "device", "trigger", "img_orig", "img_boxed",
-              "n_food", "n_drink", "outcome")
+              "n_food", "n_drink", "outcome", "timings")
 _REQ_KEYS = ("label", "model", "endpoint", "direct", "n_images",
              "max_tokens", "temperature", "img_full_px")
 # 详情才给的大字段（原尺寸图本身不进 JSON，走 /api/recoglog/{id}/image/{kind} 端点：
@@ -56,17 +56,20 @@ class RecogLog:
             "candidates": [{"id": c.get("id"), "name": c.get("name", ""),
                             "type": c.get("type", ""), "ref_img": c.get("ref_img")}
                            for c in (candidates or [])],
-            "req": None, "resp": None, "outcome": [],
+            "req": None, "resp": None, "outcome": [], "timings": {},
         }
 
-    def set_response(self, entry, ok, error="", raw="", items=None) -> None:
-        """写响应侧。raw 超长截断——单条几十 KB 的思考链会把缓冲吃光。"""
+    def set_response(self, entry, ok, error="", raw="", items=None, timings=None) -> None:
+        """写响应侧。raw 超长截断——单条几十 KB 的思考链会把缓冲吃光。
+        timings 是识别调用内部的分段（encode/http/parse），并进 entry["timings"]。"""
         if entry is None:
             return
         raw = raw or ""
         entry["resp"] = {"ok": bool(ok), "error": error or "",
                          "raw": raw[:self.raw_max], "truncated": len(raw) > self.raw_max,
                          "items": list(items or []), "n_items": len(items or [])}
+        if timings:
+            entry.setdefault("timings", {}).update(timings)
 
     def commit(self, entry) -> None:
         with self._lock:
