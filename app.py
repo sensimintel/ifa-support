@@ -1868,10 +1868,14 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
       visibility 延迟 .3s 切换保住双缓冲 crossfade 不闪 */
    visibility:hidden;transition:opacity .3s ease,visibility 0s linear .3s}
  .bgmv.on{opacity:1;visibility:visible;transition:opacity .3s ease,visibility 0s}
- /* 压暗层（设计稿导出 static/bg-shade.png，2240×1260 RGBA）：中心全透、椭圆边一圈微光、
-    四周暗角压黑，保证两侧文案可读。铺满 100% 100%（不裁切），暗角始终贴合视口四边 */
+ /* 压暗层（设计稿导出，2240×1260 RGBA）：中心全透、边缘一圈微光、四周暗角压黑，
+    保证两侧文案可读。铺满 100% 100%（不裁切），暗角始终贴合视口四边。
+    两版备选，默认 B，加 ?shade=a 现场切回 A 对比（改默认只需换下面这行的文件名）：
+      A = bg-shade.png  横椭圆、透光区偏小、四角留 ~28% 透光
+      B = bg-shade2.png 正圆、透光区更大、四角压到近全黑 */
+ :root{--shade-img:url('/static/bg-shade2.png')}
  #shade{position:absolute;inset:0;pointer-events:none;
-   background:url('/static/bg-shade.png') center/100% 100% no-repeat}
+   background:var(--shade-img) center/100% 100% no-repeat}
  /* ── 左侧 ODYSS logo（Figma：左边距 26px、宽 210px、垂直居中） ── */
  #logo{position:absolute;left:.26rem;top:50%;transform:translateY(-50%);width:2.1rem;height:auto;opacity:.95}
  /* ── 右侧状态区（两态叠放，淡入淡出切换；Figma：右边距 43px、宽 515px、垂直居中） ── */
@@ -2400,6 +2404,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <script>
 const $=id=>document.getElementById(id);
 const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无后端时目检布局用
+// 压暗层备选方案切换：?shade=a 用 A 版（横椭圆），缺省用 CSS 里的默认 B 版（正圆）
+if(new URLSearchParams(location.search).get('shade')==='a')
+  document.documentElement.style.setProperty('--shade-img',"url('/static/bg-shade.png')");
 
 // ══ 背景层：两种来源下拉框选择（临时工具），默认设备深度图（g335 硬件深度伪彩）══
 // 只保留硬件深度的两条：伪彩深度帧(mini 端渲染)与真深度反投影彩色点云(devpc)；
