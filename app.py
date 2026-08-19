@@ -1926,7 +1926,11 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  #card .rvw+.rvw{margin-top:.24rem}
  #card .rvw.g8{margin-top:.08rem}          /* 名称与描述之间是 8，不是 24 */
  #card .rvw>*{transform:translateY(105%);opacity:0;
-   transition:transform .3s cubic-bezier(.22,.61,.36,1),opacity .3s ease}
+   transition:transform .2s cubic-bezier(.22,.61,.36,1),opacity .2s ease}
+ /* 标题行不做遮罩裁切：h1 是 line-height:1，"Orange"/"Yogurt" 里 g、y 的降部会伸出
+    行盒，被 overflow:hidden 齐根切掉。改成不裁 + 小位移推入（幅度大了会盖到描述行）*/
+ #card .rvw.nom{overflow:visible}
+ #card .rvw.nom>*{transform:translateY(.12rem)}
  #card .rvw.in>*{transform:none;opacity:1}
  #card.out .rvw>*,#card.out #creg{transition:opacity .24s ease;opacity:0;transform:none}
  .krow{display:flex;justify-content:space-between;align-items:center;gap:.3rem}
@@ -2053,7 +2057,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    <div id="cardbg"></div>
    <span id="creg" title="from reference catalog"></span>
    <!-- 每行外面套一层 .rvw 当遮罩，内容从下往上推入；行距移到 .rvw 上（内层不再留 margin） -->
-   <div class="rvw"><h1 id="cname"></h1></div>
+   <div class="rvw nom"><h1 id="cname"></h1></div>
    <div class="rvw g8"><p class="sub" id="cdesc"></p></div>
    <div class="rvw"><hr class="rule"></div>
    <div class="rvw"><div class="krow" id="ckcalrow"><span class="klab">Calories</span><span class="kval" id="ckcal"></span></div></div>
@@ -3528,21 +3532,27 @@ function grpAnchor(cards,k){
   return a;
 }
 // ══ 成功卡出入场动效 ══
-// 出现：玻璃底先拉开(CARD_BG_IN)，再逐行推入——每行 CARD_ROW，相邻两行错峰 CARD_STAGGER
-//       (= 行时长的一半，上一行走到一半下一行就起步)
+// 出现：玻璃底先拉开(CARD_BG_IN)，再逐行推入——每个元素走 CARD_ROW，相邻两行只错峰
+//       CARD_STAGGER(= 行时长的一半)，前一行走到一半后一行就起步，不必等它落地
 // 消失：内容先一起淡出(CARD_OUT_TXT)，再折叠玻璃底(CARD_OUT_BG)，收完才让待机文案渐显
-// 行时长 300、错峰 150 = 行时长的一半（规格：上一行走到一半下一行起步）。
-// 8 行铺满也只要 120+7×150+300 ≈ 1.5s，卡片驻留 DWELL_MS(3s) 里还剩 1.5s 给人读，
-// 退场再花 0.66s——节奏往上调之前先看这本账，别让最后一行刚落地就被收走。
-const CARD_BG_IN=420,CARD_ROW_DELAY=120,CARD_STAGGER=150,CARD_OUT_TXT=240,CARD_OUT_BG=420;
+// 节奏账：每个元素 200ms、错峰 100ms。分割线不占节拍（见 cardRowsIn），内容行就 5 行——
+// 80+4×100+200=680ms 全部落地，分割线再统一花 200ms，入场共 ~0.9s；卡片驻留
+// DWELL_MS(3s) 里留出 2s 给人读，退场再花 0.66s。
+const CARD_BG_IN=420,CARD_ROW_DELAY=80,CARD_ROW=200,CARD_STAGGER=100,CARD_OUT_TXT=240,CARD_OUT_BG=420;
 let cardTimers=[];
 function cardClear(){cardTimers.forEach(clearTimeout);cardTimers=[];}
 function cardRows(){   // 只取当前可见的行（无营养数据的行整行隐藏，不该占动画节拍）
   return [...$('card').querySelectorAll('.rvw')].filter(w=>w.style.display!=='none');
 }
-function cardRowsIn(delay0){   // 逐行推入
-  cardRows().forEach((w,i)=>cardTimers.push(
+// 内容行逐个错峰推入；分割线不参与逐行节拍——它们只是分区的线，跟着内容一条条爬
+// 反而拖慢观感，统一等内容全部落地后一起出现
+function cardRowsIn(delay0){
+  const rows=cardRows(),isRule=w=>!!w.querySelector('hr');
+  const body=rows.filter(w=>!isRule(w)),rules=rows.filter(isRule);
+  body.forEach((w,i)=>cardTimers.push(
     setTimeout(()=>w.classList.add('in'),delay0+i*CARD_STAGGER)));
+  const tail=delay0+Math.max(0,body.length-1)*CARD_STAGGER+CARD_ROW;   // 末行落地的时刻
+  rules.forEach(w=>cardTimers.push(setTimeout(()=>w.classList.add('in'),tail)));
 }
 // 下一帧执行；页面被切到后台时 rAF 会停摆，用定时器兜底一次（只会跑一次），
 // 免得运营切走窗口那会儿的状态切换把卡片卡在半路

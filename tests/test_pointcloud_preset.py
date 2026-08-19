@@ -95,6 +95,12 @@ class PointcloudPresetTest(unittest.TestCase):
         self.assertIn("#card.bgin #cardbg{transform:scaleY(1)}", source)
         self.assertIn("#card .rvw>*{transform:translateY(105%);opacity:0;", source)
         self.assertIn("#card .rvw.in>*{transform:none;opacity:1}", source)
+        # 标题行不裁切：h1 的 g/y 降部伸出行盒，遮罩会齐根切掉
+        self.assertIn("#card .rvw.nom{overflow:visible}", source)
+        self.assertIn('<div class="rvw nom"><h1 id="cname"></h1></div>', source)
+        # 分割线不占逐行节拍，等内容行全部落地后一起出现
+        self.assertIn("const rows=cardRows(),isRule=w=>!!w.querySelector('hr');", source)
+        self.assertIn("rules.forEach(w=>cardTimers.push(setTimeout(()=>w.classList.add('in'),tail)))", source)
         self.assertIn("h1{font-family:'ABC Arizona Serif',Georgia,serif;font-weight:400;font-size:.5rem", source)
 
 
