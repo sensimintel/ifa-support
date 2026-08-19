@@ -899,6 +899,41 @@ def api_necklace_fallback_report(device_id: str, body: dict = Body(...)):
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
 
 
+@app.get("/api/necklaces/{device_id}/scale-summary")
+def api_necklace_scale_summary(device_id: str, segment_id: str = ""):
+    """某台项链某一段的秤汇总：两种食物各吃了多少克、逐条事件的判定、闭合自检。
+
+    segment_id 留空取最新一段。分类是 services 按当前阈值**读时算**的，
+    所以控制面改完阈值直接重拉这个接口就能看到新的账，不用重新采数据。
+    """
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    path = "/api/v1/ifa/devices/%s/scale-summary" % urllib.parse.quote(device_id)
+    if segment_id.strip():
+        path += "?segment_id=" + urllib.parse.quote(segment_id.strip())
+    data, status = _ifa_services_request("GET", path)
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
+@app.get("/api/necklaces/{device_id}/scale-events")
+def api_necklace_scale_events(device_id: str, limit: int = 100):
+    """某台项链最近的秤事件（与餐段无关），排障用。
+
+    与本服务的 /api/scale-events 分工：那个查的是 dx 本地内存环（检测出来了没有），
+    这个查的是 services 落库的（上报上去了没有）。两边对不上就说明上报这一段有问题。
+    """
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    data, status = _ifa_services_request(
+        "GET", "/api/v1/ifa/devices/%s/scale-events?limit=%d" % (
+            urllib.parse.quote(device_id), max(1, min(limit, 1000))))
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
 @app.get("/api/necklaces/{device_id}/params")
 def api_necklace_params_get(device_id: str):
     """查询该项链当前生效的深区分析参数（取帧窗口 / 帧数 / 图片规格 / 模型 / prompt）。
