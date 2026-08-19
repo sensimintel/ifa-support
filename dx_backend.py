@@ -667,6 +667,39 @@ def api_necklace_close_meal(device_id: str):
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
 
 
+@app.get("/api/fallback-report/foods")
+def api_fallback_report_foods():
+    """兜底食物表：控制面据此渲染「推送报告」的克数输入框。
+
+    食物清单与每 100 g 营养常量都由 services 定义（那边才是算这份报告的人），
+    本服务只透传，避免两处各存一份口径、现场对不上账。
+    """
+    data, status = _ifa_services_request("GET", "/api/v1/ifa/fallback-report/foods")
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
+@app.post("/api/necklaces/{device_id}/fallback-report")
+def api_necklace_fallback_report(device_id: str, body: dict = Body(...)):
+    """推送兜底报告：按填入的克数直接给这一轮出一份报告（不走任何大模型）。
+
+    请求体 {"items": [{"food_key": "blueberry", "grams": 120}, ...]}，原样透传。
+    什么状态能推、克数合不合法全由 services 判断——它才知道这一轮停在哪、
+    食物表里有什么，在代理这层再抄一份规则必然与它漂移。
+    """
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    body = body or {}
+    # 只做一处结构性把关：items 必须是数组，否则误传的裸参数会被当成空清单发出去。
+    if not isinstance(body.get("items"), list):
+        return JSONResponse({"ok": False, "error": "需要 items 数组"}, status_code=400)
+    data, status = _ifa_services_request(
+        "POST", "/api/v1/ifa/devices/%s/fallback-report" % urllib.parse.quote(device_id), body)
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
 @app.get("/api/necklaces/{device_id}/params")
 def api_necklace_params_get(device_id: str):
     """查询该项链当前生效的深区分析参数（取帧窗口 / 帧数 / 图片规格 / 模型 / prompt）。

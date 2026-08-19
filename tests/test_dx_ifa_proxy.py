@@ -195,6 +195,44 @@ class ParamsTest(IfaProxyTestBase):
         self.assertEqual(self.calls, [])
 
 
+class FallbackReportPassthroughTest(IfaProxyTestBase):
+    """推送报告兜底：食物表与推送请求都只做透传，状态闸门留在 services。"""
+
+    def test_食物表透出(self):
+        self.reply = ({"foods": [{"key": "blueberry", "name": "Blueberries",
+                                  "calories_per_100g": 57}]}, 200)
+        resp = self.client.get("/api/fallback-report/foods")
+        self.assertEqual(self.last["method"], "GET")
+        self.assertEqual(self.last["path"], "/api/v1/ifa/fallback-report/foods")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["foods"][0]["key"], "blueberry")
+
+    def test_推送请求体原样透传(self):
+        self.reply = ({"device_id": DEVICE, "journal_meal_id": 901,
+                       "state": "report_published"}, 200)
+        body = {"items": [{"food_key": "blueberry", "grams": 120},
+                          {"food_key": "popcorn", "grams": 30}]}
+        resp = self.client.post("/api/necklaces/%s/fallback-report" % DEVICE, json=body)
+        self.assertEqual(self.last["method"], "POST")
+        self.assertEqual(self.last["path"],
+                         "/api/v1/ifa/devices/%s/fallback-report" % DEVICE)
+        self.assertEqual(self.last["body"], body)
+        self.assertEqual(resp.json()["journal_meal_id"], 901)
+
+    def test_services_拒绝时透传状态码(self):
+        self.reply = ({"error": "该设备当前没有演示周期"}, 404)
+        resp = self.client.post("/api/necklaces/%s/fallback-report" % DEVICE,
+                                json={"items": [{"food_key": "popcorn", "grams": 30}]})
+        self.assertEqual(resp.status_code, 404)
+        self.assertFalse(resp.json()["ok"])
+
+    def test_items_不是数组时本地就拒掉(self):
+        for bad in ({}, {"items": "x"}, {"items": None}):
+            resp = self.client.post("/api/necklaces/%s/fallback-report" % DEVICE, json=bad)
+            self.assertEqual(resp.status_code, 400, bad)
+        self.assertEqual(self.calls, [])
+
+
 class ServicesUnreachableTest(unittest.TestCase):
     """services 不可达时，新老 ifa 端点走同一条错误通道：502 + ok=false。"""
 
@@ -211,6 +249,9 @@ class ServicesUnreachableTest(unittest.TestCase):
             ("POST", "/api/necklaces/%s/close-meal" % DEVICE, None),
             ("GET", "/api/necklaces/%s/params" % DEVICE, None),
             ("PUT", "/api/necklaces/%s/params" % DEVICE, {"params": {"max_frames": 8}}),
+            ("GET", "/api/fallback-report/foods", None),
+            ("POST", "/api/necklaces/%s/fallback-report" % DEVICE,
+             {"items": [{"food_key": "popcorn", "grams": 30}]}),
         ]
         for method, path, body in cases:
             resp = self.client.request(method, path, json=body)
