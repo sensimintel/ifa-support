@@ -1896,6 +1896,10 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  #panel .state{grid-area:1/1;opacity:0;transition:opacity .5s ease;pointer-events:none;
    display:flex;flex-direction:column;justify-content:center}
  #panel .state.on{opacity:1}
+ /* 成功卡不吃这条渐显：玻璃底只做拉伸，透明度全程 100%（渐显叠在拉伸上会让矩形
+    从半透明"浮"出来）。opacity 仍是 0/1 的开关，只是瞬时切换——切到 on 的那一刻
+    玻璃底还是 scaleY(0)、各行也还没推入，看不到任何硬闪 */
+ #panel #card{transition:none}
  #idle{width:5.15rem;margin-right:.43rem}
  /* 让位给卡片时快速退场（默认的 .5s 渐隐会和卡片展开撞在一起，两段文案叠着）；
     卡片收完再渐显时把这个类摘掉，走回默认的慢渐显 */
@@ -1916,12 +1920,16 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
        background:rgba(255,253,247,.55);display:none}
  #creg.on{display:block}
  /* ── 卡片出入场动效 ──
-    出现：玻璃底先从中间往上下拉开，随后各行依次从下往上推入（上一行走到一半下一行就起步）
+    出现：玻璃底先从中间往上下拉开（只拉伸、不渐显），随后各行依次从下往上推入
+          （上一行走到一半下一行就起步）
     消失：内容先一起淡出，再由玻璃底向中间折叠收走（宽度不变、只压高度） */
  #cardbg{position:absolute;inset:0;background:rgba(255,253,247,.1);backdrop-filter:blur(.4rem);
    transform:scaleY(0);transform-origin:center;
    transition:transform .42s cubic-bezier(.22,.61,.36,1)}
  #card.bgin #cardbg{transform:scaleY(1)}
+ /* 整卡不再渐显后，库内命中的小圆点得自己跟着玻璃底显出来，否则会先在空卡上冒出来 */
+ #creg{opacity:0;transition:opacity .42s ease}
+ #card.bgin #creg{opacity:1}
  #card .rvw{position:relative;overflow:hidden}
  #card .rvw+.rvw{margin-top:.24rem}
  #card .rvw.g8{margin-top:.08rem}          /* 名称与描述之间是 8，不是 24 */
