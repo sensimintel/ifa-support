@@ -73,7 +73,8 @@
 | `foodref.py` | **参考食物库**的目录与配置态（条目校验/落盘/参考区文案/命中判定，纯逻辑可单测），落盘 `food_catalog.json` + `food_ref/`；接口 `/api/foodref/*`，消费方是 superadmin 浅体验区控制面的「参考食物库」页签 |
 | `docs/sam3-usage-map.md` | **SAM3 使用路径地图**：SAM3 被哪些链路消费、各自产出什么、识别触发的两种口径与开关速查 |
 | `run.sh` | 用 `da3` conda 环境在 `0.0.0.0:8060` 起服务的启动脚本 |
-| `dx_backend.py` | **深体验区后端（8070）**：四通道食物秤读数与软件去皮、桌边分组绑定，独立于 8060 |
+| `dx_backend.py` | **深体验区后端（8070）**：四通道食物秤读数与软件去皮、桌边分组绑定、秤事件检测与上报，独立于 8060 |
+| `dx_scale_events.py` | 秤事件检测（平台法切「一次变化」、端碗离台/回台识别），纯逻辑零 I/O，被 `dx_backend.py` 调用 |
 | `run-dx.sh` | 起 8070 的启动脚本（复用 `da3` conda 环境） |
 | `dx-backend.service` | 8070 的 systemd 单元 |
 | `deploy.sh` | 5090 上一键部署：`git pull` + 重启服务（8060 与 8070 一并重启，systemd 优先） |

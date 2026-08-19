@@ -261,3 +261,34 @@ class ServicesUnreachableTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScaleProxyTest(IfaProxyTestBase):
+    """秤汇总与秤事件的代理：路径拼装与 segment_id / limit 的透传。"""
+
+    def test_汇总默认取最新一段(self):
+        self.reply = ({"device_id": DEVICE, "blueberry_total_g": 8.8}, 200)
+        body = self.client.get(f"/api/necklaces/{DEVICE}/scale-summary").json()
+        self.assertEqual(self.last["method"], "GET")
+        self.assertEqual(self.last["path"], f"/api/v1/ifa/devices/{DEVICE}/scale-summary")
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["blueberry_total_g"], 8.8)
+
+    def test_汇总带上指定段(self):
+        self.client.get(f"/api/necklaces/{DEVICE}/scale-summary?segment_id=ifa-seg%3Ax%3A1")
+        self.assertIn("segment_id=ifa-seg", self.last["path"])
+
+    def test_事件列表透传条数(self):
+        self.reply = ({"items": []}, 200)
+        self.client.get(f"/api/necklaces/{DEVICE}/scale-events?limit=50")
+        self.assertEqual(self.last["path"], f"/api/v1/ifa/devices/{DEVICE}/scale-events?limit=50")
+
+    def test_事件条数被夹到上限内(self):
+        self.client.get(f"/api/necklaces/{DEVICE}/scale-events?limit=99999")
+        self.assertTrue(self.last["path"].endswith("limit=1000"))
+
+    def test_services_报错原样透出状态码(self):
+        self.reply = ({"error": "ifa 秤事实层未启用"}, 503)
+        resp = self.client.get(f"/api/necklaces/{DEVICE}/scale-summary")
+        self.assertEqual(resp.status_code, 503)
+        self.assertFalse(resp.json()["ok"])

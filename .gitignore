@@ -61,3 +61,6 @@ tools/mac-cam/Log/
 food_catalog.json
 food_catalog.json.tmp
 food_ref/
+
+# 秤原始采样（按日切，供离线回放调参）
+dx_scale_raw_*.jsonl
