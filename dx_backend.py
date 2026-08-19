@@ -22,6 +22,8 @@ dx_pairing_log.jsonl 追加写绑定变更流水。两者均 gitignore，不进�
 启动：./run-dx.sh 或 systemd dx-backend.service（见 deploy.sh）。
 """
 
+import collections
+import datetime
 import json
 import os
 import select
@@ -34,6 +36,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+import dx_scale_events as sev
 from fastapi import Body, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -321,6 +324,199 @@ def _read_scale_raws():
     return raws
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 秤事件：平台检测 → 本地留痕 → 上报 services
+# ══════════════════════════════════════════════════════════════════════
+# 秤读数本身只回答「此刻多重」，而餐段要的是「每次变化了多少、变化了多大范围」。
+# 切变化的逻辑在 dx_scale_events.py（纯逻辑、有单测），这里只负责喂样本、留痕、上报。
+#
+# 三条刻意的设计：
+#   · **全程录，不看餐段边界**。餐段起止在 services，dx 这边压根不知道；而且全程录
+#     之后，改阈值、重跑分析、甚至改餐段边界都不用重新采一次数据。
+#   · **只上报原始变化，不上报分类**。是蓝莓还是爆米花由 services 按可调阈值读时算；
+#     在这里判死了，现场调完阈值就再也算不回历史。
+#   · **检测跑毛重不跑净重**。软件去皮会让净重瞬间跳几百克，跑净重会凭空造出一次
+#     几百克的假取食；而去皮量在相邻两个平台的差里本来就抵消掉了。
+SCALE_STABLE_WINDOW_S = float(os.environ.get("SCALE_STABLE_WINDOW_S", "1.0"))
+SCALE_STABLE_EPSILON_G = float(os.environ.get("SCALE_STABLE_EPSILON_G", "0.2"))
+SCALE_LIFT_THRESHOLD_G = float(os.environ.get("SCALE_LIFT_THRESHOLD_G", "20.0"))
+SCALE_ABSENT_TIMEOUT_S = float(os.environ.get("SCALE_ABSENT_TIMEOUT_S", "300"))
+# 原始采样落盘，供离线回放调参（第一版阈值一定是错的，没有回放就只能靠现场重现）。
+# 只写已接秤的通道，5 Hz 一天约 20 MB/通道，按日切文件，旧文件由运维清理。
+SCALE_RAW_LOG = os.environ.get("SCALE_RAW_LOG", "1") not in ("0", "false", "False")
+SCALE_RAW_LOG_DIR = Path(os.environ.get("SCALE_RAW_LOG_DIR",
+                                        str(Path(__file__).resolve().parent)))
+# 上报积压上限：services 长时间不可达时最多缓这么多条，超了丢最旧的。
+# 保新不保全是有意的——现场关心「刚才那几口记上没有」，一小时前的积压补上去也没人看。
+SCALE_UPLOAD_QUEUE_MAX = int(os.environ.get("SCALE_UPLOAD_QUEUE_MAX", "2000"))
+SCALE_UPLOAD_BATCH = 50
+SCALE_EVENT_RING = 500          # 控制面查「最近事件」用的内存环
+SCALE_EVENTS_PATH = "/api/v1/ifa/scale-events"
+
+_scale_detectors = {
+    ch: sev.ScaleEventDetector(
+        ch,
+        sample_interval_s=SCALE_POLL_INTERVAL,
+        stable_window_s=SCALE_STABLE_WINDOW_S,
+        stable_epsilon_g=SCALE_STABLE_EPSILON_G,
+        lift_threshold_g=SCALE_LIFT_THRESHOLD_G,
+        absent_timeout_s=SCALE_ABSENT_TIMEOUT_S,
+    )
+    for ch in SCALE_CHANNELS
+}
+_scale_events_recent = collections.deque(maxlen=SCALE_EVENT_RING)
+_scale_upload_queue = collections.deque()
+_scale_events_lock = threading.Lock()
+_scale_upload_wake = threading.Event()
+_scale_online = True
+_scale_upload_dropped = 0
+_raw_log_warned = False
+
+
+def _necklace_of_channel(ch):
+    """按秤通道反查绑在同一条桌边上的项链蓝牙名；没绑返回空串。"""
+    with _state_lock:
+        for group in _state["groups"]:
+            if group.get("scale_channel") == ch:
+                return (group.get("necklace_device_id") or "").strip()
+    return ""
+
+
+def _iso_utc(ts):
+    """epoch 秒 → services 认的 RFC3339 UTC 串。"""
+    return datetime.datetime.fromtimestamp(
+        ts, datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _raw_log_path(ts):
+    return SCALE_RAW_LOG_DIR / ("dx_scale_raw_%s.jsonl" % datetime.datetime.fromtimestamp(
+        ts, datetime.timezone.utc).strftime("%Y%m%d"))
+
+
+def _append_raw_samples(read_at, samples):
+    """把已接秤通道的原始采样追加到当日文件。失败只提醒一次，绝不影响检测。"""
+    global _raw_log_warned
+    if not SCALE_RAW_LOG or not samples:
+        return
+    try:
+        line = json.dumps({"ts": round(read_at, 3), "g": samples}, ensure_ascii=False)
+        with _raw_log_path(read_at).open("a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+        _raw_log_warned = False
+    except OSError as exc:
+        if not _raw_log_warned:
+            print(f"[秤原始采样] 落盘失败（检测与上报不受影响）：{exc}", flush=True)
+            _raw_log_warned = True
+
+
+def _emit_scale_events(events):
+    """给检测器吐出来的事件补上归属，留进内存环并排进上报队列。"""
+    global _scale_upload_dropped
+    if not events:
+        return
+    enriched = []
+    for event in events:
+        record = dict(event)
+        record["device_id"] = _necklace_of_channel(event["channel"])
+        record["started_at_iso"] = _iso_utc(event["started_at"])
+        record["occurred_at_iso"] = _iso_utc(event["occurred_at"])
+        enriched.append(record)
+    with _scale_events_lock:
+        for record in enriched:
+            _scale_events_recent.append(record)
+            # 没绑项链的通道照样留痕，但不上报：services 按项链归属，
+            # 硬塞一条空 device_id 只会往事实表里灌无主数据
+            if not record["device_id"]:
+                continue
+            if len(_scale_upload_queue) >= SCALE_UPLOAD_QUEUE_MAX:
+                _scale_upload_queue.popleft()
+                _scale_upload_dropped += 1
+            _scale_upload_queue.append(record)
+    _scale_upload_wake.set()
+    for record in enriched:
+        print("[秤事件] 通道%s %s %s→%s Δ=%s g 项链=%s" % (
+            record["channel"], record["kind"], record["before_g"], record["after_g"],
+            record["delta_g"], record["device_id"] or "未绑定"), flush=True)
+
+
+def _feed_detectors(read_at, raws):
+    """把这一轮读数喂给各通道检测器（跑毛重），并落原始采样。"""
+    global _scale_online
+    if not _scale_online:
+        # 掉线期间发生的事情无从归属：可能有人吃了半碗，也可能什么都没动。
+        # 与其把重连后的读数差当成一次取食，不如显式记一条 resync 说明这里有个洞。
+        for ch in SCALE_CHANNELS:
+            _scale_detectors[ch].mark_gap(read_at)
+        _scale_online = True
+    with _state_lock:
+        connected = {ch: bool(_state["scale_connected"].get(str(ch), True))
+                     for ch in SCALE_CHANNELS}
+    events, samples = [], {}
+    for ch, raw in sorted(raws.items()):
+        # 没插传感器的通道浮空输入照样出稳定读数，喂进去只会造一堆无主事件
+        if not connected.get(ch, True):
+            continue
+        gross = round(raw * SCALE_DIVISION, 1)
+        samples[str(ch)] = gross
+        events.extend(_scale_detectors[ch].feed(read_at, gross))
+    _append_raw_samples(read_at, samples)
+    _emit_scale_events(events)
+
+
+def _mark_detector_gap():
+    """整组掉线：打断档标记，重连后由 _feed_detectors 落实成一条 resync。"""
+    global _scale_online
+    _scale_online = False
+
+
+def _scale_upload_payload(batch):
+    """组装上报请求体。services 只认这 8 个字段——本地留痕多带的 duration_s、
+    两个 epoch 时刻等都是排障用的，不往事实表里塞。"""
+    return {"events": [{
+        "device_id": r["device_id"],
+        "scale_channel": r["channel"],
+        "kind": r["kind"],
+        "started_at": r["started_at_iso"],
+        "occurred_at": r["occurred_at_iso"],
+        "before_g": r["before_g"],
+        "after_g": r["after_g"],
+        "delta_g": r["delta_g"],
+    } for r in batch]}
+
+
+def _scale_uploader():
+    """把积压事件批量 POST 给 services；可重试的失败原样退回队首并退避。"""
+    backoff = 1.0
+    while True:
+        _scale_upload_wake.wait(timeout=5.0)
+        _scale_upload_wake.clear()
+        while True:
+            with _scale_events_lock:
+                batch = [_scale_upload_queue.popleft()
+                         for _ in range(min(SCALE_UPLOAD_BATCH, len(_scale_upload_queue)))]
+            if not batch:
+                backoff = 1.0
+                break
+            _, status = _ifa_services_request(
+                "POST", SCALE_EVENTS_PATH, _scale_upload_payload(batch))
+            if status < 400:
+                backoff = 1.0
+                continue
+            if 400 <= status < 500:
+                # 4xx 是这批数据本身的问题，重试多少次都一样；留日志然后丢掉，
+                # 否则一条坏记录会把后面所有事件永远堵在队列里
+                print("[秤事件] services 拒收 %d 条（status=%s），丢弃" % (len(batch), status),
+                      flush=True)
+                continue
+            with _scale_events_lock:
+                _scale_upload_queue.extendleft(reversed(batch))
+            print("[秤事件] 上报失败 status=%s，%d 条退回队列，%.0fs 后重试" % (
+                status, len(batch), backoff), flush=True)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+            break
+
+
 def _scale_poller():
     """后台线程：周期性读四通道并缓存；失败整组标离线、保留上次 raw。"""
     backoff = SCALE_POLL_INTERVAL
@@ -331,6 +527,8 @@ def _scale_poller():
             with _scale_lock:
                 for ch, raw in raws.items():
                     _scale_latest[ch] = {"ok": True, "raw": raw, "read_at": read_at}
+            # 检测放在缓存之后：读数先可见，事件慢一步不影响控制面实时读数
+            _feed_detectors(read_at, raws)
             backoff = SCALE_POLL_INTERVAL
         except Exception:
             with _scale_lock:
@@ -338,6 +536,7 @@ def _scale_poller():
                     # 掉线时保留上次 raw 与其 read_at——读数是旧的，新鲜度必须能看出来
                     _scale_latest[ch] = {"ok": False, "raw": _scale_latest[ch].get("raw"),
                                          "read_at": _scale_latest[ch].get("read_at")}
+            _mark_detector_gap()
             # 秤不可达时逐步退避，避免每轮都卡在建连/首包的长超时上空转
             backoff = min(backoff * 2, SCALE_MAX_BACKOFF)
         time.sleep(backoff)
@@ -798,3 +997,45 @@ def api_food_scale_tare(channel: int):
         _save_state(_state)
     return JSONResponse({"ok": True, "channel": channel,
                          "tare_g": round(st["raw"] * SCALE_DIVISION, 1)})
+
+
+@app.get("/api/scale-events")
+def api_scale_events(limit: int = 100, channel: int = 0, countable_only: bool = False):
+    """最近的秤事件（倒序）+ 各通道检测器现状 + 上报积压。
+
+    这是排障的第一现场：现场说「我明明拿了一颗，报告里没有」，先看这里有没有出事件，
+    再决定是检测的问题（没切出来）还是归属的问题（切出来了但没绑项链、没上报）。
+
+    countable_only 只留可计入摄入的两类（step / lift_return）；其余（lift、
+    absent_step、lift_expired、resync）是诊断线索，不参与克数统计。
+    """
+    limit = max(1, min(limit, SCALE_EVENT_RING))
+    with _scale_events_lock:
+        records = list(_scale_events_recent)
+        pending = len(_scale_upload_queue)
+        dropped = _scale_upload_dropped
+    if channel:
+        records = [r for r in records if r["channel"] == channel]
+    if countable_only:
+        records = [r for r in records if r["kind"] in sev.COUNTABLE_KINDS]
+    records = list(reversed(records))[:limit]
+    return JSONResponse({
+        "events": records,
+        "detectors": [_scale_detectors[ch].snapshot() for ch in SCALE_CHANNELS],
+        "upload": {"pending": pending, "dropped": dropped,
+                   "queue_max": SCALE_UPLOAD_QUEUE_MAX},
+        "params": {
+            "poll_interval_s": SCALE_POLL_INTERVAL,
+            "stable_window_s": SCALE_STABLE_WINDOW_S,
+            "stable_epsilon_g": SCALE_STABLE_EPSILON_G,
+            "lift_threshold_g": SCALE_LIFT_THRESHOLD_G,
+            "absent_timeout_s": SCALE_ABSENT_TIMEOUT_S,
+        },
+        "raw_log": str(_raw_log_path(time.time())) if SCALE_RAW_LOG else "",
+        "ts": time.time(),
+    })
+
+
+# 上报线程放在模块末尾再起：它要用 _ifa_services_request，而那个函数定义在本文件
+# 靠后的位置——在定义之前就把线程拉起来，第一条事件会撞上 NameError。
+threading.Thread(target=_scale_uploader, daemon=True).start()
