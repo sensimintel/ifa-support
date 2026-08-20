@@ -15,8 +15,9 @@ WorkingDirectory=/home/odyss
 Environment=SAM3_CKPT=/home/odyss/models/sam3/sam3.pt
 Environment=SAM3_PORT=8013
 Environment=SAM3_HOST=127.0.0.1
-# 固定显存上限占比（0.28×32G≈9G），与同卡其他服务隔离
-Environment=SAM3_MEM_FRACTION=0.28
+# 固定显存上限占比（RTX PRO 6000 96G 卡：0.26×95.6G≈25G），与同卡 vLLM(0.73) 隔离；
+# 分配纪律=SAM3 固定 25G、其余全给 vLLM，DA3 等不预留（显存不足任其失败）
+Environment=SAM3_MEM_FRACTION=0.26
 # 服务代码走仓库 checkout（~/da3-web 即 ifa-support），部署=git pull + restart
 ExecStart=/home/odyss/sam3-env/bin/python -u /home/odyss/da3-web/model/sam3/sam3_server.py
 Restart=on-failure
