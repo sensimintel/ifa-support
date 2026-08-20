@@ -293,3 +293,56 @@ class ScaleProxyTest(IfaProxyTestBase):
         resp = self.client.get(f"/api/necklaces/{DEVICE}/scale-summary")
         self.assertEqual(resp.status_code, 503)
         self.assertFalse(resp.json()["ok"])
+
+
+class SensitiveMarkProxyTest(IfaProxyTestBase):
+    """敏感 session 标记：布尔透传、applied 原样透出、生效判断全在 services。"""
+
+    def test_put_标记透传(self):
+        self.reply = ({"device_id": DEVICE, "applied": True,
+                       "state": {"state": "ready", "sensitive": True}}, 200)
+        resp = self.client.put("/api/necklaces/%s/sensitive" % DEVICE,
+                               json={"sensitive": True})
+        self.assertEqual(self.last["method"], "PUT")
+        self.assertEqual(self.last["path"], "/api/v1/ifa/devices/%s/sensitive" % DEVICE)
+        self.assertEqual(self.last["body"], {"sensitive": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["applied"])
+
+    def test_put_撤标记也是显式_false(self):
+        self.reply = ({"device_id": DEVICE, "applied": True,
+                       "state": {"state": "ready", "sensitive": False}}, 200)
+        self.client.put("/api/necklaces/%s/sensitive" % DEVICE, json={"sensitive": False})
+        self.assertEqual(self.last["body"], {"sensitive": False})
+
+    def test_applied_false_原样透出(self):
+        """本轮已发布/未开轮时 services 回 applied=false，代理不改写、控制面据此提示。"""
+        self.reply = ({"device_id": DEVICE, "applied": False,
+                       "state": {"state": "report_published"}}, 200)
+        resp = self.client.put("/api/necklaces/%s/sensitive" % DEVICE,
+                               json={"sensitive": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()["applied"])
+
+
+class ReportConfirmProxyTest(IfaProxyTestBase):
+    """待审报告放行：受理即 202，段 id 冒号原样透传（同 analyze）。"""
+
+    def test_confirm_的_segment_id_冒号不被编码(self):
+        segment_id = "ifa-seg:%s:1755500000000" % DEVICE
+        self.reply = ({"accepted": True, "segment": {"segment_id": segment_id}}, 202)
+        resp = self.client.post(
+            "/api/necklaces/%s/meal-segments/%s/report-confirm" % (DEVICE, segment_id))
+        self.assertEqual(self.last["method"], "POST")
+        self.assertEqual(
+            self.last["path"],
+            "/api/v1/ifa/devices/%s/meal-segments/%s/report-confirm" % (DEVICE, segment_id))
+        self.assertEqual(resp.status_code, 202)
+        self.assertTrue(resp.json()["accepted"])
+
+    def test_不在待审状态时透传_4xx(self):
+        self.reply = ({"error": "该段报告不在待审核状态"}, 400)
+        resp = self.client.post(
+            "/api/necklaces/%s/meal-segments/latest/report-confirm" % DEVICE)
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.json()["ok"])

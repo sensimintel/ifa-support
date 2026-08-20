@@ -1116,6 +1116,26 @@ def api_necklace_meal_state_delete(device_id: str):
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
 
 
+@app.put("/api/necklaces/{device_id}/sensitive")
+def api_necklace_sensitive_set(device_id: str, body: dict = Body(...)):
+    """给该项链当前这一轮打/撤「敏感 session」标记。
+
+    标了之后本轮生成的报告无论识别出什么食物都会停在 pending_review，等控制面
+    review 后再推送。生效窗口（ready / meal_in_progress / analyzing / failed）由
+    services 判断，本服务不做状态判断；没生效时 services 回 applied=false，
+    这里原样透传，由控制面提示「本轮已发布或还没开轮」。
+    """
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    sensitive = bool((body or {}).get("sensitive"))
+    data, status = _ifa_services_request(
+        "PUT", "/api/v1/ifa/devices/%s/sensitive" % urllib.parse.quote(device_id),
+        {"sensitive": sensitive})
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
 @app.get("/api/necklaces/{device_id}/meal-segments")
 def api_necklace_meal_segments(device_id: str, limit: int = 10):
     """列出某条项链最近的演示餐段（meal 分析链的取帧时间窗）。
@@ -1145,6 +1165,26 @@ def api_necklace_meal_segment_analyze(device_id: str, segment_id: str):
     # 编成 %3A，services 侧路由参数拿到的就不是原始 id，查不到段。
     data, status = _ifa_services_request(
         "POST", "/api/v1/ifa/devices/%s/meal-segments/%s/analyze" % (
+            urllib.parse.quote(device_id), urllib.parse.quote(segment_id, safe=":")))
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 202)
+
+
+@app.post("/api/necklaces/{device_id}/meal-segments/{segment_id}/report-confirm")
+def api_necklace_meal_segment_report_confirm(device_id: str, segment_id: str):
+    """放行一段 pending_review 的报告（控制面 review 后的「确认推送」）。
+
+    受理即返回，发布在 services 后台执行；控制面轮询餐段的 report 状态看进展
+    （generating → published / failed）。段不在待审状态时 services 回 4xx，
+    这里原样透传状态码与 error 说明。
+    """
+    device_id = (device_id or "").strip()
+    segment_id = (segment_id or "latest").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    # 冒号透传的理由同 analyze：段 id 形如 ifa-seg:<device>:<millis>。
+    data, status = _ifa_services_request(
+        "POST", "/api/v1/ifa/devices/%s/meal-segments/%s/report-confirm" % (
             urllib.parse.quote(device_id), urllib.parse.quote(segment_id, safe=":")))
     ok = status < 400
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 202)
