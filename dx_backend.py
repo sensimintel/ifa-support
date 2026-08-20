@@ -853,12 +853,22 @@ def api_group_resolve(device_id: str = "", client_id: str = ""):
 # ══════════════════════════════════════════════════════════════════════
 # 手机台账：一台手机一行，机号做主键
 # ══════════════════════════════════════════════════════════════════════
+def _phone_view(phone):
+    """台账行对外的样子：自身字段 + 它当前绑在哪条桌边（没绑为 None）。
+
+    列表与单条更新必须走同一个函数——少了 bound_edge 的那一份会让控制面把「已上桌」
+    显示成「未上桌」，还会多出一个删除按钮（2026-08-20 现场撞到：点一次「查询」，
+    那一行就从桌边 3 变成未上桌）。调用方需自持 _state_lock。
+    """
+    bound = next((g["edge"] for g in _state["groups"] if g.get("phone_no") == phone.get("no")), None)
+    return dict(phone, bound_edge=bound)
+
+
 @app.get("/api/phones")
 def api_phones():
-    """手机台账全表，按机号升序；each 行附带它当前绑在哪条桌边（没绑为 null）。"""
+    """手机台账全表，按机号升序；每行附带它当前绑在哪条桌边（没绑为 null）。"""
     with _state_lock:
-        bound = {g.get("phone_no"): g["edge"] for g in _state["groups"] if g.get("phone_no")}
-        phones = [dict(p, bound_edge=bound.get(p.get("no"))) for p in _state.get("phones", [])]
+        phones = [_phone_view(p) for p in _state.get("phones", [])]
     return JSONResponse({"phones": sorted(phones, key=lambda item: item.get("no") or 0)})
 
 
@@ -925,7 +935,7 @@ def api_phone_upsert(no: int, patch: dict = Body(...)):
                     group["phone_no"] = new_no
         phones.sort(key=lambda item: item.get("no") or 0)
         _save_state(_state)
-        updated = dict(phone)
+        updated = _phone_view(phone)
     return JSONResponse({"ok": True, "phone": updated, "created": created})
 
 

@@ -107,6 +107,16 @@ class PhoneLedgerTest(DxStateTestBase):
         res = self.client.put("/api/phones/1", json={"resolved": {"client_id": "NEW"}})
         self.assertEqual(res.json()["phone"]["resolved"], {"client_id": "NEW"})
 
+    def test_upsert_response_carries_bound_edge_too(self):
+        """列表与单条更新必须同形状：少了 bound_edge 那一行就会显示成「未上桌」。"""
+        self.add_phone(1, serial="LXWVK71CP9")
+        self.client.put("/api/groups/3", json={"phone_no": 1})
+        res = self.client.put("/api/phones/1", json={"identity": "test2@odyss.dev"})
+        self.assertEqual(res.json()["phone"]["bound_edge"], 3)
+        # 换成解析结果回写（控制面点「查询」走的就是这条）同样要带上
+        res = self.client.put("/api/phones/1", json={"resolved": {"client_id": "X"}})
+        self.assertEqual(res.json()["phone"]["bound_edge"], 3)
+
     def test_bound_edge_is_reported_per_phone(self):
         self.add_phone(1, serial="LXWVK71CP9")
         self.add_phone(5, serial="DCJWF5W0M4")
