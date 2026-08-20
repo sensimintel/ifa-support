@@ -13,6 +13,7 @@ import os
 import unittest
 
 os.environ.setdefault("SCALE_HOST", "127.0.0.1")
+os.environ.setdefault("DX_BACKGROUND_THREADS", "0")
 
 from fastapi.testclient import TestClient  # noqa: E402
 

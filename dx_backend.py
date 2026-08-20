@@ -5,13 +5,20 @@
    后台线程轮询缓存实时读数；「清空」= 软件去皮（记当前 raw 为皮重）。
    注意 ok 只表示模块可达（四通道整组同生共死）；通道是否真插了称重传感器
    硬件报不出来（空通道浮空输入照样出稳定读数），靠人工标注 connected 区分。
-2. 桌边分组绑定配置：每条桌边一组「手机 / 项链 / 秤通道」，可查可改、落盘持久化。
-   这份绑定信息是深体验区的编排事实源——services 按项链 device_id 反查所在组，
-   即可得知要读哪个秤通道、以及把通知推给哪台手机（见 GET /api/groups/resolve）。
+2. 设备编排，分两层存：
+   · **手机台账（phones）**：一台手机一行、机号做主键的全局资产表，与桌边无关，
+     可以多于四行（备用机不占桌边）。手填的只有机号 / 序列号 / 账号三样。
+   · **桌边分组（groups）**：每条桌边一组「机号 / 项链 / 秤通道」，手机只写一个机号
+     引用台账，身份读时展开。
+   拆两层是因为「这台手机是谁」与「它今天摆在哪条边」是两件事：旧结构把身份抄在每条
+   桌边里，六个字段各自能改、彼此无约束，换一次手机要同时改六处，改漏一处就分叉。
+   这份编排是深体验区的事实源——秤事件按「通道→桌边→项链」反查后才带得上归属，
+   绑错就是把克数记到别人的餐上（见 _necklace_of_channel 与 GET /api/groups/resolve）。
    三层身份（详见 NETWORK.md）：
      · 秤   = 通道号 1..4，固定不变
      · 项链 = 蓝牙名（odyss-XXXX），随帧上报在 camera_info.device_id，跨手机稳定
-     · 手机 = client_id（App 每个请求的 X-Client-Id），推送定向用它；
+     · 手机 = 机号（现场喊的「3 号机」）指向台账；台账里序列号认机身、
+              client_id（X-Client-Id）认 App 身份。推送定向用 client_id，
               不能用 FCM token 或 target_id——token 会轮换、target_id 由它派生
 3. 在线项链列表（代理 8060 帧中继）与绑定变更流水，供控制面下拉选择与追踪配对历史。
 
@@ -54,14 +61,38 @@ DATA_FILE = Path(__file__).resolve().parent / "dx_data.json"
 PAIRING_LOG_FILE = Path(__file__).resolve().parent / "dx_pairing_log.jsonl"
 EDGES = (1, 2, 3, 4)
 
-# 分组允许编辑的字段（除 edge 外全部可改）
-GROUP_EDITABLE_FIELDS = (
-    "label", "phone_no", "phone_identity", "phone_client_id", "phone_user_id",
-    "phone_udid", "phone_serial", "phone_build",
-    "necklace_device_id", "scale_channel",
-)
-# 会写入配对流水的字段（只关心「谁换到了哪条桌边」这类物理配对）
-PAIRING_TRACKED_FIELDS = ("necklace_device_id", "phone_client_id")
+# 分组允许编辑的字段。手机身份不在其中——桌边只写一个机号引用台账（见 PHONES 段注释），
+# 「这台手机是谁」只有台账那一处能改，避免同一个事实在四条桌边里各存一份、各改各的。
+GROUP_EDITABLE_FIELDS = ("label", "phone_no", "necklace_device_id", "scale_channel")
+# 桌边读出去时从台账展开的手机字段。**只读**：写入口一律走 /api/phones，
+# 这里保留旧字段名是为了不惊动下游（ios-build 拿 phone_udid/phone_serial 定位设备、
+# 深区页面显示 phone_client_id），换成新名字得同时改好几处，收益却是零。
+PHONE_VIEW_FIELDS = ("phone_identity", "phone_client_id", "phone_user_id",
+                     "phone_udid", "phone_serial", "phone_build", "phone_device_name")
+# 会写入配对流水的字段（只关心「谁换到了哪条桌边」这类物理配对）。
+# scale_channel 也在其中：秤事件按「通道→桌边→项链」实时反查、没有快照，
+# 演示中途改通道会把前后事件分给两条不同项链，事后只能靠流水看出这里动过手。
+PAIRING_TRACKED_FIELDS = ("necklace_device_id", "phone_no", "scale_channel")
+
+# ══════════════════════════════════════════════════════════════════════
+# 手机台账（phones）：一台手机一行，全局资产，不属于任何一条桌边
+# ══════════════════════════════════════════════════════════════════════
+# **主键是机号**（现场喊的「3 号机」），不是序列号。用机号做主键有个直接好处：
+# 「机号唯一」由主键天然保证，撞号的数据根本存不进来——旧结构里两条桌边都写着
+# 「3 号机」，光看编号分不出哪台是哪台，白跑过几轮装机。
+#
+# 序列号是这一行的属性而非主键：它确实是唯一确定一台机身的东西（机身「设置→通用→
+# 关于本机」可查），但现场没人按序列号喊人。两者的分工是「机号用来指认，序列号用来核对」。
+#
+# 手填的只有三样：机号 / 序列号 / 账号。udid 与 device_name 装机时由 Mac 回填
+# （xcrun devicectl 一条命令同时给出两者），resolved 那组由控制面按账号解析。
+PHONE_EDITABLE_FIELDS = ("no", "serial", "identity", "udid", "device_name",
+                         "build", "resolved")
+# 台账里必须互不重复的属性（空值不参与判重：还没填的行不算撞车）
+PHONE_UNIQUE_FIELDS = (("serial", "序列号"), ("identity", "账号"))
+# 解析结果（控制面按账号查 services 的推送目标后回写）。这一组刻意不做校验：
+# 它们是 services 的事实的副本，本服务无从判断对错，存下来只为让页面能显示、能比对。
+PHONE_RESOLVED_FIELDS = ("user_id", "client_id", "platform", "last_seen_at", "resolved_at")
 
 # 在线项链来源：8060 帧中继按 camera_info.device_id 分桶维护的设备表（60s 无新帧即下线）。
 # 走宿主 localhost——控制面只经 nginx /dx-api/ 访问 8070，8060 那条 ufw 放行早已移除，
@@ -108,30 +139,55 @@ def _default_group(edge):
         "edge": edge,
         "label": f"桌边 {edge}",
         "scale_channel": edge,
-        # 手机编号：纯人类标签，方便现场喊「1 号机」；定向一律用 phone_client_id
-        "phone_no": edge,
-        # 账号（手机号/邮箱）：控制面据此查该手机的推送目标；4 台演示手机各登一个账号
-        "phone_identity": "",
-        # 手机唯一身份：App 每个请求的 X-Client-Id。推送定向用它，不用 FCM token
-        # （token 会轮换，target_id 由 token_hash 派生也会跟着变）
-        "phone_client_id": "",
-        "phone_user_id": "",
-        # 手机硬件 UDID（如 00008150-001D15E43478401C）：Mac 上 xcodebuild / run-ios
-        # 装机的 build 目标身份，跟机身走、重装 App 不变——与 client_id 互补
-        "phone_udid": "",
-        # 手机序列号：机身「设置→通用→关于本机」可查，现场人肉对照哪台是几号机用
-        "phone_serial": "",
-        # 当前装机 build 描述（自由文本，如 "fe 75f0eb62 + hub f92b405 @ 2026-08-10"）
-        "phone_build": "",
+        # 手机：只存机号，指向台账里那一行。0 = 这条桌边还没摆手机。
+        # 身份（序列号 / 账号 / client_id / UDID / build）一律从台账读时展开，
+        # 不在这里存副本——存了就会有两份各自能改的事实，迟早对不上。
+        "phone_no": 0,
         # 项链蓝牙名，随帧上报在 camera_info.device_id
         "necklace_device_id": "",
     }
+
+
+def _default_phone(no):
+    """台账里一台手机的默认行。手填的只有 no / serial / identity 三样。"""
+    return {
+        # 机号：主键，也是桌边引用它的键。现场喊的「3 号机」就是它
+        "no": no,
+        # 机身序列号：唯一确定一台机身，「设置→通用→关于本机」可查
+        "serial": "",
+        # 这台登的账号（手机号 / 邮箱）：控制面据此解析出推送目标
+        "identity": "",
+        # 硬件 UDID：Mac 上 run-ios 的装机目标。与 device_name 一起由装机流程回填
+        # （xcrun devicectl device info details 一条命令同时给出两者）
+        "udid": "",
+        # 设备名（如 "Xiao 17 iPhone"）：现场认机用，同样装机时回填
+        "device_name": "",
+        # 当前装机 build 描述（自由文本）
+        "build": "",
+        # 按账号解析出来的 services 侧事实，控制面查完回写。空 dict = 还没解析过
+        "resolved": {},
+    }
+
+
+# 一次性机号纠正表：旧结构的 phone_no 没有唯一性校验，桌边 2 与桌边 3 都写着「3 号机」，
+# 迁移到「机号做主键」时撞号的数据进不来，必须先裁决。
+# 裁决依据是序列号而不是猜——这份对应关系由用户 2026-08-19 当面确认，并写在 ios-build 台账里。
+# 迁移跑过一次之后这张表就没用了，下次动这块代码时可以直接删掉。
+_LEGACY_PHONE_NO_BY_SERIAL = {
+    "LXWVK71CP9": 1,
+    "MVM4N0XTYQ": 2,
+    "HK3H3FK6KW": 3,
+    "FMKMQ62JK0": 4,
+    "DCJWF5W0M4": 5,   # 备用机，不占桌边
+}
 
 
 def _default_state():
     """默认状态：桌边 N 绑秤通道 N，设备身份留空待配置。"""
     return {
         "groups": [_default_group(e) for e in EDGES],
+        # 手机台账：全局资产表，一台一行，可以多于四行（备用机不占桌边）
+        "phones": [],
         # 皮重按通道存 raw 值（与读数同分度），服务重启不丢
         "tare_raw": {str(ch): 0 for ch in EDGES},
         # 每通道「已接秤」人工标注：模块上没插称重传感器的通道，浮空输入照样出
@@ -144,17 +200,24 @@ def _default_state():
 def _migrate_groups(state):
     """把旧结构升级到新结构，返回是否发生改动。
 
-    旧版把手机记成 phone_device_id 自由文本（实际存的是 "iPhone-5 (192.168.0.243)"
-    这类带 IP 的描述，IP 会变、也无法用于推送定向），这里直接丢弃并打日志留痕，
-    改由 phone_client_id 承担手机身份。
+    两轮历史包袱：
+      · 更早的版本把手机记成 phone_device_id 自由文本（存的是 "iPhone-5 (192.168.0.243)"
+        这类带 IP 的描述，IP 会变、也无法用于推送定向），直接丢弃并打日志留痕。
+      · 上一版把手机身份的六个字段抄在每条桌边里（phone_serial / phone_udid /
+        phone_identity / phone_client_id / phone_user_id / phone_build）。它们现在搬进台账，
+        由 _migrate_phones 先搬走，这里只负责把桌边上的残留字段清干净。
     """
     changed = False
     for group in state.get("groups", []):
         legacy = group.pop("phone_device_id", None)
         if legacy:
             print(f"[迁移] 桌边 {group.get('edge')} 的旧 phone_device_id={legacy!r} 已丢弃，"
-                  f"请在控制面重新绑定手机（改用 client_id 定向）", flush=True)
+                  f"请在控制面重新绑定手机（改用机号引用台账）", flush=True)
             changed = True
+        # 台账搬完后，桌边上抄的那份手机身份就是死数据，留着只会让人以为还能在这改
+        for key in PHONE_VIEW_FIELDS:
+            if group.pop(key, None) is not None:
+                changed = True
         for key, value in _default_group(group.get("edge") or 0).items():
             if key not in group:
                 group[key] = value
@@ -162,16 +225,73 @@ def _migrate_groups(state):
     return changed
 
 
+def _migrate_phones(state):
+    """把桌边里抄的手机身份搬进台账，返回是否发生改动。
+
+    只在台账还不存在时搬一次（已有台账说明搬过了，再搬会拿旧数据盖掉后来的编辑）。
+
+    机号撞号必须在这里裁决：旧的 phone_no 没有唯一性校验，桌边 2 与桌边 3 都写着 3，
+    而机号是台账主键，撞号的两行合不成两台机。裁决依据是序列号（见
+    _LEGACY_PHONE_NO_BY_SERIAL），认不出序列号的才退回原编号，再撞就顺延到下一个空号——
+    顺延是最后兜底，会打日志要求人去核对，而不是让它悄悄顶着一个错编号跑下去。
+    """
+    if "phones" in state:
+        return False
+    phones, used_nos, changed = [], set(), False
+    for group in state.get("groups", []):
+        serial = str(group.get("phone_serial") or "").strip()
+        legacy = {key: group.get(key) for key in PHONE_VIEW_FIELDS}
+        # 一条身份都没填过的桌边不生成台账行，免得凭空多出几台不存在的空手机。
+        # 它旧的 phone_no 也必须清掉——那是个没有台账行撑着的编号，留着就是一条悬空引用。
+        if not any(str(value or "").strip() for value in legacy.values()):
+            if group.get("phone_no"):
+                group["phone_no"] = 0
+                changed = True
+            continue
+        wanted = _LEGACY_PHONE_NO_BY_SERIAL.get(serial) or int(group.get("phone_no") or 0)
+        no = wanted
+        if no <= 0 or no in used_nos:
+            no = next(n for n in range(1, 100) if n not in used_nos)
+            print(f"[迁移] 桌边 {group.get('edge')} 的机号 {wanted} 无法使用"
+                  f"（重复或缺失），暂定为 {no} 号机，序列号 {serial or '未填'}；"
+                  f"请在控制面核对这一行", flush=True)
+        elif no != int(group.get("phone_no") or 0):
+            print(f"[迁移] 桌边 {group.get('edge')} 的机号按序列号 {serial} 纠正："
+                  f"{group.get('phone_no')} → {no}", flush=True)
+        used_nos.add(no)
+        phone = _default_phone(no)
+        phone.update({
+            "serial": serial,
+            "identity": str(group.get("phone_identity") or "").strip(),
+            "udid": str(group.get("phone_udid") or "").strip(),
+            "build": str(group.get("phone_build") or ""),
+        })
+        # 旧结构里 client_id 与 user_id 是查询出来的结果，原样搬进 resolved；
+        # 解析时刻旧数据里没有，留空即可——控制面会显示「未解析过」提示人刷一次
+        for key, value in (("client_id", group.get("phone_client_id")),
+                           ("user_id", group.get("phone_user_id"))):
+            if str(value or "").strip():
+                phone["resolved"][key] = str(value).strip()
+        phones.append(phone)
+        group["phone_no"] = no
+        changed = True
+    state["phones"] = sorted(phones, key=lambda item: item["no"])
+    return changed or bool(phones)
+
+
 def _load_state():
     """启动加载持久化文件；文件缺失/损坏时回落默认并立即落盘。"""
     if DATA_FILE.exists():
         try:
             state = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            # 台账迁移必须跑在结构兜底之前：兜底会把 phones 补成空数组，
+            # 而「有没有 phones 这个键」正是判断搬没搬过的唯一依据，补完就再也搬不动了
+            changed = _migrate_phones(state)
             # 结构兜底：缺 key 用默认补齐，防旧版本文件升级后崩
             default = _default_state()
             for key, value in default.items():
                 state.setdefault(key, value)
-            if _migrate_groups(state):
+            if _migrate_groups(state) or changed:
                 _save_state(state)
             return state
         except Exception:
@@ -206,6 +326,35 @@ def _group_of(edge):
     return next((g for g in _state["groups"] if g["edge"] == edge), None)
 
 
+def _phone_of(no):
+    """按机号取台账行；没有返回 None。调用方需自持 _state_lock。"""
+    if not no:
+        return None
+    return next((p for p in _state.get("phones", []) if p.get("no") == no), None)
+
+
+def _group_view(group):
+    """桌边对外的样子：自身字段 + 从台账展开的手机身份。
+
+    展开而不是让调用方自己去查台账，是为了让 GET /api/groups 的响应形状与旧版一致——
+    ios-build 靠 phone_udid/phone_serial 定位设备、深区页面显示 phone_client_id，
+    它们都不该因为存储结构变了而跟着改。**这些字段只读**：写入口只有 /api/phones。
+    """
+    view = dict(group)
+    phone = _phone_of(group.get("phone_no"))
+    resolved = (phone or {}).get("resolved") or {}
+    view.update({
+        "phone_identity": (phone or {}).get("identity", ""),
+        "phone_client_id": resolved.get("client_id", ""),
+        "phone_user_id": resolved.get("user_id", ""),
+        "phone_udid": (phone or {}).get("udid", ""),
+        "phone_serial": (phone or {}).get("serial", ""),
+        "phone_build": (phone or {}).get("build", ""),
+        "phone_device_name": (phone or {}).get("device_name", ""),
+    })
+    return view
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 四通道食物秤：Modbus TCP 轮询（契约与硬件铭牌一致，实测确认于 2026-08-04）
 #   <SCALE_HOST>:502  unit=1  FC3  通道 N → addr (N-1)*2
@@ -219,6 +368,12 @@ def _group_of(edge):
 #   SCALE_HOST=192.168.0.80 ./run-dx.sh
 # 网络形态与各地址的由来见 NETWORK.md。
 # ══════════════════════════════════════════════════════════════════════
+# 两条后台线程（秤轮询、事件上报）在模块导入时就起跑，这对测试是灾难：轮询会去连真的
+# 秤模块并在连不上时给检测器打 gap，上报线程会异步把事件队列搬空再退回——断言看到的是
+# 一个自己会动的状态，跑得慢一点结果就变了。DX_BACKGROUND_THREADS=0 把它们按住，
+# 只留纯函数与接口，测试自己喂数据。生产不设这个变量，行为不变。
+BACKGROUND_THREADS = os.environ.get("DX_BACKGROUND_THREADS", "1") not in ("0", "false", "False")
+
 SCALE_HOST = os.environ.get("SCALE_HOST", "192.168.100.80")
 SCALE_PORT = int(os.environ.get("SCALE_PORT", "502"))
 SCALE_UNIT = 1
@@ -542,7 +697,8 @@ def _scale_poller():
         time.sleep(backoff)
 
 
-threading.Thread(target=_scale_poller, daemon=True).start()
+if BACKGROUND_THREADS:
+    threading.Thread(target=_scale_poller, daemon=True).start()
 
 
 def _channel_reading(ch):
@@ -587,34 +743,68 @@ def api_health():
 
 @app.get("/api/groups")
 def api_groups():
-    """四条桌边的分组绑定配置（手机 / 项链 / 秤通道）。"""
+    """四条桌边的分组绑定配置（手机 / 项链 / 秤通道）。
+
+    手机身份从台账展开后一并返回，形状与旧版一致——下游（ios-build 取 UDID/序列号、
+    深区页面显示 client_id）不用感知存储结构变了。要改这些值请走 /api/phones。
+    """
     with _state_lock:
-        return JSONResponse({"groups": _state["groups"]})
+        return JSONResponse({"groups": [_group_view(g) for g in _state["groups"]]})
 
 
 @app.put("/api/groups/{edge}")
 def api_group_update(edge: int, patch: dict = Body(...)):
-    """更新一条桌边的绑定（支持部分字段），立即落盘并记配对流水。"""
+    """更新一条桌边的绑定（支持部分字段），立即落盘并记配对流水。
+
+    只接受四个字段：label / phone_no / necklace_device_id / scale_channel。
+    手机身份字段一律拒绝并指路台账——「这台手机是谁」只有台账那一处能改。
+    """
     if edge not in EDGES:
         return JSONResponse({"ok": False, "error": f"桌边 {edge} 不存在（合法 1~4）"},
                             status_code=404)
+    stale = [k for k in patch if k in PHONE_VIEW_FIELDS]
+    if stale:
+        return JSONResponse(
+            {"ok": False,
+             "error": f"手机身份不在桌边上改：{stale} 属于手机台账，请改 /api/phones，"
+                      f"桌边这边只需选机号（phone_no）"},
+            status_code=400)
     unknown = [k for k in patch if k not in GROUP_EDITABLE_FIELDS]
     if unknown:
         return JSONResponse({"ok": False, "error": f"不支持的字段：{unknown}"}, status_code=400)
-    for key, allowed in (("scale_channel", SCALE_CHANNELS), ("phone_no", EDGES)):
-        if key in patch and (not isinstance(patch[key], int) or patch[key] not in allowed):
-            return JSONResponse({"ok": False, "error": f"{key} 必须是 1~4 的整数"},
-                                status_code=400)
-    for key in ("label", "phone_identity", "phone_client_id", "phone_user_id",
-                "phone_udid", "phone_serial", "phone_build", "necklace_device_id"):
+    # 0 = 这条桌边不接秤。它不只是「可以没有」——四条桌边占满四路通道时，
+    # 想把两条边的通道对调就必须先有一个地方能把通道放下，否则中间态必然撞唯一性。
+    if "scale_channel" in patch and (not isinstance(patch["scale_channel"], int)
+                                     or isinstance(patch["scale_channel"], bool)
+                                     or patch["scale_channel"] not in (0,) + SCALE_CHANNELS):
+        return JSONResponse({"ok": False, "error": "scale_channel 必须是 0~4 的整数（0 = 不接秤）"},
+                            status_code=400)
+    # phone_no 不再限制 1~4：它是台账主键，而台账放得下不占桌边的备用机。
+    # 0 是有意义的取值——这条桌边还没摆手机。
+    if "phone_no" in patch and (not isinstance(patch["phone_no"], int)
+                                or isinstance(patch["phone_no"], bool)
+                                or patch["phone_no"] < 0):
+        return JSONResponse({"ok": False, "error": "phone_no 必须是非负整数（0 = 未绑手机）"},
+                            status_code=400)
+    for key in ("label", "necklace_device_id"):
         if key in patch and not isinstance(patch[key], str):
             return JSONResponse({"ok": False, "error": f"{key} 必须是字符串"}, status_code=400)
 
     with _state_lock:
-        # 同一项链 / 同一手机不能同时绑在两条桌边，否则 resolve 会出现歧义
-        for key, name_cn in (("necklace_device_id", "项链"), ("phone_client_id", "手机")):
-            value = str(patch.get(key, "") or "").strip()
-            if not value:
+        if patch.get("phone_no") and not _phone_of(patch["phone_no"]):
+            return JSONResponse(
+                {"ok": False,
+                 "error": f"台账里没有 {patch['phone_no']} 号机，请先在手机台账里登记这台机器"},
+                status_code=400)
+        # 同一项链 / 同一手机 / 同一路秤都不能同时挂在两条桌边上。
+        # 秤通道这条尤其要紧：秤事件按「通道→桌边→项链」反查、命中第一条就返回，
+        # 两条桌边共用一路时，那一路的克数会静默记到编号靠前那条边的项链上。
+        for key, name_cn in (("necklace_device_id", "项链"), ("phone_no", "手机"),
+                             ("scale_channel", "秤通道")):
+            value = patch.get(key)
+            if isinstance(value, str):
+                value = value.strip()
+            if not value:      # 空串 / 0 / None 都表示解绑，不参与判重
                 continue
             conflict = next((g for g in _state["groups"]
                              if g["edge"] != edge and g.get(key) == value), None)
@@ -629,7 +819,7 @@ def api_group_update(edge: int, patch: dict = Body(...)):
                    if k in patch and patch[k] != group.get(k, "")]
         group.update({k: v for k, v in patch.items() if k in GROUP_EDITABLE_FIELDS})
         _save_state(_state)
-        updated = dict(group)
+        updated = _group_view(group)
 
     for field, old, new in changes:
         _append_pairing_log(edge, field, old, new)
@@ -650,12 +840,110 @@ def api_group_resolve(device_id: str = "", client_id: str = ""):
                             status_code=400)
     with _state_lock:
         for group in _state["groups"]:
-            if device_id and device_id == group.get("necklace_device_id"):
-                return JSONResponse({"ok": True, "group": dict(group)})
-            if client_id and client_id == group.get("phone_client_id"):
-                return JSONResponse({"ok": True, "group": dict(group)})
+            view = _group_view(group)
+            if device_id and device_id == view.get("necklace_device_id"):
+                return JSONResponse({"ok": True, "group": view})
+            # client_id 现在存在台账的 resolved 里，靠展开后的视图比对
+            if client_id and client_id == view.get("phone_client_id"):
+                return JSONResponse({"ok": True, "group": view})
     missing = device_id or client_id
     return JSONResponse({"ok": False, "error": f"没有分组绑定 {missing}"}, status_code=404)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 手机台账：一台手机一行，机号做主键
+# ══════════════════════════════════════════════════════════════════════
+@app.get("/api/phones")
+def api_phones():
+    """手机台账全表，按机号升序；each 行附带它当前绑在哪条桌边（没绑为 null）。"""
+    with _state_lock:
+        bound = {g.get("phone_no"): g["edge"] for g in _state["groups"] if g.get("phone_no")}
+        phones = [dict(p, bound_edge=bound.get(p.get("no"))) for p in _state.get("phones", [])]
+    return JSONResponse({"phones": sorted(phones, key=lambda item: item.get("no") or 0)})
+
+
+@app.put("/api/phones/{no}")
+def api_phone_upsert(no: int, patch: dict = Body(...)):
+    """新增或更新一台手机（upsert，支持部分字段）。
+
+    机号是主键，所以「改机号」是一次搬家而不是改一个属性：body 里带 no 即表示改号，
+    本服务会把引用它的桌边一并更新——否则那条桌边会指向一个不存在的机号。
+    """
+    if no <= 0:
+        return JSONResponse({"ok": False, "error": "机号必须是正整数"}, status_code=400)
+    unknown = [k for k in patch if k not in PHONE_EDITABLE_FIELDS]
+    if unknown:
+        return JSONResponse({"ok": False, "error": f"不支持的字段：{unknown}"}, status_code=400)
+    for key in ("serial", "identity", "udid", "device_name", "build"):
+        if key in patch and not isinstance(patch[key], str):
+            return JSONResponse({"ok": False, "error": f"{key} 必须是字符串"}, status_code=400)
+    if "resolved" in patch and not isinstance(patch["resolved"], dict):
+        return JSONResponse({"ok": False, "error": "resolved 必须是对象"}, status_code=400)
+    new_no = no
+    if "no" in patch:
+        if not isinstance(patch["no"], int) or isinstance(patch["no"], bool) or patch["no"] <= 0:
+            return JSONResponse({"ok": False, "error": "机号必须是正整数"}, status_code=400)
+        new_no = patch["no"]
+
+    with _state_lock:
+        phones = _state.setdefault("phones", [])
+        phone = _phone_of(no)
+        if new_no != no and _phone_of(new_no):
+            return JSONResponse(
+                {"ok": False, "error": f"{new_no} 号机已存在，机号不能重复"}, status_code=409)
+        # 序列号与账号在台账内必须唯一：它们是「唯一确定一台手机」这件事的两个抓手，
+        # 重复了就等于说不清面前这台到底是哪一行。空值不参与判重（还没填的行不算撞车）。
+        for key, name_cn in PHONE_UNIQUE_FIELDS:
+            value = str(patch.get(key, "") or "").strip()
+            if not value:
+                continue
+            conflict = next((p for p in phones
+                             if p.get("no") != no and str(p.get(key) or "").strip() == value), None)
+            if conflict:
+                return JSONResponse(
+                    {"ok": False,
+                     "error": f"{name_cn} {value} 已登记在 {conflict['no']} 号机名下"},
+                    status_code=409)
+        created = phone is None
+        if created:
+            phone = _default_phone(no)
+            phones.append(phone)
+        for key in ("serial", "identity", "udid", "device_name"):
+            if key in patch:
+                phone[key] = patch[key].strip()
+        if "build" in patch:
+            phone["build"] = patch["build"]
+        if "resolved" in patch:
+            # 整组替换而不是合并：解析是一次性的快照，半新半旧的 resolved
+            # 会让人以为 client_id 与 last_seen 是同一次查出来的
+            phone["resolved"] = {k: v for k, v in patch["resolved"].items()
+                                 if k in PHONE_RESOLVED_FIELDS}
+        if new_no != no:
+            phone["no"] = new_no
+            for group in _state["groups"]:
+                if group.get("phone_no") == no:
+                    group["phone_no"] = new_no
+        phones.sort(key=lambda item: item.get("no") or 0)
+        _save_state(_state)
+        updated = dict(phone)
+    return JSONResponse({"ok": True, "phone": updated, "created": created})
+
+
+@app.delete("/api/phones/{no}")
+def api_phone_delete(no: int):
+    """从台账里删掉一台手机。还绑在桌边上时拒绝——先在那条桌边解绑再删。"""
+    with _state_lock:
+        phone = _phone_of(no)
+        if phone is None:
+            return JSONResponse({"ok": False, "error": f"台账里没有 {no} 号机"}, status_code=404)
+        bound = next((g for g in _state["groups"] if g.get("phone_no") == no), None)
+        if bound:
+            return JSONResponse(
+                {"ok": False, "error": f"{no} 号机还绑在桌边 {bound['edge']}，请先在那边解绑"},
+                status_code=409)
+        _state["phones"] = [p for p in _state["phones"] if p.get("no") != no]
+        _save_state(_state)
+    return JSONResponse({"ok": True, "no": no})
 
 
 @app.get("/api/necklaces/online")
@@ -1073,4 +1361,5 @@ def api_scale_events(limit: int = 100, channel: int = 0, countable_only: bool = 
 
 # 上报线程放在模块末尾再起：它要用 _ifa_services_request，而那个函数定义在本文件
 # 靠后的位置——在定义之前就把线程拉起来，第一条事件会撞上 NameError。
-threading.Thread(target=_scale_uploader, daemon=True).start()
+if BACKGROUND_THREADS:
+    threading.Thread(target=_scale_uploader, daemon=True).start()

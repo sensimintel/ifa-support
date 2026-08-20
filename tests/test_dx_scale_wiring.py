@@ -11,6 +11,8 @@ import os
 import unittest
 
 os.environ.setdefault("SCALE_HOST", "127.0.0.1")
+# 后台轮询与上报线程会异步改状态（搬空事件队列、给检测器打 gap），断言必须按住它们
+os.environ.setdefault("DX_BACKGROUND_THREADS", "0")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
