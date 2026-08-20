@@ -121,6 +121,10 @@ IFA_SERVICES_BASE_URL = os.environ.get(
 IFA_DEMO_CONTROL_TOKEN = os.environ.get(
     "IFA_DEMO_CONTROL_TOKEN", "local-ifa-demo-control-token")
 IFA_SERVICES_TIMEOUT = 5.0
+# 估算那条路径要等 services 那边跑完一次模型调用（远端 gemini 常见 5-15s），5 秒必然
+# 超时。超时的后果不只是这里返回 502：连接一断，services 侧的 request context 跟着取消，
+# 那次模型调用被 cancel、回落成派生公式——现场看到的是「点了估算，营养还是空的」。
+IFA_SERVICES_LLM_TIMEOUT = 60.0
 
 # 帧中继对「camera_info 缺失或其中没有 device_id」的兜底桶名。
 # 它不是真实身份：多个未识别设备的帧会混进同一个桶，绑定它毫无意义，故不进候选。
@@ -1023,7 +1027,7 @@ def api_necklace_frame(device: str = ""):
                     headers={"Cache-Control": "no-store", "X-Frame-Seq": seq})
 
 
-def _ifa_services_request(method, path, body=None):
+def _ifa_services_request(method, path, body=None, timeout=None):
     """调 services 的 ifa 端点（演示状态机/餐段），统一补 service token 与错误封装。
 
     返回 (payload, status)：payload 是 services 响应 data 段（或错误说明），
@@ -1036,7 +1040,7 @@ def _ifa_services_request(method, path, body=None):
         "Content-Type": "application/json",
     })
     try:
-        with urllib.request.urlopen(req, timeout=IFA_SERVICES_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=timeout or IFA_SERVICES_TIMEOUT) as resp:
             payload = json.loads(resp.read().decode("utf-8")) or {}
             return payload.get("data") or {}, resp.status
     except urllib.error.HTTPError as exc:
@@ -1214,7 +1218,8 @@ def api_necklace_fallback_report_estimate(device_id: str, body: dict = Body(...)
     if not isinstance(body.get("foods"), list):
         return JSONResponse({"ok": False, "error": "需要 foods 数组"}, status_code=400)
     data, status = _ifa_services_request(
-        "POST", "/api/v1/ifa/devices/%s/fallback-report/estimate" % urllib.parse.quote(device_id), body)
+        "POST", "/api/v1/ifa/devices/%s/fallback-report/estimate" % urllib.parse.quote(device_id), body,
+        timeout=IFA_SERVICES_LLM_TIMEOUT)
     ok = status < 400
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
 
