@@ -1197,6 +1197,28 @@ def api_necklace_fallback_report(device_id: str, body: dict = Body(...)):
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
 
 
+@app.post("/api/necklaces/{device_id}/fallback-report/estimate")
+def api_necklace_fallback_report_estimate(device_id: str, body: dict = Body(...)):
+    """按食物名估营养：推送之前那一步，把现场手填的食物补成一份完整营养表 + 文案。
+
+    请求体 {"foods": [{"name": "Bratwurst", "grams": 120}, ...]}，原样透传。
+    这条链上唯一一次模型调用就发生在这里，而且**不看图**——它只吃名字与克数，
+    因此与「摄像头没拍到进食」那类失败无关。估不出来时 services 会回落到确定性
+    派生公式，所以这个接口正常情况下不会失败，只会返回精度低一些的数字。
+    """
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    body = body or {}
+    # 同 fallback-report：只做一处结构性把关，名字与克数合不合法由 services 判定。
+    if not isinstance(body.get("foods"), list):
+        return JSONResponse({"ok": False, "error": "需要 foods 数组"}, status_code=400)
+    data, status = _ifa_services_request(
+        "POST", "/api/v1/ifa/devices/%s/fallback-report/estimate" % urllib.parse.quote(device_id), body)
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
 @app.get("/api/necklaces/{device_id}/scale-summary")
 def api_necklace_scale_summary(device_id: str, segment_id: str = ""):
     """某台项链某一段的秤汇总：两种食物各吃了多少克、逐条事件的判定、闭合自检。
