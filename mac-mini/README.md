@@ -46,7 +46,7 @@ da3-web。每个推帧节拍推两路（同一节拍 → 同设备两路 fps 天
   macOS arm64 wheel 只配 3.11）。不需要 brew / ffmpeg；Xcode CLT 只为 git（已装，
   2026-08-13）。
 - 配置走 mini 部署目录 `~/ifa-support/mac-mini/.env`（gitignore，不进仓）：
-  `RELAY_URL`（默认 `http://192.168.0.50:8060`）、`PUSH_FPS`（**兜底值**，默认 3）、
+  `RELAY_URL`（默认 `http://192.168.100.50:8060`）、`PUSH_FPS`（**兜底值**，默认 3）、
   `JPEG_QUALITY`（默认 80）。
 - **推帧频率的权威来源是 8060 的 per-device 配置，两台相机各调各的**：`/panel`
   设备栏滑杆与 `/experience`「调节」抽屉的「数据源帧率」区都 POST
@@ -79,14 +79,14 @@ ssh mac-mini 'MINI_SUDO_PASS=... ~/ifa-support/mac-mini/deploy.sh'
 
 ## 展会搬迁「一步拉起」
 
-网络按仓根 [`NETWORK.md`](../NETWORK.md) 搬（整段复刻 `192.168.0.0/24`）。mini 已配
+网络按仓根 [`NETWORK.md`](../NETWORK.md) 搬（整段复刻 `192.168.100.0/24`）。mini 已配
 `pmset sleep 0 + autorestart 1`（防睡眠、断电来电自动开机），搬过去**插电即活**：
 开机 → LaunchDaemon 自动起推帧器 → 相机帧出现在 8060。无需任何人工步骤。
 
 验证一条就够：
 
 ```bash
-curl -s http://192.168.0.50:8060/api/frame/status | grep -o 'macmini-[a-z0-9]*'
+curl -s http://192.168.100.50:8060/api/frame/status | grep -o 'macmini-[a-z0-9]*'
 ```
 
 ## 排障

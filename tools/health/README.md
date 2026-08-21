@@ -64,13 +64,13 @@ odyss-gitea、cpa-preview 两容器、comfyui / food-image-search / milvus / net
 5090 开着 ufw 且 INPUT 默认 DROP。**docker 端口映射的服务（18090/18091）走 FORWARD 链绕过 ufw**；**host 网络的服务（3001/3000/8000/9091 等）进 INPUT 链，必须逐端口放行**。因此体检除了在服务器上跑 check.sh，还要**在开发机（Mac）上**对用户入口做连通性探测：
 
 ```bash
-for p in 18090 18091 8060 3001; do nc -z -G 3 192.168.0.50 $p && echo "$p 通" || echo "$p 不通"; done
+for p in 18090 18091 8060 3001; do nc -z -G 3 192.168.100.50 $p && echo "$p 通" || echo "$p 不通"; done
 ```
 
 不通且服务器侧 OK → 补 ufw 放行（仅限局域网网段，照现有模式）：
 
 ```bash
-sudo ufw allow from 192.168.0.0/24 to any port <端口> proto tcp comment "<用途> LAN"
+sudo ufw allow from 192.168.100.0/24 to any port <端口> proto tcp comment "<用途> LAN"
 ```
 
 已放行：8060（da3-web）、3001（统一 Grafana，2026-07-31 补）。8000/3000 有意未放行（LA 由 da3-web 经 127.0.0.1 内部调用；旧 LA-Grafana 走公网 file.odyss.life/grafana）。

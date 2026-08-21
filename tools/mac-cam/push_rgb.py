@@ -116,7 +116,7 @@ def push_loop(cap, server: str, device_id: str, fallback_fps: float, quality: in
 
 def main():
     ap = argparse.ArgumentParser(description="Mac 相机 RGB 推流到 8060 /api/frame")
-    ap.add_argument("--server", default="http://192.168.0.50:8060")
+    ap.add_argument("--server", default="http://192.168.100.50:8060")
     ap.add_argument("--camera", default="Gemini 335", help="AVFoundation 相机名称子串")
     ap.add_argument("--index", type=int, default=None, help="直接指定相机索引（跳过名称匹配）")
     ap.add_argument("--device-id", default="mac-g335")

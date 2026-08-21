@@ -113,6 +113,6 @@
 1. **DA3 源码**：`app.py` 通过 `sys.path` 引用 `/home/odyss/Depth-Anything-3/src` 的 `depth_anything_3` 包（不在 PyPI），只用其推理 API（官方 Gradio 应用已于 2026-08-17 去冗余下线）。
 2. **模型权重**：`/home/odyss/Depth-Anything-3/models/DA3NESTED-GIANT-LARGE-1.1`。
 3. **conda 环境**：`da3`（含 torch/CUDA 等）。
-4. **电子秤硬件**（dx-backend / 8070 用，非 8060）：一台四通道称重变送模块 `SJ101T2_CH4_ETH`，需与 5090 在同一局域网可达（静态 `192.168.0.80`，Modbus TCP 502，通道 1..4 → 寄存器 addr 0/2/4/6）。网络前提见 [`NETWORK.md`](NETWORK.md)。
+4. **电子秤硬件**（dx-backend / 8070 用，非 8060）：一台四通道称重变送模块 `SJ101T2_CH4_ETH`，需与 5090 在同一局域网可达（静态 `192.168.100.80`，Modbus TCP 502，通道 1..4 → 寄存器 addr 0/2/4/6）。网络前提见 [`NETWORK.md`](NETWORK.md)。
 
 如需迁移到其他机器，上述路径（`app.py` 中的 `DA3_ROOT` / `MODEL_DIR`、`run.sh` 中的 `HF_HOME` 与 conda python 路径）需相应调整。

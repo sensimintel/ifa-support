@@ -24,7 +24,7 @@ cd tools/mac-cam && ./setup.sh    # 需要 uv；建 .venv(Python 3.11) 并装依
 .venv/bin/python push_astra.py
 ```
 
-默认服务端 `http://192.168.0.50:8060`，可用 `--server` 覆盖。
+默认服务端 `http://192.168.100.50:8060`，可用 `--server` 覆盖。
 
 ## 帧率调节（按设备，两台摄像机各调各的）
 

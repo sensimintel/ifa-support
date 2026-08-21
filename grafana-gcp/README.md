@@ -5,7 +5,7 @@
 1. **frp STCP 隧道**：把 GCP `gpu-g4-01`（算力服务器）上 loopback 的 **Prometheus** 点对点拉到本机 `127.0.0.1:${G4_PROM_LOCAL_PORT}`（默认 29090）；
 2. **本机统一 Grafana**（docker，绑 `0.0.0.0:${GRAFANA_PORT}`，默认 3001）：两个数据源分别展示两台服务器。
 
-访问：**`http://192.168.0.50:3001`**（office 局域网直连，不走公网、不用 SSH 隧道）。
+访问：**`http://192.168.100.50:3001`**（office 局域网直连，不走公网、不用 SSH 隧道）。
 
 ## 架构（方案二 · 算力/主分离 + 统一 Grafana）
 
@@ -32,7 +32,7 @@
 cd grafana-gcp
 cp .env.example .env      # 首次：填 FRP_TOKEN / STCP_SECRET / GRAFANA_ADMIN_PASSWORD
 bash up.sh                # 一步拉起：frp 隧道 + 统一 Grafana
-# 访问 http://192.168.0.50:3001
+# 访问 http://192.168.100.50:3001
 bash down.sh              # 停
 ```
 
@@ -44,7 +44,7 @@ bash down.sh              # 停
 
 ## 前置
 
-- 5090 iptables INPUT 默认 DROP：需放行 Grafana 端口（`iptables -I INPUT -s 192.168.0.0/24 -p tcp --dport 3001 -j ACCEPT`）。
+- 5090 iptables INPUT 默认 DROP：需放行 Grafana 端口（`iptables -I INPUT -s 192.168.100.0/24 -p tcp --dport 3001 -j ACCEPT`）。
 - g4-01 端已跑 `prometheus` + `frpc`（STCP 暴露 `g4-prometheus`=本地 9090）。
 
 ## 文件

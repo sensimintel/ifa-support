@@ -50,5 +50,5 @@ curl -fsS -o /dev/null -m3 "http://127.0.0.1:${LOCAL_PROM_PORT}/-/ready" 2>/dev/
 
 # 5) 起统一 Grafana
 echo "==> docker compose up -d"; docker compose up -d
-echo ""; echo "==> 完成。访问 http://<本机内网IP>:${GRAFANA_PORT}（在 5090 即 http://192.168.0.50:${GRAFANA_PORT}）"
+echo ""; echo "==> 完成。访问 http://<本机内网IP>:${GRAFANA_PORT}（在 5090 即 http://192.168.100.50:${GRAFANA_PORT}）"
 echo "    看板：/d/g4-01、/d/locateanything"

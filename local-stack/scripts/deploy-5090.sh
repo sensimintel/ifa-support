@@ -25,7 +25,7 @@ set +a
 SERVICES_REPO="${SERVICES_REPO:-$STACK_DIR/../../odyss-services}"
 SUPERADMIN_REPO="${SUPERADMIN_REPO:-$STACK_DIR/../../odyss-superadmin}"
 # 默认走局域网直连；不在局域网时用 DEPLOY_TARGET=odyss-server-frpc ./stack deploy-5090 走 frp
-REMOTE="${DEPLOY_TARGET:-odyss@192.168.0.50}"
+REMOTE="${DEPLOY_TARGET:-odyss@192.168.100.50}"
 REMOTE_DIR="${DEPLOY_REMOTE_DIR:-/home/odyss/odyss-services-ifa}"
 # 构建上下文放 /tmp：目标机上不留配置孤本，用完即删（MANAGEMENT.md §6）
 BUILD_CTX="/tmp/odyss-services-build-ctx"
@@ -109,4 +109,4 @@ ssh "$REMOTE" "
   curl -sf -o /dev/null -w 'services health: %{http_code}\n' http://127.0.0.1:18090/api/v1/base/health || echo 'services 探活失败'
   curl -sf -o /dev/null -w 'superadmin: %{http_code}\n' http://127.0.0.1:18091/ || echo 'superadmin 探活失败'
 "
-echo "完成。浏览器打开 http://192.168.0.50:18091 需**硬刷新**（index.html 会被缓存，旧 JS 会让人以为没部署上）。"
+echo "完成。浏览器打开 http://192.168.100.50:18091 需**硬刷新**（index.html 会被缓存，旧 JS 会让人以为没部署上）。"

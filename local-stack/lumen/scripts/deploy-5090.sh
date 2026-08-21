@@ -4,12 +4,12 @@
 #   1. rsync overlay（compose / Dockerfile / 配置 / 二进制 / 迁移）到目标机 ~/odyss-ifa-lumen
 #   2. 目标机 docker build lumen 镜像 → docker compose up -d（幂等）
 #   3. 同步 superadmin.conf 与渲染后的 superadmin-runtime-config.json → 重启 superadmin 容器
-# 前置：已跑 ./scripts/build-lumen-artifacts.sh；目标机可 SSH（默认 odyss@192.168.0.50）。
+# 前置：已跑 ./scripts/build-lumen-artifacts.sh；目标机可 SSH（默认 odyss@192.168.100.50）。
 set -euo pipefail
 
 LUMEN_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 STACK_DIR="$(cd "$LUMEN_DIR/.." && pwd)"
-REMOTE="${LUMEN_DEPLOY_TARGET:-odyss@192.168.0.50}"
+REMOTE="${LUMEN_DEPLOY_TARGET:-odyss@192.168.100.50}"
 REMOTE_DIR="${LUMEN_DEPLOY_DIR:-/home/odyss/odyss-ifa-lumen}"
 SUPERADMIN_DIR="${LUMEN_DEPLOY_SUPERADMIN_DIR:-/home/odyss/odyss-services-ifa/superadmin}"
 STACK_ID="${STACK_ID:-ifa-5090}"

@@ -32,7 +32,7 @@ import time
 import urllib.error
 import urllib.request
 
-APP = os.environ.get("TUNNEL_APP", "http://192.168.0.50:8060")   # 5090 的 da3-web
+APP = os.environ.get("TUNNEL_APP", "http://192.168.100.50:8060")   # 5090 的 da3-web
 LOCAL_PORT = 18011        # Mac 本机中转端口
 POLL = 5.0                # 心跳/巡检周期(秒)
 HEARTBEAT_TIMEOUT = 15.0  # 心跳超时(秒)：原来 5s。识别满负载时 Mac↔5090 这段局域网
@@ -62,7 +62,7 @@ IAP_CMD = ["gcloud", "compute", "ssh", "gpu-g4-01",
 REV_CMD = ["ssh", "-N", "-o", "ExitOnForwardFailure=yes",
            "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
            "-o", "ConnectTimeout=10",
-           "-R", f"127.0.0.1:8011:127.0.0.1:{LOCAL_PORT}", "odyss@192.168.0.50"]
+           "-R", f"127.0.0.1:8011:127.0.0.1:{LOCAL_PORT}", "odyss@192.168.100.50"]
 
 iap_proc = None
 rev_proc = None

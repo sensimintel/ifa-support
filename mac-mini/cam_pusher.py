@@ -32,7 +32,7 @@ da3-web 服务。每台相机独立成一个 device_id 桶，/panel 下拉可切
   · 必须 root 运行（libusb 直读 USB），由 LaunchDaemon 承载。
 
 配置经环境变量（LaunchDaemon 经 run-pusher.sh source 同目录 .env）：
-  RELAY_URL     推帧目标，默认 http://192.168.0.50:8060
+  RELAY_URL     推帧目标，默认 http://192.168.100.50:8060
   PUSH_FPS      推帧频率兜底值，默认 3——仅在拿不到服务端配置时生效
   JPEG_QUALITY  非 MJPG 相机转码 JPEG 质量，默认 80
   LASER_MODE    G335 激光策略 on|interleave|off，默认 on（投射器常开）
@@ -58,7 +58,7 @@ from pyorbbecsdk import (AlignFilter, Config, Context, OBFormat,
                          OBFrameMetadataType, OBPropertyID,
                          OBSensorType, OBStreamType, Pipeline)
 
-RELAY_URL = os.environ.get("RELAY_URL", "http://192.168.0.50:8060").rstrip("/")
+RELAY_URL = os.environ.get("RELAY_URL", "http://192.168.100.50:8060").rstrip("/")
 PUSH_FPS = float(os.environ.get("PUSH_FPS", "3"))
 JPEG_QUALITY = int(os.environ.get("JPEG_QUALITY", "80"))
 LASER_MODE = os.environ.get("LASER_MODE", "on").strip().lower()

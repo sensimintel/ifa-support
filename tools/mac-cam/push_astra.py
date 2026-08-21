@@ -128,7 +128,7 @@ class AstraDepth:
 
 def main():
     ap = argparse.ArgumentParser(description="Astra RGB 推帧 + 真深度点云直传 8060")
-    ap.add_argument("--server", default="http://192.168.0.50:8060")
+    ap.add_argument("--server", default="http://192.168.100.50:8060")
     ap.add_argument("--camera", default="USB相机", help="Astra RGB 的 AVFoundation 名称子串")
     ap.add_argument("--index", type=int, default=None)
     ap.add_argument("--device-id", default="mac-astra")

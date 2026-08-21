@@ -47,7 +47,7 @@ for i in 1 2 3 4 5; do
 done
 
 echo "==> 健康检查：等 8060 出现 macmini-* 设备帧（至多 30s）"
-RELAY_URL="${RELAY_URL:-http://192.168.0.50:8060}"
+RELAY_URL="${RELAY_URL:-http://192.168.100.50:8060}"
 for i in $(seq 1 10); do
   if curl -fsS --max-time 5 "$RELAY_URL/api/frame/status" 2>/dev/null | grep -q 'macmini-'; then
     echo "    8060 已收到 macmini 设备帧"
