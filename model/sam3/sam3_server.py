@@ -27,7 +27,15 @@
 #     · 内部 id 在代内由 tracker 原生稳定；跨代/新对象经注册表映射成跨请求稳定的公共 obj_id，
 #       离场超 forget_frames 帧才遗忘。
 #   风险面：_append_frame_to_state 耦合 sam3 内部字段名（Sam3VideoInference 的 state 结构），
-#   上游升级若变动，运行时会抛错——自动回退到 v2 的"滚动窗口全量重放"路径（replay），功能不断。
+#   上游升级若变动，运行时会抛错——自动回退到 v2 的"滚动窗口全量重放"路径（replay），功能不断；
+#   降级非终身（v5）：replay 每满 SAM3_STREAM_RECOVER_EVERY 步自动尝试重建增量 session 切回增量，
+#   失败则继续 replay 重新计步（详见 _step_with_fallback 的降级/恢复状态机）。
+# triton autotune 并发竞态（v5 根治）：上游 connected_components 的 _local_prop_kernel 用
+#   @triton.autotune(restore_value=["labels_ptr"]) 装饰，Autotuner 单例的 restore_copies/nargs
+#   是无锁共享实例态；MAX_CONCURRENCY=2 时两路 session 并发进同一 kernel（重启后 autotune
+#   冷缓存的 benchmark 窗口内必撞），后完成方抛 KeyError('labels_ptr') / TypeError(nargs=None)，
+#   过去被误判成「上游 state 结构不符」而永久降级。_install_triton_autotune_lock 给
+#   Autotuner.run 包进程级互斥锁消除（锁只罩 Python 端调度，GPU kernel 异步下发不受影响）。
 import io, os, base64, shutil, tempfile, threading, time, uuid, logging, contextlib
 import hashlib, collections
 import numpy as np, torch
@@ -68,6 +76,8 @@ STREAM_MATCH_IOU = float(os.environ.get("SAM3_STREAM_MATCH_IOU", "0.4"))  # 身�
 # 增量路径开关与整代重建周期（重建=显存兜底：img_batch 每帧 ~6MB 线性涨，到期整体重来一代）
 STREAM_INCREMENTAL = os.environ.get("SAM3_STREAM_INCREMENTAL", "1") not in ("0", "false", "False")
 STREAM_REBUILD_EVERY = int(os.environ.get("SAM3_STREAM_REBUILD_EVERY", "60"))
+# 降级恢复周期：从增量降级到 replay 的 session，每满这么多步自动尝试重建增量 session 恢复
+STREAM_RECOVER_EVERY = int(os.environ.get("SAM3_STREAM_RECOVER_EVERY", "20"))
 
 # 推理有界并发限流（默认 2=两路流式 session 并行；=1 回退旧的全串行行为）。
 # 注意 _LOCK 语义是「限流」而非「互斥」：临界区内不得依赖它保护共享可变状态（见文件头注释）。
@@ -305,9 +315,49 @@ def _build_debug_payload(calls):
                     "clamp ±12); clamped=联合 logit 触 clamp 限幅"}
 
 
+def _install_triton_autotune_lock():
+    """给 triton Autotuner.run 包一把进程级可重入锁（labels_ptr 竞态的根因修复）。
+
+    实锤根因（5090 journalctl + 上游源码核对）：sam3 上游 connected_components 的
+    _local_prop_kernel（sam3/perflib/triton/connected_components.py，
+    @triton.autotune(restore_value=["labels_ptr"])）由模块级单例 Autotuner 调度，
+    其 restore_copies 与 nargs 都是无锁共享实例态（triton/runtime/autotuner.py 的
+    _post_hook 先 copy_ 恢复再把 restore_copies 置空、run 里整体覆写 nargs）。
+    本服务 MAX_CONCURRENCY=2 时 food/drink 两线程并发进同一 kernel：服务重启后
+    autotune 冷缓存的 benchmark 窗口（跑几十次基准、窗口大）内两线程 pre/post hook
+    交叉，后完成的一方必抛 KeyError('labels_ptr')；warmup 后 nargs 覆写竞态则偶发
+    TypeError('NoneType' object is not a mapping)。崩点在 add_prompt 的
+    fill_holes_in_mask_scores 深处，先前被误判成「上游 state 结构不符」而永久降级。
+
+    修法：把 Autotuner.run 全局串行化。锁只罩 Python 端调度与一次性的 autotune
+    benchmark（GPU kernel 本身异步下发，不在锁内等待执行），正常路径每次多持锁
+    几十微秒，代价可忽略；用 RLock 防未来嵌套调用死锁；幂等可重复调用。"""
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except Exception as e:  # noqa: BLE001
+        logger.warning("triton Autotuner 不可用，跳过并发锁安装（若并发>1 竞态风险仍在）：%r", e)
+        return False
+    if getattr(Autotuner.run, "_sam3_autotune_locked", False):   # 幂等：已装过不叠包
+        return True
+    lock = threading.RLock()
+    orig_run = Autotuner.run
+
+    def _locked_run(self, *args, **kwargs):
+        # 串行化 autotune 调度，消除 restore_copies/nargs 的双线程互踩
+        with lock:
+            return orig_run(self, *args, **kwargs)
+
+    _locked_run._sam3_autotune_locked = True
+    Autotuner.run = _locked_run
+    logger.info("triton Autotuner 并发锁已安装（根治 labels_ptr/nargs 竞态）")
+    return True
+
+
 def _load():
     global _pred, _err
     try:
+        # 必须在首次推理前安装：重启后第一波并发步进就会触发 autotune benchmark 竞态
+        _install_triton_autotune_lock()
         _mf = float(os.environ.get("SAM3_MEM_FRACTION", "0"))
         if _mf > 0 and torch.cuda.is_available():
             torch.cuda.set_per_process_memory_fraction(_mf, 0)  # 固定显存上限（9G≈0.28，与 5090 其他服务隔离）
@@ -658,6 +708,8 @@ def stream_start(req: StreamStartReq):
             # 增量代（generation）状态：live_sid=活着的 sam3 会话；id_map=本代内部id→公共id
             "live_sid": None, "gen_frames": 0, "gen_base_global": 0, "id_map": {},
             "impl": "incremental" if (STREAM_INCREMENTAL and _INCR_IMPORTS_OK) else "replay",
+            # 降级/恢复状态机（_step_with_fallback）：降级次数 + replay 模式下的恢复计步
+            "degrade_count": 0, "replay_steps": 0,
             "last_ts": time.time(),
             "step_lock": threading.Lock(),   # 同一 session 的步进串行
         }
@@ -752,6 +804,50 @@ def _step_incremental(s, img, g):
     return inst
 
 
+def _degrade_to_replay(s, log_sid, err, scene):
+    """统一降级动作：记完整轨迹日志 → 关活会话 → 切 replay → 降级计数 +1、恢复计步清零。
+    只能在 except 块内调用（logger.exception 依赖当前异常上下文输出堆栈）。"""
+    logger.exception("%s，session %s 降级 replay（累计第 %d 次；replay 每满 %d 步自动尝试恢复增量）：%s",
+                     scene, log_sid, s["degrade_count"] + 1, STREAM_RECOVER_EVERY, err)
+    _close_live(s)
+    s["live_sid"] = None
+    s["impl"] = "replay"
+    s["degrade_count"] += 1
+    s["replay_steps"] = 0
+
+
+def _step_with_fallback(s, img, g, log_sid):
+    """步进 + 降级/恢复状态机（降级不再终身）：
+      · incremental：正常走增量；抛错 → 降级 replay，本步立即用 replay 补齐结果；
+      · replay 且是「从增量降级下来的」session（degrade_count>0）：每满
+        STREAM_RECOVER_EVERY 步尝试切回增量（live_sid 为空，_step_incremental 会用
+        ring 种子重开一代，注册表缝合保证公共 obj_id 连续）；成功即恢复增量，
+        失败记日志、继续 replay 并重新计步；
+      · 一开始就是 replay 的 session（增量被关闭 / 上游 import 失败）不做恢复尝试。"""
+    if s["impl"] == "incremental":
+        try:
+            return _step_incremental(s, img, g)
+        except Exception as e:  # noqa: BLE001
+            _degrade_to_replay(s, log_sid, e, "增量路径失败")
+            return _step_replay(s)
+    if s["degrade_count"] > 0 and STREAM_INCREMENTAL and _INCR_IMPORTS_OK:
+        s["replay_steps"] += 1
+        if s["replay_steps"] >= STREAM_RECOVER_EVERY:
+            s["replay_steps"] = 0
+            logger.info("session %s replay 已满 %d 步，尝试重建增量 session 恢复",
+                        log_sid, STREAM_RECOVER_EVERY)
+            s["impl"] = "incremental"
+            try:
+                inst = _step_incremental(s, img, g)
+            except Exception as e:  # noqa: BLE001
+                _degrade_to_replay(s, log_sid, e, "增量恢复尝试失败")
+                return _step_replay(s)
+            logger.info("session %s 增量路径恢复成功（此前累计降级 %d 次）",
+                        log_sid, s["degrade_count"])
+            return inst
+    return _step_replay(s)
+
+
 @app.post("/v1/stream/frame")
 def stream_frame(req: StreamFrameReq):
     """流式步进：追加 1 帧 → 增量 propagate（或回退全窗重放）→ 返回最新帧实例（obj_id 跨请求稳定）。"""
@@ -773,31 +869,23 @@ def stream_frame(req: StreamFrameReq):
         # 窗口（增量=新帧一帧；replay/开代=全窗口，口径一致）；debug 取最新帧那次前向
         rescore, alpha, det_thresh = _dbg_begin(req.debug, req.topk, req.alpha, req.det_thresh)
         try:
-            if s["impl"] == "incremental":
-                try:
-                    inst = _step_incremental(s, img, g)
-                except Exception as e:
-                    # 上游内部结构不符/运行时异常：本 session 永久降级 replay，服务不断
-                    logger.exception("增量路径失败，session %s 降级 replay：%s", req.session_id, e)
-                    _close_live(s)
-                    s["live_sid"] = None
-                    s["impl"] = "replay"
-                    inst = _step_replay(s)
-            else:
-                inst = _step_replay(s)
+            # 降级/恢复状态机：增量抛错降 replay（非终身），replay 满周期自动尝试恢复增量
+            inst = _step_with_fallback(s, img, g, req.session_id)
         finally:
             _dbg_end()
         run_ms = (time.time() - t0) * 1000.0
         s["next_global"] = g + 1
         n_reg = len(s["registry"])
         impl, gen_frames = s["impl"], s["gen_frames"]
+        degrade_count = s["degrade_count"]
     W, H = img.size
     gpu_mb = int(torch.cuda.memory_allocated() // (1024 * 1024)) if torch.cuda.is_available() else 0
     resp = {"session_id": req.session_id, "global_index": g,
             "width": W, "height": H, "window_frames": min(g + 1, s["window"]),
             "num_instances": len(inst), "instances": inst,
             "active_objects": n_reg, "run_ms": round(run_ms, 1),
-            "impl": impl, "gen_frames": gen_frames, "gpu_mb": gpu_mb}
+            "impl": impl, "gen_frames": gen_frames, "degrade_count": degrade_count,
+            "gpu_mb": gpu_mb}
     if rescore:
         resp["rescore"] = {"alpha": alpha, "det_thresh": det_thresh,
                            "applied": bool(_dbg.calls and _dbg.calls[-1].get("rescore_applied"))}
@@ -815,6 +903,7 @@ def stream_list():
             {"session_id": sid, "text": s["text"], "window": s["window"],
              "frames_seen": s["next_global"], "active_objects": len(s["registry"]),
              "impl": s["impl"], "gen_frames": s["gen_frames"],
+             "degrade_count": s["degrade_count"], "replay_steps": s["replay_steps"],
              "idle_sec": round(now - s["last_ts"], 1)} for sid, s in _streams.items()]}
 
 @app.delete("/v1/stream/{session_id}")
