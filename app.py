@@ -4556,8 +4556,12 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
         messages.append({"role": "user", "content": ref_blocks})
         messages.append({"role": "assistant", "content": foodref.menu_ack(len(ref_items))})
     messages.append({"role": "user", "content": content})
+    # enable_thinking=False：5090 本机的 Qwen3.6 是混合思考模型且**默认开思考**，
+    # 思考散文会顶满 max_tokens 把 JSON 挤没（截断被 _parse_recog 容错吞掉，表现为
+    # 静默 0 项）。GCP 时代跑的是 Instruct（非思考）权重，这里显式关掉思考对齐当时表现。
     payload = {"model": cfg["model"], "messages": messages,
-               "max_tokens": 1536, "temperature": 0}
+               "max_tokens": 1536, "temperature": 0,
+               "chat_template_kwargs": {"enable_thinking": False}}
     if RECOG_STREAM:
         # include_usage：流式下 token 数只在最后一个 usage-only chunk 里给
         payload["stream"] = True
