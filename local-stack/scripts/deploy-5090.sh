@@ -92,6 +92,10 @@ if [ "$migrate_code" != "0" ]; then
 fi
 echo "  ✓ migration 完成"
 ssh "$REMOTE" "cd '$REMOTE_DIR' && docker compose up -d --no-deps --force-recreate $RECREATE_SERVICES"
+# 孤本 compose 的 odyss-services 块漏写 restart 策略（模板已有 unless-stopped，孤本禁止手改），
+# force-recreate 会让容器退回默认 no、宿主机重启后不自愈（2026-08-21 秤读数 18090 拒连即此因）。
+# 在此兜底补上；将来按模板重拉标准栈后本行幂等无害。
+ssh "$REMOTE" "docker update --restart unless-stopped odyss-ifa-services odyss-ifa-llm-mock"
 
 echo "== 6/6 发 superadmin dist 并探活"
 # dist 是 nginx 的只读 bind mount，换文件即生效，不需重启容器。
