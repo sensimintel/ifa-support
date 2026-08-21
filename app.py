@@ -5735,7 +5735,16 @@ def recoglog_clear():
 #   · 转发指令：网页点「一键重建」→ 置 rebuild_requested 标志，Mac 上的守护
 #     进程（本仓 tools/qwen_tunnel_keeper.py，launchd 常驻）心跳时领走执行。
 # ══════════════════════════════════════════════════════════════════════
-TUNNEL_PROBE_URL = "http://127.0.0.1:8011/v1/models"
+# 2026-08-21 起识别端点已切到 5090 本机 vLLM(8000)，探测地址跟随 RECOG_ENDPOINT 推导
+# （其 origin + /v1/models）；RECOG_ENDPOINT 缺省时才回落旧的 8011 反向隧道探测。
+def _tunnel_probe_url() -> str:
+    _ep = os.environ.get("RECOG_ENDPOINT", "").strip()
+    if "/v1/" in _ep:
+        return _ep.rsplit("/v1/", 1)[0] + "/v1/models"
+    return "http://127.0.0.1:8011/v1/models"
+
+
+TUNNEL_PROBE_URL = _tunnel_probe_url()
 TUNNEL_PROBE_CACHE = 2.0     # 探测结果缓存(秒)：多个前端轮询共享，避免每次都真探一枪
 # 探测超时：原来 3s。识别满负载时单个请求体 600KB+、并发 2，隧道上行只有 ~400KB/s，
 # 探测小包要排在几 MB 数据后面——3s 必然探不通，而链路其实好好的。放宽到 8s。
