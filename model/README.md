@@ -4,13 +4,14 @@
 
 **第一性目标**：在一台「稳定、有外网、显存足够」的新服务器上，凭本目录 + 本仓根目录，
 一次性拉起所有模型、对应服务 gateway 与全部依赖，复刻 5090 现网的完整演示栈。
+（「5090」沿用主机称谓；显卡已于 2026-08 换为 **RTX Pro 6000 Blackwell 96GB**，不做全文改名。）
 
 ## 架构与端口
 
 ```
 设备帧 → app.py(:8060, 本仓根目录, DA3 进程内推理 + 各页面 gateway)
               ├─ SAM3            http://127.0.0.1:8013   (sam3_server.py, systemd)
-              └─ 识别 Qwen3-VL    RECOG_ENDPOINT          (外部服务, 不在本仓, 经 .env 配置)
+              └─ 识别 Qwen3-VL    RECOG_ENDPOINT          (本机 vLLM 裸进程 :8000, 不在本仓, 经 .env 配置)
 ```
 
 | 端口 | 服务 | 来源 |
@@ -20,17 +21,20 @@
 
 ## 硬件 / 系统前置
 
-- NVIDIA 驱动 ≥ 580（SAM3 环境用 torch cu130 需 CUDA 13；DA3 环境用 cu128。5090 现网驱动 580.95）
+- NVIDIA 驱动 ≥ 580（SAM3 环境用 torch cu130 需 CUDA 13；DA3 环境用 cu128。现网驱动版本以 `nvidia-smi` 实测为准——2026-08 换卡 RTX Pro 6000 后驱动已随卡更新，不要按旧记录写死）
 - 外网：github.com、huggingface.co（国内可 `export HF_ENDPOINT=https://hf-mirror.com`；
   **例外：`facebook/sam3` 是 gated 仓，必须官方源 + `HF_TOKEN`**，镜像上没有）
 - 磁盘：权重合计约 18GB（DA3 nested giant ~13GB、sam3.pt 3.45GB）+ 各 venv 若干 GB
 
-## 显存预算（5090 32GB 现网实测）
+## 显存预算（RTX Pro 6000 96GB 现网口径）
 
 | 服务 | 显存 | 控制手段 |
 |---|---|---|
-| DA3（app.py 进程内） | ~9.2G | `process_res` 越高越吃 |
-| SAM3 | 实占 ~4.2G，上限 9G | `SAM3_MEM_FRACTION=0.28`；流式窗口 `window` 控瞬时占用 |
+| 本机 vLLM（`:8000`，Qwen3.6-35B-A3B-FP8，不在本目录管理） | ~64G | `gpu-memory-utilization 0.73` |
+| DA3（app.py 进程内） | ~9.2G（换卡前实测，换卡后待复测） | `process_res` 越高越吃 |
+| SAM3 | 实占 ~4.2G，预算约 9G | `SAM3_MEM_FRACTION`（原按 32G 基数取 0.28≈9G，换卡后上限随 96G 基数变化，具体待实测）；流式窗口 `window` 控瞬时占用 |
+
+96GB 下 vLLM ~64G + SAM3 ~9G 之外余量充足，旧「32G 紧张 / OOM 风险」口径作废；上述调参开关保留，仅在极端情况下需要动。
 
 ## 拉起顺序（新机器从零）
 
@@ -50,7 +54,7 @@ cp da3-web.service /etc/systemd/system/ && systemctl enable --now da3-web
 
 ## 已知缺口（如实记录）
 
-- **识别 Qwen3-VL 不在本仓**：GCP g4-01 的 Qwen3.6-35B 属外部依赖，只经 `.env` 接入。
+- **识别 Qwen3-VL 不在本仓**：现为 5090 宿主裸进程 `vllm serve :8000`（Qwen3.6-35B-A3B-FP8，别名 `gemini-3.1-pro-preview`），本机 vLLM 启动配置即模型名正源，本服务只经 `.env` 接入；旧的 GCP g4-01 链路（frp / 反向 SSH 隧道）已废弃。
 
 ## 5090 现网对照（排障用）
 

@@ -30,15 +30,14 @@
 | minio | 内部 | 对象存储（App 上传的图片/音频），卷 `odyss-local-minio-data` |
 | valkey (redis) | 内部 | 缓存，卷 `odyss-local-redis-data` |
 | llm-mock | 内部 | 栈内 mock LLM（mock 模式的全部 LLM 调用；real 模式下作为兜底常驻） |
-| llm-tunnel | 内部 | 仅 real 模式（compose profile `real-vlm`）：frp stcp visitor 接远端真实 VLM |
 
 ## LLM 两种模式
 
 模式由 `stack.env` 的 `LLM_MODE` 决定（缺省 `mock`），**切换 = 改 stack.env 后重跑 `./stack bootstrap`**（幂等，密钥与数据不动）：
 
 - **mock（默认）**：chunk / 整餐分析全走栈内 llm-mock，完全离线。
-- **real**：chunk（`chunk_inhouse`）与整餐都直连 `llm-tunnel` 背后的远端 vLLM（模型见 `manifest.env` 的 `VLM_MODEL`）。需在 `stack.env` 配齐 `VLM_API_KEY` 与 `FRP_*`（见 `stack.env.example`）。
-  - VLM 服务端正源在 **odyss-models 仓 `deploy/gcp-g4/`**（勿复制，改动走该仓 PR + 其 `deploy.sh` 部署）。
+- **real**：chunk（`chunk_inhouse`）与整餐都直连本机 vLLM（宿主 `vllm serve :8000`，栈内经 `http://172.23.0.1:8000/v1`——docker 自定义网桥网关直达宿主；模型见 `manifest.env` 的 `VLM_MODEL`）。需在 `stack.env` 配 `VLM_API_KEY`（见 `stack.env.example`）。
+  - VLM=宿主 vllm serve（本机 RTX Pro 6000），暂无仓内部署单元，待沉淀；原 frp 隧道接远端 GCP g4 的链路已废弃。
   - ⚠️ **模型名对齐契约**（2026-07-31 起取代旧「别名契约」）：odyss-services（ifa）workflow YAML 的 chunk 与 meal 节点均直接写 `VLM_MODEL` 真名，须与 vLLM 的 `--served-model-name` 一致，否则分析 404；切模型时 services YAML 与 serve 侧同步改。serve 侧的 `gemini-3.1-pro-preview` 别名仅为旧二进制回滚兼容保留。
 
 ## 阶段 A：制作离线包（有公网的开发机）
@@ -103,13 +102,13 @@ docker exec odyss-local-postgres psql -U odyss -d odyss_services \
 
 ### 5090 演示机（孤本栈）的增量更新
 
-5090 的 `~/odyss-services-ifa` 是标准化之前的手工孤本（见 `MANAGEMENT.md` §5），走不了上面的 bundle 流程。ifa 分支有新代码时用：
+5090 的 `~/odyss-services-ifa` 是标准化之前的手工孤本（见 `MANAGEMENT.md` §5；「5090」沿用主机称谓，显卡已换 RTX Pro 6000 96GB），走不了上面的 bundle 流程。ifa 分支有新代码时用：
 
 ```bash
 ./stack deploy-5090     # 校验两仓在 ifa tip → 本机构建 → 建镜像 → migrate → 只重建 services/llm-mock → 发 dist → 探活
 ```
 
-不在局域网时走 frp：`DEPLOY_TARGET=odyss-server-frpc ./stack deploy-5090`。
+不在局域网时走 frp：`DEPLOY_TARGET=odyss-server-frpc ./stack deploy-5090`（2026-08-21 现状：服务器暂无外网、frpc 断，此通道暂不可用，见仓根 `NETWORK.md` 双态说明）。
 
 ⚠️ 该栈的 pg/minio **没有命名卷**，数据在容器可写层里。所以更新只能用这个脚本（它对 compose 的每次调用都点名服务并带 `--no-deps`），**不要手敲 `docker compose up -d`**——按 depends_on 连带重建 postgres 就是清库。脚本每次部署前自动 `pg_dump -Fc` 留一份退路（滚动保留 3 份），dist 同样滚动备份 3 份。
 
@@ -118,4 +117,4 @@ docker exec odyss-local-postgres psql -U odyss -d odyss_services \
 - **安全边界**：18090/18091 仅应在局域网可达，不要做公网暴露；账号密码是唯一防线。`config/` 下渲染出的运行配置与 `stack.env` 含密钥，随备份妥善保管，均不入 git。
 - **FCM 推送、邮件、地理编码在闭环内均不可用**（配置已显式关闭/留空），对应功能静默降级。
 - 镜像版本 pin 在 `manifest.env`，离线环境不自动升级；升级 base 镜像改 manifest 后重做离线包。
-- real 模式断网时：chunk/meal 分析报错但设备连接、上传、历史数据不受影响；可随时切回 mock 模式。
+- real 模式已直连本机 vLLM，不依赖公网；宿主 vLLM 进程故障时 chunk/meal 分析报错，但设备连接、上传、历史数据不受影响，可随时切回 mock 模式。

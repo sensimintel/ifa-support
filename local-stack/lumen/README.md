@@ -25,6 +25,10 @@
 ./scripts/deploy-5090.sh             # rsync 到 5090 → 构建镜像 → compose up → 同步 superadmin 无状态文件
 ```
 
+> 部署目标即 5090 主机（沿用「5090」称谓，显卡已换 RTX Pro 6000 96GB）。脚本默认
+> `odyss@192.168.0.50`（现场目标态地址）；办公网双态下机器现用 `192.168.100.50`，
+> 用 `LUMEN_DEPLOY_TARGET=odyss@192.168.100.50` 覆盖，双态说明见仓根 `NETWORK.md`。
+
 目标机手动操作（等价于 deploy 脚本第 2 步，排障用）：
 
 ```bash

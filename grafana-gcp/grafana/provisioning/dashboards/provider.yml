@@ -1,5 +1,4 @@
-# Grafana 看板自动加载：从固定目录读 dashboards/*.json。
-# g4-vllm.json 复用自 odyss-models/deploy/gcp-g4 的 GCP 端看板（同一份，数据源 uid=prometheus）。
+# Grafana 看板自动加载：从固定目录读 dashboards/*.json（数据源统一 uid=prometheus，本机 9091）。
 apiVersion: 1
 providers:
   - name: g4-vllm

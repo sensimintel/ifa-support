@@ -21,9 +21,6 @@ STACK_LABEL="${STACK_LABEL:-本地栈}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@odyss.local}"
 ADMIN_PASSWORD="${ADMIN_PASSWORD:-Odyss@Local1}"
 API="http://127.0.0.1:18090/api/v1"
-COMPOSE_PROFILES=""
-[ "$LLM_MODE" = "real" ] && COMPOSE_PROFILES="real-vlm"
-export COMPOSE_PROFILES
 
 echo "== 1/7 校验前置（LLM_MODE=$LLM_MODE）"
 command -v docker >/dev/null || { echo "docker 不可用"; exit 1; }
@@ -31,9 +28,7 @@ docker compose version >/dev/null || { echo "docker compose 插件不可用"; ex
 [ -f artifacts/bin/odyss-services ] || { echo "artifacts 缺失（应从离线包解出或先 ./stack build）"; exit 1; }
 [ -d artifacts/superadmin-dist ] || { echo "superadmin dist 缺失（应从离线包解出或先 ./stack build）"; exit 1; }
 if [ "$LLM_MODE" = "real" ]; then
-  for v in VLM_API_KEY FRP_SERVER_ADDR FRP_SERVER_PORT FRP_TOKEN FRP_STCP_SERVER_NAME FRP_STCP_SECRET; do
-    [ -n "${!v:-}" ] || { echo "real 模式缺少 stack.env 配置项：$v（见 stack.env.example）"; exit 1; }
-  done
+  [ -n "${VLM_API_KEY:-}" ] || { echo "real 模式缺少 stack.env 配置项：VLM_API_KEY（见 stack.env.example）"; exit 1; }
 fi
 
 echo "== 2/7 导入 base 镜像（本机已有的自动跳过）"
@@ -88,21 +83,16 @@ fi
 
 echo "== 4/7 按 LLM_MODE 渲染运行配置"
 if [ "$LLM_MODE" = "real" ]; then
-  LLM_BASE_URL="http://llm-tunnel:28000/v1"
+  # 直连本机 vLLM（宿主 vllm serve :8000）：172.23.0.1 是 odyss-local-network
+  # 自定义网桥的网关地址，容器经它直达宿主，不再经任何隧道。
+  LLM_BASE_URL="http://172.23.0.1:8000/v1"
   LLM_API_KEY="$VLM_API_KEY"
   REALTIME_MODEL="$VLM_MODEL"
   MEAL_MODEL="$VLM_MODEL"
   CHUNK_MODEL="$VLM_MODEL"
   CHUNK_INHOUSE_ENABLED=true
-  sed -e "s|__FRP_SERVER_ADDR__|$FRP_SERVER_ADDR|" \
-      -e "s|__FRP_SERVER_PORT__|$FRP_SERVER_PORT|" \
-      -e "s|__FRP_TOKEN__|$FRP_TOKEN|" \
-      -e "s|__FRP_STCP_SERVER_NAME__|$FRP_STCP_SERVER_NAME|" \
-      -e "s|__FRP_STCP_SECRET__|$FRP_STCP_SECRET|" \
-      config/frpc-visitor.template.toml > config/frpc-visitor.toml
-  chmod 600 config/frpc-visitor.toml
-  echo "  real 模式：LLM 指向 llm-tunnel（$VLM_MODEL）；已渲染 frpc-visitor.toml"
-  echo "  ⚠️ services(ifa) workflow YAML 的 chunk/meal 模型名均为 $VLM_MODEL，须与远端 vLLM served-model-name 一致，否则分析 404"
+  echo "  real 模式：LLM 直连本机 vLLM $LLM_BASE_URL（$VLM_MODEL）"
+  echo "  ⚠️ services(ifa) workflow YAML 的 chunk/meal 模型名均为 $VLM_MODEL，须与本机 vLLM served-model-name 一致，否则分析 404"
 else
   LLM_BASE_URL="http://llm-mock:8081/v1"
   LLM_API_KEY="local-mock-key"
@@ -110,8 +100,6 @@ else
   MEAL_MODEL="local-mock-meal-v1"
   CHUNK_MODEL="local-mock-chunk-v1"
   CHUNK_INHOUSE_ENABLED=false
-  # 残留的 real 模式渲染物清掉，防误用
-  rm -f config/frpc-visitor.toml
 fi
 sed -e "s|__PASSWORD_KEY_B64__|$PASSWORD_KEY_B64|" \
     -e "s|__TOKEN_SECRET__|$TOKEN_SECRET|" \

@@ -823,7 +823,7 @@
     {
       "id": 16,
       "type": "row",
-      "title": "GPU (RTX 5090)",
+      "title": "GPU (RTX Pro 6000 Blackwell 96GB)",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -1726,7 +1726,7 @@
     "to": "now"
   },
   "timezone": "browser",
-  "title": "5090 服务器性能",
+  "title": "5090 服务器性能（RTX Pro 6000）",
   "uid": "gpu5090-server",
   "version": 1,
   "weekStart": ""

@@ -32,7 +32,7 @@ BUILD_CTX="/tmp/odyss-services-build-ctx"
 STAMP="$(date +%Y%m%d-%H%M)"
 IMAGE="odyss-services:ifa"
 
-# 本脚本只重建这两个无状态容器；postgres/redis/minio/llm-switch/llm-tunnel 一律不碰
+# 本脚本只重建这两个无状态容器；postgres/redis/minio/llm-switch 一律不碰
 RECREATE_SERVICES="odyss-services llm-mock"
 
 echo "== 1/6 校验本地仓停在 ${SERVICES_REF} tip"

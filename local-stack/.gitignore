@@ -6,5 +6,4 @@ backups/
 stack.env
 config/runtime-config.yaml
 config/secrets.env
-config/frpc-visitor.toml
 config/superadmin-runtime-config.json

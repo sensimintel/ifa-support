@@ -1,6 +1,6 @@
 # 展会网络方案与公司内模拟（现场网络）
 
-本文管演示现场的**网络形态**：展会目标拓扑、在公司如何 1:1 模拟、以及为什么网段不能随便改。部署与编排纪律见 [`MANAGEMENT.md`](MANAGEMENT.md)，服务探活见 [`tools/health/README.md`](tools/health/README.md)。
+本文管演示现场的**网络形态**：展会目标拓扑、在公司如何 1:1 模拟、以及为什么网段不能随便改。部署与编排纪律见 [`MANAGEMENT.md`](MANAGEMENT.md)，服务探活见 [`tools/health/README.md`](tools/health/README.md)。文中「5090」沿用主机称谓（显卡已换 RTX Pro 6000 96GB），不影响网络方案。
 
 ## 1. 结论先行
 
@@ -44,6 +44,8 @@ mac mini（浅体验区相机帧源，见 [`mac-mini/README.md`](mac-mini/README
 开发机与演示手机没有这个约束，走 DHCP 即可。
 
 > **历史沿革**：秤在 2026-08-05 先被改到 `192.168.100.80/24`（当时视为过渡状态）；2026-08-21 网段迁移后，`192.168.100.80` 就是目标状态，**不再改回** `192.168.0.80`。通用教训依旧有效：改秤的地址要趁它的 web 还够得着——**先改 IP、再动网络拓扑**，否则静态地址与所在网段错位后它就成了孤岛，只能拿台电脑改成同网段直连才能救。
+>
+> 另注（2026-08-21 现状）：服务器**当前无外网**（VLAN40 transit 对端 `172.22.40.1` 未通），frpc 公网中转与 g4 隧道全断；涉及出网的验证项与 frp 通道在恢复前均不可用。
 
 ## 3.1 跨网段访问的首包延迟（会伪装成"秤离线"）
 
@@ -66,7 +68,6 @@ mac mini（浅体验区相机帧源，见 [`mac-mini/README.md`](mac-mini/README
 | 位置 | 影响 |
 |---|---|
 | `local-stack/superadmin/superadmin.conf` 的 `proxy_pass http://192.168.100.50:8070` | superadmin 深体验区反代 dx-backend，不改即 504 |
-| `tools/qwen_tunnel_keeper.py`（`TUNNEL_APP` 与 ssh 目标） | 开发机 launchd 常驻的 Qwen 隧道守护会失效 |
 | `local-stack/lumen/scripts/deploy-5090.sh` | 部署目标，可用环境变量 `LUMEN_DEPLOY_TARGET` 覆盖 |
 | `dx_backend.py` 的 `SCALE_HOST` | 秤地址 |
 | **手机 App 的 `IMAGE_RELAY_URL`** | **最贵**：由 `react-native-config` 从 `.env` 读、**编译进 App**，改地址必须重跑 ios-build 并重新装机 |
@@ -108,6 +109,7 @@ for p in 22 18090 18091 8060 8070 3001 8000; do
 done
 
 # 6. 外网通路（5090 侧，DNS 与出网一起验）
+#    注：2026-08-21 现状服务器无外网（VLAN40 transit 未通），外网通路恢复前本项不通
 ssh odyss@192.168.100.50 'curl -s -o /dev/null -w "%{http_code}\n" -m 8 https://www.google.com/generate_204'
 
 # 7. 浅体验区相机帧源（mac mini 推帧器，应列出 macmini-g335 / macmini-astra）

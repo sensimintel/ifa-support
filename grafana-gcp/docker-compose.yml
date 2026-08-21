@@ -1,6 +1,6 @@
-# 本机统一 Grafana（同时消费 5090 本机 Prometheus 与经 frp 隧道来的 g4-01 Prometheus）。
+# 本机统一 Grafana（唯一数据源 = 本机 Prometheus 127.0.0.1:${LOCAL_PROM_PORT}）。
 # network_mode: host——Grafana 直接绑 0.0.0.0:${GRAFANA_PORT}（局域网 IP 可访问），
-# 且共享宿主 loopback，能直接读 127.0.0.1:${LOCAL_PROM_PORT}（本机 Prom）与 127.0.0.1:${G4_PROM_LOCAL_PORT}（隧道落地）。
+# 且共享宿主 loopback，能直接读 127.0.0.1:${LOCAL_PROM_PORT}（本机 Prometheus）。
 # ⚠️ host 网络仅 Linux 有效；host 模式下 ports: 被忽略，端口由 GF_SERVER_HTTP_PORT 决定。
 services:
   grafana:
@@ -16,12 +16,11 @@ services:
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_ANALYTICS_REPORTING_ENABLED=false
       - GF_ANALYTICS_CHECK_FOR_UPDATES=false
-      # 局域网内看板免登录浏览(只读 Viewer)，对标 locateanything grafana；admin 仍需密码
+      # 局域网内看板免登录浏览(只读 Viewer)；admin 仍需密码
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
       # 供数据源 provisioning 插值
       - LOCAL_PROM_PORT=${LOCAL_PROM_PORT:-9091}
-      - G4_PROM_LOCAL_PORT=${G4_PROM_LOCAL_PORT:-29090}
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro

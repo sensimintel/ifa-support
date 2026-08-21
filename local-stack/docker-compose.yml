@@ -1,8 +1,8 @@
 # Odyss 全栈本地化栈：services + superadmin + 全部存储，局域网闭环运行。
 # 第一性：拉起后不依赖任何公网访问——镜像离线导入、存储全部落本机命名卷。
-# LLM 两种模式（由 ./stack 依 stack.env 注入 COMPOSE_PROFILES）：
-#   mock（默认）    ：chunk/meal 全走栈内 llm-mock，零外部依赖
-#   real（profile real-vlm）：起 llm-tunnel（frp stcp visitor）接远端真实 VLM
+# LLM 两种模式（由 stack.env 的 LLM_MODE 决定，bootstrap 渲染配置时切换）：
+#   mock（默认）：chunk/meal 全走栈内 llm-mock，零外部依赖
+#   real        ：直连本机 vLLM（172.23.0.1:8000，docker 网关直达宿主），无需任何隧道容器
 # 镜像 tag 一律 ${IMG_*} 取 manifest.env（./stack 统一注入）；默认值与 manifest 同步，
 # 仅兜底裸跑 docker compose 的场景。
 name: odyss-local-stack
@@ -86,19 +86,6 @@ services:
     networks:
       - odyss-local-net
 
-  # real 模式专属：远端 vLLM 的 frp stcp visitor，栈内经 http://llm-tunnel:28000 访问。
-  # 做成栈内容器而非宿主端口：宿主防火墙（如 5090 的 INPUT policy DROP）不影响容器互访。
-  # frpc-visitor.toml 由 bootstrap 从模板渲染（密钥来自 stack.env，不入库）。
-  llm-tunnel:
-    image: ${IMG_FRPC:-snowdreamtech/frpc:0.61.1}
-    container_name: odyss-local-llm-tunnel
-    restart: unless-stopped
-    profiles: ["real-vlm"]
-    volumes:
-      - ./config/frpc-visitor.toml:/etc/frp/frpc.toml:ro
-    networks:
-      - odyss-local-net
-
   migrate:
     image: odyss-services:local
     container_name: odyss-local-migrate
@@ -116,7 +103,8 @@ services:
     container_name: odyss-local-services
     restart: unless-stopped
     # workers 默认开启：outbox/realtime/delivery 全量运行，实时分析链路可用。
-    # mock 模式 chunk 走 llm-mock（chunk_inhouse gate 关闭），real 模式走 llm-tunnel。
+    # mock 模式 chunk 走 llm-mock（chunk_inhouse gate 关闭），real 模式直连本机 vLLM
+    # （172.23.0.1:8000，docker 自定义网桥网关直达宿主）。
     command: ["/app/odyss-services", "-config", "/app/runtime-config.yaml"]
     ports:
       - "18090:8080"
