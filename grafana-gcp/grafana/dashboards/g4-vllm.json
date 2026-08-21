@@ -14,7 +14,7 @@
       "description": "取自 counter 的耗时累积量而非瞬时 gauge。按 Little's law, rate(耗时_sum[1m]) = 该 1 分钟内的平均并发请求数(单位: 个)。\n\n不要改回 vllm:num_requests_running / num_requests_waiting 这两个瞬时 gauge: 上游是每 30s 一批的定时请求、每批只忙 1~3s, 瞬时 gauge 的稀疏采样会系统性漏掉 burst(vllm job 现为 5s 抓取, 有所缓解但仍可能漏 1~3s 的批)。counter 是累积量, 不受采样相位影响。",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -54,7 +54,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:request_inference_time_seconds_sum[1m]))",
           "legendFormat": "{{model_name}} · 推理中(均)"
@@ -63,7 +63,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:request_queue_time_seconds_sum[1m]))",
           "legendFormat": "{{model_name}} · 排队中(均)"
@@ -76,7 +76,7 @@
       "title": "吞吐: 生成 / prefill tok/s",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -116,7 +116,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:generation_tokens_total[1m]))",
           "legendFormat": "{{model_name}} · 生成 tok/s"
@@ -125,7 +125,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:prompt_tokens_total[1m]))",
           "legendFormat": "{{model_name}} · prefill tok/s"
@@ -138,7 +138,7 @@
       "title": "完成请求 req/s",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -178,7 +178,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:request_success_total[1m]))",
           "legendFormat": "{{model_name}} · req/s"
@@ -191,7 +191,7 @@
       "title": "TTFT p50/p90/p99",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -231,7 +231,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.5, sum by(le, model_name) (rate(vllm:time_to_first_token_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · p50"
@@ -240,7 +240,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.9, sum by(le, model_name) (rate(vllm:time_to_first_token_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · p90"
@@ -249,7 +249,7 @@
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.99, sum by(le, model_name) (rate(vllm:time_to_first_token_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · p99"
@@ -263,7 +263,7 @@
       "description": "decode(解码/生成)阶段的逐 token 延时, 只覆盖「首 token 之后」的吐字过程, 不含排队与 prefill\n(那两段分别看「排队等待」「TTFT」面板)。\n\n两条口径故意并列, 语义不同, 勿只留其一:\n- ITL(inter_token_latency): 相邻两个输出 token 的实际间隔, decode 每步都记一条, 是「实时抖动」视角,\n  请求进行中就有数据; 并发升高/被抢占时最先反映在 p90-p99 上。\n- TPOT(request_time_per_output_token): 单个请求的 decode 总时长 ÷ 该请求输出 token 数, 是「整条请求平均」视角,\n  只在请求结束时记一条, 因此长请求会有滞后, burst 结束后才补上。\n\n读数注意(重要): 直方图桶上界虽到 80s, 但本机 decode 实测样本几乎全落在最低那档(le=0.01), 后续桶边界是\n0.025/0.05/0.075/0.1。histogram_quantile 在桶内做线性插值, 样本全挤在第一档时 p50/p90 只会给出\n0.005/0.009 这类「档内均匀分布」的假象值, 不是真实分位。因此常态下以 ITL 均值 / TPOT 均值 为准,\n分位线只用来看「有没有跨档恶化」(如 p99 抬到 0.025 甚至 0.05 档), 那才是真信号。",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -303,7 +303,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.5, sum by(le, model_name) (rate(vllm:inter_token_latency_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · ITL p50"
@@ -312,7 +312,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.9, sum by(le, model_name) (rate(vllm:inter_token_latency_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · ITL p90"
@@ -321,7 +321,7 @@
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.99, sum by(le, model_name) (rate(vllm:inter_token_latency_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · ITL p99"
@@ -330,7 +330,7 @@
           "refId": "D",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:inter_token_latency_seconds_sum[1m])) / sum by(model_name) (rate(vllm:inter_token_latency_seconds_count[1m]))",
           "legendFormat": "{{model_name}} · ITL 均值"
@@ -339,7 +339,7 @@
           "refId": "E",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:request_time_per_output_token_seconds_sum[1m])) / sum by(model_name) (rate(vllm:request_time_per_output_token_seconds_count[1m]))",
           "legendFormat": "{{model_name}} · TPOT 均值(每请求)"
@@ -353,7 +353,7 @@
       "description": "decode 输出速度 = 每秒吐出多少 token, 即上面 decode 延时的倒数, 用来直接回答「模型说话有多快」。\n\n- 单请求均速 = rate(ITL_count) / rate(ITL_sum) = 1 / ITL 均值, 表示「一个请求自己感受到的 tok/s」,\n  是用户/上游 SSE 端感知的吐字速度。\n- p50 速度 / 慢尾速度分别取 ITL 的 p50 与 p90 求倒数。注意 1/x 单调递减, 所以\n  1/(延时 p90) 对应的是「速度 p10」即慢的那一端, 不要读成「速度 p90」。\n- 整机合计 = rate(vllm:generation_tokens_total), 是全部并发请求的 decode token 之和(与「吞吐」面板同源),\n  放在同图是为了对照: 并发上来时整机合计上涨、单请求均速下降, 二者背离即说明 GPU 已在分摊算力。\n\n低负载时「整机合计」低于「单请求均速」是正常的: 整机合计按墙钟时间摊薄(含没有请求的空闲秒),\n单请求均速只在真正 decode 的时刻计。并发 >1 之后整机合计才会超过单请求均速。\n\np50/慢尾两条同样受直方图分档限制(见左侧延时面板的读数注意), 常态下以「单请求均速」为准。\n单位是 tok/s(Grafana 无内置 token 速率单位, 故不设 unit, 直接看数值)。",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -393,7 +393,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:inter_token_latency_seconds_count[1m])) / sum by(model_name) (rate(vllm:inter_token_latency_seconds_sum[1m]))",
           "legendFormat": "{{model_name}} · 单请求均速"
@@ -402,7 +402,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "1 / histogram_quantile(0.5, sum by(le, model_name) (rate(vllm:inter_token_latency_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · p50 速度"
@@ -411,7 +411,7 @@
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "1 / histogram_quantile(0.9, sum by(le, model_name) (rate(vllm:inter_token_latency_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · 慢尾速度(=1/ITL p90)"
@@ -420,7 +420,7 @@
           "refId": "D",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:generation_tokens_total[1m]))",
           "legendFormat": "{{model_name}} · 整机合计"
@@ -434,7 +434,7 @@
       "description": "请求级(整条请求)的 decode 段总时长: 从首 token 产出到最后一个 token 结束的墙钟耗时,\n不含排队与 prefill。与上一行「逐 token(ITL)」的区别是口径不是「每个 token」而是「整条请求」——\ndecode 总时长 ≈ 该请求输出 token 数 × TPOT, 所以它同时被「回答多长」和「吐字多快」两件事驱动。\n\n右轴叠了「每请求输出 token 数均值」正是为了拆这两个因子: 总时长涨而 token 数不涨 = 真的变慢(看 ITL 面板);\n总时长涨且 token 数同步涨 = 只是回答变长了, 不是性能退化。\n\n本指标只在请求结束时记一条, 因此进行中的长请求不体现, burst 结束后才补上。\n桶边界 0.3/0.5/0.8/1/1.5/2/2.5/5/10/15/20/30…s, 分档比 ITL 密, 分位数可当量级读(但仍是桶内插值估计)。",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -509,7 +509,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.5, sum by(le, model_name) (rate(vllm:request_decode_time_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · decode 总时长 p50"
@@ -518,7 +518,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.9, sum by(le, model_name) (rate(vllm:request_decode_time_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · decode 总时长 p90"
@@ -527,7 +527,7 @@
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.99, sum by(le, model_name) (rate(vllm:request_decode_time_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · decode 总时长 p99"
@@ -536,7 +536,7 @@
           "refId": "D",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:request_decode_time_seconds_sum[1m])) / sum by(model_name) (rate(vllm:request_decode_time_seconds_count[1m]))",
           "legendFormat": "{{model_name}} · decode 总时长 均值"
@@ -545,7 +545,7 @@
           "refId": "E",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:request_generation_tokens_sum[1m])) / sum by(model_name) (rate(vllm:request_generation_tokens_count[1m]))",
           "legendFormat": "{{model_name}} · 输出 token 数 均值(右轴)"
@@ -559,7 +559,7 @@
       "description": "把「一条请求从进来到结束」按 vLLM 自己的分段拆开, 全部取均值(rate(_sum)/rate(_count)), 一眼看清耗时花在哪:\n- 排队 queue: 请求进来到被调度进 batch 的等待, 涨说明并发打满/被限流。\n- prefill: 处理输入(含多模态图像 token)的一次性前向, 图越多越大它越高。\n- decode: 逐 token 生成阶段总耗时(与左侧面板同源)。\n- e2e(对照): 端到端总时长。近似关系 e2e ≈ 排队 + prefill + decode, 差值是引擎内的杂项开销\n  (调度、detokenize、多模态预处理等), 不必强求三段严格相加等于 e2e。\n\n用法: 看哪一段占大头再决定优化方向——排队高→加并发/扩容; prefill 高→降图数/分辨率或开前缀缓存;\ndecode 高→看是输出太长还是单 token 太慢(左侧面板的右轴 token 数)。",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -599,7 +599,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:request_queue_time_seconds_sum[1m])) / sum by(model_name) (rate(vllm:request_queue_time_seconds_count[1m]))",
           "legendFormat": "{{model_name}} · 排队"
@@ -608,7 +608,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:request_prefill_time_seconds_sum[1m])) / sum by(model_name) (rate(vllm:request_prefill_time_seconds_count[1m]))",
           "legendFormat": "{{model_name}} · prefill"
@@ -617,7 +617,7 @@
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:request_decode_time_seconds_sum[1m])) / sum by(model_name) (rate(vllm:request_decode_time_seconds_count[1m]))",
           "legendFormat": "{{model_name}} · decode"
@@ -626,7 +626,7 @@
           "refId": "D",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "sum by(model_name) (rate(vllm:e2e_request_latency_seconds_sum[1m])) / sum by(model_name) (rate(vllm:e2e_request_latency_seconds_count[1m]))",
           "legendFormat": "{{model_name}} · e2e(对照)"
@@ -639,7 +639,7 @@
       "title": "端到端延时 p50/p90/p99",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -679,7 +679,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.5, sum by(le, model_name) (rate(vllm:e2e_request_latency_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · p50"
@@ -688,7 +688,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.9, sum by(le, model_name) (rate(vllm:e2e_request_latency_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · p90"
@@ -697,7 +697,7 @@
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.99, sum by(le, model_name) (rate(vllm:e2e_request_latency_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · p99"
@@ -710,7 +710,7 @@
       "title": "排队等待 p50/p99",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -750,7 +750,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.5, sum by(le, model_name) (rate(vllm:request_queue_time_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · p50"
@@ -759,7 +759,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.99, sum by(le, model_name) (rate(vllm:request_queue_time_seconds_bucket[1m])))",
           "legendFormat": "{{model_name}} · p99"
@@ -772,7 +772,7 @@
       "title": "KV cache 占用率 + 绝对量",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -829,7 +829,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "avg_over_time(vllm:kv_cache_usage_perc[$__interval])",
           "interval": "1m",
@@ -839,7 +839,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "avg_over_time(vllm:kv_cache_usage_perc[$__interval]) * 51.11 * 1024 * 1024 * 1024",
           "interval": "1m",
@@ -854,7 +854,7 @@
       "title": "GPU 利用率",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -938,7 +938,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "avg_over_time(nvidia_smi_utilization_gpu_ratio[$__interval])",
           "interval": "1m",
@@ -948,7 +948,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "max_over_time(nvidia_smi_utilization_gpu_ratio[$__interval])",
           "interval": "1m",
@@ -963,7 +963,7 @@
       "title": "GPU 显存占用",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -1003,7 +1003,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "nvidia_smi_memory_used_bytes",
           "legendFormat": "used"
@@ -1012,7 +1012,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "nvidia_smi_memory_total_bytes",
           "legendFormat": "total"
@@ -1026,7 +1026,7 @@
       "title": "GPU 功耗 / 温度",
       "datasource": {
         "type": "prometheus",
-        "uid": "g4-01-prometheus"
+        "uid": "prometheus"
       },
       "gridPos": {
         "h": 8,
@@ -1155,7 +1155,7 @@
           "refId": "A",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "avg_over_time(nvidia_smi_power_draw_watts[$__interval])",
           "interval": "1m",
@@ -1165,7 +1165,7 @@
           "refId": "B",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "avg_over_time(nvidia_smi_temperature_gpu[$__interval])",
           "interval": "1m",
@@ -1175,7 +1175,7 @@
           "refId": "C",
           "datasource": {
             "type": "prometheus",
-            "uid": "g4-01-prometheus"
+            "uid": "prometheus"
           },
           "expr": "max_over_time(nvidia_smi_power_draw_watts[$__interval])",
           "interval": "1m",
@@ -1200,7 +1200,7 @@
   },
   "timepicker": {},
   "timezone": "Asia/Shanghai",
-  "title": "g4-01 · Qwen vLLM & GPU",
+  "title": "5090 · Qwen vLLM & GPU (本机)",
   "uid": "g4-01",
   "version": 1,
   "weekStart": ""
