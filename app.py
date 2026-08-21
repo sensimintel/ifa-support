@@ -4062,6 +4062,11 @@ if _recog_target not in RECOG_TARGETS or not RECOG_TARGETS[_recog_target]["endpo
     _recog_target = "qwen"   # 非法或未配置的默认目标一律回退 qwen（与历史行为一致）
 RECOG_MIN_INTERVAL = float(os.environ.get("RECOG_MIN_INTERVAL", "4.0"))  # 两次识别最小间隔(秒)，节流防刷屏
 RECOG_TIMEOUT = 30.0
+# 识别触发整轮周期下限（秒）：一轮 = 一次 SAM3 门控（词表 2 个词 = 2 个请求）+ 至多一次
+# VLM，1s 下限即 SAM3 ≤2 qps、VLM ≤1 qps。关思考后识别只要 ~0.2s/轮，仅靠 interval_s(0.2)
+# 节拍会空转到 SAM3 ~6 qps（空桌上 SAM3 误触发、VLM 秒答空数组也拦不住节奏），白烧
+# 每轮 ~3900 token 的 prefill 与门控算力，日志也被灌满。
+RECOG_MIN_CYCLE_S = float(os.environ.get("RECOG_MIN_CYCLE_S", "1.0"))
 # 流式返回：开=stream=true 逐块收 SSE。收满才建卡的链路不变，但能把 http 段拆成
 # 「网络往返+prefill」(ttft) 与「decode」两截——之前这两截混在一个 http_ms 里，
 # 「这轮慢是慢在传图还是慢在生成」只能靠猜。出问题设 RECOG_STREAM=0 立刻回非流式。
@@ -5172,7 +5177,9 @@ def _recog_direct_loop():
             print(f"[da3-web] 直传识别触发异常（已忽略）：{msg}", flush=True)
             time.sleep(1.0)
             continue
-        time.sleep(max(0.05, _recog_direct.interval_s()))
+        # 节流：从拿起帧（_t）起算整轮周期，不足 RECOG_MIN_CYCLE_S 补齐——上限 qps 见常量注释
+        time.sleep(max(0.05, _recog_direct.interval_s(),
+                       RECOG_MIN_CYCLE_S - (time.time() - _t)))
 
 
 threading.Thread(target=_recog_direct_loop, daemon=True, name="recog-direct").start()
