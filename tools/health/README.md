@@ -65,7 +65,7 @@ ssh odyss-server-frpc 'bash -s' < tools/health/check.sh
 for p in 18090 18091 8060 3001; do nc -z -G 3 192.168.100.50 $p && echo "$p 通" || echo "$p 不通"; done
 ```
 
-不通且服务器侧 OK → 补 ufw 放行（仅限所在局域网网段，办公网 192.168.100.0/24 / 现场 192.168.0.0/24，照现有模式）：
+不通且服务器侧 OK → 补 ufw 放行（演示网网段 192.168.100.0/24，照现有模式）：
 
 ```bash
 sudo ufw allow from 192.168.100.0/24 to any port <端口> proto tcp comment "<用途> LAN"
