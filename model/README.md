@@ -4,7 +4,7 @@
 
 **第一性目标**：在一台「稳定、有外网、显存足够」的新服务器上，凭本目录 + 本仓根目录，
 一次性拉起所有模型、对应服务 gateway 与全部依赖，复刻 5090 现网的完整演示栈。
-（「5090」沿用主机称谓；显卡已于 2026-08 换为 **RTX Pro 6000 Blackwell 96GB**，不做全文改名。）
+（「5090」沿用主机称谓；2026-08-24 起双卡：**RTX Pro 6000 Blackwell 96GB（独占 vLLM）+ RTX 5090 32GB（SAM3/DA3）**，不做全文改名。）
 
 ## 架构与端口
 
@@ -26,15 +26,17 @@
   **例外：`facebook/sam3` 是 gated 仓，必须官方源 + `HF_TOKEN`**，镜像上没有）
 - 磁盘：权重合计约 18GB（DA3 nested giant ~13GB、sam3.pt 3.45GB）+ 各 venv 若干 GB
 
-## 显存预算（RTX Pro 6000 96GB 现网口径）
+## 显存预算（2026-08-24 起双卡现网口径）
 
-| 服务 | 显存 | 控制手段 |
-|---|---|---|
-| 本机 vLLM（`:8000`，Qwen3.6-35B-A3B-FP8，不在本目录管理） | ~64G | `gpu-memory-utilization 0.73` |
-| DA3（app.py 进程内） | ~9.2G（换卡前实测，换卡后待复测） | `process_res` 越高越吃 |
-| SAM3 | 实占 ~4.2G，预算约 9G | `SAM3_MEM_FRACTION`（原按 32G 基数取 0.28≈9G，换卡后上限随 96G 基数变化，具体待实测）；流式窗口 `window` 控瞬时占用 |
+双卡布局：GPU0 = RTX Pro 6000 Blackwell 96GB **独占给 vLLM**；GPU1 = RTX 5090 32GB 归 SAM3 + DA3。三个 unit 都在 systemd 里用 `CUDA_VISIBLE_DEVICES=<GPU UUID>` 钉卡（UUID 而非 index：CUDA 默认枚举是「最快卡优先」，重启后 index 不保证稳定），任何重启都各归各卡。
 
-96GB 下 vLLM ~64G + SAM3 ~9G 之外余量充足，旧「32G 紧张 / OOM 风险」口径作废；上述调参开关保留，仅在极端情况下需要动。
+| 服务 | 落卡 | 显存 | 控制手段 |
+|---|---|---|---|
+| 本机 vLLM（`:8000`，Qwen3.6-35B-A3B-FP8，不在本目录管理） | GPU0 Pro 6000（`GPU-5938e8ce…`） | ~86G | `gpu-memory-utilization 0.90`（独占卡口径） |
+| SAM3 | GPU1 RTX 5090（`GPU-565f6e8d…`） | 实占 ~7G，上限 0.9×31.8G≈28.6G | `SAM3_MEM_FRACTION=0.9`（按可见卡基数）；流式窗口 `window` 控瞬时占用 |
+| DA3（app.py 进程内，懒加载） | GPU1 RTX 5090（同上） | 峰值 ~8.6G@process_res=504 | `process_res` 越高越吃；不为其预留（显存不足任其失败，OOM 时调低重试） |
+
+GPU1 上 SAM3 常态 ~7G + DA3 峰值 ~8.6G，32G 内互不影响；SAM3 上限 0.9 是隔离兜底而非预留。旧「96G 单卡共享」与更早的「32G 紧张 / OOM 风险」口径均作废。
 
 ## 拉起顺序（新机器从零）
 

@@ -45,6 +45,6 @@ bash down.sh              # 停
 - `grafana/provisioning/datasources/prometheus.yml`：唯一数据源（本机 Prometheus 9091），并幂等清理历史 g4-01 数据源。
 - `grafana/dashboards/`：
   - `g4-vllm.json`：**本机 Qwen vLLM** 看板（宿主 `vllm serve :8000`，vLLM 指标经本机 Prometheus）。
-  - `gpu5090-server.json`：5090 服务器性能（CPU/内存/GPU/温度/磁盘/网络；GPU 现为 **RTX Pro 6000 Blackwell 96GB**），依赖 odyss-models `deploy/gpu5090` 栈里的 node_exporter + gpu-exporter。
+  - `gpu5090-server.json`：5090 服务器性能（CPU/内存/GPU/温度/磁盘/网络；GPU 现为双卡 **RTX Pro 6000 Blackwell 96GB（vLLM）+ RTX 5090 32GB（SAM3/DA3）**，面板会出两张卡的曲线），依赖 odyss-models `deploy/gpu5090` 栈里的 node_exporter + gpu-exporter。
   - `sam3.json`：SAM3 服务看板。
 - `up.sh` / `down.sh`：一步拉起 / 停。

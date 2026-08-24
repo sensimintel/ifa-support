@@ -70,6 +70,26 @@ need_pid_match() { # $1=unit $2=端口 $3=组件标签
   fi
 }
 
+# ---- 双卡落位（2026-08-24 起）：GPU0=RTX PRO 6000 96G 独占 vLLM；GPU1=RTX 5090 32G 归 SAM3/DA3 ----
+GPU_PRO6000="GPU-5938e8ce-154b-31e1-f5c6-2aa6cbe73fc6"   # RTX PRO 6000 Blackwell 96G
+GPU_RTX5090="GPU-565f6e8d-550f-38cf-56d1-fe49fb280b05"   # RTX 5090 32G
+# unit 的 GPU 计算进程必须落在期望卡上（拿 nvidia-smi compute-apps 的 pid 反查所属 systemd unit）。
+# $4=lazy 表示该 unit 的模型是懒加载：暂无 GPU 进程不算异常
+need_gpu_place() { # $1=unit $2=期望UUID $3=组件标签 $4=可选lazy
+  local found=0 wrong="" pid uuid u
+  while IFS=, read -r pid uuid; do
+    pid=$(tr -dc 0-9 <<<"$pid"); uuid=$(tr -d ' ' <<<"$uuid")
+    [ -n "$pid" ] || continue
+    u=$(ps -o unit= -p "$pid" 2>/dev/null | tr -d ' ')
+    [ "$u" = "$1.service" ] || continue
+    if [ "$uuid" = "$2" ]; then found=1; else wrong="$uuid"; fi
+  done < <(nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv,noheader 2>/dev/null)
+  if [ -n "$wrong" ]; then say FAIL "$3" "GPU 进程落在 $wrong，期望 $2——查该 unit 的 CUDA_VISIBLE_DEVICES 后 daemon-reload + restart"
+  elif [ "$found" = 1 ]; then say OK "$3" "已落在期望卡（$2）"
+  elif [ "${4:-}" = lazy ]; then say INFO "$3" "该 unit 暂无 GPU 计算进程（懒加载未触发，属正常）"
+  else say FAIL "$3" "该 unit 无 GPU 计算进程——模型没真正加载上卡？"; fi
+}
+
 # ---------------- D. 底座 ----------------
 if docker info >/dev/null 2>&1; then say OK "底座/docker" "daemon 可用"
 else say FAIL "底座/docker" "daemon 不可用——后续容器检查全部失效"; fi
@@ -80,7 +100,7 @@ need_systemd frpc "底座/frp公网入口"
 disk=$(df --output=pcent / 2>/dev/null | tail -1 | tr -dc 0-9)
 if [ -n "$disk" ] && [ "$disk" -ge 90 ]; then say WARN "底座/磁盘" "根分区已用 ${disk}%"
 else say OK "底座/磁盘" "根分区已用 ${disk:-?}%"; fi
-say INFO "底座/显存" "$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader 2>/dev/null | head -1 || echo 未知)"
+say INFO "底座/显存" "$(nvidia-smi --query-gpu=name,memory.used,memory.total --format=csv,noheader 2>/dev/null | paste -sd '；' - || echo 未知)"
 say INFO "底座/负载" "$(uptime 2>/dev/null | sed 's/.*load average/load average/' || echo 未知)"
 
 # ---------------- A. 业务闭环（local-stack 孤本 ~/odyss-services-ifa） ----------------
@@ -121,6 +141,7 @@ need_http "业务/lumen接口" "http://127.0.0.1:18091/lumen/api/health" '^200$'
 # 本机 VLM：宿主裸进程 vllm serve（/home/odyss/vllm-env，0.0.0.0:8000，随开机启动）。
 # 带 api-key：未带 key 探 /v1/models 可能 401，200/401 都算活。
 need_http "业务/本机vLLM" "http://127.0.0.1:8000/v1/models" '^(200|401)$'
+need_gpu_place vllm "$GPU_PRO6000" "业务/vLLM落卡"
 # VLM 深链：从栈内网络经 docker 网关 172.23.0.1 直探宿主 vLLM（HTTP 4xx 也算活：仅说明未带 key）
 NET=$(docker inspect odyss-ifa-services -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' 2>/dev/null || true)
 if [ -n "${NET:-}" ]; then
@@ -139,9 +160,11 @@ need_systemd da3-web "演示/da3-web"
 # 根路径现为 307 → /experience，200 与 30x 都算活
 need_http "演示/da3-web页面" "http://127.0.0.1:8060/" '^(200|30[0-9])$'
 need_pid_match da3-web 8060 "演示/da3-web漂移"
+need_gpu_place da3-web "$GPU_RTX5090" "演示/DA3落卡" lazy
 need_systemd sam3 "演示/SAM3"
 ss -tln 2>/dev/null | grep -q ':8013 ' && say OK "演示/SAM3端口" "8013 在监听" || say FAIL "演示/SAM3端口" "8013 未监听"
 need_pid_match sam3 8013 "演示/SAM3漂移"
+need_gpu_place sam3 "$GPU_RTX5090" "演示/SAM3落卡"
 # mac-mini 帧链路：cam-pusher（192.168.100.3，LaunchDaemon）持续推帧到 8060，帧桶 60s 过期。
 # 判据：/api/frame/status 存在 macmini-* 设备且帧龄 ≤30s（演示链路第一环，断推 = 浅体验区无画面）
 fs=$(curl -sS -m 8 http://127.0.0.1:8060/api/frame/status 2>/dev/null)

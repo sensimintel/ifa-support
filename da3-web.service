@@ -11,6 +11,9 @@ Wants=network-online.target
 Type=simple
 User=odyss
 WorkingDirectory=/home/odyss/da3-web
+# 双卡布局（2026-08-24 起）：DA3 深度模型（懒加载，峰值约 8.6G）与 SAM3 同落 GPU1=RTX 5090 32G，
+# GPU0=RTX PRO 6000 独占给 vLLM(0.90)。按 UUID 钉卡，重启后不会落错卡
+Environment=CUDA_VISIBLE_DEVICES=GPU-565f6e8d-550f-38cf-56d1-fe49fb280b05
 ExecStart=/home/odyss/da3-web/run.sh
 Restart=on-failure
 RestartSec=3
