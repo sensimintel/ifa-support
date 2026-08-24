@@ -112,6 +112,42 @@ class UploadPayloadTest(ScaleWiringTestBase):
         self.assertEqual(payload["events"][0]["scale_channel"], 1)
 
 
+class HeartbeatPayloadTest(ScaleWiringTestBase):
+    """心跳只报「已绑项链 + 人工标注接了秤 + 模块此刻可达」的通道，alive_at 用采样时刻。"""
+
+    def setUp(self):
+        super().setUp()
+        self._latest = {ch: dict(dx_backend._scale_latest[ch])
+                        for ch in dx_backend.SCALE_CHANNELS}
+        self.addCleanup(lambda: dx_backend._scale_latest.update(self._latest))
+
+    def mark_alive(self, channel, read_at=1000.0):
+        dx_backend._scale_latest[channel] = {"ok": True, "raw": 2803, "read_at": read_at}
+
+    def test_绑定且可达的通道出一拍心跳(self):
+        self.bind(1, NECKLACE)
+        self.mark_alive(1)
+        beats = dx_backend._scale_heartbeat_payload()
+        self.assertEqual(len(beats), 1)
+        self.assertEqual(beats[0]["device_id"], NECKLACE)
+        # alive_at 是采样时刻 read_at，不是拼包时刻
+        self.assertEqual(beats[0]["alive_at"], dx_backend._iso_utc(1000.0))
+
+    def test_没绑项链或模块不可达都不出心跳(self):
+        self.bind(1, "")
+        self.mark_alive(1)
+        self.assertEqual(dx_backend._scale_heartbeat_payload(), [])
+        self.bind(1, NECKLACE)
+        dx_backend._scale_latest[1] = {"ok": False, "raw": 2803, "read_at": 1000.0}
+        self.assertEqual(dx_backend._scale_heartbeat_payload(), [])
+
+    def test_人工标注没接秤的通道不出心跳(self):
+        self.bind(1, NECKLACE)
+        self.mark_alive(1)
+        dx_backend._state["scale_connected"] = {"1": False, "2": False, "3": False, "4": False}
+        self.assertEqual(dx_backend._scale_heartbeat_payload(), [])
+
+
 class EventsEndpointTest(ScaleWiringTestBase):
     def test_接口倒序返回并能只看可计入的事件(self):
         self.bind(1, NECKLACE)

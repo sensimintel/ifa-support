@@ -511,6 +511,12 @@ SCALE_UPLOAD_QUEUE_MAX = int(os.environ.get("SCALE_UPLOAD_QUEUE_MAX", "2000"))
 SCALE_UPLOAD_BATCH = 50
 SCALE_EVENT_RING = 500          # 控制面查「最近事件」用的内存环
 SCALE_EVENTS_PATH = "/api/v1/ifa/scale-events"
+SCALE_HEARTBEATS_PATH = "/api/v1/ifa/scale-heartbeats"
+# 心跳上报间隔（秒）。事件表只记「变化」，秤静止时 services 分不清「掉线」与
+# 「活着但没人碰」——后者恰恰是「摆着没吃」的强证据。心跳把「此刻读得到数」
+# 周期性报上去，services 按「关餐前 max(整段时长, 30s) 内有心跳」判活；
+# 取 10s 保证 30s 的判活底窗里至少落两拍，漏发一次也不至于误判掉线。
+SCALE_HEARTBEAT_INTERVAL = float(os.environ.get("SCALE_HEARTBEAT_INTERVAL_S", "10"))
 
 _scale_detectors = {
     ch: sev.ScaleEventDetector(
@@ -676,6 +682,53 @@ def _scale_uploader():
             break
 
 
+def _scale_heartbeat_payload():
+    """拼当前这一拍的心跳：已绑项链、人工标注接了秤、且模块此刻可达的通道才算活。
+
+    alive_at 用采样时刻 read_at 而不是发送时刻：上报是攒着发的，用发送时刻会把
+    「攒了几秒才发出去」误判成「那几秒前就死了」。同一条项链只报一次。
+    """
+    beats = {}
+    with _state_lock:
+        bindings = [((g.get("necklace_device_id") or "").strip(), g.get("scale_channel"))
+                    for g in _state["groups"]]
+        connected = {ch: bool(_state["scale_connected"].get(str(ch), True))
+                     for ch in SCALE_CHANNELS}
+    with _scale_lock:
+        latest = {ch: dict(_scale_latest[ch]) for ch in SCALE_CHANNELS}
+    for device_id, ch in bindings:
+        if not device_id or ch not in latest or not connected.get(ch, True):
+            continue
+        st = latest[ch]
+        if not st.get("ok") or not st.get("read_at"):
+            continue
+        beats[device_id] = {"device_id": device_id, "alive_at": _iso_utc(st["read_at"])}
+    return list(beats.values())
+
+
+def _scale_heartbeat_loop():
+    """后台线程：周期性把秤心跳报给 services。
+
+    尽力而为、不排队不重试：漏一拍的后果只是 services 判活更保守（回落纯模型），
+    比为它维护一条积压队列划算。失败只在状态翻转时各提醒一次，不刷屏。
+    """
+    failing = False
+    while True:
+        time.sleep(SCALE_HEARTBEAT_INTERVAL)
+        beats = _scale_heartbeat_payload()
+        if not beats:
+            continue
+        _, status = _ifa_services_request(
+            "POST", SCALE_HEARTBEATS_PATH, {"heartbeats": beats})
+        if status < 400:
+            if failing:
+                print("[秤心跳] 上报恢复", flush=True)
+            failing = False
+        elif not failing:
+            print("[秤心跳] 上报失败 status=%s（判活将回落保守，不重试）" % status, flush=True)
+            failing = True
+
+
 def _scale_poller():
     """后台线程：周期性读四通道并缓存；失败整组标离线、保留上次 raw。"""
     backoff = SCALE_POLL_INTERVAL
@@ -703,6 +756,7 @@ def _scale_poller():
 
 if BACKGROUND_THREADS:
     threading.Thread(target=_scale_poller, daemon=True).start()
+    threading.Thread(target=_scale_heartbeat_loop, daemon=True).start()
 
 
 def _channel_reading(ch):
