@@ -297,6 +297,48 @@ def _timing_locked(st: dict) -> dict:
     }
 
 
+# 队列进度在 camera_info JSON 里的键名（镜像上传链路专属，见跨仓契约 v1 §1a/§2a）。
+# 对外字段名去掉 queue_ 前缀：queue_pending_count→pending_count、
+# queue_oldest_pending_ts_ms→oldest_pending_ts_ms，其余同名。
+_QUEUE_KEYS = ("enqueued_at_ms", "attempt", "queue_pending_count",
+               "queue_oldest_pending_ts_ms", "is_newest_slot")
+
+
+def _parse_int(val) -> Optional[int]:
+    """把计数类值（str/int/float）解析成 int；无效返回 None。"""
+    try:
+        return int(float(val))
+    except (TypeError, ValueError):
+        return None
+
+
+def _queue_locked(st: dict) -> Optional[dict]:
+    """从设备桶最新帧的 camera_info JSON 解析手机端上传队列进度（缺失为 None）：
+      enqueued_at_ms         该帧上传任务首次入队时刻（手机钟，epoch 毫秒）；
+      attempt                第几次上传尝试（1-based）；
+      pending_count          发起此帧上传时队列里 pending 任务数；
+      oldest_pending_ts_ms   最旧 pending 帧的拍摄时间戳（设备钟，epoch 毫秒）；
+      is_newest_slot         该帧是否由「最新帧槽」选中（hub 每轮 1 新 + 2 旧交织）。
+    单个键缺失/非法为 null；camera_info 里一个队列键都没有（老版本 App）或
+    解析失败时整体返回 None——让前端能区分「没升级」与「队列空」。
+    每轮轮询逐设备解析一次 JSON：camera_info 只有几百字节、设备至多几台，
+    开销与 _timing_locked 同量级，不值得在收帧时预解析加缓存字段。"""
+    try:
+        info = json.loads(st["camera_info"]) or {}
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(info, dict) or not any(k in info for k in _QUEUE_KEYS):
+        return None
+    newest = info.get("is_newest_slot")
+    return {
+        "enqueued_at_ms": _parse_ms(info.get("enqueued_at_ms")),
+        "attempt": _parse_int(info.get("attempt")),
+        "pending_count": _parse_int(info.get("queue_pending_count")),
+        "oldest_pending_ts_ms": _parse_ms(info.get("queue_oldest_pending_ts_ms")),
+        "is_newest_slot": None if newest is None else bool(newest),
+    }
+
+
 def _parse_device_id(camera_info: Optional[str]) -> str:
     """从随帧上报的 camera_info JSON 字符串里取 device_id；解析失败/缺失归 unknown 桶。"""
     if camera_info:
@@ -751,6 +793,10 @@ def frame_status(device: Optional[str] = Query(None)):
                 "config": dict(_dev_config.get(d) or {}),
                 # 设备点云按需推流标志（app.py 注入；True=推流端应推原始深度）
                 "pc_want": _pc_want(d),
+                # 传输时序三时刻 + 手机端队列进度（跨仓契约 v1 §2a）：
+                # 供 dx-backend /api/necklaces/online 透传给控制面画「补传落后多少」
+                **_timing_locked(b),
+                "queue": _queue_locked(b),
             })
         if st is None:
             return JSONResponse({
@@ -761,6 +807,7 @@ def frame_status(device: Optional[str] = Query(None)):
                 "received_at": None, "age": None, "interval": None, "fps": None,
                 "content_type": None, "camera_info": None, "timestamp": None,
                 "capture_ts_ms": None, "upload_ts_ms": None, "server_ts_ms": None,
+                "queue": None,
                 "product_kind": None, "product_url": None, "product_meta": None,
                 "product_seq": 0, "product_gen": 0, "product_error": None,
             })
@@ -782,6 +829,8 @@ def frame_status(device: Optional[str] = Query(None)):
             "camera_info": st["camera_info"],
             "timestamp": st["timestamp"],
             **_timing_locked(st),
+            # 手机端上传队列进度（镜像链路专属；老版本 App 没有队列键时为 None）
+            "queue": _queue_locked(st),
             # 产物状态
             "processor": _processor is not None,
             "config": _config,

@@ -993,7 +993,14 @@ def api_necklaces_online():
             unknown_active = True   # 不进候选，但要报出去让人去修那个项链
             continue
         items.append({"device_id": device_id, "age": age, "seq": dev.get("seq"),
-                      "fps": dev.get("fps"), "bound_edge": bound.get(device_id)})
+                      "fps": dev.get("fps"), "bound_edge": bound.get(device_id),
+                      # 传输时序三时刻 + 手机端队列进度（跨仓契约 v1 §2b）：
+                      # 原样透传 8060 的解析结果，8060 未升级没给这些键时一律 None，
+                      # 控制面据此画镜像延迟与「补传落后多少」
+                      "capture_ts_ms": dev.get("capture_ts_ms"),
+                      "upload_ts_ms": dev.get("upload_ts_ms"),
+                      "server_ts_ms": dev.get("server_ts_ms"),
+                      "queue": dev.get("queue")})
     return JSONResponse({"necklaces": items, "error": error,
                          "max_age_s": NECKLACE_ONLINE_MAX_AGE,
                          "unknown_active": unknown_active, "ts": time.time()})
