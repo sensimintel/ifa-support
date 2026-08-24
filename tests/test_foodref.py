@@ -110,6 +110,34 @@ class ItemTest(unittest.TestCase):
         self.assertEqual(foodref.name_key(" 香蕉 "), "香蕉")
 
 
+class SelectKeptTest(unittest.TestCase):
+    """编辑时逐张删图的挑选逻辑：keep 决定留哪些旧图、顺序照 keep 给的来。"""
+
+    IMAGES = [{"n": 0, "w": 100, "h": 80}, {"n": 1, "w": 200, "h": 160}]
+
+    def test_keep_subset_in_given_order(self):
+        got = foodref.select_kept(self.IMAGES, [1])
+        self.assertEqual([im["n"] for im in got], [1])
+        self.assertEqual(got[0]["w"], 200)
+        # 顺序照 keep 的来，不按原序号排
+        got = foodref.select_kept(self.IMAGES, [1, 0])
+        self.assertEqual([im["n"] for im in got], [1, 0])
+
+    def test_keep_empty_means_delete_all(self):
+        self.assertEqual(foodref.select_kept(self.IMAGES, []), [])
+
+    def test_unknown_dup_and_bad_values_ignored(self):
+        got = foodref.select_kept(self.IMAGES, [9, 0, 0, "x", None, 1])
+        self.assertEqual([im["n"] for im in got], [0, 1])
+
+    def test_capped_and_copies_not_aliases(self):
+        many = [{"n": i} for i in range(5)]
+        got = foodref.select_kept(many, [0, 1, 2, 3, 4])
+        self.assertEqual(len(got), foodref.MAX_IMAGES_PER_ITEM)
+        got[0]["n"] = 99                     # 返回的是副本，改它不该污染目录态
+        self.assertEqual(many[0]["n"], 0)
+
+
 class CatalogTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()

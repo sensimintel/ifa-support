@@ -5623,15 +5623,27 @@ def foodref_config_set(body: dict = Body(default=None)):
 
 @app.post("/api/foodref/item")
 async def foodref_item_save(meta: str = Form(...), item_id: Optional[str] = Form(None),
+                            keep: Optional[str] = Form(None),
                             images: List[UploadFile] = File(default=[])):
     """新增或更新一条参考食物。
 
-    meta 是 JSON 串（名称/别名/类型/外观/营养/分级/描述）；images 传了就**整组替换**
-    该条的实物图，不传就保留原有的——控制面改个营养数字不必重新上传照片。"""
+    meta 是 JSON 串（名称/别名/类型/外观/营养/分级/描述）。图片语义分两档：
+      · 不传 keep（旧客户端）：images 传了就**整组替换**该条的实物图，不传就全保留
+        ——控制面改个营养数字不必重新上传照片；
+      · 传 keep（JSON 数组，要保留的旧图序号，按展示顺序）：最终图组 = 保留的旧图
+        + 新上传的 images，逐张增删都走这一条，落盘后序号重排为 0..k-1。"""
     try:
         patch = json.loads(meta or "{}")
     except ValueError:
         return JSONResponse({"error": "meta 不是合法 JSON"}, status_code=400)
+    keep_ns = None
+    if keep is not None:
+        try:
+            keep_ns = json.loads(keep)
+        except ValueError:
+            keep_ns = "bad"
+        if not isinstance(keep_ns, list):
+            return JSONResponse({"error": "keep 不是合法的序号数组"}, status_code=400)
     try:
         item = _foodref.upsert(patch, int(item_id) if item_id else None)
     except ValueError as e:
@@ -5639,21 +5651,42 @@ async def foodref_item_save(meta: str = Form(...), item_id: Optional[str] = Form
     except KeyError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
     files = [f for f in (images or []) if f is not None and f.filename]
-    if files:
-        if len(files) > foodref.MAX_IMAGES_PER_ITEM:
+    if keep_ns is not None or files:
+        kept = (foodref.select_kept(item.get("images") or [], keep_ns)
+                if keep_ns is not None else [])
+        if len(kept) + len(files) > foodref.MAX_IMAGES_PER_ITEM:
             return JSONResponse({"error": "每种最多 %d 张实物图"
                                  % foodref.MAX_IMAGES_PER_ITEM}, status_code=400)
-        _foodref_drop_cache(item["id"])      # 换图必须作废旧产物，否则一直发老图
-        metas = []
-        for n, f in enumerate(files):
+        # 新图先全部读进来并验证能解码，再动磁盘——避免写了一半才发现坏图，
+        # 留下目录态与文件对不上的中间状态
+        raws = []
+        for i, f in enumerate(files):
             raw = await f.read()
-            got = _foodref_save_original(item["id"], n, raw)
-            if got is None:
-                return JSONResponse({"error": "第 %d 张图解不出来（只收 jpg/png/heic）" % (n + 1)},
+            if _foodref_decode_upload(raw) is None:
+                return JSONResponse({"error": "第 %d 张新图解不出来（只收 jpg/png/heic）" % (i + 1)},
                                     status_code=400)
+            raws.append(raw)
+        # 保留的旧原图先整张读进内存：序号重排会覆盖同名文件，不能边读边写
+        kept_srcs = []
+        for im in kept:
+            try:
+                kept_srcs.append((dict(im), _foodref_orig_path(item["id"], im["n"]).read_bytes()))
+            except OSError:
+                pass                          # 原图丢了就当这张不存在，别让整次保存失败
+        _foodref_drop_cache(item["id"])       # 换图必须作废旧产物，否则一直发老图
+        metas = []
+        FOODREF_DIR.mkdir(parents=True, exist_ok=True)
+        for im, raw in kept_srcs:             # 旧原图直接搬字节，不重编码（免二次画质损失）
+            im["n"] = len(metas)
+            _foodref_orig_path(item["id"], im["n"]).write_bytes(raw)
+            metas.append(im)
+        for raw in raws:
+            got = _foodref_save_original(item["id"], len(metas), raw)
+            if got is None:
+                return JSONResponse({"error": "新图编码失败"}, status_code=500)
             metas.append(got)
         for stale in FOODREF_DIR.glob("%d_*.orig.jpg" % item["id"]):
-            try:                              # 从 2 张改成 1 张时，把多出来的原图删掉
+            try:                              # 张数变少时，把多出来的原图删掉
                 if int(stale.stem.split(".")[0].split("_")[1]) >= len(metas):
                     stale.unlink()
             except (OSError, ValueError, IndexError):
