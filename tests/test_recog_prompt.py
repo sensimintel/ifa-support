@@ -91,6 +91,37 @@ class FixedHeadTest(unittest.TestCase):
         self.assertNotIn("B1C1S1V1", head)
 
 
+class EdibleConstraintTest(unittest.TestCase):
+    """只认能进嘴的东西（治 2026-08-21 识别迁到本机 Qwen3.6 后把手机/电脑/容器当 item）：
+    硬性约束 4 + edible 字段 + 容器名禁令 + 空数组反例 + 收尾复读，一处都不许少。"""
+
+    def test_fixed_head_bans_non_food_items(self):
+        p = recog_prompt.fixed_head(True)
+        self.assertIn("能进嘴的食物或饮料", p)
+        self.assertIn("纯包装不算食物", p)
+
+    def test_fixed_head_asks_edible_field(self):
+        p = recog_prompt.fixed_head(True)
+        self.assertIn("edible：布尔值 true/false", p)
+        # 两个正例都必须带 edible:true——字段顺序契约靠示例钉死
+        self.assertEqual(p.count('"edible":true'), 2)
+
+    def test_fixed_head_bans_container_names(self):
+        self.assertIn("Container、Cup、Bottle", recog_prompt.fixed_head(True))
+
+    def test_fixed_head_has_empty_items_example(self):
+        # 反例示例三：桌上只有电子设备 → 空数组。旧版只有正例，弱模型见样学样必给一个 item
+        p = recog_prompt.fixed_head(True)
+        self.assertIn("示例三", p)
+        self.assertIn('{"items":[]}', p)
+
+    def test_tail_repeats_the_edible_constraint(self):
+        # 收尾紧贴生成位置，是模型印象最深的一段，硬性约束 4 必须在这里复读
+        t = recog_prompt.tail(None, [])
+        self.assertIn("能进嘴的食物或饮料", t)
+        self.assertIn("items 必须是空数组", t)
+
+
 class VariableBlocksTest(unittest.TestCase):
     """可变段：编号对得齐、标签把图片命名、收尾复读约束。"""
 

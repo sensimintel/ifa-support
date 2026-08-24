@@ -4415,6 +4415,10 @@ def _parse_recog(content):
 
     校验规则（每字段一个静态 guardrail）：
       name           非空、限 40 字，否则丢弃该 item；
+      edible         必须为布尔 true（宽容字符串 "true"），否则丢弃该 item——
+                     这是「只展示能进嘴的食物/饮料」的服务端硬闸：识别模型迁到
+                     5090 本机 Qwen3.6 后约束遵循变弱，出现过把手机/电脑/空容器
+                     当 item 输出的漏网，prompt 约束之外必须有这道兜底；
       type           枚举 → 归一到 “食物”/“液体”；
       description_en  字符串、去换行、限 RECOG_DESC_MAX 字符；
       description_de  同上，限 RECOG_DESC_DE_MAX（德语更长，放宽）；
@@ -4436,6 +4440,10 @@ def _parse_recog(content):
             continue
         name = str(it.get("name", "")).strip()[:40]
         if not name:
+            continue
+        # edible 硬闸：模型没明确说 true 就不落卡（缺字段、false、乱值一律丢）。
+        # 原始返回仍完整进观测日志（raw），被丢的条目在日志里可见，不影响排障。
+        if it.get("edible") not in (True, "true", "True"):
             continue
         typ = str(it.get("type", "")).strip().lower()
         is_liquid = ("液" in typ or "饮" in typ or "drink" in typ or "liquid" in typ)

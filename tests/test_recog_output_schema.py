@@ -144,6 +144,14 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class EdibleGateWiringTest(WiringTest):
+    """服务端 edible 硬闸：prompt 约束是软的（迁到本机 Qwen3.6 后已被突破过），
+    _parse_recog 必须只放行模型明确标了 edible=true 的条目。"""
+
+    def test_parse_drops_items_without_edible_true(self):
+        self.assertHas('if it.get("edible") not in (True, "true", "True"):')
+
+
 class EvidenceCodeTest(unittest.TestCase):
     """证据码：合法性校验 + 解码。旧版闸门判的是「文本含『不一致』」，
     模型换个措辞就绕过去了；码可校验，非法本身就是拒合并的理由。"""

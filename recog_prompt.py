@@ -58,7 +58,12 @@ def fixed_head(direct: bool, refs=None, min_conf: str = "medium") -> str:
         "items 必须是空数组，不要硬凑；\n"
         "  3. **先看像素、后看清单**。任何名称都必须先由你从【当前画面】的像素里读出来。"
         "候选清单上的名称只是过去几轮的结论，**它可能本来就是错的**，"
-        "绝不能拿「清单里有这个名字」当作当前画面里存在这样东西的证据。\n\n"
+        "绝不能拿「清单里有这个名字」当作当前画面里存在这样东西的证据。\n"
+        "  4. items 里只能出现**能进嘴的食物或饮料**。手机、电脑、键盘、遥控器、餐具、"
+        "纸巾、桌面摆件等一切非食物物体，无论在画面里多醒目，都绝不能作为 item 输出；"
+        "**纯包装不算食物**——空袋、空盒、空瓶、空杯这类看不到也读不出可吃内容物的"
+        "包装/容器，一律不输出。检测框只说明「那里可能有东西」，"
+        "框住了非食物或空容器照样不输出。\n\n"
     )
     if refs:
         p += foodref.task_zero(refs, min_conf) + "\n"
@@ -81,8 +86,13 @@ def fixed_head(direct: bool, refs=None, min_conf: str = "medium") -> str:
         "  name：具体名称（简短，优先英文）。食物可用品牌名（如 Banana、Snickers）；"
         "液体一律按**内容物**命名（如 Water、Coffee、Cola）——容器上的文字只有当它是"
         "饮料产品本身的品牌（如可乐罐上的 Coca-Cola）才可用作名称，"
-        "杯子上的装饰文案（如 Good morning）不是名称；\n"
+        "杯子上的装饰文案（如 Good morning）不是名称；"
+        "内容物看不出来、容器上也读不出饮品品牌时，这不是一个可输出的液体——"
+        "**绝不要**拿 Container、Cup、Bottle 这类容器名当名称，直接不输出这个 item；\n"
         "  type：只能是「食物」或「液体」；\n"
+        "  edible：布尔值 true/false——它是不是此刻画面里看得到、**能直接进嘴**的"
+        "食物或饮料本体？非食物物体、空包装、空容器、仿真食品摆件一律 false，"
+        "拿不准也写 false。服务端只展示 edible 为 true 的条目；\n"
         "  description_en：一句话英文描述（不超过 60 字符）；\n"
         "  description_de：一句话德文描述（不超过 90 字符）；\n"
         "  calories_kcal / protein_g / carbs_g / fat_g：整数卡路里与三项克数。"
@@ -146,7 +156,7 @@ def _json_skeleton() -> str:
         "只输出 JSON，不要任何解释。字段顺序必须与下面完全一致：\n"
         "示例一（【当前画面】是包装零食，候选[1] 是 Orange —— 正确做法是拒绝合并）：\n"
         "{\"items\":[{\"seen\":\"金黄色方形软包装，正面读到 Werther's Original，"
-        "摆在桌面中央偏右\",\"name\":\"Werther's Original Caramel Popcorn\",\"type\":\"食物\","
+        "摆在桌面中央偏右\",\"name\":\"Werther's Original Caramel Popcorn\",\"type\":\"食物\",\"edible\":true,"
         "\"ref_id\":null,\"ref_confidence\":null,\"ref_evidence\":null,"
         "\"description_en\":\"Sweet caramel-coated popcorn snack.\","
         "\"description_de\":\"Süßes Popcorn mit Karamellüberzug.\","
@@ -157,7 +167,7 @@ def _json_skeleton() -> str:
         "\"match_confidence\":null}]}\n"
         "示例二（【当前画面】确实还是候选[1] 那袋，允许合并）：\n"
         "{\"items\":[{\"seen\":\"金黄色方形软包装，正面读到 Werther's Original，位置没变\","
-        "\"name\":\"Werther's Original Caramel Popcorn\",\"type\":\"食物\","
+        "\"name\":\"Werther's Original Caramel Popcorn\",\"type\":\"食物\",\"edible\":true,"
         "\"ref_id\":null,\"ref_confidence\":null,\"ref_evidence\":null,"
         "\"description_en\":\"Sweet caramel-coated popcorn snack.\","
         "\"description_de\":\"Süßes Popcorn mit Karamellüberzug.\","
@@ -167,6 +177,9 @@ def _json_skeleton() -> str:
         "\"match_evidence\":\"B1C1S?V1\",\"match\":1,"
         "\"matched_name\":\"Werther's Original Caramel Popcorn\","
         "\"match_confidence\":\"high\"}]}\n"
+        "示例三（【当前画面】只有手机和笔记本电脑，没有任何吃的——正确做法是空数组，"
+        "不要把电子设备或空容器硬凑成 item）：\n"
+        "{\"items\":[]}\n"
         "items 里**只放一个对象**；【当前画面】里没有食物也没有液体时，items 为空数组 []。\n"
     )
 
@@ -237,7 +250,9 @@ def tail(last_pick, candidates) -> str:
     这段紧贴生成位置，是模型印象最深的一段，所以把最关键的那条约束放在这里复读。"""
     return (pick_rule(last_pick, candidates) +
             "现在开始：只描述上面那张【当前画面】里真实存在的东西，"
-            "参考图与清单只能用于任务二的判同。只输出 JSON，不要任何解释。\n")
+            "参考图与清单只能用于任务二的判同。再复读一次硬性约束 4："
+            "只输出能进嘴的食物或饮料；画面里只有手机、电脑、餐具、空包装、空容器"
+            "这类非食物时，items 必须是空数组。只输出 JSON，不要任何解释。\n")
 
 
 def render_for_log(content) -> str:
