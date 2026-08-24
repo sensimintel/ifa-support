@@ -47,11 +47,11 @@
 
 ## 5. 现场对齐状态（2026-08-21）
 
-> 文中「5090」沿用主机称谓；2026-08-21 换卡 **RTX Pro 6000 Blackwell 96GB**，2026-08-24 起为**双卡**：GPU0 = RTX Pro 6000 96GB（独占给 vLLM），GPU1 = RTX 5090 32GB（SAM3 + DA3）。三个 unit（vllm / sam3 / da3-web）均按 GPU UUID 钉卡（`CUDA_VISIBLE_DEVICES`），重启后不会落错卡；不做全文改名。
+> 文中「5090」沿用主机称谓；2026-08-21 换卡 **RTX Pro 6000 Blackwell 96GB**，2026-08-24 起为**双卡**：GPU0 = RTX Pro 6000 96GB（独占给 vLLM），GPU1 = RTX 5090 32GB（SAM3 + DA3）。三个 unit（vllm / sam3 / da3-web）都在 systemd 里钉卡，重启后不会落错卡——sam3/da3-web 用 GPU UUID；vllm 用 `CUDA_DEVICE_ORDER=PCI_BUS_ID` + `CUDA_VISIBLE_DEVICES=0`（**vLLM 把该变量按整数解析、不认 UUID**，UUID 会 ValidationError 崩溃循环，2026-08-24 实测）；不做全文改名。
 
 | 部署点 | 状态 | 待办 |
 |---|---|---|
-| 5090 本机 VLM（RTX Pro 6000 96GB 独占） | **VLM 已本机化承接**：宿主裸进程 `vllm serve :8000`（Qwen3.6-35B-A3B-FP8，别名 `gemini-3.1-pro-preview`）；services 的 `chunk_inhouse.base_url` 已切 `http://172.23.0.1:8000/v1`（2026-08-21 服务器手工生效，repo 配置另行同步）。2026-08-24 双卡布局后 vLLM **独占 GPU0=RTX Pro 6000**（unit 里 `CUDA_VISIBLE_DEVICES` 按 UUID 钉卡，`gpu-memory-utilization 0.90` 约 86G）；SAM3/DA3 全部挪到 GPU1=RTX 5090 32GB。vllm.service 正源即 `/etc/systemd/system/vllm.service`（服务器本地运维配置，api-key 在 `/etc/vllm/vllm.env`，均不入库） | repo 侧配置同步落库后复核一致 |
+| 5090 本机 VLM（RTX Pro 6000 96GB 独占） | **VLM 已本机化承接**：宿主裸进程 `vllm serve :8000`（Qwen3.6-35B-A3B-FP8，别名 `gemini-3.1-pro-preview`）；services 的 `chunk_inhouse.base_url` 已切 `http://172.23.0.1:8000/v1`（2026-08-21 服务器手工生效，repo 配置另行同步）。2026-08-24 双卡布局后 vLLM **独占 GPU0=RTX Pro 6000**（unit 里 `CUDA_DEVICE_ORDER=PCI_BUS_ID`+`CUDA_VISIBLE_DEVICES=0` 钉卡——vLLM 不认 UUID 形式；`gpu-memory-utilization 0.90` 约 86G）；SAM3/DA3 全部挪到 GPU1=RTX 5090 32GB。vllm.service 正源即 `/etc/systemd/system/vllm.service`（服务器本地运维配置，api-key 在 `/etc/vllm/vllm.env`，均不入库） | repo 侧配置同步落库后复核一致 |
 | GCP gpu-g4-01 | **已非 IFA 链路依赖**：llm-tunnel(:28000 frp) 与 8011 反向 SSH keeper 隧道均废弃；odyss-models `deploy/gcp-g4/` 单元保留但不再是本链路的 VLM 正源 | — |
 | LocateAnything（原 5090 生产链） | **已从 IFA 链路完全剔除**（LA vLLM / gateway / LB / SigLIP 全下线）；名为 locateanything-prometheus / gpu-exporter / node-exporter 的容器保留（历史名，承担全机观测） | — |
 | 观测入口 | 统一 Grafana `:3001` + 本机 Prometheus `:9091` 为唯一观测入口；g4 联邦数据源 / 29090 隧道废弃 | — |

@@ -28,7 +28,7 @@
 
 ## 显存预算（2026-08-24 起双卡现网口径）
 
-双卡布局：GPU0 = RTX Pro 6000 Blackwell 96GB **独占给 vLLM**；GPU1 = RTX 5090 32GB 归 SAM3 + DA3。三个 unit 都在 systemd 里用 `CUDA_VISIBLE_DEVICES=<GPU UUID>` 钉卡（UUID 而非 index：CUDA 默认枚举是「最快卡优先」，重启后 index 不保证稳定），任何重启都各归各卡。
+双卡布局：GPU0 = RTX Pro 6000 Blackwell 96GB **独占给 vLLM**；GPU1 = RTX 5090 32GB 归 SAM3 + DA3。三个 unit 都在 systemd 里钉卡，任何重启都各归各卡：sam3/da3-web 用 `CUDA_VISIBLE_DEVICES=<GPU UUID>`（torch 认 UUID；CUDA 默认枚举「最快卡优先」，裸 index 不稳定）；vllm 用 `CUDA_DEVICE_ORDER=PCI_BUS_ID` + `CUDA_VISIBLE_DEVICES=0`（**vLLM 按整数解析该变量、不认 UUID**——UUID 会 ValidationError 崩溃循环，2026-08-24 实测；PCI 序稳定，0=02:00.0=Pro 6000）。
 
 | 服务 | 落卡 | 显存 | 控制手段 |
 |---|---|---|---|
