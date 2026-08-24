@@ -8,6 +8,7 @@ python-multipart
 numpy
 opencv-python
 Pillow
+pillow-heif   # 参考食物库上传 iPhone HEIC 实物图的解码兜底（cv2 不认 HEIC）
 
 # 网格 mesh 产物导出 GLB（/panel 的 mesh 模式，由深度反投影自建三角网格）
 trimesh

@@ -4253,9 +4253,31 @@ def _make_menu_img(bgr, edge, quality):
     return buf.tobytes() if ok else None
 
 
+def _foodref_decode_upload(raw):
+    """解码一张上传图为 BGR 数组：cv2 直解（jpg/png），失败再走 Pillow 兜底（HEIC 等）。
+
+    iPhone 相册默认 HEIC，cv2 不认；pillow-heif 注册 opener 后 PIL 能开。Pillow 路径
+    顺带按 EXIF 方向转正（cv2.imdecode 本就不理 EXIF，jpg/png 老行为保持不变）。
+    pillow-heif 未安装时只影响 HEIC，jpg/png 不受牵连。"""
+    arr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if arr is not None:
+        return arr
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except ImportError:
+        print("[da3-web] 参考食物库：未安装 pillow-heif，HEIC 上传不可用", flush=True)
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img = ImageOps.exif_transpose(img).convert("RGB")
+    except Exception:
+        return None
+    return cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
+
+
 def _foodref_save_original(item_id, n, raw):
     """存一张上传原图（长边限 FOODREF_ORIG_MAX），返回图片元信息；失败返回 None。"""
-    arr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    arr = _foodref_decode_upload(raw)
     if arr is None:
         return None
     h, w = arr.shape[:2]
@@ -5627,7 +5649,7 @@ async def foodref_item_save(meta: str = Form(...), item_id: Optional[str] = Form
             raw = await f.read()
             got = _foodref_save_original(item["id"], n, raw)
             if got is None:
-                return JSONResponse({"error": "第 %d 张图解不出来（只收 jpg/png）" % (n + 1)},
+                return JSONResponse({"error": "第 %d 张图解不出来（只收 jpg/png/heic）" % (n + 1)},
                                     status_code=400)
             metas.append(got)
         for stale in FOODREF_DIR.glob("%d_*.orig.jpg" % item["id"]):
