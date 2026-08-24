@@ -1836,9 +1836,12 @@ setInterval(tunTick,5000);tunTick();
 # - 右侧状态区：待机「Place your food here」 ↔ 识别成功（名称/英文描述/营养标签/食物信号）
 # - 流水视图：临时按钮进入，当日识别记录（名称+时间）+ 实时画面小窗
 # - 设计稿 2240×1260，用 rem 等比缩放（1rem=设计稿 100px）；品牌字体走 /static/fonts
+# - 手机适配：按视口横竖切版式（@media orientation:portrait），竖屏走 Figma 手机版
+#   375×812（1473-2538 / 1473-2656）：logo 顶部居中、待机文案与营养卡贴底通栏；
+#   竖屏按宽度等比（1rem=100vw/3.75，clamp 上限防竖屏平板过大）+ 贴边元素锚边 + safe-area
 # ══════════════════════════════════════════════════════════════════════
 EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>ODYSS · Experience</title>
 <script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
 <style>
@@ -2029,6 +2032,50 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
    white-space:nowrap;color:rgba(255,253,247,.85)}
  #hlcfg .prow .ts{font-size:10px;color:rgba(255,253,247,.4);white-space:nowrap;
    font-variant-numeric:tabular-nums}
+ /* ══ 手机竖屏（Figma 手机版 1473-2538 / 1473-2656，设计稿 375×812）══
+    切换规则：按视口横竖切版式——竖屏（高>宽）走本块的手机构图，横屏（展台大屏、
+    手机横持）维持上方大屏构图；不判 UA/设备。
+    缩放规则：竖屏按「宽度」等比（1rem = 100vw/3.75，仍是 1rem=设计稿 100px 口径），
+    纵向不做固定内接画布：logo 锚顶、待机文案/营养卡锚底（各带 safe-area），中间由
+    背景 cover 自然填充——手机高宽比从 16:9 到 19.5:9+ 不等，内接固定画布会留黑/脱边。
+    clamp 上限 115px：竖屏平板/竖置大屏不随宽度无限放大（内容约等效 431px 宽居中） */
+ @media (orientation:portrait){
+  html{font-size:min(calc(100vw/3.75),115px)}
+  /* iOS Safari 地址栏收放：100vh 会比可视区高，底部锚定元素被工具栏盖住；dvh 跟随可视区 */
+  body{height:100dvh}
+  /* UI 画布铺满视口：竖屏构图全部贴边锚定，不再用 16:9 内接画布 */
+  #ui{width:100%;height:100%;top:0;left:0;transform:none}
+  /* logo 顶部居中（Figma：105×30、状态栏下 25 → safe-area + .25rem） */
+  #logo{left:50%;top:calc(env(safe-area-inset-top,0px) + .25rem);transform:translateX(-50%);width:1.05rem}
+  /* 状态区从贴右垂直居中改为贴底通栏，两态各自给底边距 */
+  #panel{left:0;right:0;top:auto;bottom:0;transform:none;justify-items:center;align-items:end}
+  h1{font-size:.24rem;letter-spacing:-.0048rem}
+  .sub{font-size:.12rem;letter-spacing:-.0012rem}
+  #idle{width:auto;margin:0 0 calc(env(safe-area-inset-bottom,0px) + .8rem)}
+  #idle h1{text-align:center}
+  /* 营养卡贴底通栏（Figma 343×223：左右 16、距底 54、padding 16、区块间距 12） */
+  #card{width:calc(100% - .32rem);max-width:3.43rem;
+        margin:0 0 calc(env(safe-area-inset-bottom,0px) + .54rem);padding:.16rem}
+  #cardbg{backdrop-filter:blur(.13rem)}
+  #card .rvw+.rvw{margin-top:.12rem}
+  #card .rvw.g8{margin-top:.04rem}
+  .rule{border-top-color:rgba(255,253,247,.2)}
+  .klab{font-size:.12rem;letter-spacing:-.0012rem}
+  .kval{font-size:.2rem;letter-spacing:-.002rem}
+  #macros{gap:.58rem;padding:.16rem 0}
+  #macros .mlab{font-size:.12rem;letter-spacing:-.0012rem}
+  #macros .mval{font-size:.2rem;letter-spacing:-.002rem;margin-top:.06rem}
+  /* 手机版设计没有 Food Classification 行（连同其上方分隔线一起隐藏） */
+  #card .rvw:has(#crule),#card .rvw:has(#cclsrow){display:none}
+  /* 工程调试 UI（右下按钮组/调节抽屉/右键菜单）在手机上必挡内容，竖屏一律隐藏；
+     display 用 !important 压过 applyConsole 写的 inline style */
+  #tools,#hlcfg,#ctxmenu{display:none!important}
+  /* 流水视图竖屏改上下排（运营偶尔手机看，保可用即可，不追求精排） */
+  #tlinset{left:6%;right:6%;width:auto;top:10%;height:34%}
+  #tllist{left:6%;right:6%;top:48%;bottom:6%;justify-content:flex-start}
+  .trow{font-size:.2rem}
+  #tlempty{font-size:.2rem}
+ }
 </style></head><body>
 <div id="stage">
  <img class="bg" id="bgA" alt=""><img class="bg" id="bgB" alt="">
