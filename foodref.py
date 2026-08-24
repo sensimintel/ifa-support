@@ -427,8 +427,11 @@ def task_zero(items: list, min_confidence: str = "medium") -> str:
         "（如 \"盘子中间偏左，深棕包装上有白色 Snickers 字样\"）。"
         "说不出画面位置就说明你在照参考图编，这时必须填 null。\n"
         "命中时（ref_id 不为 null）：name 一字不差照抄清单里的名称，"
-        "description_en / description_de / calories_kcal / protein_g / carbs_g / fat_g /"
-        " classification **一律填 null**——这些系统会查库回填，你编的会被丢弃。\n"
+        "然后**写完 ref_evidence 就直接结束这个对象**——description_en / description_de /"
+        " calories_kcal / protein_g / carbs_g / fat_g / classification / cur_text / diff /"
+        " match_evidence / match / matched_name 这些字段**一律省略不写**："
+        "内容系统会查库回填，去重系统会按清单编号自动归并，你写了也会被整组丢弃。\n"
+        "未命中（ref_id=null）时，才继续把上面这些字段全部填完。\n"
         % (n, lines, n, min_confidence)
     )
 

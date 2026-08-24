@@ -47,6 +47,21 @@ def check_evidence(code):
     return ("mismatch" if "0" in m.groups() else "ok"), text
 
 
+def derive_confidence(code) -> str:
+    """由证据码推导合并置信度（match_confidence 字段已从输出契约移除，2026-08-24）。
+
+    旧 prompt 里 high 的定义是「B=1，或 C、S、V 三项全 1 且参考图清晰可辨」——
+    前两个条件本来就是证据码的确定性函数，让模型再报一遍 confidence 纯属可派生
+    冗余（每轮 ~7 token），还留了「码很硬却自报 high 造假」的口子。改成服务端推导：
+    语义与旧闸门四完全一致，「参考图清晰可辨」的主观项由 ? 状态吸收（看不清该填 ?，
+    填了 ? 自然推不出 high）。码非法/NONE 一律 low——宁拒勿并。"""
+    m = _EV_RE.fullmatch((code or "").strip().upper())
+    if not m:
+        return "low"
+    b, c, s, v = m.groups()
+    return "high" if b == "1" or (c == "1" and s == "1" and v == "1") else "low"
+
+
 def check_self_evidence(item):
     """闸门六·当前画面自证 + 闸门七·B 位抵押（纯格式判定，零语义、零误伤空间）。
 

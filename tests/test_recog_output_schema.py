@@ -190,8 +190,70 @@ class EvidenceCodeTest(unittest.TestCase):
         self.assertIn("品牌一致", recog_match.check_evidence("品牌一致")[1])
 
 
-class MatchFieldWiringTest(WiringTest):
-    """match 三字段：evidence 换码、reason 删除、matched_name 保持不动。"""
+class DeriveConfidenceTest(unittest.TestCase):
+    """置信度推导（2026-08-24 起 match_confidence 从输出契约移除）：
+    high 的口径与旧 prompt 完全一致——B=1，或 C、S、V 三项全 1；其余一律 low。"""
+
+    def test_brand_bit_alone_is_high(self):
+        self.assertEqual(recog_match.derive_confidence("B1C?S?V?"), "high")
+
+    def test_csv_all_ones_is_high(self):
+        # 天然食材路径：读不到文字 B 只能 ?，靠外观三项全一致
+        self.assertEqual(recog_match.derive_confidence("B?C1S1V1"), "high")
+
+    def test_two_of_three_is_low(self):
+        # C/S/V 只有两项 1 推不出 high——与旧闸门四的实际放行口径一致
+        self.assertEqual(recog_match.derive_confidence("B?C1S1V?"), "low")
+
+    def test_none_and_malformed_are_low(self):
+        for bad in ("NONE", "", None, "B1C1S1", "乱写"):
+            self.assertEqual(recog_match.derive_confidence(bad), "low", bad)
+
+    def test_case_insensitive(self):
+        self.assertEqual(recog_match.derive_confidence("b1c1s1v1"), "high")
+
+
+class ConfidenceDerivationWiringTest(WiringTest):
+    """接线：闸门四改用推导值，模型自报字段在解析/prompt 两侧都不能残留。"""
+
+    def test_gate_four_uses_derived_confidence(self):
+        self.assertHas("m_conf = recog_match.derive_confidence(")
+        self.assertHas('elif m_conf != "high":')
+
+    def test_model_reported_field_gone(self):
+        # 带引号的键名一处都不许剩——解析、prompt 示例、字段定义全清干净
+        self.assertLacks('"match_confidence"')
+        self.assertLacks('it.get("match_confidence")')
+
+    def test_log_confidence_split_by_merge_path(self):
+        """合并史/outcome 的 confidence：ref 并卡看 ref_confidence，判同并卡看推导值
+        ——superadmin 那侧读的键名不变，不用跟着改。"""
+        self.assertHas('(it.get("ref_confidence") or "") if ref_hit else m_conf')
+
+
+class CatalogHitOmissionWiringTest(WiringTest):
+    """ref 命中条件省略（收益排序第 1 条）：命中项写完 ref_evidence 就收束对象，
+    判同六件套 + 7 个查库回填键全部省掉——命中轮 completion 预计砍近半。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = ((ROOT / "app.py").read_text(encoding="utf-8")
+                   + (ROOT / "recog_prompt.py").read_text(encoding="utf-8")
+                   + (ROOT / "foodref.py").read_text(encoding="utf-8"))
+
+    def test_prompt_tells_model_to_stop_after_ref_evidence(self):
+        self.assertHas("写完 ref_evidence 就直接结束这个对象")
+        self.assertHas("一律省略不写")
+
+    def test_miss_path_must_still_fill_everything(self):
+        # 不显式说「未命中才继续填完」，模型会学着在自由路径上也乱省
+        self.assertHas("未命中（ref_id=null）时")
+
+    def test_parse_tolerates_missing_keys(self):
+        """省略字段落地的前提：解析层全部 it.get() 带缺省，键缺失不炸。
+        这里断言几处关键缺省确实存在（真炸会在别的测试里现形，这里守契约）。"""
+        self.assertHas('it.get("cur_text", "")')
+        self.assertHas('it.get("calories_kcal")')
 
     def test_prompt_asks_for_evidence_code(self):
         self.assertHas("match_evidence：8 字符证据码 BxCxSxVx")

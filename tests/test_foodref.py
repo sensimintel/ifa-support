@@ -228,8 +228,11 @@ class MenuTextTest(unittest.TestCase):
         self.assertIn("[2] B", text)
         self.assertIn("high", text)
         self.assertIn("ref_evidence", text)
-        # 命中时不许模型编营养——这条是查库回填的前提
-        self.assertIn("一律填 null", text)
+        # 命中时不许模型编营养，且直接省略后续字段（省 decode）——查库回填的前提
+        self.assertIn("写完 ref_evidence 就直接结束这个对象", text)
+        self.assertIn("一律省略不写", text)
+        # 未命中路径必须显式说「才继续填完」，否则模型会学着在自由路径上也乱省
+        self.assertIn("未命中（ref_id=null）时", text)
 
 
 class BuildBlocksTest(unittest.TestCase):

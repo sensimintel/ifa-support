@@ -86,9 +86,44 @@ class FixedHeadTest(unittest.TestCase):
     def test_examples_never_show_all_ones(self):
         """连"允许合并"的正面示例都带一个 ?——这是消灭清一色全 1 最省事的一招。"""
         head = recog_prompt.fixed_head(False)
-        self.assertIn("B0C0S0V?", head)
-        self.assertIn("B1C1S?V1", head)
+        self.assertIn("B1C1S?V1", head)      # 包装零食允并：S 位判不了
+        self.assertIn("B?C1S1V1", head)      # 天然食材允并：读不到文字 B 只能 ?
+        self.assertIn('"match_evidence":"NONE"', head)   # 无相似候选的形状
         self.assertNotIn("B1C1S1V1", head)
+
+    def test_examples_cover_orthogonal_branches_not_one_food(self):
+        """2026-08-24 few-shot 换血：旧版 Werther's 在固定段出现 4 次，而 cur_text
+        是无法 OCR 核验的 B 位抵押物——few-shot 等于供应了一个现成的合法值。
+        新版每个示例一个正交分支、食物词汇彼此不同。"""
+        head = recog_prompt.fixed_head(False)
+        self.assertNotIn("Werther", head)
+        for food in ("Pringles", "Banana", "Coffee"):
+            self.assertIn(food, head)
+        # 液体示例必须演示「按内容物命名」而不是容器名
+        self.assertIn('"type":"液体"', head)
+
+    def test_catalog_hit_example_only_when_refs(self):
+        """命中是展台主路径，「写完 ref_evidence 就结束对象」这种反直觉形状必须有
+        示例钉住；没开参考库时清单不存在，该示例整个跳过。"""
+        with_refs = recog_prompt.fixed_head(False, _refs(), "medium")
+        self.assertIn('"ref_id":2,"ref_confidence":"high"', with_refs)
+        self.assertIn("示例五", with_refs)           # 命中示例排第一，共 5 个
+        no_refs = recog_prompt.fixed_head(False)
+        self.assertNotIn("Milka", no_refs)
+        self.assertNotIn("示例五", no_refs)          # 无参考库只有 4 个
+        # 命中示例的对象必须在 ref_evidence 后收束——不许把判同字段带进来
+        hit_obj = with_refs[with_refs.index("Milka Alpine"):]
+        hit_obj = hit_obj[:hit_obj.index("}]}")]
+        for absent in ("cur_text", "match_evidence", "calories_kcal"):
+            self.assertNotIn(absent, hit_obj, "命中示例不该带 %s" % absent)
+
+    def test_match_confidence_removed_from_contract(self):
+        """置信度改由服务端从证据码推导（recog_match.derive_confidence），
+        prompt 不再要求模型自报 match_confidence 字段。"""
+        for head in (recog_prompt.fixed_head(False),
+                     recog_prompt.fixed_head(False, _refs(), "medium")):
+            self.assertNotIn('"match_confidence"', head)
+            self.assertNotIn("6. match_confidence", head)
 
 
 class EdibleConstraintTest(unittest.TestCase):
@@ -103,17 +138,22 @@ class EdibleConstraintTest(unittest.TestCase):
     def test_fixed_head_asks_edible_field(self):
         p = recog_prompt.fixed_head(True)
         self.assertIn("edible：布尔值 true/false", p)
-        # 两个正例都必须带 edible:true——字段顺序契约靠示例钉死
-        self.assertEqual(p.count('"edible":true'), 2)
+        # 所有正例都必须带 edible:true——字段顺序契约靠示例钉死。
+        # 无参考库 3 个正例（零食/天然食材/液体），开参考库多一个命中正例
+        self.assertEqual(p.count('"edible":true'), 3)
+        self.assertEqual(
+            recog_prompt.fixed_head(True, _refs(), "medium").count('"edible":true'), 4)
 
     def test_fixed_head_bans_container_names(self):
         self.assertIn("Container、Cup、Bottle", recog_prompt.fixed_head(True))
 
     def test_fixed_head_has_empty_items_example(self):
-        # 反例示例三：桌上只有电子设备 → 空数组。旧版只有正例，弱模型见样学样必给一个 item
+        # 空数组反例必须垫底：旧版只有正例，弱模型见样学样必给一个 item。
+        # 无参考库 4 个示例（空数组是示例四），开参考库 5 个（示例五）
         p = recog_prompt.fixed_head(True)
-        self.assertIn("示例三", p)
+        self.assertIn("示例四", p)
         self.assertIn('{"items":[]}', p)
+        self.assertIn('{"items":[]}', recog_prompt.fixed_head(True, _refs(), "medium"))
 
     def test_tail_repeats_the_edible_constraint(self):
         # 收尾紧贴生成位置，是模型印象最深的一段，硬性约束 4 必须在这里复读

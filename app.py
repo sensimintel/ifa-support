@@ -4462,8 +4462,8 @@ def _parse_recog(content):
         # 合法性交给 recog_match.check_evidence，这里不做语义判断
         evidence = str(it.get("match_evidence", "")).strip().replace("\n", " ")[:16]
         mname = str(it.get("matched_name") or "").strip()[:40]
-        conf = str(it.get("match_confidence") or "").strip().lower()
-        conf = conf if conf in ("high", "low") else ""    # 非法/缺省按 low 语义处理（不合并）
+        # match_confidence 已从输出契约移除（2026-08-24）：它是证据码的确定性函数，
+        # 置信度改由 recog_match.derive_confidence 在闸门四现场推导，这里不再解析
         # 当前画面自证三件套（治「照着参考图编」）：seen 是任务一强制先写的观察，
         # cur_text 是照抄的包装文字（B 位填 1 的抵押物），diff 是与候选的否定证据。
         # 这里只做长度/换行的 guardrail，合法性交给 recog_match.check_self_evidence。
@@ -4486,7 +4486,7 @@ def _parse_recog(content):
                     "calories_kcal": kcal, "protein_g": protein,
                     "carbs_g": carbs, "fat_g": fat, "classification": cls,
                     "match": match, "match_evidence": evidence,
-                    "matched_name": mname, "match_confidence": conf})
+                    "matched_name": mname})
     return out
 
 
@@ -4523,7 +4523,7 @@ def _recognize_dedup(orig_rgb, boxed_rgb, candidates, n_food=0, n_drink=0, targe
     直传版（参考图编号从图2起）。
     target：识别目标预设（RECOG_TARGETS 里的一项，缺省=当前选中目标）。
     log：观测日志条目（_vlmlog_begin 建的 dict），非空则把请求与原始返回填回去。
-    返回 [{name,type,description,...,match,matched_name,match_confidence}]；任何失败返回 []。"""
+    返回 [{name,type,description,...,match,matched_name}]；任何失败返回 []。"""
     cfg = target or RECOG_TARGETS[_recog_target]
     if not cfg["endpoint"]:
         _vlmlog.set_response(log, False, error="识别服务未接入（endpoint 为空）")
@@ -4819,6 +4819,9 @@ def _recog_worker(idx=0):
                 # 不该让人去背 B1C1S1V1
                 ev_verdict, ev_text = recog_match.check_evidence(it.get("match_evidence"))
                 self_ok, self_reason = recog_match.check_self_evidence(it)
+                # 置信度由证据码推导（B=1 或 C/S/V 全 1 才 high）——match_confidence
+                # 字段已从输出契约移除，模型不再自报，闸门四与日志都用这个推导值
+                m_conf = recog_match.derive_confidence(it.get("match_evidence"))
                 ref_hit = it.get("ref_hit_id")
                 if ref_hit:
                     # 参考库命中项不走证据码那五道闸：库里的 id 本身就是「同一种东西」的
@@ -4861,11 +4864,12 @@ def _recog_worker(idx=0):
                         # 码可校验，格式不合法本身就是拒合并的理由（宁拒勿并）。
                         print("[da3-web] 识别拒合并（证据不通过·%s）：『%s』match=%s 证据『%s』→ 按新卡处理" % (
                             ev_verdict, it["name"], m, it.get("match_evidence")), flush=True)
-                    elif it.get("match_confidence") != "high":
-                        gate = "低置信：confidence=%s" % (it.get("match_confidence") or "缺省")
-                        # 闸门四·置信度：模型自报不确定 → 宁拒勿并（high 在 prompt 里有硬性定义）
-                        print("[da3-web] 识别拒合并（低置信）：『%s』match=%s confidence=%s → 按新卡处理" % (
-                            it["name"], m, it.get("match_confidence") or "缺省"), flush=True)
+                    elif m_conf != "high":
+                        gate = "低置信：证据码 %s 推导为 low" % (it.get("match_evidence") or "空")
+                        # 闸门四·置信度：由证据码推导（B=1 或 C/S/V 全 1 才 high），
+                        # 语义与旧的模型自报字段一致 → 宁拒勿并
+                        print("[da3-web] 识别拒合并（低置信）：『%s』match=%s 证据码 %s 推导为 low → 按新卡处理" % (
+                            it["name"], m, it.get("match_evidence") or "空"), flush=True)
                     elif not (_name_tokens(it["name"]) & _name_tokens(cand["name"])):
                         gate = "名称零重叠：『%s』vs 候选『%s』" % (it["name"], cand["name"])
                         # 闸门五·名称零重叠：合并时模型被要求照抄候选名，本轮识别名与候选名
@@ -4914,7 +4918,8 @@ def _recog_worker(idx=0):
                         "t": t, "name": it["name"],
                         "evidence": ev_text,
                         "seen": it.get("seen", ""),     # 这一轮模型自己写的观察
-                        "confidence": it.get("match_confidence", "")})
+                        # ref 命中并卡看 ref_confidence，判同并卡看证据码推导值
+                        "confidence": (it.get("ref_confidence") or "") if ref_hit else m_conf})
                     del target["merge_history"][:-20]    # 只留最近 20 条
                     if shot_url:
                         target["shots"].append(shot_url)
@@ -4966,7 +4971,8 @@ def _recog_worker(idx=0):
                     "diff": it.get("diff", ""),
                     "action": "merge" if target is not None else "new",
                     "card_id": target["id"] if target is not None else _recog_id,
-                    "gate": gate, "confidence": it.get("match_confidence", ""),
+                    "gate": gate,
+                    "confidence": (it.get("ref_confidence") or "") if ref_hit else m_conf,
                     "evidence": ev_text})
                 # 记下本轮真正上屏的这一个，下一轮 prompt 拿它做「还在就别换」的粘性锚
                 _recog_last_pick[dev] = {

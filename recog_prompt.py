@@ -7,7 +7,7 @@
 
 排布（2026-08-18 重排，治「参考图污染当前画面」）：
     [固定段] 图片指称约定 + 硬性约束 + 任务零(参考库) + 任务一 + 字段定义
-             + 判同流程 + JSON 骨架与两个示例
+             + 判同流程 + JSON 骨架与一组正交示例（开参考库时含命中正例）
     [可变段] 任务二开场 + 候选清单文字
              → 【历史参考图 · 候选[i]】标签 + 该候选的裁剪图（逐个交错）
              → 「以上参考图到此结束，下面这一张是【当前画面】」+ 当前帧
@@ -72,7 +72,7 @@ def fixed_head(direct: bool, refs=None, min_conf: str = "medium") -> str:
         "第一步，**先不要看任何清单、不要看任何参考图**，用自己的话把【当前画面】里"
         "最主要的那一样可食用物体如实描述出来，写进 seen 字段：\n"
         "  seen =「颜色 / 形状 / 包装或容器上你亲眼读到的文字 / 它在画面中的位置」\n"
-        "  例：\"金黄色方形软包装，正面读到 Werther's Original，摆在桌面中央偏右\"\n"
+        "  例：\"深蓝色方形软包装，正面读到 OREO 字样，摆在桌面中央偏右\"\n"
         "  例：\"橙色球形果实，表面有果皮凹坑，无任何文字，白盘左半边\"\n"
         "  包装上一个字也读不到就在文字那格写 none，但颜色、形状、位置三项必须写满。\n"
         "第二步，再根据 seen 给它命名（name）。**name 必须能被 seen 里写下的事实支持**：\n"
@@ -102,7 +102,7 @@ def fixed_head(direct: bool, refs=None, min_conf: str = "medium") -> str:
         "  classification：健康分级，只能是 " + "、".join(foodref.CLASSIFICATIONS) +
         "（营养密度高、天然少加工的选 Good；高糖/高盐/油炸/高度加工的选 Bad；"
         "介于两者之间选 Neutral）。\n\n"
-        + _judge_flow() + "\n" + _json_skeleton()
+        + _judge_flow() + "\n" + _json_skeleton(bool(refs))
     )
     return p
 
@@ -139,47 +139,80 @@ def _judge_flow() -> str:
         "换了口味或包装的同名产品、**包装零食 vs 同色的水果**；\n"
         "       · 在参考图里定位不到该物品、或参考图看不清 → null。\n"
         "  5. matched_name：match≠null 时一字不差照抄清单里该编号的名称；否则 null。\n"
-        "  6. match_confidence：只有「B=1」或「C、S、V 三项全为 1 且参考图清晰可辨」"
-        "才允许 high，其余一切情况一律 low。\n"
         "错误合并（把两样不同的东西记成同一个）比重复建一张卡严重得多；"
         "宁可多一张卡，不可错并一次。\n"
     )
+    # 旧契约还有第 6 项 match_confidence——它是证据码的确定性函数（B=1 或 CSV 全 1
+    # 才 high），2026-08-24 起由服务端 recog_match.derive_confidence 推导，字段删除
 
 
-def _json_skeleton() -> str:
-    """JSON 骨架 + 两个示例。
+def _json_skeleton(has_refs: bool = False) -> str:
+    """JSON 骨架 + 一组正交示例（2026-08-24 换血）。
 
-    示例在固定段里，边际成本≈0（只有换版那一轮付费），所以给两个完整示例：
-    一个**拒绝**合并、一个允许合并。注意允许合并那个给的是 B1C1S?V1 而不是全 1——
-    连正面示例都带一个 ?，这是消灭「清一色全 1」最省事的一招。"""
-    return (
-        "只输出 JSON，不要任何解释。字段顺序必须与下面完全一致：\n"
-        "示例一（【当前画面】是包装零食，候选[1] 是 Orange —— 正确做法是拒绝合并）：\n"
-        "{\"items\":[{\"seen\":\"金黄色方形软包装，正面读到 Werther's Original，"
-        "摆在桌面中央偏右\",\"name\":\"Werther's Original Caramel Popcorn\",\"type\":\"食物\",\"edible\":true,"
+    旧版三个示例只覆盖「包装零食拒并/允并」一个分支的两面，且 Werther's 在固定段
+    出现 4 次——cur_text 是 B 位抵押物又无法 OCR 核验，few-shot 恰好供应了一个
+    「长得就很合法」的现成值。新版原则：**每个示例覆盖一个正交分支**、食物词汇
+    彼此不同、避开展台常驻登记食物；允并示例的证据码都带 ?（消灭清一色全 1）。
+
+    has_refs=True 时多一个「参考库命中」正例——命中是展台主路径，
+    「写完 ref_evidence 就结束对象」这种反直觉输出形状必须有示例钉住；
+    没开参考库时该示例讲不通（清单不存在），整个跳过。示例数量随之 4↔5，
+    但 has_refs 本来就是换版级配置态，不破坏固定段的逐字节稳定。"""
+    demos = []
+    if has_refs:
+        demos.append((
+            "（【当前画面】的食物命中了参考清单——name 照抄清单名称，"
+            "写完 ref_evidence 就结束对象，其余字段全部省略）",
+            "{\"items\":[{\"seen\":\"紫色方形排块巧克力包装，正面读到 Milka 字样，"
+            "桌面中央\",\"name\":\"Milka Alpine Milk Chocolate\",\"type\":\"食物\","
+            "\"edible\":true,\"ref_id\":2,\"ref_confidence\":\"high\","
+            "\"ref_evidence\":\"桌面中央，紫色包装上有白色 Milka 字样，与清单[2]一致\"}]}"))
+    demos.append((
+        "（未命中参考清单的包装零食，与候选[1] 是同一罐——允许合并；"
+        "证据码带 ?，matched_name 照抄候选名）",
+        "{\"items\":[{\"seen\":\"绿色圆筒罐装薯片，罐身读到 Pringles 字样，桌面右侧\","
+        "\"name\":\"Pringles Sour Cream\",\"type\":\"食物\",\"edible\":true,"
         "\"ref_id\":null,\"ref_confidence\":null,\"ref_evidence\":null,"
-        "\"description_en\":\"Sweet caramel-coated popcorn snack.\","
-        "\"description_de\":\"Süßes Popcorn mit Karamellüberzug.\","
-        "\"calories_kcal\":250,\"protein_g\":2.0,\"carbs_g\":30.0,\"fat_g\":13.0,"
-        "\"classification\":\"Bad\",\"cur_text\":\"Werther's Original\","
-        "\"diff\":\"候选是无包装的橙色球形果实，这里是方形软包装\","
-        "\"match_evidence\":\"B0C0S0V?\",\"match\":null,\"matched_name\":null,"
-        "\"match_confidence\":null}]}\n"
-        "示例二（【当前画面】确实还是候选[1] 那袋，允许合并）：\n"
-        "{\"items\":[{\"seen\":\"金黄色方形软包装，正面读到 Werther's Original，位置没变\","
-        "\"name\":\"Werther's Original Caramel Popcorn\",\"type\":\"食物\",\"edible\":true,"
-        "\"ref_id\":null,\"ref_confidence\":null,\"ref_evidence\":null,"
-        "\"description_en\":\"Sweet caramel-coated popcorn snack.\","
-        "\"description_de\":\"Süßes Popcorn mit Karamellüberzug.\","
-        "\"calories_kcal\":250,\"protein_g\":2.0,\"carbs_g\":30.0,\"fat_g\":13.0,"
-        "\"classification\":\"Bad\",\"cur_text\":\"Werther's Original\","
-        "\"diff\":\"参考图只裁到包装一角，看不出份量差别\","
+        "\"description_en\":\"Stackable potato chips in a can.\","
+        "\"description_de\":\"Stapelbare Kartoffelchips in der Dose.\","
+        "\"calories_kcal\":530,\"protein_g\":4.0,\"carbs_g\":50.0,\"fat_g\":35.0,"
+        "\"classification\":\"Bad\",\"cur_text\":\"Pringles\","
+        "\"diff\":\"参考图只裁到罐身上半截，看不出高度差别\","
         "\"match_evidence\":\"B1C1S?V1\",\"match\":1,"
-        "\"matched_name\":\"Werther's Original Caramel Popcorn\","
-        "\"match_confidence\":\"high\"}]}\n"
-        "示例三（【当前画面】只有手机和笔记本电脑，没有任何吃的——正确做法是空数组，"
-        "不要把电子设备或空容器硬凑成 item）：\n"
-        "{\"items\":[]}\n"
+        "\"matched_name\":\"Pringles Sour Cream\"}]}"))
+    demos.append((
+        "（无包装的天然食材，读不到任何文字——B 位只能填 ?，"
+        "靠颜色/形状/摆放三项全一致与候选[1] 合并）",
+        "{\"items\":[{\"seen\":\"黄色弯月形果实，表皮有褐色斑点，无任何文字，白盘中央\","
+        "\"name\":\"Banana\",\"type\":\"食物\",\"edible\":true,"
+        "\"ref_id\":null,\"ref_confidence\":null,\"ref_evidence\":null,"
+        "\"description_en\":\"A ripe banana with brown spots.\","
+        "\"description_de\":\"Eine reife Banane mit braunen Flecken.\","
+        "\"calories_kcal\":105,\"protein_g\":1.3,\"carbs_g\":27.0,\"fat_g\":0.4,"
+        "\"classification\":\"Good\",\"cur_text\":\"none\","
+        "\"diff\":\"参考图里果柄朝左，这里朝右\","
+        "\"match_evidence\":\"B?C1S1V1\",\"match\":1,\"matched_name\":\"Banana\"}]}"))
+    demos.append((
+        "（液体按**内容物**命名，杯子上没有饮品品牌就不算名称；"
+        "画面里没有相似候选时 match_evidence 写 NONE）",
+        "{\"items\":[{\"seen\":\"白色马克杯盛深棕色液体，杯身无饮品品牌文字，桌面左侧\","
+        "\"name\":\"Coffee\",\"type\":\"液体\",\"edible\":true,"
+        "\"ref_id\":null,\"ref_confidence\":null,\"ref_evidence\":null,"
+        "\"description_en\":\"A mug of black coffee.\","
+        "\"description_de\":\"Eine Tasse schwarzer Kaffee.\","
+        "\"calories_kcal\":5,\"protein_g\":0.3,\"carbs_g\":0.0,\"fat_g\":0.0,"
+        "\"classification\":\"Neutral\",\"cur_text\":\"none\","
+        "\"diff\":\"无相似候选\",\"match_evidence\":\"NONE\","
+        "\"match\":null,\"matched_name\":null}]}"))
+    demos.append((
+        "（【当前画面】只有手机和空杯子，没有任何吃的——正确做法是空数组，"
+        "不要把电子设备或空容器硬凑成 item）",
+        "{\"items\":[]}"))
+    nums = "一二三四五"
+    body = "".join("示例%s%s：\n%s\n" % (nums[i], title, js)
+                   for i, (title, js) in enumerate(demos))
+    return (
+        "只输出 JSON，不要任何解释。字段顺序必须与下面完全一致：\n" + body +
         "items 里**只放一个对象**；【当前画面】里没有食物也没有液体时，items 为空数组 []。\n"
     )
 
