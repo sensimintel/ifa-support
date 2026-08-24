@@ -186,6 +186,32 @@ def normalize_item(patch, base=None) -> dict:
     return out
 
 
+def select_kept(images, keep) -> list:
+    """按 keep 序号列表挑出要保留的旧图元信息（编辑时逐张删图/换图用）。
+
+    keep 是控制面传来的旧图序号数组（按展示顺序）；未知序号忽略、重复去重、
+    非法值跳过，返回的元信息按 keep 顺序排列——序号重排（0..k-1）由调用方在
+    落盘时完成，这里只做挑选，不碰文件。"""
+    by_n = {}
+    for im in images or []:
+        if isinstance(im, dict) and im.get("n") is not None:
+            try:
+                by_n.setdefault(int(im["n"]), im)
+            except (TypeError, ValueError):
+                continue
+    out, seen = [], set()
+    for n in keep or []:
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            continue
+        if n in seen or n not in by_n:
+            continue
+        seen.add(n)
+        out.append(dict(by_n[n]))
+    return out[:MAX_IMAGES_PER_ITEM]
+
+
 def item_public(item: dict) -> dict:
     """下发控制面的条目投影：去掉内部字段，图片只给数量与尺寸元信息。"""
     out = {k: v for k, v in item.items() if k != "images"}
