@@ -2,6 +2,7 @@
 # =============================================================================
 # ifa-health-check 探活脚本（只读，在 5090 上执行）。
 # 用法（开发机）：ssh odyss-server-frpc 'bash -s' < tools/health/check.sh
+#（整机无外网期间 frp 入口不可用，改用局域网别名：ssh odyss-server-local 'bash -s' < ...）
 # 输出：每行「状态|组件|详情」，状态 ∈ OK / FAIL / WARN / INFO；存在 FAIL 时退出码 1。
 # 铁律：本脚本只探测、不修复；修复按 tools/health/README.md 的「单元唯一入口」执行。
 # 两态期望清单（应运行 / 一次性完成）以 README.md 为准，改期望先改仓。
@@ -51,6 +52,24 @@ need_http() { # $1=组件标签 $2=URL $3=期望码正则
   else say FAIL "$1" "HTTP $c $2（期望 $3）"; fi
 }
 
+# 漂移判据：监听 PID 必须 == systemd MainPID（允许差一级父子，防 fork 型启动）。
+# 覆盖两种假绿：systemd inactive 但游离进程占端口；systemd active 但孤儿旧进程仍在应答
+#（deploy.sh 假绿事故，2026-08 FAQ：健康检查探到的是旧进程的 200）。
+need_pid_match() { # $1=unit $2=端口 $3=组件标签
+  local main lp pp
+  main=$(systemctl show -p MainPID --value "$1" 2>/dev/null)
+  lp=$(ss -ltnp 2>/dev/null | awk -v p=":$2\$" '$4 ~ p {print; exit}' | grep -o 'pid=[0-9]*' | head -1 | tr -dc 0-9)
+  if [ -z "$lp" ]; then
+    say FAIL "$3" "端口 $2 未监听"
+  elif [ -z "$main" ] || [ "$main" = 0 ]; then
+    say FAIL "$3" "端口 $2 被 PID $lp 占用但 systemd 无主进程——游离进程接管（漂移）"
+  elif [ "$lp" = "$main" ] || [ "$(ps -o ppid= -p "$lp" 2>/dev/null | tr -dc 0-9)" = "$main" ]; then
+    say OK "$3" "监听 PID $lp 与 systemd MainPID 一致"
+  else
+    say FAIL "$3" "监听 PID $lp ≠ MainPID $main——孤儿进程仍在应答（漂移，deploy.sh 假绿形态）"
+  fi
+}
+
 # ---------------- D. 底座 ----------------
 if docker info >/dev/null 2>&1; then say OK "底座/docker" "daemon 可用"
 else say FAIL "底座/docker" "daemon 不可用——后续容器检查全部失效"; fi
@@ -78,12 +97,27 @@ code=$(curl -sS -o /dev/null -m 8 -X POST -H 'Content-Type: application/json' -d
   -w '%{http_code}' "http://127.0.0.1:18090/api/v1/auth/send-code" 2>/dev/null || echo 000)
 if [ "$code" = 400 ]; then say OK "业务/API语义" "18090 空参返回 400（校验层应答）"
 else say FAIL "业务/API语义" "18090 返回 $code（期望 400）"; fi
+# 登录关键依赖：加密公钥必须 200（503=孤本未配 encryption key，App 登录请求根本发不出——真实故障史）
+need_http "业务/登录密钥" "http://127.0.0.1:18090/api/v1/auth/password-encryption-key" '^200$'
 need_http "业务/superadmin页面" "http://127.0.0.1:18091/" '^200$'
 code=$(http_code "http://127.0.0.1:18091/admin-api/ping")
 case "$code" in
   000|502|504) say FAIL "业务/反代" "admin-api 返回 $code（nginx→services 断了）" ;;
   *) say OK "业务/反代" "admin-api 返回 $code（后端应答，反代通）" ;;
 esac
+# llm-switch 控制面：superadmin 顶栏模型切换走 18091 /ops-api/ 反代（容器 running ≠ 反代通）
+code=$(http_code "http://127.0.0.1:18091/ops-api/")
+case "$code" in
+  000|502|504) say FAIL "业务/llm-switch控制面" "ops-api 返回 $code（nginx→llm-switch 断了）" ;;
+  *) say OK "业务/llm-switch控制面" "ops-api 返回 $code（后端应答，反代通）" ;;
+esac
+# lumen 观测栈：独立 compose 项目（/home/odyss/odyss-ifa-lumen），支撑 superadmin 的 Lumen 数据板块；
+# 不被 ~/odyss-services-ifa 的 up -d 覆盖，须单独探测
+need_running odyss-ifa-lumen-postgres "业务/lumen-postgres"
+need_running odyss-ifa-lumen-collector "业务/lumen-collector"
+need_running odyss-ifa-lumen-observation "业务/lumen-observation"
+need_oneshot_ok odyss-ifa-lumen-migrate "业务/lumen-migrate"
+need_http "业务/lumen接口" "http://127.0.0.1:18091/lumen/api/health" '^200$'
 # 本机 VLM：宿主裸进程 vllm serve（/home/odyss/vllm-env，0.0.0.0:8000，随开机启动）。
 # 带 api-key：未带 key 探 /v1/models 可能 401，200/401 都算活。
 need_http "业务/本机vLLM" "http://127.0.0.1:8000/v1/models" '^(200|401)$'
@@ -104,8 +138,56 @@ fi
 need_systemd da3-web "演示/da3-web"
 # 根路径现为 307 → /experience，200 与 30x 都算活
 need_http "演示/da3-web页面" "http://127.0.0.1:8060/" '^(200|30[0-9])$'
+need_pid_match da3-web 8060 "演示/da3-web漂移"
 need_systemd sam3 "演示/SAM3"
 ss -tln 2>/dev/null | grep -q ':8013 ' && say OK "演示/SAM3端口" "8013 在监听" || say FAIL "演示/SAM3端口" "8013 未监听"
+need_pid_match sam3 8013 "演示/SAM3漂移"
+# mac-mini 帧链路：cam-pusher（192.168.100.3，LaunchDaemon）持续推帧到 8060，帧桶 60s 过期。
+# 判据：/api/frame/status 存在 macmini-* 设备且帧龄 ≤30s（演示链路第一环，断推 = 浅体验区无画面）
+fs=$(curl -sS -m 8 http://127.0.0.1:8060/api/frame/status 2>/dev/null)
+verdict=$(printf '%s' "$fs" | python3 -c '
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("PARSE"); raise SystemExit
+devs = [x for x in d.get("devices", []) if str(x.get("device_id", "")).startswith("macmini")]
+if not devs:
+    print("NONE")
+else:
+    a = min(float(x.get("age", 1e9)) for x in devs)
+    print(("OK|%.1f" % a) if a <= 30 else ("STALE|%.1f" % a))' 2>/dev/null)
+case "$verdict" in
+  OK\|*)    say OK "演示/mac-mini帧链路" "macmini 设备帧龄 ${verdict#OK|}s" ;;
+  STALE\|*) say FAIL "演示/mac-mini帧链路" "macmini 帧龄 ${verdict#STALE|}s（>30s：cam-pusher 断推/断网？自带 KeepAlive 自愈，仍断走 mini deploy.sh）" ;;
+  NONE)     say FAIL "演示/mac-mini帧链路" "8060 无 macmini-* 设备帧（mac-mini 断推/断网/未上电？）" ;;
+  *)        say FAIL "演示/mac-mini帧链路" "8060 /api/frame/status 不可用或返回异常" ;;
+esac
+# 深体验区 dx-backend（宿主 :8070，systemd）：四通道秤读数 + 手机/项链/秤分组绑定
+need_systemd dx-backend "演示/dx-backend"
+need_http "演示/dx-backend接口" "http://127.0.0.1:8070/api/health" '^200$'
+need_http "演示/dx-backend反代" "http://127.0.0.1:18091/dx-api/api/health" '^200$'
+# 秤链路：一律经 dx-backend 持久连接看数据新鲜度（age_s），勿裸探 Modbus——
+# 新 TCP 连接首个请求约 6.4s 才应答，短超时会误判"固件卡死"。秤断电/断网 → FAIL（演示期口径）。
+sc=$(curl -sS -m 15 http://127.0.0.1:8070/api/food-scales 2>/dev/null)
+verdict=$(printf '%s' "$sc" | python3 -c '
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("PARSE"); raise SystemExit
+ages = [s.get("age_s") for s in d.get("scales", []) if s.get("age_s") is not None]
+if not ages:
+    print("NONE")
+else:
+    a = max(ages)
+    print(("OK|%.1f" % a) if a <= 30 else ("STALE|%.1f" % a))' 2>/dev/null)
+case "$verdict" in
+  OK\|*)    say OK "演示/秤链路" "四通道读数新鲜（最大 age_s=${verdict#OK|}）" ;;
+  STALE\|*) say FAIL "演示/秤链路" "读数过期 age_s=${verdict#STALE|}（>30s：查秤上电/网线/IP=192.168.100.80，dx-backend 会自动重连）" ;;
+  NONE)     say FAIL "演示/秤链路" "food-scales 无读数（dx-backend 未连上秤 192.168.100.80:502？）" ;;
+  *)        say FAIL "演示/秤链路" "8070 /api/food-scales 不可用或返回异常" ;;
+esac
 
 # ---------------- C. 观测 ----------------
 need_running ifa-grafana-gcp "观测/统一Grafana"
@@ -128,6 +210,13 @@ if printf '%s' "$gpum" | grep -q nvidia_smi_memory_used_bytes; then
   fi
 else
   say FAIL "观测/GPU指标" "9835 无 GPU 指标（failed_scrapes=${gpufs:-?}）——NVML 被吊销；docker restart 可能无效（2026-08-07 实测），用 cd ~/odyss-models/deploy/gpu5090 && docker compose -f compose.gpu.yml up -d --force-recreate gpu-exporter"
+fi
+# 自愈 cron 知会：odyss-models 的 gpu_exporter_selfheal 每 5 分钟探 9835，连续缺失自动 force-recreate。
+# 人工处置 GPU 指标前先看这里——cron 已装时可能已自愈/即将自愈，避免重复动作
+if crontab -l 2>/dev/null | grep -q gpu_exporter_selfheal; then
+  say INFO "观测/GPU指标自愈cron" "已安装（人工 force-recreate 前先看 selfheal 日志，避免与 cron 重复处置）"
+else
+  say INFO "观测/GPU指标自愈cron" "未安装（NVML 吊销需人工 force-recreate）"
 fi
 
 # ---------------- 汇总 ----------------
