@@ -230,12 +230,20 @@ class MenuTextTest(unittest.TestCase):
         self.assertIn("not the current frame", intro)
 
     def test_item_label_carries_index_and_look(self):
+        """清单名只给英文：命中时模型要一字不差照抄它，给中文名产出里就会冒出中文。
+        look 是判同线索、不会被照抄进任何字段，中文照旧原样带上。"""
         item = foodref.normalize_item(_item(name="士力架", name_en="Snickers",
                                             look="深棕包装"))
         label = foodref.item_label(2, item)
-        self.assertTrue(label.startswith("[2] 士力架"))
-        self.assertIn("Snickers", label)
+        self.assertTrue(label.startswith("[2] Snickers"))
+        self.assertNotIn("士力架", label)
         self.assertIn("深棕包装", label)
+
+    def test_item_label_falls_back_to_name_without_english(self):
+        """name_en 是 normalize_item 的派生字段（留空回落 name），但库里可能有
+        改造之前落盘的老条目，缺 name_en 时不能把名字整个丢了。"""
+        label = foodref.item_label(1, {"name": "Water", "type": "液体"})
+        self.assertTrue(label.startswith("[1] Water"))
 
     def test_item_label_skips_duplicate_english_name(self):
         item = foodref.normalize_item(_item(name="Banana", name_en="banana"))
@@ -257,6 +265,8 @@ class MenuTextTest(unittest.TestCase):
         self.assertIn("high", text)
         self.assertIn("ref_evidence", text)
         # 命中时不许模型编营养，且直接省略后续字段（省 decode）——查库回填的前提
+        # 命中时照抄的必须是英文名（清单只给英文名，见 item_label）
+        self.assertIn("copy the **English** name", text)
         self.assertIn("end the object right after ref_evidence", text)
         self.assertIn("**all omitted**", text)
         # 未命中路径必须显式说「才继续填完」，否则模型会学着在自由路径上也乱省

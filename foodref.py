@@ -394,11 +394,17 @@ def menu_intro(n_items: int, n_images: int) -> str:
 def item_label(idx: int, item: dict) -> str:
     """清单里一项的标签行（紧跟在它的实物图前面）。
 
-    idx 是 1-based 的清单编号，也就是模型要回填的 ref_id。"""
-    bits = ["[%d] %s" % (idx, item.get("name") or "")]
-    name_en = item.get("name_en") or ""
-    if name_en and name_key(name_en) != name_key(item.get("name") or ""):
-        bits.append(name_en)
+    idx 是 1-based 的清单编号，也就是模型要回填的 ref_id。
+
+    **名称只给英文（`name_en`）**：清单名是模型命中后要「一字不差照抄」进 `name`
+    的东西，给中文名它就照抄中文——2026-08-25 prompt 改英文后，命中路径成了模型
+    产出里唯一会冒出中文的地方（现网那条 `FRITT 樱桃软糖` 就是）。`name_en` 是
+    `normalize_item` 的必填派生字段（留空时回落 `name`），所以这里恒有值。
+    展示端本来就只认英文：`apply_hit` 落卡用的也是 `name_en or name`。
+
+    `look`（运营录入的外观描述）照旧原样带上，哪怕它是中文：它是判同用的线索、
+    不会被照抄进任何输出字段，删掉只会白掉命中率。"""
+    bits = ["[%d] %s" % (idx, item.get("name_en") or item.get("name") or "")]
     bits.append(type_en(item.get("type")))
     if item.get("look"):
         bits.append(item["look"])
@@ -470,7 +476,9 @@ def task_zero(items: list, min_confidence: str = "medium") -> str:
         "and what makes it this entry (e.g. \"centre-left of the plate, white Snickers lettering "
         "on a dark brown wrapper\"). Being unable to state the position in the frame means you "
         "are reading it off the reference image, and then this must be null.\n"
-        "On a hit (ref_id not null): copy the name from the list word for word, then **end the "
+        "On a hit (ref_id not null): copy the **English** name of that entry from the list "
+        "word for word into name -- the list gives every entry an English name, always use "
+        "it and never translate it or fall back to another language, then **end the "
         "object right after ref_evidence** -- description_en / calories_kcal / protein_g / "
         "carbs_g / fat_g / classification / cur_text / diff / match_evidence / match / "
         "matched_name are **all omitted**: the content is filled in from the catalog by the "
