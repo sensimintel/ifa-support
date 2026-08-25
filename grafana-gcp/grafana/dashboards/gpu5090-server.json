@@ -187,7 +187,7 @@
         },
         "graphMode": "area",
         "colorMode": "value",
-        "textMode": "auto"
+        "textMode": "value_and_name"
       },
       "targets": [
         {
@@ -196,7 +196,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "100 * max(nvidia_smi_utilization_gpu_ratio)"
+          "expr": "label_replace(100 * nvidia_smi_utilization_gpu_ratio * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}}"
         }
       ]
     },
@@ -247,7 +248,7 @@
         },
         "graphMode": "area",
         "colorMode": "value",
-        "textMode": "auto"
+        "textMode": "value_and_name"
       },
       "targets": [
         {
@@ -256,7 +257,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "100 * max(nvidia_smi_memory_used_bytes / nvidia_smi_memory_total_bytes)"
+          "expr": "label_replace(100 * nvidia_smi_memory_used_bytes / nvidia_smi_memory_total_bytes * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}}"
         }
       ]
     },
@@ -367,7 +369,7 @@
         },
         "graphMode": "area",
         "colorMode": "value",
-        "textMode": "auto"
+        "textMode": "value_and_name"
       },
       "targets": [
         {
@@ -376,7 +378,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max(nvidia_smi_temperature_gpu)"
+          "expr": "label_replace(nvidia_smi_temperature_gpu * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}}"
         }
       ]
     },
@@ -823,7 +826,7 @@
     {
       "id": 16,
       "type": "row",
-      "title": "GPU (RTX Pro 6000 Blackwell 96GB)",
+      "title": "GPU（GPU0 RTX Pro 6000 96G · Qwen vLLM ｜ GPU1 RTX 5090 32G · SAM3）",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -883,8 +886,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "100 * nvidia_smi_utilization_gpu_ratio",
-          "legendFormat": "核心利用率"
+          "expr": "label_replace(100 * nvidia_smi_utilization_gpu_ratio * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 核心利用率"
         },
         {
           "refId": "B",
@@ -892,8 +895,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "100 * nvidia_smi_utilization_memory_ratio",
-          "legendFormat": "显存带宽利用率"
+          "expr": "label_replace(100 * nvidia_smi_utilization_memory_ratio * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 显存带宽利用率"
         }
       ]
     },
@@ -947,8 +950,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_memory_used_bytes",
-          "legendFormat": "已用"
+          "expr": "label_replace(nvidia_smi_memory_used_bytes * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 已用"
         },
         {
           "refId": "B",
@@ -956,8 +959,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_memory_reserved_bytes",
-          "legendFormat": "保留"
+          "expr": "label_replace(nvidia_smi_memory_reserved_bytes * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 保留"
         },
         {
           "refId": "C",
@@ -965,8 +968,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_memory_total_bytes",
-          "legendFormat": "总量"
+          "expr": "label_replace(nvidia_smi_memory_total_bytes * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 总量"
         }
       ]
     },
@@ -1020,8 +1023,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_power_draw_watts",
-          "legendFormat": "功耗(1s 平均)"
+          "expr": "label_replace(nvidia_smi_power_draw_watts * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 功耗(1s 平均)"
         },
         {
           "refId": "B",
@@ -1029,8 +1032,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_power_draw_instant_watts",
-          "legendFormat": "功耗(瞬时)"
+          "expr": "label_replace(nvidia_smi_power_draw_instant_watts * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 功耗(瞬时)"
         },
         {
           "refId": "C",
@@ -1038,8 +1041,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_power_limit_watts",
-          "legendFormat": "功耗上限"
+          "expr": "label_replace(nvidia_smi_power_limit_watts * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 功耗上限"
         }
       ]
     },
@@ -1093,8 +1096,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_clocks_current_sm_clock_hz",
-          "legendFormat": "当前 SM 频率"
+          "expr": "label_replace(nvidia_smi_clocks_current_sm_clock_hz * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 当前 SM 频率"
         },
         {
           "refId": "B",
@@ -1102,8 +1105,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_clocks_max_sm_clock_hz",
-          "legendFormat": "最大 SM 频率"
+          "expr": "label_replace(nvidia_smi_clocks_max_sm_clock_hz * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 最大 SM 频率"
         }
       ]
     },
@@ -1157,8 +1160,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "100 * rate(nvidia_smi_clocks_event_reasons_counters_sw_power_cap_seconds[5m])",
-          "legendFormat": "软件功耗墙"
+          "expr": "label_replace(100 * rate(nvidia_smi_clocks_event_reasons_counters_sw_power_cap_seconds[5m]) * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 软件功耗墙"
         },
         {
           "refId": "B",
@@ -1166,8 +1169,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "100 * rate(nvidia_smi_clocks_event_reasons_counters_sw_thermal_slowdown_seconds[5m])",
-          "legendFormat": "软件过热降频"
+          "expr": "label_replace(100 * rate(nvidia_smi_clocks_event_reasons_counters_sw_thermal_slowdown_seconds[5m]) * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 软件过热降频"
         },
         {
           "refId": "C",
@@ -1175,8 +1178,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "100 * rate(nvidia_smi_clocks_event_reasons_counters_hw_thermal_slowdown_seconds[5m])",
-          "legendFormat": "硬件过热降频"
+          "expr": "label_replace(100 * rate(nvidia_smi_clocks_event_reasons_counters_hw_thermal_slowdown_seconds[5m]) * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 硬件过热降频"
         },
         {
           "refId": "D",
@@ -1184,8 +1187,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "100 * rate(nvidia_smi_clocks_event_reasons_counters_hw_power_brake_slowdown_seconds[5m])",
-          "legendFormat": "硬件功耗急刹"
+          "expr": "label_replace(100 * rate(nvidia_smi_clocks_event_reasons_counters_hw_power_brake_slowdown_seconds[5m]) * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 硬件功耗急刹"
         }
       ]
     },
@@ -1278,8 +1281,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max(nvidia_smi_temperature_gpu)",
-          "legendFormat": "GPU"
+          "expr": "label_replace(nvidia_smi_temperature_gpu * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "GPU {{gpu}}"
         }
       ]
     },
@@ -1334,8 +1337,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "100 * nvidia_smi_fan_speed_ratio",
-          "legendFormat": "GPU 风扇"
+          "expr": "label_replace(100 * nvidia_smi_fan_speed_ratio * on(uuid) group_left(name) nvidia_smi_gpu_info, \"gpu\", \"$1\", \"name\", \"NVIDIA (?:GeForce )?(RTX (?:PRO )?[0-9]+).*\")",
+          "legendFormat": "{{gpu}} 风扇"
         }
       ]
     },
@@ -1726,7 +1729,7 @@
     "to": "now"
   },
   "timezone": "browser",
-  "title": "5090 服务器性能（RTX Pro 6000）",
+  "title": "5090 服务器性能（RTX Pro 6000 + RTX 5090）",
   "uid": "gpu5090-server",
   "version": 1,
   "weekStart": ""

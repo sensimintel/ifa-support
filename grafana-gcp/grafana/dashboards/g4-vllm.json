@@ -940,7 +940,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "avg_over_time(nvidia_smi_utilization_gpu_ratio[$__interval])",
+          "expr": "avg_over_time(nvidia_smi_utilization_gpu_ratio{uuid=~\"$gpu_uuid\"}[$__interval])",
           "interval": "1m",
           "legendFormat": "util (均)"
         },
@@ -950,7 +950,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max_over_time(nvidia_smi_utilization_gpu_ratio[$__interval])",
+          "expr": "max_over_time(nvidia_smi_utilization_gpu_ratio{uuid=~\"$gpu_uuid\"}[$__interval])",
           "interval": "1m",
           "legendFormat": "util (峰)"
         }
@@ -1005,7 +1005,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_memory_used_bytes",
+          "expr": "nvidia_smi_memory_used_bytes{uuid=~\"$gpu_uuid\"}",
           "legendFormat": "used"
         },
         {
@@ -1014,7 +1014,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_memory_total_bytes",
+          "expr": "nvidia_smi_memory_total_bytes{uuid=~\"$gpu_uuid\"}",
           "legendFormat": "total"
         }
       ],
@@ -1157,7 +1157,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "avg_over_time(nvidia_smi_power_draw_watts[$__interval])",
+          "expr": "avg_over_time(nvidia_smi_power_draw_watts{uuid=~\"$gpu_uuid\"}[$__interval])",
           "interval": "1m",
           "legendFormat": "功耗W (均)"
         },
@@ -1167,7 +1167,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "avg_over_time(nvidia_smi_temperature_gpu[$__interval])",
+          "expr": "avg_over_time(nvidia_smi_temperature_gpu{uuid=~\"$gpu_uuid\"}[$__interval])",
           "interval": "1m",
           "legendFormat": "温度℃ (均)"
         },
@@ -1177,7 +1177,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "max_over_time(nvidia_smi_power_draw_watts[$__interval])",
+          "expr": "max_over_time(nvidia_smi_power_draw_watts{uuid=~\"$gpu_uuid\"}[$__interval])",
           "interval": "1m",
           "legendFormat": "功耗W (峰)"
         }
@@ -1192,7 +1192,31 @@
     "loadtest"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "name": "gpu_uuid",
+        "label": "GPU",
+        "type": "query",
+        "hide": 2,
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(nvidia_smi_gpu_info{name=~\".*RTX PRO 6000.*\"}, uuid)",
+        "query": {
+          "qryType": 1,
+          "query": "label_values(nvidia_smi_gpu_info{name=~\".*RTX PRO 6000.*\"}, uuid)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 0,
+        "includeAll": false,
+        "multi": false,
+        "options": [],
+        "current": {}
+      }
+    ]
   },
   "time": {
     "from": "now-30m",
@@ -1200,7 +1224,7 @@
   },
   "timepicker": {},
   "timezone": "Asia/Shanghai",
-  "title": "5090 · Qwen vLLM & GPU (本机)",
+  "title": "Qwen vLLM · RTX Pro 6000（本机:8000）",
   "uid": "g4-01",
   "version": 1,
   "weekStart": ""

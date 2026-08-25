@@ -1,5 +1,5 @@
 {
-  "title": "SAM3 服务观测",
+  "title": "SAM3 服务观测 · RTX 5090",
   "uid": "sam3",
   "schemaVersion": 39,
   "version": 1,
@@ -14,7 +14,31 @@
     "5090"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "name": "gpu_uuid",
+        "label": "GPU",
+        "type": "query",
+        "hide": 2,
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(nvidia_smi_gpu_info{name=~\".*GeForce RTX 5090.*\"}, uuid)",
+        "query": {
+          "qryType": 1,
+          "query": "label_values(nvidia_smi_gpu_info{name=~\".*GeForce RTX 5090.*\"}, uuid)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 0,
+        "includeAll": false,
+        "multi": false,
+        "options": [],
+        "current": {}
+      }
+    ]
   },
   "annotations": {
     "list": []
@@ -292,7 +316,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_utilization_gpu_ratio",
+          "expr": "nvidia_smi_utilization_gpu_ratio{uuid=~\"$gpu_uuid\"}",
           "legendFormat": "GPU",
           "refId": "A",
           "range": true
@@ -344,7 +368,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_memory_used_bytes",
+          "expr": "nvidia_smi_memory_used_bytes{uuid=~\"$gpu_uuid\"}",
           "legendFormat": "已用",
           "refId": "A",
           "range": true
@@ -354,7 +378,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_memory_total_bytes",
+          "expr": "nvidia_smi_memory_total_bytes{uuid=~\"$gpu_uuid\"}",
           "legendFormat": "总",
           "refId": "B",
           "range": true
@@ -406,7 +430,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_power_draw_watts",
+          "expr": "nvidia_smi_power_draw_watts{uuid=~\"$gpu_uuid\"}",
           "legendFormat": "功耗",
           "refId": "A",
           "range": true
@@ -458,7 +482,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_temperature_gpu",
+          "expr": "nvidia_smi_temperature_gpu{uuid=~\"$gpu_uuid\"}",
           "legendFormat": "温度",
           "refId": "A",
           "range": true
