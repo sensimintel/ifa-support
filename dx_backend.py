@@ -1,4 +1,4 @@
-"""深体验区（superadmin ifa-support 页面）专属后端，独立于 8060 DA3 服务，跑在 8070。
+"""深体验区（superadmin ifa-support 页面）专属后端，独立于 8060 da3-web 服务，跑在 8070。
 
 职责：
 1. 四通道食物秤（一台 SJ101T2_CH4_ETH 模块，通道 1..4 → 寄存器 addr 0/2/4/6）：

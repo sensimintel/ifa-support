@@ -75,7 +75,7 @@
 | `dx-backend.service` | 8070 的 systemd 单元 |
 | `deploy.sh` | 5090 上一键部署：`git pull` + 重启服务（8060 与 8070 一并重启，systemd 优先） |
 | `da3-web.service` | 可选 systemd 单元（正规化开机自启/重启） |
-| `requirements.txt` | pip 依赖（不含 `depth_anything_3`，见下） |
+| `requirements.txt` | pip 依赖 |
 | `model/` | **SAM3 模型服务的一键拉起脚本与部署信息**（推理服务源码·流式长记忆版 + systemd 单元），见 `model/README.md`（DA3 已于 2026-08-25 退役并删除） |
 | `mac-mini/` | **mac mini 摄像头推帧器（cam-pusher）**：把 mini 上两台 Orbbec 相机（Gemini 335 / Astra Pro Plus）的彩色流按 `/api/frame` 契约推给 8060，LaunchDaemon 常驻、开发机 rsync 推送部署，见 `mac-mini/README.md` |
 
@@ -84,7 +84,6 @@
 ```bash
 ./run.sh
 # 等价于：
-# export HF_HOME=/home/odyss/Depth-Anything-3/models
 # python -m uvicorn app:app --host 0.0.0.0 --port 8060
 ```
 

@@ -904,7 +904,7 @@
       "id": 18,
       "type": "timeseries",
       "title": "显存",
-      "description": "5090 显存与产线服务(vLLM/ViT/SigLIP)及 DA3 演示服务共享，逼近总量时新加载模型会 OOM。",
+      "description": "双卡：GPU0=RTX Pro 6000 96G 独占 vLLM(0.90 预分配约 88G)；GPU1=RTX 5090 32G 由 SAM3 独享(上限 0.9)。DA3/LA 均已退役。",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

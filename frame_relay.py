@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
-"""设备实时帧中继模块（零重依赖，可脱离 DA3/torch 独立运行与自测）。
+"""设备实时帧中继模块（零重依赖，可独立运行与自测，无 torch 依赖）。
 
 用途：mobile 端把从设备取到的照片按现有上传链路的 multipart 形态直发到本服务，
 本模块接收后：
   1. 按 device_id（从 camera_info JSON 解析，缺省归 "unknown"）分桶，在内存里缓存
      每台设备的"最新一帧"（原始字节 + 元信息），供 /panel 面板动态刷新展示；
-  2. 服务端维护一个"当前选中设备"（面板可切换）：若 app.py 注入了 DA3 处理回调
+  2. 服务端维护一个"当前选中设备"（页面可切换）：若 app.py 注入了产物处理回调
      （set_processor），后台单线程用"最新优先"策略把**选中设备**的最新帧按「当前
-     控件配置」跑一次 DA3，产物（深度图字节 或 GLB 模型 url）写回该设备的桶。
+     控件配置」跑一次处理，产物写回该设备的桶（原 DA3 产物链已于 2026-08-25 退役，现无注册方，纯中继）。
      非选中设备的帧只更新自己的桶（可供缩略图预览），不触发 GPU 处理。
 
 多设备语义：
@@ -17,7 +17,7 @@
   · 设备条目超过 DEVICE_TTL 没有新帧即过期清理；选中设备过期后自动回落到
     最近有帧的设备。
 
-刻意不 import torch / cv2 / depth_anything_3：DA3 能力通过回调注入。配置（产物类型/分辨率
+刻意不 import torch / cv2：重处理能力只经回调注入（现无注册方）。配置（产物类型/分辨率
 等控件值）由 /panel 经 POST /api/frame/config 下发，本模块只当作不透明字典存下并转交回调，
 因此本模块在本地无 GPU、无模型的环境下也能被 include_router 起来并跑通收图 + 展示链路。
 """
@@ -48,7 +48,7 @@ _cv = threading.Condition()
 #   seq                帧单调递增序号（每设备独立计数）
 #   image / content_type / received_at / prev_received_at / camera_info / timestamp
 #   first_seen         该设备首次出现时间（列表排序用，保证下拉顺序稳定）
-#   product/product_seq/product_gen/product_error   该设备最新一次 DA3 产物
+#   product/product_seq/product_gen/product_error   该设备最新一次处理产物（外部接管方写入）
 _devices: dict = {}
 _selected: Optional[str] = None       # 当前选中设备（粘性；None=还没有任何设备）
 
@@ -198,7 +198,7 @@ def _save_depth_presets_locked() -> None:
         print(f"[frame-relay] 深度配置预设落盘失败（忽略）：{type(e).__name__}: {e}",
               flush=True)
 
-# DA3 处理回调：fn(image_bytes, config, device_id, seq, gen) -> 产物描述字典，
+# 产物处理回调：fn(image_bytes, config, device_id, seq, gen) -> 产物描述字典，
 # 或返回 DEFERRED（流水线模式：产物由构建级稍后经 set_product(device_id, seq, gen, …)
 # 异步写回）；由 app.py 在有模型时注入
 #   {"kind":"image","bytes":b"...","content_type":"image/jpeg","meta":{...}}  # 深度图
@@ -231,7 +231,7 @@ def _pc_want(device_id: str) -> bool:
 
 
 def set_processor(fn: Callable[[bytes, dict, str], dict]) -> None:
-    """注入 DA3 处理回调并按需启动后台处理线程。
+    """注入产物处理回调并按需启动后台处理线程（DA3 退役后现无注册方）。
 
     app.py 里在模型可用时调用；本地自测不调用即为纯中继（只收图 + 展示原图）。
     """
@@ -355,7 +355,7 @@ def _new_bucket(now: float) -> dict:
     return {
         "seq": 0, "image": None, "content_type": "image/jpeg",
         # 相机硬件深度图（帧源已伪彩渲染好的 JPEG，如 mac mini 推帧器）：独立计数，
-        # 不参与 DA3 处理，仅供 /panel 左上角展示。depth_received_at 单独记时：
+        # 不参与产物处理，仅供页面展示。depth_received_at 单独记时：
         # 深度独立帧率高于 RGB 时存在 depth-only 上报，须一并续设备 TTL
         "depth_image": None, "depth_seq": 0, "depth_content_type": "image/jpeg",
         "depth_received_at": 0.0,
@@ -363,7 +363,7 @@ def _new_bucket(now: float) -> dict:
         "camera_info": None, "timestamp": None, "first_seen": now,
         "product": None, "product_seq": 0, "product_gen": 0, "product_error": None,
         # 外部产物（设备直传，如 Mac 端真深度点云）：字节存桶内经 /api/frame/product-model
-        # 提供；ext_until 内该设备跳过 DA3 处理（产物槽位交给外部方），过期自动恢复 DA3
+        # 提供；ext_until 内该设备产物槽位交给外部方，过期自动恢复
         "ext_model": None, "ext_until": 0.0, "ext_ver": 0,
     }
 
