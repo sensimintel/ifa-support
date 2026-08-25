@@ -45,6 +45,365 @@
   },
   "panels": [
     {
+      "id": 1,
+      "type": "stat",
+      "title": "请求 QPS",
+      "description": "近 5 分钟平均(不含 /metrics /health)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "blue",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(rate(http_request_duration_seconds_count{service=\"sam3\",handler!~\"/metrics|/health|none\"}[5m]))",
+          "refId": "A",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "延时 P95",
+      "description": "近 5 分钟整体 P95",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 3
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{service=\"sam3\",handler!~\"/metrics|/health|none\"}[5m])))",
+          "refId": "A",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "错误率",
+      "description": "4xx+5xx 占比(近 5 分钟)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "100 * (sum(rate(http_requests_total{service=\"sam3\",status=~\"4xx|5xx\",handler!~\"/metrics|/health|none\"}[5m])) or vector(0)) / sum(rate(http_requests_total{service=\"sam3\",handler!~\"/metrics|/health|none\"}[5m]))",
+          "refId": "A",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "GPU 利用率",
+      "description": "RTX 5090(本卡)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 80
+              },
+              {
+                "color": "red",
+                "value": 95
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "100 * nvidia_smi_utilization_gpu_ratio{uuid=~\"$gpu_uuid\"}",
+          "refId": "A",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "显存占用",
+      "description": "RTX 5090(本卡)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 85
+              },
+              {
+                "color": "red",
+                "value": 95
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "100 * nvidia_smi_memory_used_bytes{uuid=~\"$gpu_uuid\"} / nvidia_smi_memory_total_bytes{uuid=~\"$gpu_uuid\"}",
+          "refId": "A",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "GPU 温度",
+      "description": "RTX 5090(本卡)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "celsius",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 70
+              },
+              {
+                "color": "red",
+                "value": 85
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "graphMode": "area",
+        "colorMode": "value",
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "nvidia_smi_temperature_gpu{uuid=~\"$gpu_uuid\"}",
+          "refId": "A",
+          "range": true
+        }
+      ]
+    },
+    {
+      "id": 7,
       "type": "timeseries",
       "title": "接口 QPS(按端点)",
       "description": "各端点每秒请求数(不含 /metrics /health)",
@@ -56,30 +415,32 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 0
+        "y": 4
       },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
+          "min": 0,
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10,
-            "showPoints": "never"
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "lineInterpolation": "smooth",
+            "gradientMode": "opacity"
           }
         },
         "overrides": []
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom",
-          "calcs": [
-            "last",
-            "max"
-          ]
+          "calcs": []
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
@@ -89,17 +450,17 @@
             "uid": "prometheus"
           },
           "expr": "sum by(handler)(rate(http_request_duration_seconds_count{service=\"sam3\",handler!~\"/metrics|/health|none\"}[1m]))",
-          "legendFormat": "{{handler}}",
           "refId": "A",
-          "range": true
+          "range": true,
+          "legendFormat": "{{handler}}"
         }
-      ],
-      "id": 1
+      ]
     },
     {
+      "id": 8,
       "type": "timeseries",
       "title": "端到端延时 P95(按端点)",
-      "description": "每端点 P95 处理延时",
+      "description": "各端点 5 分钟窗口 P95",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -108,30 +469,32 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 0
+        "y": 4
       },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
+          "min": 0,
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10,
-            "showPoints": "never"
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "lineInterpolation": "smooth",
+            "gradientMode": "opacity"
           }
         },
         "overrides": []
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom",
-          "calcs": [
-            "last",
-            "max"
-          ]
+          "calcs": []
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
@@ -141,17 +504,17 @@
             "uid": "prometheus"
           },
           "expr": "histogram_quantile(0.95, sum by(handler,le)(rate(http_request_duration_seconds_bucket{service=\"sam3\",handler!~\"/metrics|/health|none\"}[5m])))",
-          "legendFormat": "{{handler}}",
           "refId": "A",
-          "range": true
+          "range": true,
+          "legendFormat": "{{handler}}"
         }
-      ],
-      "id": 2
+      ]
     },
     {
+      "id": 9,
       "type": "timeseries",
       "title": "延时 P50/P95/P99(整体)",
-      "description": "",
+      "description": "整体延时分位(不含 /metrics /health)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -160,30 +523,78 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 12
       },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
+          "min": 0,
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10,
-            "showPoints": "never"
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "lineInterpolation": "smooth",
+            "gradientMode": "opacity"
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p50"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p95"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "p99"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom",
-          "calcs": [
-            "last",
-            "max"
-          ]
+          "calcs": []
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
@@ -192,38 +603,38 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.50, sum by(le)(rate(http_request_duration_seconds_bucket{service=\"sam3\"}[5m])))",
-          "legendFormat": "p50",
+          "expr": "histogram_quantile(0.50, sum by(le)(rate(http_request_duration_seconds_bucket{service=\"sam3\",handler!~\"/metrics|/health|none\"}[5m])))",
           "refId": "A",
-          "range": true
+          "range": true,
+          "legendFormat": "p50"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{service=\"sam3\"}[5m])))",
-          "legendFormat": "p95",
+          "expr": "histogram_quantile(0.95, sum by(le)(rate(http_request_duration_seconds_bucket{service=\"sam3\",handler!~\"/metrics|/health|none\"}[5m])))",
           "refId": "B",
-          "range": true
+          "range": true,
+          "legendFormat": "p95"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.99, sum by(le)(rate(http_request_duration_seconds_bucket{service=\"sam3\"}[5m])))",
-          "legendFormat": "p99",
+          "expr": "histogram_quantile(0.99, sum by(le)(rate(http_request_duration_seconds_bucket{service=\"sam3\",handler!~\"/metrics|/health|none\"}[5m])))",
           "refId": "C",
-          "range": true
+          "range": true,
+          "legendFormat": "p99"
         }
-      ],
-      "id": 3
+      ]
     },
     {
+      "id": 10,
       "type": "timeseries",
-      "title": "错误率(4xx/5xx 按状态)",
-      "description": "错误请求速率",
+      "title": "请求结果(按状态)",
+      "description": "按状态码分档的请求速率——绿色 2xx 是常在基线，黄/红(4xx/5xx)一冒头就是异常",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -232,30 +643,93 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 12
       },
       "fieldConfig": {
         "defaults": {
           "unit": "reqps",
+          "min": 0,
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10,
-            "showPoints": "never"
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never",
+            "lineInterpolation": "smooth",
+            "gradientMode": "opacity"
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "2xx"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "3xx"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "4xx"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "5xx"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom",
-          "calcs": [
-            "last",
-            "max"
-          ]
+          "calcs": []
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
@@ -264,50 +738,84 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by(status)(rate(http_requests_total{service=\"sam3\",status=~\"4xx|5xx\"}[1m]))",
-          "legendFormat": "{{status}}",
+          "expr": "sum by(status)(rate(http_requests_total{service=\"sam3\",handler!~\"/metrics|/health|none\"}[1m]))",
           "refId": "A",
-          "range": true
+          "range": true,
+          "legendFormat": "{{status}}"
         }
-      ],
-      "id": 4
+      ]
     },
     {
+      "id": 11,
       "type": "timeseries",
-      "title": "GPU 利用率",
-      "description": "",
+      "title": "GPU 利用率 / 显存占用",
+      "description": "RTX 5090(本卡)。SAM3 空闲时核心利用率贴 0、来请求才打尖峰属正常",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
-        "h": 7,
-        "w": 6,
+        "h": 8,
+        "w": 12,
         "x": 0,
-        "y": 16
+        "y": 20
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "percentunit",
+          "unit": "percent",
+          "min": 0,
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10,
-            "showPoints": "never"
-          }
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "lineInterpolation": "smooth",
+            "gradientMode": "opacity"
+          },
+          "max": 100
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "核心利用率"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "green"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "显存占用"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "blue"
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom",
-          "calcs": [
-            "last",
-            "max"
-          ]
+          "calcs": []
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
@@ -316,112 +824,138 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_utilization_gpu_ratio{uuid=~\"$gpu_uuid\"}",
-          "legendFormat": "GPU",
+          "expr": "100 * nvidia_smi_utilization_gpu_ratio{uuid=~\"$gpu_uuid\"}",
           "refId": "A",
-          "range": true
-        }
-      ],
-      "id": 5
-    },
-    {
-      "type": "timeseries",
-      "title": "GPU 显存(已用/总)",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 6,
-        "x": 6,
-        "y": 16
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes",
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "showPoints": "never"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "last",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "nvidia_smi_memory_used_bytes{uuid=~\"$gpu_uuid\"}",
-          "legendFormat": "已用",
-          "refId": "A",
-          "range": true
+          "range": true,
+          "legendFormat": "核心利用率"
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "nvidia_smi_memory_total_bytes{uuid=~\"$gpu_uuid\"}",
-          "legendFormat": "总",
+          "expr": "100 * nvidia_smi_memory_used_bytes{uuid=~\"$gpu_uuid\"} / nvidia_smi_memory_total_bytes{uuid=~\"$gpu_uuid\"}",
           "refId": "B",
-          "range": true
+          "range": true,
+          "legendFormat": "显存占用"
         }
-      ],
-      "id": 6
+      ]
     },
     {
+      "id": 12,
       "type": "timeseries",
-      "title": "GPU 功耗",
-      "description": "",
+      "title": "GPU 功耗 / 温度",
+      "description": "RTX 5090(本卡)。温度走右轴(℃)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
       "gridPos": {
-        "h": 7,
-        "w": 6,
+        "h": 8,
+        "w": 12,
         "x": 12,
-        "y": 16
+        "y": 20
       },
       "fieldConfig": {
         "defaults": {
           "unit": "watt",
+          "min": 0,
           "custom": {
             "drawStyle": "line",
-            "fillOpacity": 10,
-            "showPoints": "never"
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "never",
+            "lineInterpolation": "smooth",
+            "gradientMode": "opacity"
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "功耗"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "功耗上限"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "text"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              },
+              {
+                "id": "custom.lineWidth",
+                "value": 1
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "温度"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "red"
+                }
+              },
+              {
+                "id": "unit",
+                "value": "celsius"
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "legend": {
-          "displayMode": "table",
+          "displayMode": "list",
           "placement": "bottom",
-          "calcs": [
-            "last",
-            "max"
-          ]
+          "calcs": []
         },
         "tooltip": {
-          "mode": "multi"
+          "mode": "multi",
+          "sort": "desc"
         }
       },
       "targets": [
@@ -431,64 +965,32 @@
             "uid": "prometheus"
           },
           "expr": "nvidia_smi_power_draw_watts{uuid=~\"$gpu_uuid\"}",
-          "legendFormat": "功耗",
           "refId": "A",
-          "range": true
-        }
-      ],
-      "id": 7
-    },
-    {
-      "type": "timeseries",
-      "title": "GPU 温度",
-      "description": "",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "gridPos": {
-        "h": 7,
-        "w": 6,
-        "x": 18,
-        "y": 16
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "celsius",
-          "custom": {
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "showPoints": "never"
-          }
+          "range": true,
+          "legendFormat": "功耗"
         },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "calcs": [
-            "last",
-            "max"
-          ]
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "nvidia_smi_power_limit_watts{uuid=~\"$gpu_uuid\"}",
+          "refId": "B",
+          "range": true,
+          "legendFormat": "功耗上限"
         },
-        "tooltip": {
-          "mode": "multi"
-        }
-      },
-      "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
           "expr": "nvidia_smi_temperature_gpu{uuid=~\"$gpu_uuid\"}",
-          "legendFormat": "温度",
-          "refId": "A",
-          "range": true
+          "refId": "C",
+          "range": true,
+          "legendFormat": "温度"
         }
-      ],
-      "id": 8
+      ]
     }
-  ]
+  ],
+  "graphTooltip": 1
 }
