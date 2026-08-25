@@ -94,21 +94,16 @@ PHONE_UNIQUE_FIELDS = (("serial", "序列号"), ("identity", "账号"))
 # 它们是 services 的事实的副本，本服务无从判断对错，存下来只为让页面能显示、能比对。
 PHONE_RESOLVED_FIELDS = ("user_id", "client_id", "platform", "last_seen_at", "resolved_at")
 
-# 在线项链来源：8060 帧中继按 camera_info.device_id 分桶维护的设备表（60s 无新帧即下线）。
-# 走宿主 localhost——控制面只经 nginx /dx-api/ 访问 8070，8060 那条 ufw 放行早已移除，
-# 让 8070 代理比再开一条对外通路省事。
-NECKLACE_SOURCE_URL = os.environ.get(
-    "NECKLACE_SOURCE_URL", "http://127.0.0.1:8060/api/frame/status")
-# 取某个项链最新一帧原图（image/jpeg）。同样经本服务转发，理由见 api_necklace_frame。
-NECKLACE_FRAME_URL = os.environ.get(
-    "NECKLACE_FRAME_URL", "http://127.0.0.1:8060/api/frame/latest")
-NECKLACE_SOURCE_TIMEOUT = 2.0
-# 判定「项链在线」的最大数据龄（秒）：超过这么久没有新帧就不算在线。
+# 8060 帧中继的两个代理端点（/api/necklaces/online 与 /api/necklaces/frame）已于
+# 2026-08-25 删除，连同 NECKLACE_SOURCE_URL / NECKLACE_FRAME_URL / NECKLACE_ONLINE_MAX_AGE
+# 与 UNKNOWN_NECKLACE 一并移除。
 #
-# 故意不改帧中继自己的 DEVICE_TTL(60s)——那是它的桶清理策略，8060 的 /experience
-# 多设备下拉、/panel 的选中设备回落都依赖它，调小会让那些页面在短暂停传时就丢设备。
-# 这里只在本接口按更严的阈值过滤，影响面收在深体验区内。
-NECKLACE_ONLINE_MAX_AGE = float(os.environ.get("NECKLACE_ONLINE_MAX_AGE", "15"))
+# 原因不是没人调，而是**不该有人调**：8060 收的是 App 那份 fire-and-forget 镜像，
+# 不校验 token 也不查绑定，与生产上传的成败完全解耦。现场 odyss-0F20 解绑后每帧挨
+# 422、services 一帧没入库，8060 却仍以 0.6 fps 稳推，控制面照着它满屏绿灯。
+# 控制面（superadmin #575/#577）已把绑定、入库乃至实时画面全部改读 services，
+# 这两个端点就此没有消费者。**不要因为「加个在线列表很方便」把它们加回来**——
+# 它天然回答不了「services 收到帧了吗」这个唯一要紧的问题。
 # ifa 演示状态机（项链 standby / ready / meal_in_progress / analyzing /
 # report_published / failed，一次「开轮→开餐→分析→出报告」为一轮 cycle；
 # standby 是控制面「归零」的落点，那时还没有人认领这一轮，进食信号不算数）：
@@ -125,12 +120,6 @@ IFA_SERVICES_TIMEOUT = 5.0
 # 超时。超时的后果不只是这里返回 502：连接一断，services 侧的 request context 跟着取消，
 # 那次模型调用被 cancel、回落成派生公式——现场看到的是「点了估算，营养还是空的」。
 IFA_SERVICES_LLM_TIMEOUT = 60.0
-
-# 帧中继对「camera_info 缺失或其中没有 device_id」的兜底桶名。
-# 它不是真实身份：多个未识别设备的帧会混进同一个桶，绑定它毫无意义，故不进候选。
-# 但它出现本身是个运维信号——说明有项链的蓝牙名没被 App 侧的 BleDeviceIdentityCache
-# 缓存到（回落顺序：缓存 → 已连接设备 → 配置值 → "unknown"），该项链需要重连一次。
-UNKNOWN_NECKLACE = "unknown"
 
 _state_lock = threading.Lock()
 
@@ -1012,80 +1001,6 @@ def api_phone_delete(no: int):
         _state["phones"] = [p for p in _state["phones"] if p.get("no") != no]
         _save_state(_state)
     return JSONResponse({"ok": True, "no": no})
-
-
-@app.get("/api/necklaces/online")
-def api_necklaces_online():
-    """在线项链列表：代理 8060 帧中继的设备表，并标注每个项链当前绑在哪条桌边。
-
-    「在线」的唯一依据是 **NECKLACE_ONLINE_MAX_AGE 秒内有新帧到达**（默认 15s）——
-    它不代表设备通电、BLE 已连接或 App 里显示绑定成功，只代表这个 device_id 最近
-    确实有图片传进来。帧中继自己的桶保留 60s，这里按更严的阈值过滤。
-
-    项链身份取 camera_info.device_id（蓝牙名，如 odyss-0F0B），跨手机稳定。
-    帧中继不可达时返回空列表 + error 说明，让控制面回落到手工输入而不是报错。
-    """
-    devices, error = [], ""
-    try:
-        with urllib.request.urlopen(NECKLACE_SOURCE_URL, timeout=NECKLACE_SOURCE_TIMEOUT) as resp:
-            devices = (json.loads(resp.read().decode("utf-8")) or {}).get("devices") or []
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        error = f"帧中继（{NECKLACE_SOURCE_URL}）不可达：{exc}"
-    with _state_lock:
-        bound = {g["necklace_device_id"]: g["edge"] for g in _state["groups"]
-                 if g.get("necklace_device_id")}
-    items, unknown_active = [], False
-    for dev in devices:
-        device_id = str((dev or {}).get("device_id") or "").strip()
-        if not device_id:
-            continue
-        age = (dev or {}).get("age")
-        # age 未知一律当不在线：宁可少列一个，也不要把停传的项链说成在线
-        if age is None or age > NECKLACE_ONLINE_MAX_AGE:
-            continue
-        if device_id == UNKNOWN_NECKLACE:
-            unknown_active = True   # 不进候选，但要报出去让人去修那个项链
-            continue
-        items.append({"device_id": device_id, "age": age, "seq": dev.get("seq"),
-                      "fps": dev.get("fps"), "bound_edge": bound.get(device_id),
-                      # 传输时序三时刻 + 手机端队列进度（跨仓契约 v1 §2b）：
-                      # 原样透传 8060 的解析结果，8060 未升级没给这些键时一律 None，
-                      # 控制面据此画镜像延迟与「补传落后多少」
-                      "capture_ts_ms": dev.get("capture_ts_ms"),
-                      "upload_ts_ms": dev.get("upload_ts_ms"),
-                      "server_ts_ms": dev.get("server_ts_ms"),
-                      "queue": dev.get("queue")})
-    return JSONResponse({"necklaces": items, "error": error,
-                         "max_age_s": NECKLACE_ONLINE_MAX_AGE,
-                         "unknown_active": unknown_active, "ts": time.time()})
-
-
-@app.get("/api/necklaces/frame")
-def api_necklace_frame(device: str = ""):
-    """代理某个项链的最新帧原图（image/jpeg），供控制面的 <img> 直接展示。
-
-    为什么经本服务转发、而不让控制面直连 8060：superadmin 的 nginx 只反代了
-    /dx-api/ → 宿主 8070，8060 对容器网络的 ufw 放行早已移除，加回去要动部署机
-    防火墙与 nginx 配置。而这里的帧很小（几十 KB、1~2 fps），转发开销可忽略。
-
-    404 原样透出（该项链暂无帧），让前端显示占位而不是当成错误。
-    """
-    device = (device or "").strip()
-    if not device:
-        return JSONResponse({"ok": False, "error": "需要 device 参数"}, status_code=400)
-    url = "%s?device=%s" % (NECKLACE_FRAME_URL, urllib.parse.quote(device))
-    try:
-        with urllib.request.urlopen(url, timeout=NECKLACE_SOURCE_TIMEOUT) as resp:
-            data = resp.read()
-            content_type = resp.headers.get("Content-Type") or "image/jpeg"
-            seq = resp.headers.get("X-Frame-Seq") or "0"
-    except urllib.error.HTTPError as exc:
-        return JSONResponse({"ok": False, "error": "该项链暂无帧"}, status_code=exc.code)
-    except (urllib.error.URLError, OSError) as exc:
-        return JSONResponse({"ok": False, "error": "帧中继不可达：%s" % exc}, status_code=502)
-    # no-store：帧是一直在变的，缓存住就成了静态图
-    return Response(content=data, media_type=content_type,
-                    headers={"Cache-Control": "no-store", "X-Frame-Seq": seq})
 
 
 def _ifa_services_request(method, path, body=None, timeout=None):
