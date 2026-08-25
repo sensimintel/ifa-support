@@ -196,6 +196,40 @@ class ParamsTest(IfaProxyTestBase):
         self.assertEqual(self.calls, [])
 
 
+class GlobalParamsTest(IfaProxyTestBase):
+    """全局分析参数：秤阈值这一组只有全局那一层作数，控制面调阈值走这条路。"""
+
+    PARAMS = {"window_max_minutes": 20, "max_frames": 32, "image_max_edge": 640,
+              "image_jpeg_quality": 85, "model": "gemini-3.1-pro-preview",
+              "prompt": "meal_analysis_ifa_v1", "scale_min_event_g": 0.2,
+              "scale_split_threshold_g": 1.0, "scale_max_single_event_g": 3.0}
+
+    def test_get_走全局端点(self):
+        self.reply = ({"device_id": "", "scope": "global", "params": self.PARAMS}, 200)
+        resp = self.client.get("/api/ifa/params")
+        self.assertEqual(self.last["method"], "GET")
+        self.assertEqual(self.last["path"], "/api/v1/ifa/params")
+        self.assertEqual(resp.json(), {"ok": True, "device_id": "",
+                                       "scope": "global", "params": self.PARAMS})
+
+    def test_put_阈值原样透传给全局端点(self):
+        self.reply = ({"device_id": "", "scope": "global",
+                       "params": dict(self.PARAMS, scale_split_threshold_g=2.5)}, 200)
+        body = {"params": {"scale_split_threshold_g": 2.5, "scale_min_event_g": 0}}
+        resp = self.client.put("/api/ifa/params", json=body)
+        self.assertEqual(self.last["method"], "PUT")
+        self.assertEqual(self.last["path"], "/api/v1/ifa/params")
+        # 死区显式填 0 = 把死区关掉，代理不能把它当成「没填」丢掉
+        self.assertEqual(self.last["body"], body)
+        self.assertEqual(resp.json()["params"]["scale_split_threshold_g"], 2.5)
+
+    def test_params_不是对象时本地就拒掉(self):
+        for bad in ({}, {"params": "x"}, {"params": None}):
+            resp = self.client.put("/api/ifa/params", json=bad)
+            self.assertEqual(resp.status_code, 400, bad)
+        self.assertEqual(self.calls, [])
+
+
 class FallbackReportPassthroughTest(IfaProxyTestBase):
     """推送报告兜底：食物表与推送请求都只做透传，状态闸门留在 services。"""
 

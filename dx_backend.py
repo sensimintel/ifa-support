@@ -1313,6 +1313,30 @@ def api_necklace_params_set(device_id: str, body: dict = Body(...)):
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
 
 
+@app.get("/api/ifa/params")
+def api_ifa_global_params_get():
+    """查询深区**全局**分析参数（秤阈值这一组只有全局那一层作数）。
+
+    桌上几台秤称的是同一批食物，「多大的变化算漂移、多少克分蓝莓与爆米花」是
+    这场演示的一条口径，不是某台项链的属性——控制面调阈值一律走这里，
+    改一次对所有秤生效。整体透传 services 的 data 段，不在代理这层维护字段白名单。
+    """
+    data, status = _ifa_services_request("GET", "/api/v1/ifa/params")
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
+@app.put("/api/ifa/params")
+def api_ifa_global_params_set(body: dict = Body(...)):
+    """部分更新深区全局分析参数，请求体 {"params": {...}}，原样透传给 services。"""
+    body = body or {}
+    if not isinstance(body.get("params"), dict):
+        return JSONResponse({"ok": False, "error": "需要 params 对象"}, status_code=400)
+    data, status = _ifa_services_request("PUT", "/api/v1/ifa/params", body)
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
 @app.get("/api/pairing-log")
 def api_pairing_log(limit: int = 50):
     """最近的绑定变更流水（倒序）：追踪一天里项链/手机什么时候换到了哪条桌边。"""
