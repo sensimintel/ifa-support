@@ -43,7 +43,6 @@ _CLS_CANON = {c.lower(): c for c in CLASSIFICATIONS}
 NAME_MAX = 40
 LOOK_MAX = 60
 DESC_EN_MAX = 60
-DESC_DE_MAX = 90
 PORTION_MAX = 24
 ALIAS_MAX = 8               # 每项最多几个别名
 
@@ -91,6 +90,16 @@ def _clamp_num(v, lo, hi, as_int=False):
 def _text(v, limit):
     """文本字段：转字符串、去换行、截断。"""
     return str(v or "").strip().replace("\n", " ")[:limit]
+
+
+def type_en(typ) -> str:
+    """内部类型枚举 → 发给模型的英文词。
+
+    库里与卡片上的 type 恒为「食物」/「液体」（控制面、前端 typeCls 都读这两个值），
+    但 2026-08-25 起 prompt 与模型 JSON 一律英文，参考清单/候选清单里的类型要翻过去。
+    模型回填的英文 type 由 _parse_recog / normalize_item 归一回中文，两侧闭环。"""
+    t = str(typ or "").strip().lower()
+    return "drink" if ("液" in t or "饮" in t or "drink" in t or "liquid" in t) else "food"
 
 
 def name_key(s: str) -> str:
@@ -152,7 +161,6 @@ def normalize_item(patch, base=None) -> dict:
     out["look"] = _text(take("look"), LOOK_MAX)
     out["portion"] = _text(take("portion"), PORTION_MAX)
     out["description_en"] = _text(take("description_en"), DESC_EN_MAX)
-    out["description_de"] = _text(take("description_de"), DESC_DE_MAX)
 
     typ = str(take("type", "食物") or "").strip().lower()
     out["type"] = "液体" if ("液" in typ or "饮" in typ or "drink" in typ
@@ -375,10 +383,12 @@ def menu_intro(n_items: int, n_images: int) -> str:
 
     历史教训：画面空无一物时模型会照着参考图报 Snickers，所以隔离要在文字与图片
     （角标横幅）两处同时说，且后面任务里还要再申明一次。"""
-    return ("本展台已登记 %d 种参考食物，下面依次给出它们的编号、名称与实物照片"
-            "（共 %d 张，每张左上角烧有 REF 角标）。\n"
-            "这些照片**全部是参考清单**，不是当前画面、也不代表桌上现在有这些东西——"
-            "它们只用于稍后判断「桌上那一样是不是其中某一项」。\n" % (n_items, n_images))
+    return ("This booth has %d registered reference foods. Their number, name and photo "
+            "follow below (%d photos in total, each burnt with a REF badge in the top-left "
+            "corner).\n"
+            "These photos are **the reference list only**. They are not the current frame and "
+            "they do not mean these things are on the table now -- they serve solely to judge, "
+            "later on, whether the thing on the table is one of them.\n" % (n_items, n_images))
 
 
 def item_label(idx: int, item: dict) -> str:
@@ -389,7 +399,7 @@ def item_label(idx: int, item: dict) -> str:
     name_en = item.get("name_en") or ""
     if name_en and name_key(name_en) != name_key(item.get("name") or ""):
         bits.append(name_en)
-    bits.append(item.get("type") or "食物")
+    bits.append(type_en(item.get("type")))
     if item.get("look"):
         bits.append(item["look"])
     return " · ".join(bits)
@@ -422,8 +432,8 @@ def build_blocks(items, uri_of):
 
 def menu_ack(n_items: int) -> str:
     """预填的 assistant 回执：把固定前缀的边界钉死在这句话上。"""
-    return ("已登记 %d 项参考食物，我不会把它们当成当前画面里的东西。"
-            "接下来请给我当前画面。" % n_items)
+    return ("%d reference foods registered. I will not treat any of them as something in the "
+            "current frame. Please give me the current frame next." % n_items)
 
 
 def task_zero(items: list, min_confidence: str = "medium") -> str:
@@ -434,30 +444,39 @@ def task_zero(items: list, min_confidence: str = "medium") -> str:
     n = len(items)
     lines = "\n".join("  " + item_label(i + 1, it) for i, it in enumerate(items))
     return (
-        "任务零·参考清单命中判定（先做这个，它决定后面几项要不要填）：\n"
-        "开头那 %d 项参考食物的编号与名称是：\n%s\n"
-        "看当前画面里你要报的那一样东西，判断它是不是清单里某一项的**同一种商品/同一种食材**：\n"
-        "  · 判的是「同一种」，不是「同一个」——同一款包装的另一根、同一种水果的另一颗，"
-        "都算命中；角度、光线、摆放、已经吃掉一部分，都不影响命中；\n"
-        "  · 品牌包装文字、颜色、形状、容器这四项里，只要有**两项对得上且没有一项明显冲突**，"
-        "就给编号，不要因为拍摄条件不同而犹豫；\n"
-        "  · 但同类目不同产品必须判不命中：不同品牌/口味的巧克力棒、可乐与橙汁、"
-        "换了包装的同名产品，一律 ref_id=null；\n"
-        "  · 清单里没有的东西就是没有，ref_id=null，照常按你自己的判断识别，不要硬套编号。\n"
-        "输出这三个字段：\n"
-        "  ref_id：命中的清单编号（整数 1~%d），没命中填 null；\n"
-        "  ref_confidence：\"high\"=包装文字/品牌可辨认或形状颜色高度一致；"
-        "\"medium\"=像，但拍得不够清楚；\"low\"=只是同类目。"
-        "（低于 \"%s\" 的判定会被系统丢弃当作没命中）；\n"
-        "  ref_evidence：一句话说明你在**当前画面的哪个位置**看到它、凭什么判成这一项"
-        "（如 \"盘子中间偏左，深棕包装上有白色 Snickers 字样\"）。"
-        "说不出画面位置就说明你在照参考图编，这时必须填 null。\n"
-        "命中时（ref_id 不为 null）：name 一字不差照抄清单里的名称，"
-        "然后**写完 ref_evidence 就直接结束这个对象**——description_en / description_de /"
-        " calories_kcal / protein_g / carbs_g / fat_g / classification / cur_text / diff /"
-        " match_evidence / match / matched_name 这些字段**一律省略不写**："
-        "内容系统会查库回填，去重系统会按清单编号自动归并，你写了也会被整组丢弃。\n"
-        "未命中（ref_id=null）时，才继续把上面这些字段全部填完。\n"
+        "Task 0 · Reference list hit (do this one first, it decides whether the later fields "
+        "have to be filled in at all):\n"
+        "The numbers and names of the %d reference foods at the top of this request are:\n%s\n"
+        "Look at the thing you are about to report in the current frame and decide whether it is "
+        "**the same product / the same kind of food** as one of the list entries:\n"
+        "  · the judgement is about \"the same kind\", not \"the same individual\" -- another bar "
+        "of the same packaging, another piece of the same fruit both count as a hit; angle, "
+        "lighting, placement and having been partly eaten do not affect the hit;\n"
+        "  · among brand package text, colour, shape and container, whenever **two of them agree "
+        "and none clearly conflicts**, give the number; do not hesitate merely because the "
+        "shooting conditions differ;\n"
+        "  · but different products of one category must be judged a miss: chocolate bars of a "
+        "different brand or flavour, cola vs orange juice, the same product in new packaging -- "
+        "all of them ref_id=null;\n"
+        "  · what is not on the list is simply not on it: ref_id=null, recognise it with your own "
+        "judgement as usual and never force a number onto it.\n"
+        "Output these three fields:\n"
+        "  ref_id: the list number that was hit (integer 1-%d), null when nothing was hit;\n"
+        "  ref_confidence: \"high\" = package text or brand legible, or shape and colour highly "
+        "consistent; \"medium\" = looks like it, but the shot is not clear enough; \"low\" = only "
+        "the same category. (Anything below \"%s\" is dropped by the system and treated as a "
+        "miss);\n"
+        "  ref_evidence: one English sentence saying **where in the current frame** you see it "
+        "and what makes it this entry (e.g. \"centre-left of the plate, white Snickers lettering "
+        "on a dark brown wrapper\"). Being unable to state the position in the frame means you "
+        "are reading it off the reference image, and then this must be null.\n"
+        "On a hit (ref_id not null): copy the name from the list word for word, then **end the "
+        "object right after ref_evidence** -- description_en / calories_kcal / protein_g / "
+        "carbs_g / fat_g / classification / cur_text / diff / match_evidence / match / "
+        "matched_name are **all omitted**: the content is filled in from the catalog by the "
+        "server, dedup merges by list number automatically, and whatever you write there is "
+        "dropped along with the whole group.\n"
+        "On a miss (ref_id=null), and only then, go on and fill in all of those fields.\n"
         % (n, lines, n, min_confidence)
     )
 
@@ -514,7 +533,7 @@ def resolve_hit(parsed, items, min_confidence="medium"):
 
 # 命中后由库覆盖的字段：名称、描述、营养四项、健康分级。
 # 覆盖是**整组**的，不做逐字段回退——半查库半模型编出来的卡片没法解释。
-OVERRIDE_FIELDS = ["description_en", "description_de", "calories_kcal",
+OVERRIDE_FIELDS = ["description_en", "calories_kcal",
                    "protein_g", "carbs_g", "fat_g", "classification"]
 
 

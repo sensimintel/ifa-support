@@ -227,7 +227,7 @@ class MenuTextTest(unittest.TestCase):
     def test_intro_says_not_current_frame(self):
         intro = foodref.menu_intro(3, 5)
         self.assertIn("3", intro)
-        self.assertIn("不是当前画面", intro)
+        self.assertIn("not the current frame", intro)
 
     def test_item_label_carries_index_and_look(self):
         item = foodref.normalize_item(_item(name="士力架", name_en="Snickers",
@@ -257,10 +257,10 @@ class MenuTextTest(unittest.TestCase):
         self.assertIn("high", text)
         self.assertIn("ref_evidence", text)
         # 命中时不许模型编营养，且直接省略后续字段（省 decode）——查库回填的前提
-        self.assertIn("写完 ref_evidence 就直接结束这个对象", text)
-        self.assertIn("一律省略不写", text)
+        self.assertIn("end the object right after ref_evidence", text)
+        self.assertIn("**all omitted**", text)
         # 未命中路径必须显式说「才继续填完」，否则模型会学着在自由路径上也乱省
-        self.assertIn("未命中（ref_id=null）时", text)
+        self.assertIn("On a miss (ref_id=null)", text)
 
 
 class BuildBlocksTest(unittest.TestCase):

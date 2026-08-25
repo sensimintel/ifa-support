@@ -121,10 +121,10 @@ class WiringTest(unittest.TestCase):
                       gate[:gate.index("def _recog_direct_loop")])
 
     def test_direct_prompt_variant_exists(self):
-        # 直传口径没有带框图：固定段里就不该出现【当前画面 · 检测框版】那一条
+        # 直传口径没有带框图：固定段里就不该出现 [CURRENT FRAME · BOXED] 那一条
         import recog_prompt
-        self.assertNotIn("【当前画面 · 检测框版】", recog_prompt.fixed_head(True))
-        self.assertIn("【当前画面 · 检测框版】", recog_prompt.fixed_head(False))
+        self.assertNotIn("[CURRENT FRAME · BOXED]", recog_prompt.fixed_head(True))
+        self.assertIn("[CURRENT FRAME · BOXED]", recog_prompt.fixed_head(False))
 
     def test_experience_drawer_has_direct_controls(self):
         for ident in ("r_rd_itv", "r_rd_conc", 'name="rdon"', "/api/recog/direct/config"):
