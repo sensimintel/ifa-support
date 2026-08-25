@@ -38,7 +38,7 @@ ssh odyss-server-local 'bash -s' < tools/health/check.sh
 补充事实：
 
 - 本机 vLLM 模型为 Qwen3.6-35B-A3B-FP8（served name 含别名 gemini-3.1-pro-preview），监听 `0.0.0.0:8000`；services 调 VLM 走 `http://172.23.0.1:8000/v1`（docker 网关直达宿主）。
-- 显卡为双卡（2026-08-24 起）：GPU0 = RTX Pro 6000 Blackwell 96GB **独占给 vLLM**（`gpu-memory-utilization 0.90`）；GPU1 = RTX 5090 32GB 归 SAM3（`SAM3_MEM_FRACTION=0.9`）与 DA3（懒加载）。三个 unit 均在 systemd 钉卡（sam3/da3-web 按 GPU UUID；vllm 按 `PCI_BUS_ID`+序号 0——vLLM 不认 UUID 形式），check.sh 有「落卡」检查项兜底；**「预期停止腾显存」概念已随 LocateAnything 下线一并消失**。
+- 显卡为双卡（2026-08-24 起）：GPU0 = RTX Pro 6000 Blackwell 96GB **独占给 vLLM**（`gpu-memory-utilization 0.90`）；GPU1 = RTX 5090 32GB 归 SAM3 独享（`SAM3_MEM_FRACTION=0.9`；DA3 已于 2026-08-25 退役）。三个 unit 均在 systemd 钉卡（sam3/da3-web 按 GPU UUID；vllm 按 `PCI_BUS_ID`+序号 0——vLLM 不认 UUID 形式），check.sh 有「落卡」检查项兜底；**「预期停止腾显存」概念已随 LocateAnything 下线一并消失**。
 - 观测容器名仍带 `locateanything-` 前缀（历史名，职能已是全机观测）：保留容器名，探测标签一律用中性名（「观测/本机Prometheus」「观测/gpu-exporter」等）。
 
 ### ② 一次性完成——Exited(0) 即健康

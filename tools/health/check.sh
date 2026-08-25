@@ -70,7 +70,7 @@ need_pid_match() { # $1=unit $2=端口 $3=组件标签
   fi
 }
 
-# ---- 双卡落位（2026-08-24 起）：GPU0=RTX PRO 6000 96G 独占 vLLM；GPU1=RTX 5090 32G 归 SAM3/DA3 ----
+# ---- 双卡落位：GPU0=RTX PRO 6000 96G 独占 vLLM；GPU1=RTX 5090 32G 归 SAM3（DA3 已于 2026-08-25 退役） ----
 GPU_PRO6000="GPU-5938e8ce-154b-31e1-f5c6-2aa6cbe73fc6"   # RTX PRO 6000 Blackwell 96G
 GPU_RTX5090="GPU-565f6e8d-550f-38cf-56d1-fe49fb280b05"   # RTX 5090 32G
 # unit 的 GPU 计算进程必须落在期望卡上（拿 nvidia-smi compute-apps 的 pid 反查所属 systemd unit）。
@@ -160,7 +160,6 @@ need_systemd da3-web "演示/da3-web"
 # 根路径现为 307 → /experience，200 与 30x 都算活
 need_http "演示/da3-web页面" "http://127.0.0.1:8060/" '^(200|30[0-9])$'
 need_pid_match da3-web 8060 "演示/da3-web漂移"
-need_gpu_place da3-web "$GPU_RTX5090" "演示/DA3落卡" lazy
 need_systemd sam3 "演示/SAM3"
 ss -tln 2>/dev/null | grep -q ':8013 ' && say OK "演示/SAM3端口" "8013 在监听" || say FAIL "演示/SAM3端口" "8013 未监听"
 need_pid_match sam3 8013 "演示/SAM3漂移"

@@ -15,11 +15,11 @@ WorkingDirectory=/home/odyss
 Environment=SAM3_CKPT=/home/odyss/models/sam3/sam3.pt
 Environment=SAM3_PORT=8013
 Environment=SAM3_HOST=127.0.0.1
-# 双卡布局（2026-08-24 起）：GPU0=RTX PRO 6000 96G 独占给 vLLM，GPU1=RTX 5090 32G 给 SAM3/DA3。
+# 双卡布局（2026-08-24 起）：GPU0=RTX PRO 6000 96G 独占给 vLLM，GPU1=RTX 5090 32G 归 SAM3
+# （DA3 已于 2026-08-25 退役，本卡由 SAM3 独享）。
 # 按 UUID 钉卡（CUDA 默认枚举是"最快卡优先"，index 不可靠），任何重启都保证落在 5090 上
 Environment=CUDA_VISIBLE_DEVICES=GPU-565f6e8d-550f-38cf-56d1-fe49fb280b05
-# 显存上限占比按可见卡（RTX 5090 32G）基数：0.9×31.8G≈28.6G，SAM3 独享整卡、留 context/Xorg 余量；
-# 同卡 DA3（da3-web 懒加载，峰值约 8.6G）不预留，显存不足任其失败（沿用旧纪律；SAM3 实占约 7G，常态互不影响）
+# 显存上限占比按可见卡（RTX 5090 32G）基数：0.9×31.8G≈28.6G，独享整卡、留 context/Xorg 余量（实占约 7G）
 Environment=SAM3_MEM_FRACTION=0.9
 # 服务代码走仓库 checkout（~/da3-web 即 ifa-support），部署=git pull + restart
 ExecStart=/home/odyss/sam3-env/bin/python -u /home/odyss/da3-web/model/sam3/sam3_server.py

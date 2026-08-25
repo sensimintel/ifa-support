@@ -1,8 +1,8 @@
 # SAM3 使用路径地图（ifa-support）
 
 > 用途：一眼看清 SAM3 在本仓被谁用、用在哪、动它会波及什么。
-> 最后核对：2026-08-21（2026-08-17 去冗余：双目链、8061 实验台、/sam3 页、Gradio UI 均已下线，控制面识别日志观测已接上；2026-08-21 VLM 本机化：识别直连本机 vLLM `:8000`，g4 隧道链路废弃）。
-> 文中「5090」沿用主机称谓（2026-08-24 起双卡：GPU0=RTX Pro 6000 96GB 独占 vLLM，GPU1=RTX 5090 32GB 跑 SAM3+DA3，unit 钉卡（sam3/da3-web 按 UUID，vllm 按 PCI 序））。改到 SAM3 相关链路请同步更新本文。
+> 最后核对：2026-08-25（DA3 整体退役：单目链 A' 及其四个下游、/api/infer、/panel 面板全部删除；此前 2026-08-17 去冗余：双目链、8061 实验台、/sam3 页、Gradio UI 均已下线，控制面识别日志观测已接上；2026-08-21 VLM 本机化：识别直连本机 vLLM `:8000`，g4 隧道链路废弃）。
+> 文中「5090」沿用主机称谓（2026-08-24 起双卡：GPU0=RTX Pro 6000 96GB 独占 vLLM，GPU1=RTX 5090 32GB 跑 SAM3，unit 钉卡（sam3/da3-web 按 UUID，vllm 按 PCI 序）；DA3 已于 2026-08-25 整体退役）。改到 SAM3 相关链路请同步更新本文。
 
 ## 0. 服务本体
 
@@ -14,35 +14,22 @@
 | 显存 | 实占 ~4.2G（`SAM3_MEM_FRACTION=0.28`，流式 `window` 控瞬时占用） |
 | 存活检查 | `tools/health/check.sh`：systemd 单元 + 8013 端口监听 |
 
-## 1. 消费方总表（去冗余后只剩两个）
+## 1. 消费方总表（只剩两个）
 
 | # | 消费方 | 调用方式 | 产出 / 去向 | 现网状态 |
 |---|---|---|---|---|
 | A | **识别触发线程的 SAM3 门控**（`_sam3_gate_dets`） | 每词一路并发，直接跑**当前设备的 RGB 彩色帧**，优先 `/v1/stream/frame`（带 debug 捕获），老 server 回退 `/v1/segment` | ①food/drink 归一化框 → 命中即带框送 VLM 识别 ②sam3tune 生产观测（`src="gate"`）→ 浅体验区控制面 | **在跑**（`/experience` 抽屉里直传开关设为「关」时；开=不调 SAM3） |
-| A' | 8060 单目 RGB 链（`_maybe_sam3cloud` → `_sam3cloud_refresh`） | 每词一路并发，优先 `/v1/stream/frame`，老 server 回退 `/v1/track` | ①SAM3 点云映射 ②SAM3 高亮点云 ③液体框证据 ④sam3tune 生产观测 | **停用**（`.env` `DISABLE_MONO_PIPELINE=1`）。保留为「DA3+SAM3+点云+高亮」的完整能力样本，停用即零成本 |
 | B | `/sam3tune` 调优页（`/api/sam3tune/*`） | `/v1/segment` 带 debug（presence/top-K） | 调参可视化 + **生产打分口径**落 `sam3_score_cfg.json`（词表/α/阈值），A 每帧读 | 在用（手动触发） |
 
-已删除的历史消费方（2026-08-17 去冗余）：双目 IR 链（`_stereo_sam3_overlays`，整条双目 DA3 链一并删）、
-`/sam3` 手动调试页（能力被 sam3tune 覆盖）、8061 感知链路实验台 `exp_app.py`（产线识别链路的完整复刻）。
+已删除的历史消费方：**A' 单目 RGB 链**（`_maybe_sam3cloud`→`_sam3cloud_refresh`，2026-08-25 随 DA3 整体退役删除，先前已 `DISABLE_MONO_PIPELINE=1` 停用）；双目 IR 链（`_stereo_sam3_overlays`，2026-08-17）、`/sam3` 手动调试页、8061 感知链路实验台 `exp_app.py`（同日去冗余）。
 
-## 2. A 链展开（单目 RGB 链，停用中）
+## 2. A' 单目链（已删除，2026-08-25）
 
-`_da3_frame_processor` 每帧 DA3 推理后调 `_maybe_sam3cloud`（后台单任务，忙时跳过本帧），
-`_sam3cloud_refresh` 里对 `_get_score_cfg()["words"]` 的每个词并发跑 SAM3，另补一路
-`SAM3_TEXT`(默认 `food`) 专供染色。一轮结果同时喂四个下游：
-
-1. **第三图 · SAM3 点云映射**：mask → 深度分辨率 → 逐 mask 画 3D AABB 框
-   → `/api/sam3cloud/*` → `/panel` 第三格。
-2. **第四图 · SAM3 高亮点云**：同一轮 overlays 的「无框纯高亮」版，样式读
-   `/api/sam3hl/config` → `/api/sam3hl/*`。
-3. **液体框证据**：`_sam3_dets`（TTL 6s，**只收 drink，food mask 明确排除**）
-   → `_sam3_recent_drinks()` → SAM3 口径的识别触发（仅 `export_format=glb` 分支）。
-4. **sam3tune 生产观测**：`_sam3tune_record_prod` 把生产轮的结果写回 `/sam3tune` 页展示。
-
-切设备时（`_track_stream_device`）流式 session、`_sam3_dets`、产物槽一并重置。
-
-> `/experience` 的背景来源已收敛为「设备深度图 + 设备点云」两条硬件深度链路，
-> 不再消费 A 的任何产物；A 的产物只在 `/panel` 可见。
+原「DA3 每帧推理 → SAM3 点云映射/高亮/液体框证据/sam3tune 观测」整条链路随 DA3 退役删除：
+`_da3_frame_processor`、`_maybe_sam3cloud`、`_sam3cloud_refresh`、`/api/infer`、`/api/sam3cloud/*`、
+`/panel` 面板页与 `DISABLE_MONO_PIPELINE` 开关均已移除。frame_relay 对 RGB 帧是纯中继；
+`/experience` 背景只有「设备深度图 + 设备点云」两条硬件深度链路。`/api/sam3hl/*` 样式配置
+保留（/experience 抽屉仍引用）。切设备重置（`_track_stream_device`）仍在，由识别触发线程调用。
 
 ## 3. 识别触发口径（2026-08-17 起）
 
@@ -52,7 +39,7 @@
 | 口径 | 触发条件 | 送 VLM 的图 | 节奏 |
 |---|---|---|---|
 | **直传（默认）** | 主链路定时取选中设备最新 **RGB 帧**，不看 SAM3 | 只有图1原图（+ 去重参考图） | `/api/recog/direct/config` 的 `interval_s`（默认 0.5s）× `concurrency`（默认 1=串行·最新优先） |
-| **SAM3 门控（直传关掉时）** | 同一条触发线程按同样的间隔取 RGB 帧，先跑 SAM3（生产词表 + food 词），**认出食物/饮品才送 VLM** | 图1原图 + 图2带框图（+ 参考图） | 同上间隔；每轮多一次 SAM3（约 0.5~0.9s）。单目链启用时它的液体框缓存也走这条 |
+| **SAM3 门控（直传关掉时）** | 同一条触发线程按同样的间隔取 RGB 帧，先跑 SAM3（生产词表 + food 词），**认出食物/饮品才送 VLM** | 图1原图 + 图2带框图（+ 参考图） | 同上间隔；每轮多一次 SAM3（约 0.5~0.9s） |
 
 两种口径**共用同一条触发线程与帧源**，区别只在"要不要 SAM3 先筛一道"——**两边都会出识别卡**。
 开关在 `/experience` 右下「调节」抽屉 →「识别触发（主链路直传 VLM）」。
@@ -138,9 +125,8 @@ top-K 原始分白拿；补跑的 food 词也进日志但标 `role="highlight"`�
 | `SAM3_ENDPOINT` | `.env` | SAM3 服务地址（现网 `http://127.0.0.1:8013`） |
 | `SAM3_STREAM_WINDOW` | `.env`，默认 5 | 流式服务端滚动窗口帧数 |
 | `SAM3_TEXT` | `.env`，默认 `food` | 系统补跑的 food 查询词。**判据是词面**：口径词表里已有这个词面就不补（早期按 label 判，现网 food/drink 都标 label=drink，会把 food 原样再跑一遍——白花一次 SAM3，命中时同一物体还会出两个框） |
-| `DISABLE_MONO_PIPELINE` | `.env`，现网 `1` | 停单目链：A' 的四个下游全停（不影响 A 的 SAM3 门控与识别） |
 | `sam3_score_cfg.json` | 仓根（gitignored） | 生产词表（**每个词带 label=food\|drink**）+ presence α + 检测阈值，控制面写、A 每帧读 |
-| `sam3hl_preset.json` | 仓根（gitignored） | 高亮/点渲染样式，`/panel` 与 `/experience` 抽屉共写 |
+| `sam3hl_preset.json` | 仓根（gitignored） | 高亮/点渲染样式，`/experience` 抽屉读写（原 /panel 已下线） |
 | `recog_direct_cfg.json` | 仓根（gitignored） | 直传识别开关/间隔/并发 |
 | `SAM3_OBS_LOG` | `.env`，默认开 | =0 关掉 SAM3 观测写回（控制面 SAM3 区随之空），嫌它占识别触发线程节拍时的应急开关 |
 | `VLMLOG_MAX` / `VLMLOG_RAW_MAX` | `app.py` 常量 | 识别日志条数上限 / 单条原始返回截断长度 |

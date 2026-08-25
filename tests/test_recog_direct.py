@@ -173,11 +173,13 @@ class TrimmedSurfaceTest(unittest.TestCase):
         for token in ("import gradio", "mount_gradio_app", "SPLIT_PAGE", "SAM3_PAGE"):
             self.assertNotIn(token, self.app, token)
 
-    def test_mono_chain_kept_as_sample(self):
-        # 单目链是保留的唯一 DA3+SAM3 能力样本（现网 DISABLE_MONO_PIPELINE=1 停用中）
-        for token in ("_maybe_sam3cloud", "_sam3cloud_refresh", "_sam3_recent_drinks",
-                      "DISABLE_MONO_PIPELINE", "build_pointcloud_boxes_glb"):
-            self.assertIn(token, self.app, token)
+    def test_da3_mono_chain_gone(self):
+        # DA3 于 2026-08-25 整体退役：模型加载、单目产物链、/api/infer、面板页均已删除，
+        # 不要悄悄长回来（识别走直传/SAM3 门控线程，硬件深度链路 devpc 独立存在）
+        for token in ("DepthAnything3", "_da3_frame_processor", "_maybe_sam3cloud",
+                      "_sam3cloud_refresh", "_sam3_recent_drinks", "DISABLE_MONO_PIPELINE",
+                      "PANEL_PAGE", "/api/infer", "/api/sam3cloud/"):
+            self.assertNotIn(token, self.app, token)
 
 
 if __name__ == "__main__":

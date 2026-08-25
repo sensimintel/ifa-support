@@ -1,9 +1,9 @@
-# DA3 Web 8060 服务的 systemd 单元（可选）。
+# da3-web 8060 演示服务的 systemd 单元（服务名沿用历史称谓，DA3 模型已退役）。
 # 安装：sudo cp da3-web.service /etc/systemd/system/ && sudo systemctl daemon-reload
 #       sudo systemctl enable --now da3-web.service
 # 查日志：journalctl -u da3-web -f
 [Unit]
-Description=DA3 Web (Depth Anything 3 深度图 + 实时识别) 8060 服务
+Description=da3-web 演示服务（帧中继 + 实时识别 + 硬件深度展示）8060
 After=network-online.target
 Wants=network-online.target
 
@@ -11,8 +11,9 @@ Wants=network-online.target
 Type=simple
 User=odyss
 WorkingDirectory=/home/odyss/da3-web
-# 双卡布局（2026-08-24 起）：DA3 深度模型（懒加载，峰值约 8.6G）与 SAM3 同落 GPU1=RTX 5090 32G，
-# GPU0=RTX PRO 6000 独占给 vLLM(0.90)。按 UUID 钉卡，重启后不会落错卡
+# DA3 模型已于 2026-08-25 退役，本服务常态不再占 GPU（服务名沿用历史称谓）。
+# 钉卡保留作兜底：万一残留 torch 代码路径被触发，也只会落到 GPU1=RTX 5090，绝不挤占
+# GPU0（RTX PRO 6000，vLLM 0.90 独占）
 Environment=CUDA_VISIBLE_DEVICES=GPU-565f6e8d-550f-38cf-56d1-fe49fb280b05
 ExecStart=/home/odyss/da3-web/run.sh
 Restart=on-failure
