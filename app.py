@@ -1309,6 +1309,10 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     clamp 上限 115px：竖屏平板/竖置大屏不随宽度无限放大（内容约等效 431px 宽居中） */
  @media (orientation:portrait){
   html{font-size:min(calc(100vw/3.75),115px)}
+  /* 竖屏专用压暗层（1125×2436，同为中心全透+四周压黑的 RGBA）：横屏那两版是 16:9
+     构图，竖屏拉伸后暗角形变，故独立一张；点云背景层不受影响。写 background 整条
+     覆盖（不走 --shade-img 变量），?shade=a 的 A/B 只作用横屏 */
+  #shade{background:url('/static/bg-shade-portrait.png') center/100% 100% no-repeat}
   /* iOS Safari 地址栏收放：100vh 会比可视区高，底部锚定元素被工具栏盖住；dvh 跟随可视区 */
   body{height:100dvh}
   /* UI 画布铺满视口：竖屏构图全部贴边锚定，不再用 16:9 内接画布 */
