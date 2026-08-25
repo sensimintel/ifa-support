@@ -3170,7 +3170,6 @@ $('hlcfgClose').onclick=()=>$('hlcfg').classList.remove('on');
 
 if(DEMO){  // 演示模式：不连后端，用假数据目检三个视图的布局
   curCard={name:'Banana',description_en:'A quick source of everyday energy.',
-           description_de:'Ein schneller Energielieferant für den Alltag.',
            calories_kcal:89,protein_g:1.1,carbs_g:22.8,fat_g:0.3,
            classification:'Good'};
   renderCard(curCard);cardShownAt=Date.now();lastCardKey='demo';
@@ -3386,9 +3385,6 @@ print(f"[da3-web] 直传识别配置：{_recog_direct.snapshot()}", flush=True)
 FOOD_CLASSIFICATIONS = ["Good", "Neutral", "Bad"]
 _CLS_CANON = {c.lower(): c for c in FOOD_CLASSIFICATIONS}   # 小写→规范写法，校验大小写不敏感
 RECOG_DESC_MAX = 60         # 英文描述最大字符数
-# 德文单独放宽：德语复合词长、句式也长，同样一句话按 60 字符切会把结尾削掉半个词
-# （实测 "…die Wachsamkeit steig" 这种断尾），落卡后前端直接显示残句。
-RECOG_DESC_DE_MAX = 90      # 德文描述最大字符数
 
 
 def _recog_num(v, lo, hi, as_int=False):
@@ -3689,9 +3685,8 @@ def _parse_recog(content):
                      这是「只展示能进嘴的食物/饮料」的服务端硬闸：识别模型迁到
                      5090 本机 Qwen3.6 后约束遵循变弱，出现过把手机/电脑/空容器
                      当 item 输出的漏网，prompt 约束之外必须有这道兜底；
-      type           枚举 → 归一到 “食物”/“液体”；
+      type           枚举 → 归一到 “食物”/“液体”（模型给的是英文 food/drink）；
       description_en  字符串、去换行、限 RECOG_DESC_MAX 字符；
-      description_de  同上，限 RECOG_DESC_DE_MAX（德语更长，放宽）；
       calories_kcal  整数、夹到 [0,5000]，非法置 None；
       protein_g/carbs_g/fat_g  数字（1 位小数）、夹到 [0,500]，非法置 None；
       classification 枚举白名单 FOOD_CLASSIFICATIONS，非法值置空；
@@ -3718,7 +3713,6 @@ def _parse_recog(content):
         typ = str(it.get("type", "")).strip().lower()
         is_liquid = ("液" in typ or "饮" in typ or "drink" in typ or "liquid" in typ)
         desc_en = str(it.get("description_en", "")).strip().replace("\n", " ")[:RECOG_DESC_MAX]
-        desc_de = str(it.get("description_de", "")).strip().replace("\n", " ")[:RECOG_DESC_DE_MAX]
         kcal = _recog_num(it.get("calories_kcal"), 0, 5000, as_int=True)
         protein = _recog_num(it.get("protein_g"), 0, 500)
         carbs = _recog_num(it.get("carbs_g"), 0, 500)
@@ -3752,7 +3746,7 @@ def _parse_recog(content):
         out.append({"seen": seen, "cur_text": cur_text, "diff": diff,
                     "ref_id": ref_id, "ref_confidence": ref_conf, "ref_evidence": ref_ev,
                     "name": name, "type": "液体" if is_liquid else "食物",
-                    "description_en": desc_en, "description_de": desc_de,
+                    "description_en": desc_en,
                     "calories_kcal": kcal, "protein_g": protein,
                     "carbs_g": carbs, "fat_g": fat, "classification": cls,
                     "match": match, "match_evidence": evidence,
@@ -4218,7 +4212,6 @@ def _recog_worker(idx=0):
                         "id": _recog_id, "status": "done",
                         "name": it["name"], "type": it["type"],
                         "description_en": it.get("description_en", ""),
-                        "description_de": it.get("description_de", ""),
                         "calories_kcal": it.get("calories_kcal"),
                         "protein_g": it.get("protein_g"), "carbs_g": it.get("carbs_g"),
                         "fat_g": it.get("fat_g"), "classification": it.get("classification", ""),
@@ -5535,7 +5528,6 @@ function cardEl(c){
     +'  <div class="fld"><div class="flab">识别对象 / Detected Food</div>'
     +'    <div class="name"><span class="tdot '+typeCls(c.type)+'"></span><span class="nm"></span></div></div>'
     +'  <div class="fld f-desc hide"><div class="flab">一句话描述 / Description (EN)</div><div class="desc"></div></div>'
-    +'  <div class="fld f-desde hide"><div class="flab">德文描述 / Beschreibung (DE)</div><div class="desde"></div></div>'
     +'  <div class="fld f-nutr hide"><div class="flab">卡路里与营养（按可见份量估算）/ Nutrition (est.)</div><div class="tags nutr"></div></div>'
     +'  <div class="fld f-cls hide"><div class="flab">健康分级 / Classification</div><div class="sig cls"></div></div>'
     +'  <div class="meta"><span>帧 '+(c.frame||'')+'</span><span>'+(c.t||'')+'</span></div>'
@@ -5544,7 +5536,6 @@ function cardEl(c){
   latFill(el, c);
   typeInto(el.querySelector('.nm'), c.name||'');
   if(c.description_en){ el.querySelector('.f-desc').classList.remove('hide'); el.querySelector('.desc').textContent=c.description_en; }
-  if(c.description_de){ el.querySelector('.f-desde').classList.remove('hide'); el.querySelector('.desde').textContent=c.description_de; }
   const nutr=[];   // 老卡（改版前识别的）没有这些字段 → 整段隐藏，不炸
   if(c.calories_kcal!=null)nutr.push(c.calories_kcal+' kcal');
   if(c.protein_g!=null)nutr.push('蛋白 '+c.protein_g+'g');

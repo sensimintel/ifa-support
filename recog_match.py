@@ -23,8 +23,11 @@ _EV_RE = re.compile(r"B([10?])C([10?])S([10?])V([10?])")
 # diff 字段的逃逸话术：写了这些等于没给否定证据。旧版证据码之所以退化成清一色
 # B1C1S1V1，就是因为「说不出差别」零成本——现在说不出就不许合并。
 # prompt 那侧的文案也从这里取，避免两处各写一份、改一处漏一处。
-DIFF_BLANKS = ("完全一致", "无差别", "一模一样", "没有不同", "完全相同", "无差异")
-DIFF_MIN_LEN = 6          # diff 至少这么长才算写了东西（中文 6 字 ≈ 一个短句）
+# 2026-08-25 模型产出改英文后，套话清单跟着换英文；匹配一律先转小写，
+# 免得 "No difference" 这种首字母大写的写法从闸门缝里漏过去。
+DIFF_BLANKS = ("no difference", "no differences", "exactly the same", "identical",
+               "looks the same", "nothing different", "indistinguishable")
+DIFF_MIN_LEN = 15         # diff 至少这么长才算写了东西（英文 15 字符 ≈ 三四个词）
 _NO_TEXT = ("", "none", "null", "无", "无文字", "n/a", "-")   # cur_text 视同「没读到文字」
 
 
@@ -81,10 +84,10 @@ def check_self_evidence(item):
         return False, "没写 diff：说不出与候选的任何差别"
     # 先判套话再判长度：套话往往本身就短，先报长度会把真正的原因盖掉，
     # 而拒合并理由是要给人看的（控制面「VLM 识别日志」直接展示这句）
-    if any(w in diff for w in DIFF_BLANKS):
+    if any(w in diff.lower() for w in DIFF_BLANKS):
         return False, "diff 是套话：%s" % diff
     if len(diff) < DIFF_MIN_LEN:
-        return False, "diff 太短（%d 字）：%s" % (len(diff), diff)
+        return False, "diff 太短（%d 字符）：%s" % (len(diff), diff)
     code = str((item or {}).get("match_evidence") or "").strip().upper()
     m = _EV_RE.fullmatch(code)
     if m and m.group(1) == "1":

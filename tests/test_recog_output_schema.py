@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""识别输出契约改造：去 box、描述改英/德、调用改流式。
+"""识别输出契约改造：去 box、产出全英文（德文描述已下线）、调用改流式。
 
 SSE 拼装是纯逻辑模块（recog_sse.py，零 cv2/torch 依赖）直接测；
 prompt / 解析 / worker / 页面那侧只做接线断言（正则抽源码），
@@ -88,26 +88,26 @@ class WiringTest(unittest.TestCase):
     def assertLacks(self, needle):
         self.assertTrue(needle not in self.src, "app.py 里仍残留：%s" % needle)
 
-    def test_prompt_asks_en_and_de_description(self):
-        self.assertHas("description_en：一句话英文描述")
-        self.assertHas("description_de：一句话德文描述")
-        self.assertLacks("一句话中文描述")
+    def test_prompt_asks_english_description_only(self):
+        self.assertHas("description_en: one English sentence")
+        self.assertLacks("description_de")
 
-    def test_german_description_gets_a_longer_budget(self):
-        """德语句子比英语长，两者共用 60 字符预算会把德文结尾削掉半个词。"""
-        self.assertHas("RECOG_DESC_DE_MAX = 90")
-        self.assertHas("[:RECOG_DESC_DE_MAX]")
+    def test_german_description_is_gone_end_to_end(self):
+        """德文描述 2026-08-25 整条链路下线：prompt 不要、解析不产、卡片不带、
+        前端不展示。常量若留着就说明还有半截没删干净。"""
+        self.assertLacks("RECOG_DESC_DE_MAX")
+        self.assertLacks("desc_de")
 
     def test_prompt_no_longer_asks_for_box(self):
         self.assertLacks("box：该物品在图1中的包围框")
         self.assertLacks("412,530,668,845")
 
-    def test_parse_emits_de_and_drops_box(self):
-        self.assertHas('"description_en": desc_en, "description_de": desc_de')
+    def test_parse_emits_english_desc_and_drops_box(self):
+        self.assertHas('"description_en": desc_en,')
         self.assertLacks('raw_box = it.get("box")')
 
-    def test_card_carries_de_not_chinese_desc(self):
-        self.assertHas('"description_de": it.get("description_de", "")')
+    def test_card_carries_english_desc_only(self):
+        self.assertHas('"description_en": it.get("description_en", "")')
         self.assertLacks('"description": it["description"]')
 
     def test_thumbnail_renders_without_boxes(self):
@@ -134,9 +134,9 @@ class WiringTest(unittest.TestCase):
     def test_ttft_recorded_in_timings(self):
         self.assertHas('"ttft_ms": (round(ttft_ms, 1) if ttft_ms is not None else None)')
 
-    def test_recog_page_shows_en_and_de(self):
+    def test_recog_page_shows_english_desc_only(self):
         self.assertHas("c.description_en")
-        self.assertHas("c.description_de")
+        self.assertLacks("c.description_de")
         self.assertLacks("el.querySelector('.desc').textContent=c.description;")
 
 
@@ -242,12 +242,12 @@ class CatalogHitOmissionWiringTest(WiringTest):
                    + (ROOT / "foodref.py").read_text(encoding="utf-8"))
 
     def test_prompt_tells_model_to_stop_after_ref_evidence(self):
-        self.assertHas("写完 ref_evidence 就直接结束这个对象")
-        self.assertHas("一律省略不写")
+        self.assertHas("object right after ref_evidence**")
+        self.assertHas("**all omitted**")
 
     def test_miss_path_must_still_fill_everything(self):
         # 不显式说「未命中才继续填完」，模型会学着在自由路径上也乱省
-        self.assertHas("未命中（ref_id=null）时")
+        self.assertHas("On a miss (ref_id=null)")
 
     def test_parse_tolerates_missing_keys(self):
         """省略字段落地的前提：解析层全部 it.get() 带缺省，键缺失不炸。
@@ -256,8 +256,8 @@ class CatalogHitOmissionWiringTest(WiringTest):
         self.assertHas('it.get("calories_kcal")')
 
     def test_prompt_asks_for_evidence_code(self):
-        self.assertHas("match_evidence：8 字符证据码 BxCxSxVx")
-        self.assertHas("match_evidence 写 NONE")
+        self.assertHas("match_evidence: an 8-character evidence code BxCxSxVx")
+        self.assertHas("match_evidence is NONE")
 
     def test_match_reason_gone_everywhere(self):
         self.assertLacks("match_reason")
@@ -292,38 +292,38 @@ class PickRuleTest(unittest.TestCase):
     def test_no_history_degrades_to_most_confident(self):
         for empty in (None, {}, {"name": ""}):
             t = self.rule(empty, [])
-            self.assertIn("挑你最有把握", t)
-            self.assertNotIn("上一轮", t)
+            self.assertIn("the one you are most confident about", t)
+            self.assertNotIn("the previous round displayed", t)
 
     def test_history_in_candidates_carries_the_index(self):
         """模型对编号的指称比对名称稳，上次那个还在候选里就把编号一起给它。"""
         cands = [{"id": 7, "name": "Water"}, {"id": 9, "name": "Wine"}]
         t = self.rule({"name": "Wine", "card_id": 9}, cands)
-        self.assertIn("「Wine」", t)
-        self.assertIn("清单[2]", t)
+        self.assertIn('"Wine"', t)
+        self.assertIn("list entry [2]", t)
         # 新文案不再问「它还在不在」（那是要求确认，会让错误自我延续），
         # 改成先独立得出结论、再决定要不要沿用
-        self.assertIn("独立写完 seen 与 name", t)
-        self.assertNotIn("就继续选它", t)
+        self.assertIn("write seen and name independently", t)
+        self.assertNotIn("keep picking it", t)
 
     def test_history_not_in_candidates_falls_back_to_name(self):
         """上次那张卡掉出活跃窗口后不在候选里了，只提名称，别编个不存在的编号。"""
         t = self.rule({"name": "Persimmon", "card_id": 99}, [{"id": 7, "name": "Water"}])
-        self.assertIn("「Persimmon」", t)
-        self.assertNotIn("清单[", t)
+        self.assertIn('"Persimmon"', t)
+        self.assertNotIn("list entry [", t)
 
     def test_history_survives_empty_candidate_list(self):
         t = self.rule({"name": "Water", "card_id": 1}, None)
-        self.assertIn("「Water」", t)
+        self.assertIn('"Water"', t)
 
 
 class SingleItemWiringTest(WiringTest):
     """每轮只更新一张卡：prompt 明令单选 + worker 侧门禁兜底。"""
 
     def test_prompt_demands_exactly_one_item(self):
-        self.assertHas("**画面里就算有好几样，也只输出一个 item**")
-        self.assertHas("items 里**只放一个对象**")
-        self.assertLacks("逐一分别输出")
+        self.assertHas("**Even when several things are visible, output exactly one item**")
+        self.assertHas("items holds **exactly one object**")
+        self.assertLacks("output them one by one")
 
     def test_prompt_carries_last_pick_rule(self):
         self.assertHas("recog_prompt.tail(last_pick, cands)")
@@ -465,7 +465,8 @@ class SelfEvidenceGateTest(unittest.TestCase):
     任何包装文字，都不许合并。"""
 
     def _item(self, **kw):
-        base = {"seen": "金黄方形软包装，桌面中央", "diff": "候选是橙色球形果实",
+        base = {"seen": "golden square soft package, centre of the table",
+                "diff": "the candidate is an orange spherical fruit",
                 "match_evidence": "B1C1S?V1", "cur_text": "Werther's"}
         base.update(kw)
         return base
@@ -479,12 +480,12 @@ class SelfEvidenceGateTest(unittest.TestCase):
         self.assertIn("seen", why)
 
     def test_missing_or_short_diff_blocked(self):
-        for bad in ("", "  ", "一样"):
+        for bad in ("", "  ", "same"):
             self.assertFalse(recog_match.check_self_evidence(self._item(diff=bad))[0], bad)
 
     def test_boilerplate_diff_blocked(self):
         for blank in recog_match.DIFF_BLANKS:
-            ok, why = recog_match.check_self_evidence(self._item(diff="两者" + blank))
+            ok, why = recog_match.check_self_evidence(self._item(diff="the two are " + blank))
             self.assertFalse(ok, blank)
             self.assertIn("套话", why)
 

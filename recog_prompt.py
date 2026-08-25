@@ -5,13 +5,19 @@
 混进任何一个每轮会变的量，整段 KV 缓存就作废**。这条纪律靠肉眼守不住，必须有测试
 断言「同样的配置、不同的画面/候选/上一轮结论，固定段字节完全相同」。
 
+语言（2026-08-25 起）：**prompt 正文与模型的 JSON 产出一律英文**。
+展台面向的是德国观众与英文界面，seen / diff / ref_evidence 这些自由文本过去是中文，
+控制面之外没人看得懂；德文描述字段同期整条链路删除——它只在旧调试面展示过，
+运营也从来没有录入口。服务端的日志、注释、控制面文案仍是中文，只有「发给模型的
+字符串」和「模型吐回来的字符串」改英文。
+
 排布（2026-08-18 重排，治「参考图污染当前画面」）：
     [固定段] 图片指称约定 + 硬性约束 + 任务零(参考库) + 任务一 + 字段定义
              + 判同流程 + JSON 骨架与一组正交示例（开参考库时含命中正例）
     [可变段] 任务二开场 + 候选清单文字
-             → 【历史参考图 · 候选[i]】标签 + 该候选的裁剪图（逐个交错）
-             → 「以上参考图到此结束，下面这一张是【当前画面】」+ 当前帧
-             → 【当前画面 · 检测框版】+ 带框图（仅门控口径）
+             → [PAST REFERENCE · CANDIDATE[i]] 标签 + 该候选的裁剪图（逐个交错）
+             → 「参考图到此结束，下面这一张是 [CURRENT FRAME]」+ 当前帧
+             → [CURRENT FRAME · BOXED] + 带框图（仅门控口径）
              → 粘性规则 + 收尾复读
 
 三处关键设计，都是照着线上那次「爆米花被反复报成 Orange/Clementine」开的方子：
@@ -25,10 +31,12 @@
 import foodref
 import recog_match
 
-# 描述与判同用到的字段上限（与 app.py 的 guardrail 对齐，超长截断而非报错）
-SEEN_MAX = 90
-CUR_TEXT_MAX = 40
-DIFF_MAX = 40
+# 描述与判同用到的字段上限（与 app.py 的 guardrail 对齐，超长截断而非报错）。
+# 2026-08-25 改英文后同步放宽：同样一句话英文的字符数约是中文的 2~3 倍，
+# 沿用中文口径会把 seen/diff 从中间切断，落到闸门六时看起来像「没写完」。
+SEEN_MAX = 200
+CUR_TEXT_MAX = 60
+DIFF_MAX = 100
 
 
 
@@ -38,70 +46,87 @@ def fixed_head(direct: bool, refs=None, min_conf: str = "medium") -> str:
     只有 direct（触发口径）、refs（参考食物库快照）、min_conf 三个配置态会改变它，
     而它们一变本来就该换版。**严禁**把 n_food/n_drink、上一轮选中项、候选数量
     写进这里——漏一个，整段缓存作废（tests/test_recog_prompt.py 有断言守着）。"""
-    boxed_line = ("  ·【当前画面 · 检测框版】—— 同一张当前画面上画了检测框的版本"
-                  "（红框=疑似食物，蓝框=疑似液体/容器）；\n" if not direct else "")
-    ref_line = ("  · 上一条消息里那些带 REFERENCE 角标的图片是**已登记的参考食物资料照**，"
-                "既不是此刻的桌面，也不代表桌上现在摆着这些东西。\n" if refs else "")
+    boxed_line = ("  · [CURRENT FRAME · BOXED] -- the very same current frame with detection "
+                  "boxes drawn on it (red = suspected food, blue = suspected liquid/container);\n"
+                  if not direct else "")
+    ref_line = ("  · The images carrying a REFERENCE badge in the previous message are "
+                "**registered reference photos of catalog food**. They are neither the table "
+                "right now, nor proof that these things are on the table.\n" if refs else "")
     p = (
-        "本条消息里会出现两类图片。每张图片前面都有一行方括号标签，一律以标签为准，"
-        "**不要用「第几张图」来指称任何图片**：\n"
-        "  ·【当前画面】—— 此刻摄像头拍到的真实桌面，整条消息里只有一张，"
-        "它排在所有参考图之后；\n"
+        "This message contains two kinds of images. Every image is preceded by a bracketed "
+        "label line. Always refer to an image by that label and **never by ordinal position "
+        "(\"the first image\", \"image 2\", ...)**:\n"
+        "  · [CURRENT FRAME] -- the real table the camera sees right now. There is exactly one "
+        "of it in this message and it comes after all reference images;\n"
         + boxed_line +
-        "  ·【历史参考图 · 候选[i] Xxx】—— 过去某一轮拍下来的旧画面里裁出来的物体，"
-        "只用于任务二的对照，**不是此刻的桌面**；\n"
+        "  · [PAST REFERENCE · CANDIDATE[i] Xxx] -- an object cropped out of a frame from an "
+        "earlier round, used only for Task 2, **it is not the table right now**;\n"
         + ref_line +
-        "\n硬性约束（违反即整轮作废）：\n"
-        "  1. 任务一只能描述【当前画面】。凡是只在【历史参考图】里出现、"
-        "而【当前画面】里看不到的东西，一律不许写进 items；\n"
-        "  2.【当前画面】里既没有食物也没有液体时，即使参考图里有，"
-        "items 必须是空数组，不要硬凑；\n"
-        "  3. **先看像素、后看清单**。任何名称都必须先由你从【当前画面】的像素里读出来。"
-        "候选清单上的名称只是过去几轮的结论，**它可能本来就是错的**，"
-        "绝不能拿「清单里有这个名字」当作当前画面里存在这样东西的证据。\n"
-        "  4. items 里只能出现**能进嘴的食物或饮料**。手机、电脑、键盘、遥控器、餐具、"
-        "纸巾、桌面摆件等一切非食物物体，无论在画面里多醒目，都绝不能作为 item 输出；"
-        "**纯包装不算食物**——空袋、空盒、空瓶、空杯这类看不到也读不出可吃内容物的"
-        "包装/容器，一律不输出。检测框只说明「那里可能有东西」，"
-        "框住了非食物或空容器照样不输出。\n\n"
+        "\nHard constraints (breaking any of them voids the whole round):\n"
+        "  1. Task 1 may only describe [CURRENT FRAME]. Anything that appears solely in a "
+        "[PAST REFERENCE] image and cannot be seen in [CURRENT FRAME] must never go into items;\n"
+        "  2. When [CURRENT FRAME] holds neither food nor liquid, items must be an empty array "
+        "even if the reference images are full of food. Never make something up;\n"
+        "  3. **Pixels first, lists second.** Every name must first be read by you out of the "
+        "pixels of [CURRENT FRAME]. The names on the candidate list are only conclusions from "
+        "earlier rounds and **they may well be wrong**; a name being on the list is never "
+        "evidence that such a thing is on the table now.\n"
+        "  4. items may only hold **food or drink that can go into a mouth**. Phones, laptops, "
+        "keyboards, remote controls, cutlery, napkins, table decorations and every other "
+        "non-food object must never be output as an item, however prominent they look. "
+        "**Packaging alone is not food**: an empty bag, box, bottle or cup, i.e. any package or "
+        "container whose edible content you can neither see nor read, is never output. A "
+        "detection box only says \"there may be something there\"; a box around a non-food "
+        "object or an empty container still produces no item.\n\n"
     )
     if refs:
         p += foodref.task_zero(refs, min_conf) + "\n"
     p += (
-        "任务一·识别（只看【当前画面】）：\n"
-        "第一步，**先不要看任何清单、不要看任何参考图**，用自己的话把【当前画面】里"
-        "最主要的那一样可食用物体如实描述出来，写进 seen 字段：\n"
-        "  seen =「颜色 / 形状 / 包装或容器上你亲眼读到的文字 / 它在画面中的位置」\n"
-        "  例：\"深蓝色方形软包装，正面读到 OREO 字样，摆在桌面中央偏右\"\n"
-        "  例：\"橙色球形果实，表面有果皮凹坑，无任何文字，白盘左半边\"\n"
-        "  包装上一个字也读不到就在文字那格写 none，但颜色、形状、位置三项必须写满。\n"
-        "第二步，再根据 seen 给它命名（name）。**name 必须能被 seen 里写下的事实支持**：\n"
-        "  · seen 里读到的包装文字与你打算写的 name 冲突时，以 seen 为准，改 name；\n"
-        "  · 只有 seen 写的是「无包装、球形/块状的天然食材」才可以命名成水果、蔬菜一类；"
-        "seen 里一旦出现包装文字，或出现「方形软包装 / 袋装 / 盒装 / 罐装」这类描述，"
-        "就**绝不能**命名成水果——**包装的颜色不是内容物的颜色**。\n"
-        "**画面里就算有好几样，也只输出一个 item**——展示端一次只显示一个，多给的会被直接丢弃。\n"
-        "画面里没有食物也没有液体就给空数组，不要硬凑。\n\n"
-        "这一个物品要输出的内容字段：\n"
-        "  name：具体名称（简短，优先英文）。食物可用品牌名（如 Banana、Snickers）；"
-        "液体一律按**内容物**命名（如 Water、Coffee、Cola）——容器上的文字只有当它是"
-        "饮料产品本身的品牌（如可乐罐上的 Coca-Cola）才可用作名称，"
-        "杯子上的装饰文案（如 Good morning）不是名称；"
-        "内容物看不出来、容器上也读不出饮品品牌时，这不是一个可输出的液体——"
-        "**绝不要**拿 Container、Cup、Bottle 这类容器名当名称，直接不输出这个 item；\n"
-        "  type：只能是「食物」或「液体」；\n"
-        "  edible：布尔值 true/false——它是不是此刻画面里看得到、**能直接进嘴**的"
-        "食物或饮料本体？非食物物体、空包装、空容器、仿真食品摆件一律 false，"
-        "拿不准也写 false。服务端只展示 edible 为 true 的条目；\n"
-        "  description_en：一句话英文描述（不超过 60 字符）；\n"
-        "  description_de：一句话德文描述（不超过 90 字符）；\n"
-        "  calories_kcal / protein_g / carbs_g / fat_g：整数卡路里与三项克数。"
-        "这四个数字**一律按【当前画面】里这一份的实际可见份量估算**，不是每 100 克的标准值："
-        "先目测大小/体积/数量（对照画面里的手、餐具、容器），再由份量换算；"
-        "只剩一部分就按剩下的量估；液体按容器容量与液面高度估；\n"
-        "  classification：健康分级，只能是 " + "、".join(foodref.CLASSIFICATIONS) +
-        "（营养密度高、天然少加工的选 Good；高糖/高盐/油炸/高度加工的选 Bad；"
-        "介于两者之间选 Neutral）。\n\n"
+        "Task 1 · Recognition (look only at [CURRENT FRAME]):\n"
+        "Step one, **before you look at any list and at any reference image**, describe in your "
+        "own words the single most prominent edible thing in [CURRENT FRAME] and write it into "
+        "the seen field:\n"
+        "  seen = colour / shape / any text you read with your own eyes on the package or "
+        "container / where it sits in the frame\n"
+        "  e.g. \"dark blue square soft package, reads OREO on the front, centre-right of the table\"\n"
+        "  e.g. \"orange spherical fruit, dimpled peel, no text at all, left half of a white plate\"\n"
+        "  When not a single character can be read on the package, write none in the text slot, "
+        "but colour, shape and position must all be filled in.\n"
+        "Step two, only now name it (name). **name must be supported by the facts written in "
+        "seen**:\n"
+        "  · when the package text you read into seen conflicts with the name you were about to "
+        "write, seen wins and the name changes;\n"
+        "  · only when seen says \"unpackaged, spherical or lumpy natural produce\" may it be "
+        "named a fruit or a vegetable; as soon as seen carries package text, or a description "
+        "such as \"square soft package / bagged / boxed / canned\", it must **never** be named a "
+        "fruit -- **the colour of the packaging is not the colour of the content**.\n"
+        "**Even when several things are visible, output exactly one item** -- the display shows "
+        "one at a time and anything extra is dropped.\n"
+        "When there is neither food nor liquid in the frame, return an empty array; never make "
+        "one up.\n\n"
+        "Fields to output for this one item (**every field in English**, no other language):\n"
+        "  name: the concrete name, short, in English. Food may use the brand name (e.g. Banana, "
+        "Snickers); a liquid is always named after **its content** (e.g. Water, Coffee, Cola) -- "
+        "text on the container may only be used as the name when it is the brand of the drink "
+        "itself (e.g. Coca-Cola on a cola can), while decorative wording on a mug (e.g. Good "
+        "morning) is not a name. When the content cannot be made out and no drink brand can be "
+        "read on the container, this is not an outputtable liquid: **never** put a container word "
+        "such as Container, Cup or Bottle in the name, simply do not output this item;\n"
+        "  type: either \"food\" or \"drink\";\n"
+        "  edible: boolean true/false -- is it, right now in this frame, visible food or drink "
+        "that **can go straight into a mouth**? Non-food objects, empty packages, empty "
+        "containers and fake food props are all false, and when in doubt write false. The server "
+        "only shows entries whose edible is true;\n"
+        "  description_en: one English sentence (at most 60 characters);\n"
+        "  calories_kcal / protein_g / carbs_g / fat_g: integer kcal plus three gram values. "
+        "These four numbers are **always estimated from the portion actually visible in "
+        "[CURRENT FRAME]**, not the per-100g reference values: first judge size, volume and count "
+        "by eye (against the hand, cutlery or container in the frame), then convert from that "
+        "portion; when only a part is left, estimate the part that is left; a liquid is estimated "
+        "from the container volume and the fill level;\n"
+        "  classification: health grade, one of " + "/".join(foodref.CLASSIFICATIONS) +
+        " (Good for nutrient-dense, natural, barely processed; Bad for high sugar, high salt, "
+        "deep fried or heavily processed; Neutral in between).\n\n"
         + _judge_flow() + "\n" + _json_skeleton(bool(refs))
     )
     return p
@@ -114,33 +139,44 @@ def _judge_flow() -> str:
     以及填 1 零成本。这里对第二条下手——B=1 必须以 cur_text 里照抄的包装文字作抵押，
     并把 ? 明确正当化（服务端另有两道纯格式闸门做硬校验）。"""
     return (
-        "任务二·判同流程（字段必须按下面的顺序输出，证据一律先于结论）：\n"
-        "  1. cur_text：把【当前画面】里那一样东西的包装/容器上你**亲眼读到的文字**逐字照抄。"
-        "一个字也读不到就写 none。**严禁**把参考图上的文字抄到这一格。\n"
-        "  2. diff：与你选中的那个候选相比，**最明显的一处不同**是什么，10~20 字。"
-        "必须写出一处。确实找不出不同时，写清楚「为什么找不出」"
-        "（如 \"参考图只裁到包装一角，看不出份量差别\"）。"
-        "**禁止**写「" + "」「".join(recog_match.DIFF_BLANKS[:3]) + "」这类空话"
-        "——写了本项判定作废。\n"
-        "  3. match_evidence：8 字符证据码 BxCxSxVx，x ∈ 1(一致) / 0(不一致) / ?(判不了)：\n"
-        "       B 品牌与包装文字：**只有当 cur_text 不是 none、且它与候选参考图上读到的"
-        "文字确实一致时，才允许填 1**；cur_text=none（无包装或读不出）一律填 ?，不许填 1；\n"
-        "       C 颜色与外观； S 形状与份量； V 容器/餐具/摆放位置。\n"
-        "     判不了就填 ?——**? 不丢人，瞎填 1 才是错**。参考图是从旧画面里裁出来的一小块，"
-        "S 和 V 这两项经常根本判不了，填 ? 是正常且被期待的结果。"
-        "四项全填 1 是一个**极强**的主张，只有当你在 cur_text 里读到了具体文字、"
-        "并且逐项都能指出对应的视觉事实时才允许。\n"
-        "  4. match：候选编号，或 null。**默认 null**，只有全部满足才允许给编号：\n"
-        "       · 码里没有任何 0；\n"
-        "       · 有包装的商品：B 必须为 1（即你读到了包装文字且对得上）；\n"
-        "       · 无包装的食材/饮品：C、S、V 中至少两项为 1；\n"
-        "       · 只是名称相同绝不构成理由——两根不同的香蕉、两杯不同的咖啡必须分开记录；\n"
-        "       · 同类目不同产品一律 null：巧克力棒 vs 谷物棒、可乐 vs 橙汁、"
-        "换了口味或包装的同名产品、**包装零食 vs 同色的水果**；\n"
-        "       · 在参考图里定位不到该物品、或参考图看不清 → null。\n"
-        "  5. matched_name：match≠null 时一字不差照抄清单里该编号的名称；否则 null。\n"
-        "错误合并（把两样不同的东西记成同一个）比重复建一张卡严重得多；"
-        "宁可多一张卡，不可错并一次。\n"
+        "Task 2 · Same-object procedure (the fields must be output in the order below, evidence "
+        "always before conclusion):\n"
+        "  1. cur_text: copy out, character by character, the text you **read with your own eyes** "
+        "on the package or container of that thing in [CURRENT FRAME]. Write none when not a "
+        "single character can be read. **Never** copy text off a reference image into this slot.\n"
+        "  2. diff: the **single most obvious difference** between it and the candidate you "
+        "picked, one short English sentence of roughly 5 to 15 words. One must be written. When "
+        "you truly cannot find any, spell out why (e.g. \"the reference only shows a corner of "
+        "the wrapper, so the portion cannot be compared\"). Boilerplate such as \"" +
+        "\" / \"".join(recog_match.DIFF_BLANKS[:3]) + "\" is **forbidden** -- writing it voids "
+        "this judgement.\n"
+        "  3. match_evidence: an 8-character evidence code BxCxSxVx, x ∈ 1 (agrees) / 0 (differs) "
+        "/ ? (cannot tell):\n"
+        "       B brand and package text: **1 is allowed only when cur_text is not none and it "
+        "really agrees with the text read on the candidate reference image**; cur_text=none (no "
+        "package, or unreadable) is always ?, never 1;\n"
+        "       C colour and appearance; S shape and portion; V container, cutlery and placement.\n"
+        "     Write ? whenever you cannot tell -- **? is nothing to be ashamed of, a made-up 1 "
+        "is the mistake**. A reference image is a small crop out of an older frame, so S and V "
+        "often simply cannot be judged and ? is the normal, expected answer there. Four 1s is an "
+        "**extremely strong** claim, allowed only when you read concrete text into cur_text and "
+        "can point at the matching visual fact for every single position.\n"
+        "  4. match: the candidate number, or null. **Default null**; a number is allowed only "
+        "when all of these hold:\n"
+        "       · the code carries no 0;\n"
+        "       · packaged product: B must be 1 (i.e. you read the package text and it agrees);\n"
+        "       · unpackaged produce or drink: at least two of C, S, V are 1;\n"
+        "       · the same name alone is never a reason -- two different bananas, two different "
+        "cups of coffee must stay separate records;\n"
+        "       · different products of one category are always null: chocolate bar vs cereal "
+        "bar, cola vs orange juice, the same product with a new flavour or new packaging, "
+        "**a packaged snack vs a fruit of the same colour**;\n"
+        "       · the object cannot be located in the reference image, or the reference is too "
+        "unclear → null.\n"
+        "  5. matched_name: when match is not null, copy the name of that number from the list "
+        "word for word; otherwise null.\n"
+        "Wrongly merging two different things is far worse than creating a duplicate card: "
+        "better one card too many than one wrong merge.\n"
     )
     # 旧契约还有第 6 项 match_confidence——它是证据码的确定性函数（B=1 或 CSV 全 1
     # 才 high），2026-08-24 起由服务端 recog_match.derive_confidence 推导，字段删除
@@ -161,59 +197,59 @@ def _json_skeleton(has_refs: bool = False) -> str:
     demos = []
     if has_refs:
         demos.append((
-            "（【当前画面】的食物命中了参考清单——name 照抄清单名称，"
-            "写完 ref_evidence 就结束对象，其余字段全部省略）",
-            "{\"items\":[{\"seen\":\"紫色方形排块巧克力包装，正面读到 Milka 字样，"
-            "桌面中央\",\"name\":\"Milka Alpine Milk Chocolate\",\"type\":\"食物\","
-            "\"edible\":true,\"ref_id\":2,\"ref_confidence\":\"high\","
-            "\"ref_evidence\":\"桌面中央，紫色包装上有白色 Milka 字样，与清单[2]一致\"}]}"))
+            " (the food in [CURRENT FRAME] hits the reference list -- name copies the list name "
+            "word for word, the object ends right after ref_evidence, every other field is "
+            "omitted)",
+            "{\"items\":[{\"seen\":\"purple square chocolate bar package, reads Milka on the "
+            "front, centre of the table\",\"name\":\"Milka Alpine Milk Chocolate\","
+            "\"type\":\"food\",\"edible\":true,\"ref_id\":2,\"ref_confidence\":\"high\","
+            "\"ref_evidence\":\"centre of the table, white Milka lettering on a purple wrapper, "
+            "same as list entry [2]\"}]}"))
     demos.append((
-        "（未命中参考清单的包装零食，与候选[1] 是同一罐——允许合并；"
-        "证据码带 ?，matched_name 照抄候选名）",
-        "{\"items\":[{\"seen\":\"绿色圆筒罐装薯片，罐身读到 Pringles 字样，桌面右侧\","
-        "\"name\":\"Pringles Sour Cream\",\"type\":\"食物\",\"edible\":true,"
-        "\"ref_id\":null,\"ref_confidence\":null,\"ref_evidence\":null,"
+        " (a packaged snack that misses the reference list and is the same can as candidate[1] "
+        "-- merging allowed; the code carries a ?, matched_name copies the candidate name)",
+        "{\"items\":[{\"seen\":\"green cylindrical can of crisps, reads Pringles on the tube, "
+        "right side of the table\",\"name\":\"Pringles Sour Cream\",\"type\":\"food\","
+        "\"edible\":true,\"ref_id\":null,\"ref_confidence\":null,\"ref_evidence\":null,"
         "\"description_en\":\"Stackable potato chips in a can.\","
-        "\"description_de\":\"Stapelbare Kartoffelchips in der Dose.\","
         "\"calories_kcal\":530,\"protein_g\":4.0,\"carbs_g\":50.0,\"fat_g\":35.0,"
         "\"classification\":\"Bad\",\"cur_text\":\"Pringles\","
-        "\"diff\":\"参考图只裁到罐身上半截，看不出高度差别\","
+        "\"diff\":\"the reference only shows the upper half of the tube\","
         "\"match_evidence\":\"B1C1S?V1\",\"match\":1,"
         "\"matched_name\":\"Pringles Sour Cream\"}]}"))
     demos.append((
-        "（无包装的天然食材，读不到任何文字——B 位只能填 ?，"
-        "靠颜色/形状/摆放三项全一致与候选[1] 合并）",
-        "{\"items\":[{\"seen\":\"黄色弯月形果实，表皮有褐色斑点，无任何文字，白盘中央\","
-        "\"name\":\"Banana\",\"type\":\"食物\",\"edible\":true,"
+        " (unpackaged natural produce with no readable text -- B can only be ?, merged with "
+        "candidate[1] on colour, shape and placement all agreeing)",
+        "{\"items\":[{\"seen\":\"yellow crescent fruit with brown speckles, no text at all, "
+        "centre of a white plate\",\"name\":\"Banana\",\"type\":\"food\",\"edible\":true,"
         "\"ref_id\":null,\"ref_confidence\":null,\"ref_evidence\":null,"
         "\"description_en\":\"A ripe banana with brown spots.\","
-        "\"description_de\":\"Eine reife Banane mit braunen Flecken.\","
         "\"calories_kcal\":105,\"protein_g\":1.3,\"carbs_g\":27.0,\"fat_g\":0.4,"
         "\"classification\":\"Good\",\"cur_text\":\"none\","
-        "\"diff\":\"参考图里果柄朝左，这里朝右\","
+        "\"diff\":\"the stem points left in the reference, right here\","
         "\"match_evidence\":\"B?C1S1V1\",\"match\":1,\"matched_name\":\"Banana\"}]}"))
     demos.append((
-        "（液体按**内容物**命名，杯子上没有饮品品牌就不算名称；"
-        "画面里没有相似候选时 match_evidence 写 NONE）",
-        "{\"items\":[{\"seen\":\"白色马克杯盛深棕色液体，杯身无饮品品牌文字，桌面左侧\","
-        "\"name\":\"Coffee\",\"type\":\"液体\",\"edible\":true,"
+        " (a liquid is named after **its content**, wording on the mug is not a name; with no "
+        "similar candidate in the frame match_evidence is NONE)",
+        "{\"items\":[{\"seen\":\"white mug holding dark brown liquid, no drink brand on the mug, "
+        "left side of the table\",\"name\":\"Coffee\",\"type\":\"drink\",\"edible\":true,"
         "\"ref_id\":null,\"ref_confidence\":null,\"ref_evidence\":null,"
         "\"description_en\":\"A mug of black coffee.\","
-        "\"description_de\":\"Eine Tasse schwarzer Kaffee.\","
         "\"calories_kcal\":5,\"protein_g\":0.3,\"carbs_g\":0.0,\"fat_g\":0.0,"
         "\"classification\":\"Neutral\",\"cur_text\":\"none\","
-        "\"diff\":\"无相似候选\",\"match_evidence\":\"NONE\","
+        "\"diff\":\"no similar candidate to compare against\",\"match_evidence\":\"NONE\","
         "\"match\":null,\"matched_name\":null}]}"))
     demos.append((
-        "（【当前画面】只有手机和空杯子，没有任何吃的——正确做法是空数组，"
-        "不要把电子设备或空容器硬凑成 item）",
+        " ([CURRENT FRAME] holds only a phone and an empty cup, nothing edible -- the right "
+        "answer is an empty array, never pad it with an electronic device or an empty container)",
         "{\"items\":[]}"))
-    nums = "一二三四五"
-    body = "".join("示例%s%s：\n%s\n" % (nums[i], title, js)
+    body = "".join("Example %d%s:\n%s\n" % (i + 1, title, js)
                    for i, (title, js) in enumerate(demos))
     return (
-        "只输出 JSON，不要任何解释。字段顺序必须与下面完全一致：\n" + body +
-        "items 里**只放一个对象**；【当前画面】里没有食物也没有液体时，items 为空数组 []。\n"
+        "Output JSON only, no explanation, **all values in English**. The field order must be "
+        "exactly the one below:\n" + body +
+        "items holds **exactly one object**; when [CURRENT FRAME] has neither food nor liquid, "
+        "items is the empty array [].\n"
     )
 
 
@@ -223,36 +259,41 @@ def _json_skeleton(has_refs: bool = False) -> str:
 def candidates_intro(candidates) -> str:
     """任务二开场 + 候选清单文字（紧挨着它们的参考图）。"""
     if not candidates:
-        return ("任务二·去重：当前没有已记录的物品，识别到的都是新的，"
-                "match 一律为 null，match_evidence 写 NONE，matched_name 为 null，"
-                "cur_text 与 diff 照常按上面的要求填。\n")
-    lines = "\n".join("  [%d] %s（%s）—— %s" % (
-        i + 1, c.get("name", ""), c.get("type") or "食物", c.get("desc") or "无描述")
+        return ("Task 2 · Deduplication: nothing has been recorded yet, so everything you "
+                "recognise is new. match is always null, match_evidence is NONE, matched_name is "
+                "null, while cur_text and diff are still filled in as required above.\n")
+    lines = "\n".join("  [%d] %s (%s) -- %s" % (
+        i + 1, c.get("name", ""), foodref.type_en(c.get("type")),
+        c.get("desc") or "no description")
         for i, c in enumerate(candidates))
-    return ("任务二·去重：最近 30 秒内已经记录过的物品如下（编号 · 名称 · 类型 · 描述）。"
-            "再说一次：**这些名称是过去几轮的结论，其中可能就有错的**，"
-            "它们不构成「当前画面里存在这些东西」的任何证据。\n" + lines + "\n"
-            "下面依次给出每一项的【历史参考图】。看到某样东西出现在参考图里，"
-            "只说明它「曾经」在画面里过，**不说明它现在还在桌上**。\n")
+    return ("Task 2 · Deduplication: the objects recorded within the last 30 seconds are listed "
+            "below (number · name · type · description). Once more: **these names are conclusions "
+            "from earlier rounds and some of them may simply be wrong**, and they are no evidence "
+            "at all that these things are in the current frame.\n" + lines + "\n"
+            "The [PAST REFERENCE] image of each entry follows below. Seeing something in a "
+            "reference image only means it was in frame at some point, **not that it is still on "
+            "the table**.\n")
 
 
 def candidate_label(idx: int, cand) -> str:
     """一张历史参考图前面的标签行（idx 是 1-based 的候选编号）。"""
-    return "【历史参考图 · 候选[%d] %s】—— 过去某一轮的画面里裁出来的，不是当前画面" % (
-        idx, cand.get("name", ""))
+    return ("[PAST REFERENCE · CANDIDATE[%d] %s] -- cropped out of a frame from an earlier "
+            "round, not the current frame" % (idx, cand.get("name", "")))
 
 
 def current_label(has_candidates: bool) -> str:
     """当前画面前面的标签行：把参考图区段明确收口。"""
-    prefix = "以上【历史参考图】到此结束。" if has_candidates else ""
-    return prefix + "下面这一张、也只有这一张，是【当前画面】——此刻摄像头拍到的真实桌面："
+    prefix = "The [PAST REFERENCE] images end here. " if has_candidates else ""
+    return (prefix + "This next image, and only this one, is [CURRENT FRAME] -- the real table "
+            "the camera sees right now:")
 
 
 def boxed_label(n_food: int, n_drink: int) -> str:
     """带框图前面的标签行（仅门控口径）。检测计数是每轮变量，只能待在可变段。"""
-    return ("【当前画面 · 检测框版】同一张当前画面，红框=疑似食物、蓝框=疑似液体/容器。"
-            "检测器这一轮的命中：食物框×%d、液体框×%d"
-            "（检测器可能漏检，但当前画面里明显不存在的东西绝不要输出）。" % (n_food, n_drink))
+    return ("[CURRENT FRAME · BOXED] the same current frame, red boxes = suspected food, blue "
+            "boxes = suspected liquid/container. The detector hit this round: %d food box(es), "
+            "%d liquid box(es) (the detector can miss things, but never output something that "
+            "plainly is not in the current frame)." % (n_food, n_drink))
 
 
 def pick_rule(last_pick, candidates) -> str:
@@ -262,19 +303,23 @@ def pick_rule(last_pick, candidates) -> str:
     了是非题，而 VLM 对是非题的 yes-bias 极强：错一次就会一路确认下去（线上出现过
     一张卡自我确认 252 次）。新文案强制先独立得出结论，再决定要不要沿用旧名字。"""
     if not last_pick or not last_pick.get("name"):
-        return "挑选规则：挑你最有把握、且在【当前画面】里最主要的那一个。\n"
+        return ("Picking rule: pick the one you are most confident about and that dominates "
+                "[CURRENT FRAME].\n")
     idx = next((i + 1 for i, c in enumerate(candidates or [])
                 if c.get("id") == last_pick.get("card_id")), None)
-    who = "「%s」%s" % (last_pick["name"], ("（就是清单[%d]）" % idx) if idx else "")
-    return ("挑选规则（按顺序执行，顺序不许颠倒）：\n"
-            "  · 上一轮上屏的是 %s。这只是**上一轮的结论，不保证正确**；\n"
-            "  · 请先按任务一独立写完 seen 与 name——写的时候把上一轮的结论完全放在一边，"
-            "不要拿它去「确认」，也不要让它影响你怎么读画面；\n"
-            "  · 写完之后再比对：只有当你独立得出的结论与 %s 指的确实是同一样东西时，"
-            "才沿用这个写法，让画面保持稳定；\n"
-            "  · 只要有一处对不上（包装、形态、颜色、材质任意一处），"
-            "直接按你自己的结论输出，不要迁就上一轮——"
-            "**一直报错的名字比换一次名字糟糕得多**。\n" % (who, who))
+    who = "\"%s\"%s" % (last_pick["name"], (" (that is list entry [%d])" % idx) if idx else "")
+    return ("Picking rule (run the steps in this order, the order may not be swapped):\n"
+            "  · the previous round displayed %s. That is **only the previous conclusion and it "
+            "is not guaranteed to be correct**;\n"
+            "  · first write seen and name independently, exactly as Task 1 demands -- while "
+            "writing, put the previous conclusion entirely aside: do not use it to \"confirm\" "
+            "anything and do not let it colour how you read the frame;\n"
+            "  · only afterwards compare: keep that wording only when the conclusion you reached "
+            "independently really refers to the same thing as %s, so the display stays stable;\n"
+            "  · as soon as one detail does not line up (packaging, form, colour, material, any "
+            "single one of them), output your own conclusion and do not accommodate the previous "
+            "round -- **a name that stays wrong is far worse than a name that changes once**.\n"
+            % (who, who))
 
 
 def tail(last_pick, candidates) -> str:
@@ -282,10 +327,12 @@ def tail(last_pick, candidates) -> str:
 
     这段紧贴生成位置，是模型印象最深的一段，所以把最关键的那条约束放在这里复读。"""
     return (pick_rule(last_pick, candidates) +
-            "现在开始：只描述上面那张【当前画面】里真实存在的东西，"
-            "参考图与清单只能用于任务二的判同。再复读一次硬性约束 4："
-            "只输出能进嘴的食物或饮料；画面里只有手机、电脑、餐具、空包装、空容器"
-            "这类非食物时，items 必须是空数组。只输出 JSON，不要任何解释。\n")
+            "Start now: describe only what really exists in that [CURRENT FRAME] image above; "
+            "the reference images and the list may be used for the same-object judgement of "
+            "Task 2 and for nothing else. Repeating hard constraint 4 once more: output only "
+            "food or drink that can go into a mouth; when the frame holds nothing but non-food "
+            "such as phones, laptops, cutlery, empty packages or empty containers, items must be "
+            "the empty array. Output JSON only, no explanation, all values in English.\n")
 
 
 def render_for_log(content) -> str:
