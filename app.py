@@ -1107,6 +1107,10 @@ def _track_stream_device(device_id):
 # - 手机适配：按视口横竖切版式（@media orientation:portrait），竖屏走 Figma 手机版
 #   375×812（1473-2538 / 1473-2656）：logo 顶部居中、待机文案与营养卡贴底通栏；
 #   竖屏按宽度等比（1rem=100vw/3.75，clamp 上限防竖屏平板过大）+ 贴边元素锚边 + safe-area
+# - 竖屏细调（Figma 1616-4400 / 4397 / 4484 的真机标注）：logo 上提 12；待机文案与营养卡
+#   按「距屏底」口径贴底（含 safe-area 分别为 87 / 48）；三宫格与其上分隔线间距 +2；
+#   顶底压暗层由贴图换成可调的纵向渐变。注意标注量自「未全屏」的旧截图（底部还留着
+#   浏览器工具栏那条），故落地取标注反推的目标距屏底绝对值，而非标注上的位移量
 # ══════════════════════════════════════════════════════════════════════
 EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -1125,7 +1129,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  @font-face{font-family:'ABC Arizona Serif';src:url('/static/fonts/ABCArizonaSerif-Light-Trial.otf') format('opentype');font-weight:300;font-display:swap}
  @font-face{font-family:'Seabirds';src:url('/static/fonts/SeabirdsTrial-Book-V1.ttf') format('truetype');font-weight:400;font-display:swap}
  @font-face{font-family:'Seabirds';src:url('/static/fonts/SeabirdsTrial-SemiBold-V1.ttf') format('truetype');font-weight:600;font-display:swap}
- :root{--white:#FFFDF7}
+ :root{--white:#FFFDF7;
+   /* 竖屏压暗层参数（见下方 @media orientation:portrait 的 #shade），可被 URL 参数覆盖 */
+   --sh-top:.62;--sh-bot:.62;--sh-span:24}
  /* 设计稿 2240×1260 等比缩放：1rem = 设计稿 100px，按宽高较小者定标（保持构图比例） */
  html{font-size:min(calc(100vw/22.4),calc(100vh/12.6))}
  *{box-sizing:border-box}
@@ -1317,28 +1323,39 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
     clamp 上限 115px：竖屏平板/竖置大屏不随宽度无限放大（内容约等效 431px 宽居中） */
  @media (orientation:portrait){
   html{font-size:min(calc(100vw/3.75),115px)}
-  /* 竖屏专用压暗层（1125×2436，同为中心全透+四周压黑的 RGBA）：横屏那两版是 16:9
-     构图，竖屏拉伸后暗角形变，故独立一张；点云背景层不受影响。写 background 整条
-     覆盖（不走 --shade-img 变量），?shade=a 的 A/B 只作用横屏 */
-  #shade{background:url('/static/bg-shade-portrait.png') center/100% 100% no-repeat}
+  /* 竖屏压暗层：纵向 CSS 渐变（不再用 bg-shade-portrait.png，该图留仓备回退）。原贴图顶底 alpha 高到
+     0.96、且 20% 高度内就从 0.96 急落到 0.30，顶底观感是死黑一条；而它横向剖面全程
+     全透，本就等价于一条纵向渐变，改 CSS 后既减淡又能现场调参。
+     三个参数可用 URL 覆盖（手机上改地址栏即可对比）：?shtop=.62&shbot=.62&shspan=24
+       shtop/shbot = 顶/底边缘不透明度，shspan = 单侧渐变跨度（%，越大过渡越长越柔）
+     写 background 整条覆盖（不走 --shade-img 变量），?shade=a 的 A/B 只作用横屏 */
+  #shade{background:linear-gradient(to bottom,
+     rgba(0,0,0,var(--sh-top)) 0%,
+     rgba(0,0,0,calc(var(--sh-top) * .35)) calc(var(--sh-span) * .5%),
+     rgba(0,0,0,0) calc(var(--sh-span) * 1%),
+     rgba(0,0,0,0) calc(100% - var(--sh-span) * 1%),
+     rgba(0,0,0,calc(var(--sh-bot) * .35)) calc(100% - var(--sh-span) * .5%),
+     rgba(0,0,0,var(--sh-bot)) 100%)}
   /* iOS Safari 地址栏收放：100vh 会比可视区高，底部锚定元素被工具栏盖住；dvh 跟随可视区 */
   body{height:100dvh}
   /* UI 画布铺满视口：竖屏构图全部贴边锚定，不再用 16:9 内接画布 */
   #ui{width:100%;height:100%;top:0;left:0;transform:none}
-  /* logo 顶部居中（Figma：105×30、状态栏下 25 → safe-area + .25rem） */
-  #logo{left:50%;top:calc(env(safe-area-inset-top,0px) + .25rem);transform:translateX(-50%);width:1.05rem}
+  /* logo 顶部居中（Figma：105×30、原稿状态栏下 25；1616-4400/4397 标注上提 12 → safe-area + .13rem） */
+  #logo{left:50%;top:calc(env(safe-area-inset-top,0px) + .13rem);transform:translateX(-50%);width:1.05rem}
   /* 状态区从贴右垂直居中改为贴底通栏，两态各自给底边距 */
   #panel{left:0;right:0;top:auto;bottom:0;transform:none;justify-items:center;align-items:end}
   h1{font-size:.24rem;letter-spacing:-.0048rem}
   .sub{font-size:.12rem;letter-spacing:-.0012rem}
-  #idle{width:auto;margin:0 0 calc(env(safe-area-inset-bottom,0px) + .8rem)}
+  #idle{width:auto;margin:0 0 calc(env(safe-area-inset-bottom,0px) + .53rem)}
   #idle h1{text-align:center}
   /* 营养卡贴底通栏（Figma 343×223：左右 16、距底 54、padding 16、区块间距 12） */
   #card{width:calc(100% - .32rem);max-width:3.43rem;
-        margin:0 0 calc(env(safe-area-inset-bottom,0px) + .54rem);padding:.16rem}
+        margin:0 0 calc(env(safe-area-inset-bottom,0px) + .14rem);padding:.16rem}
   #cardbg{backdrop-filter:blur(.13rem)}
   #card .rvw+.rvw{margin-top:.12rem}
   #card .rvw.g8{margin-top:.04rem}
+  /* 三宫格（Protein/Carbs/Fat）与其上方那条分隔线之间比通用区块间距多 2（Figma 1616-4397） */
+  #card .rvw:has(#macros){margin-top:.14rem}
   .rule{border-top-color:rgba(255,253,247,.2)}
   .klab{font-size:.12rem;letter-spacing:-.0012rem}
   .kval{font-size:.2rem;letter-spacing:-.002rem}
@@ -1788,6 +1805,11 @@ const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无�
 // 压暗层备选方案切换：?shade=a 用 A 版（横椭圆），缺省用 CSS 里的默认 B 版（正圆）
 if(new URLSearchParams(location.search).get('shade')==='a')
   document.documentElement.style.setProperty('--shade-img',"url('/static/bg-shade.png')");
+// 竖屏压暗层现场调参：?shtop=.62&shbot=.62&shspan=24（顶/底边缘不透明度、单侧渐变跨度%）。
+// 展台上手机改地址栏就能比出深浅，定稿后把值写回 CSS 的 :root 默认
+{const q=new URLSearchParams(location.search);
+ for(const[k,v]of[['shtop','--sh-top'],['shbot','--sh-bot'],['shspan','--sh-span']])
+   if(q.get(k)!==null) document.documentElement.style.setProperty(v,q.get(k));}
 
 // ══ 背景层：两种来源下拉框选择（临时工具），默认设备深度图（g335 硬件深度伪彩）══
 // 只保留硬件深度的两条：伪彩深度帧(mini 端渲染)与真深度反投影彩色点云(devpc)；
