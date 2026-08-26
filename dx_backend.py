@@ -1166,6 +1166,27 @@ def api_necklace_meal_segment_report_confirm(device_id: str, segment_id: str):
     return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 202)
 
 
+@app.post("/api/necklaces/{device_id}/meal-segments/{segment_id}/report-discard")
+def api_necklace_meal_segment_report_discard(device_id: str, segment_id: str):
+    """放弃这一段的报告（现场判定「这一餐没吃」）。
+
+    与 report-confirm 相反的那条出口：段落 abandoned，属于当前轮时 services 会把
+    本轮打回 ready 并重开取帧窗口，访客与角色都留在这一轮上（不换 cycle，App 不会
+    被打回宣言页）。同步做完，不是受理即返回——控制面点完就直接让访客重新开吃。
+    已经发布到访客手机上的报告不允许放弃，services 回 4xx，这里原样透传。
+    """
+    device_id = (device_id or "").strip()
+    segment_id = (segment_id or "latest").strip()
+    if not device_id:
+        return JSONResponse({"ok": False, "error": "需要 device_id"}, status_code=400)
+    # 冒号透传的理由同 analyze：段 id 形如 ifa-seg:<device>:<millis>。
+    data, status = _ifa_services_request(
+        "POST", "/api/v1/ifa/devices/%s/meal-segments/%s/report-discard" % (
+            urllib.parse.quote(device_id), urllib.parse.quote(segment_id, safe=":")))
+    ok = status < 400
+    return JSONResponse({"ok": ok, **data}, status_code=status if not ok else 200)
+
+
 @app.post("/api/necklaces/{device_id}/close-meal")
 def api_necklace_close_meal(device_id: str):
     """强制关餐：把该项链正在进行的这一餐立刻收尾，交由 services 走后续分析。

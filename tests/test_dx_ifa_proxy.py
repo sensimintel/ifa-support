@@ -380,3 +380,28 @@ class ReportConfirmProxyTest(IfaProxyTestBase):
             "/api/necklaces/%s/meal-segments/latest/report-confirm" % DEVICE)
         self.assertEqual(resp.status_code, 400)
         self.assertFalse(resp.json()["ok"])
+
+
+class ReportDiscardProxyTest(IfaProxyTestBase):
+    """不推送报告：同步完成回 200，段 id 冒号原样透传，闸门留在 services。"""
+
+    def test_discard_的_segment_id_冒号不被编码(self):
+        segment_id = "ifa-seg:%s:1755500000000" % DEVICE
+        self.reply = ({"accepted": True,
+                       "segment": {"segment_id": segment_id,
+                                   "report": {"status": "abandoned"}}}, 200)
+        resp = self.client.post(
+            "/api/necklaces/%s/meal-segments/%s/report-discard" % (DEVICE, segment_id))
+        self.assertEqual(self.last["method"], "POST")
+        self.assertEqual(
+            self.last["path"],
+            "/api/v1/ifa/devices/%s/meal-segments/%s/report-discard" % (DEVICE, segment_id))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["segment"]["report"]["status"], "abandoned")
+
+    def test_已发布的报告不允许放弃时透传_4xx(self):
+        self.reply = ({"error": "这一段的报告已经发布到访客手机上了，不能再放弃"}, 400)
+        resp = self.client.post(
+            "/api/necklaces/%s/meal-segments/latest/report-discard" % DEVICE)
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(resp.json()["ok"])
