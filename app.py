@@ -1110,6 +1110,14 @@ def _track_stream_device(device_id):
 # ══════════════════════════════════════════════════════════════════════
 EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<!-- PWA「添加到主屏幕」：手机从主屏图标打开即无地址栏全屏（iOS 走 apple-* meta 的
+     standalone，Android 走 manifest 的 fullscreen）；浏览器直开不受影响 -->
+<link rel="manifest" href="/static/experience-manifest.json">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ODYSS">
+<link rel="apple-touch-icon" href="/static/icon-odyss-180.png">
+<meta name="theme-color" content="#000000">
 <title>ODYSS · Experience</title>
 <script type="module" src="https://unpkg.com/@google/model-viewer@3.5.0/dist/model-viewer.min.js"></script>
 <style>
