@@ -1115,10 +1115,15 @@ def _track_stream_device(device_id):
 EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <!-- PWA「添加到主屏幕」：手机从主屏图标打开即无地址栏全屏（iOS 走 apple-* meta 的
-     standalone，Android 走 manifest 的 fullscreen）；浏览器直开不受影响 -->
+     standalone，Android 走 manifest 的 fullscreen）；浏览器直开不受影响。
+     状态栏样式取 black 而非 black-translucent：后者让内容从屏幕最顶开始画（点云能铺到
+     刘海），代价是视口整体上移状态栏高度、高度却不加，屏幕最底同样多少像素页面根本
+     画不到（iPhone 17 实测 screen 874 / inner 812 / safe-top 62，底部黑掉 62）。顶底
+     只能二选一，选把那一条留给状态栏——它本就该是黑的，而底部紧挨营养卡，黑边最扎眼。
+     注意 iOS 在「添加到主屏幕」那一刻快照这些 meta，改完必须删图标重加才生效 -->
 <link rel="manifest" href="/static/experience-manifest.json">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="ODYSS">
 <link rel="apple-touch-icon" href="/static/icon-odyss-180.png">
 <meta name="theme-color" content="#000000">
@@ -1816,8 +1821,19 @@ if(new URLSearchParams(location.search).get('shade')==='a')
 // 「距屏底」标注的贴底值落进视口里会凭空多抬一截。把缺口量出来写进 --vpgap，竖屏贴底
 // 元素扣掉它就能真正贴到能画的最低处；视口铺满时缺口为 0、退化成标称值。
 function setVpGap(){
+  // screen.height - innerHeight 只说明「视口比屏幕短了多少」，分不清短在哪一头：
+  //   · 状态栏 translucent：视口顶贴屏顶、env(top) 报状态栏高，短的那截全在底部
+  //   · 状态栏 opaque      ：视口顶从状态栏下方起、env(top)=0，短的那截全在顶部，
+  //                          底部本就贴着屏底，再补偿就会把内容顶起来
+  // 故以 env(top) 是否为 0 判向：只有 translucent 那种才需要补。
+  const pr=document.createElement('div');
+  pr.style.cssText='position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;'+
+    'padding-top:env(safe-area-inset-top,0px)';
+  document.body.appendChild(pr);
+  const safeTop=parseFloat(getComputedStyle(pr).paddingTop)||0;
+  pr.remove();
   const off=(window.visualViewport||{}).offsetTop||0;
-  const g=Math.max(0,(screen.height||0)-innerHeight-off);
+  const g=safeTop>0?Math.max(0,(screen.height||0)-innerHeight-off):0;
   // 只在「主屏图标打开的竖屏 web app」里校正：这是唯一会出现视口短一截的场景。
   // 浏览器标签页里 screen 是整块显示器、跟视口本就不同口径（窗口没最大化就会算出
   // 一个几十上百 px 的假缺口，把内容凭空顶上去），一律不补
