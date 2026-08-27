@@ -1131,7 +1131,9 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  @font-face{font-family:'Seabirds';src:url('/static/fonts/SeabirdsTrial-SemiBold-V1.ttf') format('truetype');font-weight:600;font-display:swap}
  :root{--white:#FFFDF7;
    /* 竖屏压暗层参数（见下方 @media orientation:portrait 的 #shade），可被 URL 参数覆盖 */
-   --sh-top:.62;--sh-bot:.62;--sh-span:24}
+   --sh-top:.62;--sh-bot:.62;--sh-span:24;
+   /* 视口底距屏底的缺口（JS 实测写入，见 setVpGap）：竖屏贴底元素据此校正 */
+   --vpgap:0px}
  /* 设计稿 2240×1260 等比缩放：1rem = 设计稿 100px，按宽高较小者定标（保持构图比例） */
  html{font-size:min(calc(100vw/22.4),calc(100vh/12.6))}
  *{box-sizing:border-box}
@@ -1346,11 +1348,16 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   #panel{left:0;right:0;top:auto;bottom:0;transform:none;justify-items:center;align-items:end}
   h1{font-size:.24rem;letter-spacing:-.0048rem}
   .sub{font-size:.12rem;letter-spacing:-.0012rem}
-  #idle{width:auto;margin:0 0 calc(env(safe-area-inset-bottom,0px) + .53rem)}
+  #idle{width:auto;margin:0 0 max(0px,calc(.8rem - var(--vpgap)))}
   #idle h1{text-align:center}
-  /* 营养卡贴底通栏（Figma 343×223：左右 16、距底 54、padding 16、区块间距 12） */
+  /* 营养卡贴底通栏（Figma 343×223：左右 16、距底 54、padding 16、区块间距 12）。
+     距底一律按「距屏幕最底」算、不叠加 safe-area（2026-08-27 用户当面定：待机文案 80、
+     营养卡 54，即 Figma 原稿值本身）——叠加 safe-area 会凭空多抬 34。
+     再扣掉 --vpgap「视口缺口」：iOS standalone 下视口有时短于屏幕（画不到最底那一条，
+     实测 iPhone 17 上短 61），此时按屏底算的 54 落到视口里其实是 54+61。扣掉缺口让元素
+     真正贴到能画的最低处；缺口为 0（视口铺满）时就退化成标称的 54 */
   #card{width:calc(100% - .32rem);max-width:3.43rem;
-        margin:0 0 calc(env(safe-area-inset-bottom,0px) + .14rem);padding:.16rem}
+        margin:0 0 max(0px,calc(.54rem - var(--vpgap)));padding:.16rem}
   #cardbg{backdrop-filter:blur(.13rem)}
   #card .rvw+.rvw{margin-top:.12rem}
   #card .rvw.g8{margin-top:.04rem}
@@ -1805,6 +1812,76 @@ const DEMO=new URLSearchParams(location.search).get('demo');   // ?demo=1：无�
 // 压暗层备选方案切换：?shade=a 用 A 版（横椭圆），缺省用 CSS 里的默认 B 版（正圆）
 if(new URLSearchParams(location.search).get('shade')==='a')
   document.documentElement.style.setProperty('--shade-img',"url('/static/bg-shade.png')");
+// 视口缺口实测：iOS standalone 下视口偶尔短于屏幕（底部那一条页面画不进去），此时按
+// 「距屏底」标注的贴底值落进视口里会凭空多抬一截。把缺口量出来写进 --vpgap，竖屏贴底
+// 元素扣掉它就能真正贴到能画的最低处；视口铺满时缺口为 0、退化成标称值。
+function setVpGap(){
+  const off=(window.visualViewport||{}).offsetTop||0;
+  const g=Math.max(0,(screen.height||0)-innerHeight-off);
+  // 只在「主屏图标打开的竖屏 web app」里校正：这是唯一会出现视口短一截的场景。
+  // 浏览器标签页里 screen 是整块显示器、跟视口本就不同口径（窗口没最大化就会算出
+  // 一个几十上百 px 的假缺口，把内容凭空顶上去），一律不补
+  const app=navigator.standalone===true||matchMedia('(display-mode:standalone)').matches
+            ||matchMedia('(display-mode:fullscreen)').matches;
+  const on=app&&innerHeight>innerWidth&&g>0&&g<200;   // 200 上限防异常值把内容顶飞
+  document.documentElement.style.setProperty('--vpgap',(on?g:0).toFixed(1)+'px');
+}
+setVpGap();
+addEventListener('resize',setVpGap);
+addEventListener('orientationchange',()=>setTimeout(setVpGap,300));
+if(window.visualViewport) visualViewport.addEventListener('resize',setVpGap);
+
+// 几何自检：?geom=1 把视口、安全区、各锚定元素的真实落点画在屏上。手机上「看着不对」
+// 十有八九是视口没铺到屏底（内容画不进去那一条），肉眼分不清是版式偏了还是视口短了，
+// 拿这一屏截图回来一算就知道差在哪
+function showGeom(){
+  const pr=document.createElement('div');
+  pr.style.cssText='position:fixed;left:0;top:0;width:0;height:0;visibility:hidden;'+
+    'padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);'+
+    'padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px)';
+  document.body.appendChild(pr);
+  const cs=getComputedStyle(pr),vv=window.visualViewport||{};
+  const r=el=>{const b=el.getBoundingClientRect();
+    return `top ${b.top.toFixed(1)} bottom↕ ${(innerHeight-b.bottom).toFixed(1)} h ${b.height.toFixed(1)}`;};
+  const cv=$('bgDot'),st=$('stage');
+  const L=[
+    ['standalone', (navigator.standalone===undefined?'-':navigator.standalone)+
+      ' / display-mode:'+(matchMedia('(display-mode:standalone)').matches?'standalone':
+        matchMedia('(display-mode:fullscreen)').matches?'fullscreen':'browser')],
+    ['screen', `${screen.width}x${screen.height}  dpr ${devicePixelRatio}`],
+    ['inner', `${innerWidth}x${innerHeight}   outerH ${outerHeight}`],
+    ['visualViewport', `${(vv.width||0).toFixed(0)}x${(vv.height||0).toFixed(0)} offTop ${(vv.offsetTop||0).toFixed(0)}`],
+    ['clientH', document.documentElement.clientHeight],
+    ['视口底距屏底', (screen.height-innerHeight-(vv.offsetTop||0)).toFixed(1)+'  ← 不为 0 就画不到屏底'],
+    ['safe-area', `T ${cs.paddingTop} B ${cs.paddingBottom} L ${cs.paddingLeft} R ${cs.paddingRight}`],
+    ['1rem', getComputedStyle(document.documentElement).fontSize],
+    ['--vpgap', getComputedStyle(document.documentElement).getPropertyValue('--vpgap')],
+    ['#stage', r(st)],
+    ['#bgDot', `css ${cv.clientWidth}x${cv.clientHeight}  buf ${cv.width}x${cv.height}`],
+    ['#logo', r($('logo'))],
+    ['#idle', r($('idle'))],
+    ['#card', r($('card'))],
+  ];
+  const box=document.createElement('div');
+  box.style.cssText='position:fixed;inset:0;z-index:999;background:rgba(0,0,0,.86);color:#0f0;'+
+    'font:13px/1.55 ui-monospace,Menlo,monospace;padding:calc(env(safe-area-inset-top,0px) + 12px) 10px 12px;'+
+    'overflow:auto;white-space:pre-wrap;word-break:break-all';
+  box.textContent=L.map(([k,v])=>k.padEnd(14)+' '+v).join('\n')+
+    '\n\n（bottom↕ = 该元素底边距视口底；点一下关掉）';
+  box.onclick=()=>box.remove();
+  document.body.appendChild(box);
+}
+if(new URLSearchParams(location.search).get('geom')!==null) setTimeout(showGeom,1200);
+// 主屏图标打开时没有地址栏、加不了 ?geom=1，留一个手势入口：连点 logo 5 下唤出自检。
+// #ui 整层 pointer-events:none，故单独把 logo 打开成可点
+{let n=0,t=0;
+ const lg=$('logo');
+ lg.style.pointerEvents='auto';
+ lg.addEventListener('click',()=>{
+   const now=Date.now();
+   n=(now-t>3000)?1:n+1; t=now;
+   if(n>=5){n=0;showGeom();}
+ });}
 // 竖屏压暗层现场调参：?shtop=.62&shbot=.62&shspan=24（顶/底边缘不透明度、单侧渐变跨度%）。
 // 展台上手机改地址栏就能比出深浅，定稿后把值写回 CSS 的 :root 默认
 {const q=new URLSearchParams(location.search);
