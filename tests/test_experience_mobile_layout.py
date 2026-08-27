@@ -36,6 +36,9 @@ class ExperienceMobileLayoutTest(unittest.TestCase):
         self.assertIn("--vpgap:0px}", src)
         self.assertIn("function setVpGap()", src)
         self.assertIn("(screen.height||0)-innerHeight-off", src)
+        # 必须按 env(top) 判向：视口短的那截在顶部（状态栏 opaque）时底部本就贴屏底，
+        # 再补偿会把内容顶起来
+        self.assertIn("const g=safeTop>0?", src)
         self.assertIn("innerHeight>innerWidth", src)   # 只在竖屏校正
         # 只在主屏图标打开的 web app 里补偿：浏览器标签页里 screen 与视口不同口径，
         # 窗口没最大化就会算出假缺口把内容顶飞
@@ -70,7 +73,9 @@ class ExperienceMobileLayoutTest(unittest.TestCase):
         src = _src()
         for needle in (
             '<meta name="apple-mobile-web-app-capable" content="yes">',
-            '<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">',
+            # 取 black 而非 black-translucent：后者视口整体上移状态栏高度、高度不加高，
+            # 屏幕最底同样多少像素页面画不到（iPhone 17 实测底部黑 62）
+            '<meta name="apple-mobile-web-app-status-bar-style" content="black">',
             '<link rel="manifest" href="/static/experience-manifest.json">',
         ):
             self.assertIn(needle, src, needle)
