@@ -61,7 +61,7 @@ class ExperienceMobileLayoutTest(unittest.TestCase):
     def test_portrait_shade_is_tunable_gradient(self):
         # 顶底压暗改纵向渐变（原贴图顶底 alpha 0.96、20% 内急落，观感死黑），且可 URL 调参
         src = _src()
-        self.assertIn("--sh-top:.62;--sh-bot:.62;--sh-span:24", src)
+        self.assertIn("--sh-top:.8;--sh-bot:.8;--sh-span:22", src)
         self.assertIn("#shade{background:linear-gradient(to bottom,", src)
         for key in ("shtop", "shbot", "shspan"):
             self.assertIn("'%s'" % key, src, key)

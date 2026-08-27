@@ -1136,7 +1136,7 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
  @font-face{font-family:'Seabirds';src:url('/static/fonts/SeabirdsTrial-SemiBold-V1.ttf') format('truetype');font-weight:600;font-display:swap}
  :root{--white:#FFFDF7;
    /* 竖屏压暗层参数（见下方 @media orientation:portrait 的 #shade），可被 URL 参数覆盖 */
-   --sh-top:.62;--sh-bot:.62;--sh-span:24;
+   --sh-top:.8;--sh-bot:.8;--sh-span:22;
    /* 视口底距屏底的缺口（JS 实测写入，见 setVpGap）：竖屏贴底元素据此校正 */
    --vpgap:0px}
  /* 设计稿 2240×1260 等比缩放：1rem = 设计稿 100px，按宽高较小者定标（保持构图比例） */
@@ -1881,10 +1881,50 @@ function showGeom(){
   const box=document.createElement('div');
   box.style.cssText='position:fixed;inset:0;z-index:999;background:rgba(0,0,0,.86);color:#0f0;'+
     'font:13px/1.55 ui-monospace,Menlo,monospace;padding:calc(env(safe-area-inset-top,0px) + 12px) 10px 12px;'+
-    'overflow:auto;white-space:pre-wrap;word-break:break-all';
-  box.textContent=L.map(([k,v])=>k.padEnd(14)+' '+v).join('\\n')+
-    '\\n\\n（bottom↕ = 该元素底边距视口底；点一下关掉）';
-  box.onclick=()=>box.remove();
+    'overflow:auto';
+  const NL=String.fromCharCode(10);   // 别在这层字符串里写转义：外面还套着一层 Python 字面量
+  const pre=document.createElement('div');
+  pre.style.cssText='white-space:pre-wrap;word-break:break-all;margin-bottom:10px';
+  pre.textContent=L.map(([k,v])=>k.padEnd(14)+' '+v).join(NL)+NL+NL+
+    '（bottom↕ = 该元素底边距视口底）';
+  box.appendChild(pre);
+  // 现场调参：主屏图标打开时没有地址栏、URL 参数用不上，只能把旋钮做进面板。
+  // 拖动即时生效，调满意了把数字报回来写成默认值
+  const tune=document.createElement('div');
+  tune.style.cssText='border-top:1px solid rgba(0,255,0,.4);padding-top:8px';
+  [['蒙版·顶',  'v','--sh-top', 0,   1,  .02],
+   ['蒙版·底',  'v','--sh-bot', 0,   1,  .02],
+   ['蒙版·跨度','v','--sh-span',5,  45,  1  ],
+   ['点云·放大','z',null,       1,   2,  .05]].forEach(([label,kind,varName,min,max,step])=>{
+    const row=document.createElement('div');
+    row.style.cssText='margin:8px 0';
+    const cur=kind==='z'?dotZoom
+      :parseFloat(getComputedStyle(document.documentElement).getPropertyValue(varName))||0;
+    const lab=document.createElement('div');
+    lab.textContent=label+'  '+(+cur).toFixed(2);
+    const r=document.createElement('input');
+    r.type='range';r.min=min;r.max=max;r.step=step;r.value=cur;
+    r.style.cssText='width:100%;margin-top:2px';
+    r.addEventListener('input',()=>{
+      const v=+r.value;
+      lab.textContent=label+'  '+v.toFixed(2);
+      if(kind==='z'){
+        dotZoom=v;
+        try{localStorage.setItem('exp_dot_zoom',String(v));}catch(e){}
+        if(+dotCfg.on&&dotIm){dotSample();dotDraw();}
+      }else{
+        document.documentElement.style.setProperty(varName,String(v));
+      }
+    });
+    row.appendChild(lab);row.appendChild(r);tune.appendChild(row);
+  });
+  const close=document.createElement('button');
+  close.textContent='关掉';
+  close.style.cssText='margin-top:10px;width:100%;padding:10px;background:transparent;'+
+    'border:1px solid #0f0;color:#0f0;font:14px ui-monospace,monospace;border-radius:6px';
+  close.onclick=()=>box.remove();
+  tune.appendChild(close);
+  box.appendChild(tune);
   document.body.appendChild(box);
 }
 if(new URLSearchParams(location.search).get('geom')!==null) setTimeout(showGeom,1200);
@@ -2386,6 +2426,13 @@ let dotCfg={on:1,mode:1,pitch:5,r:34,jitter:0,motion:0,speed:3,bg:'#000000',gsha
   pdepth:100};
 try{Object.assign(dotCfg,JSON.parse(localStorage.getItem('exp_dot')||'{}'));}catch(e){}
 let dotIm=null,dotOffCv=null;        // 最近一帧背景 Image / 离屏降采样画布（复用）
+// 竖屏点云放大系数：竖屏 cover 只取源图中间一竖条（1280 宽里约 331），画面里的东西
+// 显得小，而上下两头恰是最远的区域——点稀、色暗，看着就像"顶上没有点云"。收窄裁剪窗
+// 把内容整体放大，代价是左右各再裁掉一点（竖屏本来也只用得上中间一条）。
+// 可用 ?zoom=1.25 或自检面板的滑块现场调，调定后写回这里的默认值
+let dotZoom=1.25;
+try{const z=+localStorage.getItem('exp_dot_zoom');if(z>=1&&z<=2)dotZoom=z;}catch(e){}
+{const q=+new URLSearchParams(location.search).get('zoom');if(q>=1&&q<=2)dotZoom=q;}
 let dotData=null,dotCols=0,dotRows=0;// 降采样取色缓存：动画重绘不重复采样
 let inkT=0,inkMass=0,inkN=0;         // 诊断记账：每绘制 tick 的墨量(Σ粒径²×α)与粒/点数
 function dotSample(){
@@ -2403,8 +2450,12 @@ function dotSample(){
   dotOffCv.width=dotCols;dotOffCv.height=dotRows;
   const ar=W/H,iar=im.naturalWidth/im.naturalHeight;
   let sx,sy,sw,sh;
-  if(iar>ar){sh=im.naturalHeight;sw=sh*ar;sx=(im.naturalWidth-sw)/2;sy=0;}
-  else{sw=im.naturalWidth;sh=sw/ar;sx=0;sy=(im.naturalHeight-sh)/2;}
+  if(iar>ar){sh=im.naturalHeight;sw=sh*ar;}
+  else{sw=im.naturalWidth;sh=sw/ar;}
+  // 竖屏按 dotZoom 收窄裁剪窗（等价于放大画面），横屏是展台构图不动
+  const Z=(innerHeight>innerWidth)?Math.min(2,Math.max(1,+dotZoom||1)):1;
+  sw/=Z;sh/=Z;
+  sx=(im.naturalWidth-sw)/2;sy=(im.naturalHeight-sh)/2;
   const octx=dotOffCv.getContext('2d',{willReadFrequently:true});
   octx.drawImage(im,sx,sy,sw,sh,0,0,dotCols,dotRows);
   dotData=octx.getImageData(0,0,dotCols,dotRows).data;
