@@ -52,10 +52,12 @@ class ExperienceMobileLayoutTest(unittest.TestCase):
         # 主屏图标打开时没有地址栏，必须留手势入口，否则真机上根本调不出来
         self.assertIn("if(n>=5){n=0;showGeom();}", src)
 
-    def test_macros_row_gap_is_two_more(self):
-        # 三宫格与其上方分隔线的间距比通用区块间距多 2（.12 → .14）
+    def test_macros_row_gap(self):
+        # 三宫格与其上方分隔线的间距：Figma 标注 +2（.12→.14），真机走查再收窄 5（→.09）；
+        # 名称那块下移同样的 5，卡片总高不变
         src = _src()
-        self.assertIn("#card .rvw:has(#macros){margin-top:.14rem}", src)
+        self.assertIn("#card .rvw:has(#macros){margin-top:.09rem}", src)
+        self.assertIn("#card .rvw.nom{margin-top:.05rem}", src)
         self.assertIn("#card .rvw+.rvw{margin-top:.12rem}", src)
 
     def test_portrait_shade_is_tunable_gradient(self):

@@ -1366,8 +1366,11 @@ EXPERIENCE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   #cardbg{backdrop-filter:blur(.13rem)}
   #card .rvw+.rvw{margin-top:.12rem}
   #card .rvw.g8{margin-top:.04rem}
-  /* 三宫格（Protein/Carbs/Fat）与其上方那条分隔线之间比通用区块间距多 2（Figma 1616-4397） */
-  #card .rvw:has(#macros){margin-top:.14rem}
+  /* 三宫格（Protein/Carbs/Fat）与其上方那条分隔线之间：先按 Figma 1616-4397 比通用区块
+     间距多 2（.12→.14），再按 2026-08-27 真机走查收窄 5（.14→.09）。
+     配套把名称那块整体下移同样的 5：卡片总高因此不变，只是上半坨往下坐、与三宫格贴近 */
+  #card .rvw:has(#macros){margin-top:.09rem}
+  #card .rvw.nom{margin-top:.05rem}
   .rule{border-top-color:rgba(255,253,247,.2)}
   .klab{font-size:.12rem;letter-spacing:-.0012rem}
   .kval{font-size:.2rem;letter-spacing:-.002rem}
