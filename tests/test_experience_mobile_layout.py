@@ -20,14 +20,34 @@ def _src() -> str:
 
 class ExperienceMobileLayoutTest(unittest.TestCase):
     def test_portrait_anchors_match_figma(self):
-        # logo 上提 12（.25→.13）；待机文案与营养卡按距屏底 87 / 48 贴底（各自再加 safe-area）
+        # logo 上提 12（.25→.13）；待机文案 80 / 营养卡 54，按「距屏幕最底」算——
+        # 不叠加 safe-area（叠加会凭空多抬 34），再扣掉视口缺口 --vpgap
         src = _src()
         for needle in (
             "#logo{left:50%;top:calc(env(safe-area-inset-top,0px) + .13rem)",
-            "#idle{width:auto;margin:0 0 calc(env(safe-area-inset-bottom,0px) + .53rem)}",
-            "margin:0 0 calc(env(safe-area-inset-bottom,0px) + .14rem);padding:.16rem}",
+            "#idle{width:auto;margin:0 0 max(0px,calc(.8rem - var(--vpgap)))}",
+            "margin:0 0 max(0px,calc(.54rem - var(--vpgap)));padding:.16rem}",
         ):
             self.assertIn(needle, src, needle)
+
+    def test_viewport_gap_is_measured_and_portrait_only(self):
+        # 视口短于屏幕时（iOS standalone 画不到最底那一条），贴底值必须扣掉缺口
+        src = _src()
+        self.assertIn("--vpgap:0px}", src)
+        self.assertIn("function setVpGap()", src)
+        self.assertIn("(screen.height||0)-innerHeight-off", src)
+        self.assertIn("innerHeight>innerWidth", src)   # 只在竖屏校正
+        # 只在主屏图标打开的 web app 里补偿：浏览器标签页里 screen 与视口不同口径，
+        # 窗口没最大化就会算出假缺口把内容顶飞
+        self.assertIn("navigator.standalone===true||matchMedia('(display-mode:standalone)')", src)
+
+    def test_geometry_selfcheck_available(self):
+        # ?geom=1 自检面板：真机上「看着不对」时一屏截图就能分清是版式偏了还是视口短了
+        src = _src()
+        self.assertIn("get('geom')", src)
+        self.assertIn("视口底距屏底", src)
+        # 主屏图标打开时没有地址栏，必须留手势入口，否则真机上根本调不出来
+        self.assertIn("if(n>=5){n=0;showGeom();}", src)
 
     def test_macros_row_gap_is_two_more(self):
         # 三宫格与其上方分隔线的间距比通用区块间距多 2（.12 → .14）
