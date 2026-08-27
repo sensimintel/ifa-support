@@ -1866,8 +1866,8 @@ function showGeom(){
   box.style.cssText='position:fixed;inset:0;z-index:999;background:rgba(0,0,0,.86);color:#0f0;'+
     'font:13px/1.55 ui-monospace,Menlo,monospace;padding:calc(env(safe-area-inset-top,0px) + 12px) 10px 12px;'+
     'overflow:auto;white-space:pre-wrap;word-break:break-all';
-  box.textContent=L.map(([k,v])=>k.padEnd(14)+' '+v).join('\n')+
-    '\n\n（bottom↕ = 该元素底边距视口底；点一下关掉）';
+  box.textContent=L.map(([k,v])=>k.padEnd(14)+' '+v).join('\\n')+
+    '\\n\\n（bottom↕ = 该元素底边距视口底；点一下关掉）';
   box.onclick=()=>box.remove();
   document.body.appendChild(box);
 }
