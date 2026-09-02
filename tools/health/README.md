@@ -11,6 +11,18 @@ ssh odyss-server-local 'bash -s' < tools/health/check.sh
 
 输出每行 `状态|组件|详情`（OK / FAIL / WARN / INFO），有 FAIL 时退出码 1。
 
+### 服务器重启后一键恢复浅体验区（8060）
+
+在 5090 桌面终端直接执行（无参数，不经 AI）：
+
+```bash
+~/da3-web/tools/health/after-reboot.sh          # 等链路就绪 → 自愈 → 体检 → 打开浏览器
+KIOSK=1 ~/da3-web/tools/health/after-reboot.sh  # 全屏展台模式
+NO_OPEN=1 ~/da3-web/tools/health/after-reboot.sh # 只恢复+体检，不开浏览器（ssh 场景）
+```
+
+按依赖顺序等 da3-web(8060) → SAM3(8013) → 本机 vLLM(8000) → mac-mini 帧就绪，每个 unit 超时未就绪按本表「唯一拉起入口」`systemctl restart` 一次再等，之后跑 `check.sh` 全栈体检，最后 `firefox http://localhost:8060/experience`。不碰业务栈 `docker compose`（孤本无命名卷）、不重启 frpc、不裸探秤；四个宿主 unit 与业务/观测容器均已 enable / unless-stopped，常态下重启后 90s 内自行就绪，脚本主要负责「等到真正就绪并确认」。
+
 ## 两态期望清单（本表是唯一正源，改期望先改这里）
 
 ### ① 应运行——按四种能力分组
