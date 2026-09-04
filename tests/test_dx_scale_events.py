@@ -37,10 +37,27 @@ class PlateauStepTest(unittest.TestCase):
         self.assertEqual(events[0]["before_g"], 280.3)
         self.assertEqual(events[0]["after_g"], 278.5)
 
-    def test_爆米花级别的亚克变化也切得出来(self):
+    def test_亚克级别的微小变化也切得出来(self):
+        # 检测器的灵敏度不跟着展台食物走：切得比需要的更细没有代价，
+        # 「多小算漂移」由 services 侧那个可调死区在读的时候决定。
         det = sev.ScaleEventDetector(1)
         events, _ = feed_plateaus(det, [(280.3, 5), (279.9, 5)])
         self.assertEqual(kinds_and_deltas(events), [(sev.KIND_STEP, -0.4)])
+
+    def test_一颗草莓量级的取食判成_step_而不是离台(self):
+        # 回归保护：展台换成草莓之后一颗就有 10–25 g。离台阈还留在旧的 20 g 时，
+        # 这一次取食会被判成「容器离台」——那一克不计入，状态机还就此进 ABSENT，
+        # 后面每次取食都变成 absent_step，整段账掉到接近零。
+        det = sev.ScaleEventDetector(1)
+        events, _ = feed_plateaus(det, [(280.3, 5), (255.3, 5)])
+        self.assertEqual(kinds_and_deltas(events), [(sev.KIND_STEP, -25.0)])
+
+    def test_抓一把草莓仍然是_step(self):
+        # 「抓一把」是 services 侧判未归类的那一档（超过单次取食上限），
+        # 但它必须先以 step 的身份到得了 services；在这里被判成离台就没下文了。
+        det = sev.ScaleEventDetector(1)
+        events, _ = feed_plateaus(det, [(280.3, 5), (244.3, 5)])
+        self.assertEqual(kinds_and_deltas(events), [(sev.KIND_STEP, -36.0)])
 
     def test_峰峰值不超过_ε_的抖动不算变化(self):
         # 0.15 g < ε(0.2)：窗口从头到尾都稳定，压根不会进 MOVING
@@ -115,14 +132,14 @@ class FigureOneReplayTest(unittest.TestCase):
     PLATEAUS = [
         (280.3, 42),   # 开轮静置
         (278.5, 19),   # ① 取一颗蓝莓 −1.8
-        (278.1, 34),   # ② 取一颗爆米花 −0.4
-        (279.0, 2),    # ③ 手压在碗沿 +0.9
-        (278.1, 33),   # ④ 手松开 −0.9
+        (263.5, 34),   # ② 取一颗草莓 −15.0
+        (264.4, 2),    # ③ 手压在碗沿 +0.9
+        (263.5, 33),   # ④ 手松开 −0.9
         (11.4, 58),    # ⑤ 端起碗离台
-        (274.9, 17),   # ⑥ 碗回台，净差 −3.2
-        (273.1, 13),   # ⑦ 取一颗蓝莓 −1.8
-        (272.5, 14),   # ⑧ 取一颗爆米花 −0.6
-        (269.1, 18),   # ⑨ 抓一把爆米花 −3.4
+        (257.5, 17),   # ⑥ 碗回台，净差 −6.0
+        (255.7, 13),   # ⑦ 取一颗蓝莓 −1.8
+        (240.7, 14),   # ⑧ 取一颗草莓 −15.0
+        (204.7, 18),   # ⑨ 抓一把草莓 −36.0
     ]
 
     def setUp(self):
@@ -132,27 +149,27 @@ class FigureOneReplayTest(unittest.TestCase):
     def test_事件序列与设计稿一致(self):
         self.assertEqual(kinds_and_deltas(self.events), [
             (sev.KIND_STEP, -1.8),
-            (sev.KIND_STEP, -0.4),
+            (sev.KIND_STEP, -15.0),
             (sev.KIND_STEP, 0.9),
             (sev.KIND_STEP, -0.9),
-            (sev.KIND_LIFT, -266.7),
-            (sev.KIND_LIFT_RETURN, -3.2),
+            (sev.KIND_LIFT, -252.1),
+            (sev.KIND_LIFT_RETURN, -6.0),
             (sev.KIND_STEP, -1.8),
-            (sev.KIND_STEP, -0.6),
-            (sev.KIND_STEP, -3.4),
+            (sev.KIND_STEP, -15.0),
+            (sev.KIND_STEP, -36.0),
         ])
 
     def test_闭合不变式_可计入事件之和等于首末平台之差(self):
         # 这条不变式是整条链的自检：对不上就说明事件流有洞（漏跃变 / 未闭合的离台 /
-        # 皮重被人动过）。lift 本身不参与——它那 266.7 g 已经被 lift_return 的净差覆盖。
+        # 皮重被人动过）。lift 本身不参与——它那 252.1 g 已经被 lift_return 的净差覆盖。
         countable = sum(e["delta_g"] for e in self.events
                         if e["kind"] in sev.COUNTABLE_KINDS)
-        self.assertAlmostEqual(countable, 269.1 - 280.3, places=3)
+        self.assertAlmostEqual(countable, 204.7 - 280.3, places=3)
 
     def test_整段跑完落在稳定平台上且没有悬空锚点(self):
         snap = self.det.snapshot()
         self.assertEqual(snap["state"], "stable")
-        self.assertEqual(snap["plateau_g"], 269.1)
+        self.assertEqual(snap["plateau_g"], 204.7)
         # 锚点必须已经结算掉：留着它说明有一次离台没闭合，这一段的克数就是不完整的
         self.assertIsNone(snap["anchor_g"])
 

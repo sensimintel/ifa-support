@@ -481,13 +481,15 @@ def _read_scale_raws():
 # 三条刻意的设计：
 #   · **全程录，不看餐段边界**。餐段起止在 services，dx 这边压根不知道；而且全程录
 #     之后，改阈值、重跑分析、甚至改餐段边界都不用重新采一次数据。
-#   · **只上报原始变化，不上报分类**。是蓝莓还是爆米花由 services 按可调阈值读时算；
+#   · **只上报原始变化，不上报分类**。是草莓还是蓝莓由 services 按可调阈值读时算；
 #     在这里判死了，现场调完阈值就再也算不回历史。
 #   · **检测跑毛重不跑净重**。软件去皮会让净重瞬间跳几百克，跑净重会凭空造出一次
 #     几百克的假取食；而去皮量在相邻两个平台的差里本来就抵消掉了。
 SCALE_STABLE_WINDOW_S = float(os.environ.get("SCALE_STABLE_WINDOW_S", "1.0"))
 SCALE_STABLE_EPSILON_G = float(os.environ.get("SCALE_STABLE_EPSILON_G", "0.2"))
-SCALE_LIFT_THRESHOLD_G = float(os.environ.get("SCALE_LIFT_THRESHOLD_G", "20.0"))
+# 离台阈 20 → 60：换成草莓之后一颗就有 10–25 g，留在 20 会把取食判成容器离台。
+# 完整理由见 dx_scale_events.py 的模块头注释（含「容器必须足够重」这条前提）。
+SCALE_LIFT_THRESHOLD_G = float(os.environ.get("SCALE_LIFT_THRESHOLD_G", "60.0"))
 SCALE_ABSENT_TIMEOUT_S = float(os.environ.get("SCALE_ABSENT_TIMEOUT_S", "300"))
 # 原始采样落盘，供离线回放调参（第一版阈值一定是错的，没有回放就只能靠现场重现）。
 # 只写已接秤的通道，5 Hz 一天约 20 MB/通道，按日切文件，旧文件由运维清理。
@@ -1338,7 +1340,7 @@ def api_necklace_params_set(device_id: str, body: dict = Body(...)):
 def api_ifa_global_params_get():
     """查询深区**全局**分析参数（秤阈值这一组只有全局那一层作数）。
 
-    桌上几台秤称的是同一批食物，「多大的变化算漂移、多少克分蓝莓与爆米花」是
+    桌上几台秤称的是同一批食物，「多大的变化算漂移、多少克分蓝莓与草莓」是
     这场演示的一条口径，不是某台项链的属性——控制面调阈值一律走这里，
     改一次对所有秤生效。整体透传 services 的 data 段，不在代理这层维护字段白名单。
     """

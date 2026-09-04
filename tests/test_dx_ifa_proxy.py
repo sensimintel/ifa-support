@@ -234,19 +234,19 @@ class FallbackReportPassthroughTest(IfaProxyTestBase):
     """推送报告兜底：食物表与推送请求都只做透传，状态闸门留在 services。"""
 
     def test_食物表透出(self):
-        self.reply = ({"foods": [{"key": "blueberry", "name": "Blueberries",
+        self.reply = ({"foods": [{"key": "strawberry", "name": "Strawberries",
                                   "calories_per_100g": 57}]}, 200)
         resp = self.client.get("/api/fallback-report/foods")
         self.assertEqual(self.last["method"], "GET")
         self.assertEqual(self.last["path"], "/api/v1/ifa/fallback-report/foods")
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()["foods"][0]["key"], "blueberry")
+        self.assertEqual(resp.json()["foods"][0]["key"], "strawberry")
 
     def test_推送请求体原样透传(self):
         self.reply = ({"device_id": DEVICE, "journal_meal_id": 901,
                        "state": "report_published"}, 200)
         body = {"items": [{"food_key": "blueberry", "grams": 120},
-                          {"food_key": "popcorn", "grams": 30}]}
+                          {"food_key": "strawberry", "grams": 30}]}
         resp = self.client.post("/api/necklaces/%s/fallback-report" % DEVICE, json=body)
         self.assertEqual(self.last["method"], "POST")
         self.assertEqual(self.last["path"],
@@ -257,7 +257,7 @@ class FallbackReportPassthroughTest(IfaProxyTestBase):
     def test_services_拒绝时透传状态码(self):
         self.reply = ({"error": "该设备当前没有演示周期"}, 404)
         resp = self.client.post("/api/necklaces/%s/fallback-report" % DEVICE,
-                                json={"items": [{"food_key": "popcorn", "grams": 30}]})
+                                json={"items": [{"food_key": "strawberry", "grams": 30}]})
         self.assertEqual(resp.status_code, 404)
         self.assertFalse(resp.json()["ok"])
 
@@ -286,7 +286,7 @@ class ServicesUnreachableTest(unittest.TestCase):
             ("PUT", "/api/necklaces/%s/params" % DEVICE, {"params": {"max_frames": 8}}),
             ("GET", "/api/fallback-report/foods", None),
             ("POST", "/api/necklaces/%s/fallback-report" % DEVICE,
-             {"items": [{"food_key": "popcorn", "grams": 30}]}),
+             {"items": [{"food_key": "strawberry", "grams": 30}]}),
         ]
         for method, path, body in cases:
             resp = self.client.request(method, path, json=body)
@@ -302,12 +302,12 @@ class ScaleProxyTest(IfaProxyTestBase):
     """秤汇总与秤事件的代理：路径拼装与 segment_id / limit 的透传。"""
 
     def test_汇总默认取最新一段(self):
-        self.reply = ({"device_id": DEVICE, "blueberry_total_g": 8.8}, 200)
+        self.reply = ({"device_id": DEVICE, "strawberry_total_g": 67.5}, 200)
         body = self.client.get(f"/api/necklaces/{DEVICE}/scale-summary").json()
         self.assertEqual(self.last["method"], "GET")
         self.assertEqual(self.last["path"], f"/api/v1/ifa/devices/{DEVICE}/scale-summary")
         self.assertTrue(body["ok"])
-        self.assertEqual(body["blueberry_total_g"], 8.8)
+        self.assertEqual(body["strawberry_total_g"], 67.5)
 
     def test_汇总带上指定段(self):
         self.client.get(f"/api/necklaces/{DEVICE}/scale-summary?segment_id=ifa-seg%3Ax%3A1")
